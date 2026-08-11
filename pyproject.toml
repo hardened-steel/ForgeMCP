@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forgemcp"
+version = "0.1.0"
+description = "A safe MCP server for structured C++ project development workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "ForgeMCP contributors" }]
+dependencies = [
+    "mcp[cli]>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+forgemcp = "forgemcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forgemcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
