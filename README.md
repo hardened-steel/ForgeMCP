@@ -1,16 +1,14 @@
 # ForgeMCP
 
-ForgeMCP is an MCP server that provides AI assistants with deep, structured integration for C++ development.
+ForgeMCP is an MCP server that will provide AI assistants with deep, structured integration for C++ development.
 
-## Current MVP
+## Current Core MVP
 
-The initial server exposes safe, read-only workspace tools over the MCP stdio transport:
+The initial server exposes a diagnostic MCP tool over the stdio transport:
 
-- `workspace_info`
-- `list_files`
-- `read_file`
+- `server_status`
 
-All file paths are resolved relative to `FORGEMCP_WORKSPACE` (or the process working directory if it is unset). Paths outside that root are rejected.
+`FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
 ## Setup
 
@@ -30,15 +28,14 @@ $env:FORGEMCP_WORKSPACE = "C:\path\to\cpp-project"
 forgemcp
 ```
 
-The next increments are patch-based file edits, CMake presets/build/test tools, then clangd and Debug Adapter Protocol integrations.
+The next increments are a Workspace module, then CMake build/test, clangd, and Debug Adapter Protocol modules.
 
 ## Core structure
 
-- `config.py` — typed runtime configuration and limits.
-- `workspace.py` — the single safe filesystem boundary for all future plugins.
-- `processes.py` — async, shell-free external process execution with timeouts and bounded output.
-- `plugins.py` — contracts and lifecycle registry for pluggable CMake, clangd, debugger, and quality providers.
+- `core/config.py` — typed runtime configuration and workspace-root validation.
+- `core/services.py` — explicit dependency registry for future modules.
+- `core/application.py` — application composition, lifecycle, and server status.
+- `core/errors.py` — expected Core errors and safe MCP-facing responses.
+- `core/logging.py` — structured, redacted stderr logging.
 
-Provider plugins will depend on these services instead of reading files or launching subprocesses directly.
-
-`ProcessManager` emits transport-neutral progress events. A future MCP tool will receive an MCP `Context` and adapt them to `ctx.report_progress`, while a CMake-specific parser can convert output such as `[ 42%]` into intermediate updates.
+See [architecture.md](docs/architecture.md) for Core boundaries and extension points.

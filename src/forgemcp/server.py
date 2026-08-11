@@ -1,53 +1,37 @@
-"""ForgeMCP stdio server and the initial read-only workspace tools."""
+"""Thin MCP stdio adapter for the ForgeMCP Core application."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from mcp.server.fastmcp import FastMCP
 
-from forgemcp.config import ForgeConfig
-from forgemcp.workspace import WorkspaceService
-
-mcp = FastMCP("ForgeMCP")
+from forgemcp.core.application import ForgeApplication
 
 
-def get_workspace() -> WorkspaceService:
-    """Create a workspace service from the server's current configuration."""
-    return WorkspaceService(ForgeConfig.from_environment())
+def server_status(application: ForgeApplication) -> dict[str, object]:
+    """Return the safe Core status payload used by the MCP diagnostic tool."""
+    return application.status().as_dict()
 
 
-# Compatibility helpers retained while the MCP API is small.
-def workspace_root() -> Path:
-    return get_workspace().root
+def create_server(application: ForgeApplication) -> FastMCP:
+    """Bind Core application operations to MCP tools without owning Core state."""
+    mcp = FastMCP("ForgeMCP")
 
+    @mcp.tool(name="server_status")
+    def server_status_tool() -> dict[str, object]:
+        """Return ForgeMCP version, workspace, lifecycle state, and Core services."""
+        return server_status(application)
 
-def resolve_workspace_path(path: str) -> Path:
-    return get_workspace().resolve_path(path)
-
-
-@mcp.tool()
-def workspace_info() -> dict[str, str | bool]:
-    """Return the root directory currently accessible to ForgeMCP."""
-    root = workspace_root()
-    return {"root": str(root), "exists": root.exists()}
-
-
-@mcp.tool()
-def list_files(path: str = ".", recursive: bool = False) -> list[str]:
-    """List visible files under a workspace directory."""
-    return get_workspace().list_files(path, recursive=recursive)
-
-
-@mcp.tool()
-def read_file(path: str, max_chars: int = 100_000) -> dict[str, str | bool]:
-    """Read a UTF-8 text file inside the workspace with an output size limit."""
-    return get_workspace().read_text(path, max_chars=max_chars).as_dict()
+    return mcp
 
 
 def main() -> None:
-    """Start ForgeMCP using MCP's standard input/output transport."""
-    mcp.run(transport="stdio")
+    """Create, run, and reliably stop a stdio ForgeMCP application."""
+    application = ForgeApplication.from_environment()
+    application.start()
+    try:
+        create_server(application).run(transport="stdio")
+    finally:
+        application.stop()
 
 
 if __name__ == "__main__":
