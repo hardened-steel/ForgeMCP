@@ -4,7 +4,7 @@
 
 `forgemcp.core` is the composition root for the MCP server. It owns explicit configuration, workspace-root validation, the small service registry, application lifecycle, expected domain errors, and structured stderr logging.
 
-The Core does **not** read or edit project files, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. Those responsibilities belong to future modules and must receive dependencies through `ServiceRegistry` rather than constructing global state.
+The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
 
 `server.py` is a deliberately thin adapter: it creates `ForgeApplication`, starts it, binds Core's `server_status` diagnostic operation to MCP Python SDK's stdio server, and stops the application on exit.
 
@@ -28,8 +28,24 @@ A future module should expose a small service object and register it during appl
 
 - `config` — `ForgeConfig`
 - `logger` — `StructuredLogger`
+- `workspace` — `WorkspaceService`, the safe filesystem capability for the configured workspace
 
-Plugin discovery, dependency resolution, CMake, workspace I/O, clangd, debug adapters, and process execution are intentionally outside this initial Core boundary.
+## Workspace module
+
+`forgemcp.workspace` is a transport-neutral filesystem service for exactly `ForgeConfig.workspace_root`; it has no MCP tool adapter and does not import `mcp.server`. `ForgeApplication.create()` composes it as `application.services.get("workspace")`.
+
+Its public `WorkspaceService` API is:
+
+- `list_files(path=".", recursive=False) -> tuple[FileSnapshot, ...]`
+- `read_text(path) -> tuple[str, FileSnapshot]`
+- `get_snapshot(path) -> FileSnapshot`
+- `apply_unified_patch(patch, expected_snapshots) -> PatchResult`
+
+All supplied paths are workspace-relative strings. Absolute, drive-qualified, and parent-traversal paths are rejected. A requested path containing a symlink is rejected; directory listing does not follow and omits symlinks. The default immutable `WorkspacePolicy` excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories, and provides bounded UTF-8 reads and patch input. Callers can compose `WorkspaceService` with another policy when their generated-directory conventions differ.
+
+Every patch target must carry a compare-and-swap expectation: preferably the `FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file; `None` represents an expected absent file for creation. A snapshot conflict or hunk mismatch returns `PatchResult(applied=False)` before source files are changed. Patches are text-only unified diffs, staged beside their targets and committed with rollback backups; patch input and file content never enter Workspace log context. File change events are intentionally not implemented yet.
+
+Plugin discovery, dependency resolution, CMake, MCP Workspace tool adapters, clangd, debug adapters, and process execution are intentionally outside this initial Core boundary. Workspace I/O itself is isolated in the separately composed Workspace module.
 
 ## Error and logging policy
 

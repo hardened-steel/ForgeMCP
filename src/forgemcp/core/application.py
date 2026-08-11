@@ -12,6 +12,7 @@ from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import LifecycleError
 from forgemcp.core.logging import StructuredLogger, create_logger
 from forgemcp.core.services import ServiceRegistry
+from forgemcp.workspace import WorkspaceService
 
 
 class LifecycleState(StrEnum):
@@ -53,10 +54,12 @@ class ForgeApplication:
 
     @classmethod
     def create(cls, config: ForgeConfig) -> "ForgeApplication":
-        """Compose Core's built-in services from already validated configuration."""
+        """Compose Core services and registered domain services from validated configuration."""
         services = ServiceRegistry()
         services.register("config", config)
-        services.register("logger", create_logger(config.log_level))
+        logger = create_logger(config.log_level)
+        services.register("logger", logger)
+        services.register("workspace", WorkspaceService(config, logger))
         return cls(config, services)
 
     @classmethod
