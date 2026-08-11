@@ -13,7 +13,7 @@ def test_server_status_smoke_test(tmp_path):
 
     assert status["workspace_root"] == str(tmp_path.resolve())
     assert status["state"] == LifecycleState.RUNNING.value
-    assert status["services"] == ["config", "logger", "workspace"]
+    assert status["services"] == ["config", "logger", "process_runtime", "workspace"]
     server = create_server(application)
     assert server.name == "ForgeMCP"
     assert [tool.name for tool in asyncio.run(server.list_tools())] == ["server_status"]

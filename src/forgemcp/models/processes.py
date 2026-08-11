@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from forgemcp.models._base import ForgeModel, normalize_utc
 
@@ -14,6 +14,11 @@ MAX_PROCESS_OUTPUT_CHARACTERS = 65_536
 
 class ProcessOutput(ForgeModel):
     """One captured process stream, capped before it reaches the domain boundary."""
+
+    # Process output is opaque text, not an identifier or a user-entered label:
+    # preserving leading/trailing whitespace (including diagnostics' newlines)
+    # is part of its contract.
+    model_config = ConfigDict(str_strip_whitespace=False)
 
     text: str = Field(
         max_length=MAX_PROCESS_OUTPUT_CHARACTERS,

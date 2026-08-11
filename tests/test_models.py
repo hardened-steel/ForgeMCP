@@ -119,6 +119,8 @@ def test_process_result_bounds_output_and_hides_text_from_log_summary():
     }
     assert output.log_summary() == {"characters": 15, "truncated": True}
 
+    assert ProcessOutput(text=" compiler output\n").text == " compiler output\n"
+
     with pytest.raises(ValidationError):
         ProcessOutput(text="x" * (MAX_PROCESS_OUTPUT_CHARACTERS + 1))
     with pytest.raises(ValidationError, match="Timed-out processes must not expose an exit code"):

@@ -12,6 +12,7 @@ from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import LifecycleError
 from forgemcp.core.logging import StructuredLogger, create_logger
 from forgemcp.core.services import ServiceRegistry
+from forgemcp.processes import ProcessRuntime
 from forgemcp.workspace import WorkspaceService
 
 
@@ -60,6 +61,7 @@ class ForgeApplication:
         logger = create_logger(config.log_level)
         services.register("logger", logger)
         services.register("workspace", WorkspaceService(config, logger))
+        services.register("process_runtime", ProcessRuntime(config, logger))
         return cls(config, services)
 
     @classmethod
@@ -85,6 +87,24 @@ class ForgeApplication:
 
     def stop(self) -> None:
         """Stop the application; repeated cleanup is harmless."""
+        if self._state is LifecycleState.STOPPED:
+            return
+        self._state = LifecycleState.STOPPED
+        process_runtime = self.services.get("process_runtime")
+        if isinstance(process_runtime, ProcessRuntime):
+            process_runtime.close()
+        self._logger.info("application_stopped")
+
+    async def aclose(self) -> None:
+        """Await shutdown of async domain services before marking the app stopped.
+
+        The current stdio adapter is synchronous, so ``stop`` retains its
+        immediate best-effort signal path.  Future adapters that retain
+        protocol process handles must use this method in their async lifespan.
+        """
+        process_runtime = self.services.get("process_runtime")
+        if isinstance(process_runtime, ProcessRuntime):
+            await process_runtime.aclose()
         if self._state is LifecycleState.STOPPED:
             return
         self._state = LifecycleState.STOPPED
