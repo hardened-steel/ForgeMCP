@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "ForgeMCP contributors" }]
 dependencies = [
     "mcp[cli]>=1.0,<2.0",
+    "pydantic>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
