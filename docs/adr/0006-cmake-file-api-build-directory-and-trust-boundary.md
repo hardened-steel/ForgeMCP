@@ -1,0 +1,29 @@
+# ADR 0006: Use CMake File API v2 with workspace-contained generated build trees and an explicit project-code trust boundary
+
+## Context
+
+ForgeMCP needs its first end-to-end feature plugin: a CMake integration that can configure, inspect targets, build, and run tests. CMake offers many convenient command-line surfaces, but parsing `cmake --build --target help` is generator-specific and unstable. Its File API instead provides structured target metadata, while CTest offers a documented JSON test-listing format.
+
+CMake configuration and build steps are powerful execution mechanisms. A project may run arbitrary CMake language, `execute_process`, custom commands, generators, compiler wrappers, native build tools, and test executables. A CMake preset may also name a build directory outside the project. ForgeMCP's existing Workspace service normally excludes build directories from source inspection, so it needs a deliberate mechanism to create the File API query and read generated replies without bypassing workspace and symlink policy.
+
+## Decision
+
+Ship `CMakePlugin` as an explicitly composed builtin plugin with plugin ID `cmake`. It declares only `workspace` and `process_runtime` as required Core services, creates one application-owned `CMakeService` while running, and registers tool contributions through `ToolRegistry`. The stable qualified MCP names are `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. CMake-specific immutable models live in `forgemcp.cmake.models`, and the module imports no FastMCP type.
+
+Support CMake **3.23.0 and later**. `cmake --version` and `ctest --version` are always invoked through Process Runtime and parsed into structured status; unavailable executables and an unsupported CMake version receive intentional safe messages. CMake 3.23 is the minimum for this vertical slice because it provides mature configure/build/test preset support, CTest JSON discovery, and File API codemodel v2 support in one documented baseline.
+
+Use CMake File API `codemodel-v2` as the only target-metadata source. Before configure, CMake writes the standard `codemodel-v2` query. Target configuration, name, ID, type, artifacts, sources, dependencies, and target build directory come from a valid File API reply. Missing, stale, malformed, or non-v2 replies are errors; paths in every reply are untrusted and must be checked by Workspace before being returned. Do not parse `--target help`.
+
+Extend Workspace with a narrow `GeneratedWorkspaceDirectory` capability, opened only for an explicit workspace-relative generated directory. It creates a directory only beneath the configured workspace and rejects every symlink component. It reads, writes, lists, and snapshots bounded generated files without handing a raw `Path` to CMake. Workspace also owns conversion of an untrusted externally reported path into a verified workspace-relative path. This is the only sanctioned route for CMake File API queries and replies.
+
+Every configure request requires an explicit safe `binary_dir`; source and binary directories must be inside the workspace, and source and binary cannot be the same. CMake receives separate argv elements through Process Runtime only: `cmake -S <source> -B <binary>` and, optionally, `--preset <name>`. CMake retains ownership of preset inheritance, conditions, and macro expansion, while explicit `-B` overrides any preset build directory so it cannot escape the workspace. There is no raw shell, arbitrary extra arguments, client-provided CTest regex, or arbitrary build-tool passthrough. Optional cache variables are a validated scalar mapping, never logged.
+
+Build and CTest non-zero exit codes are ordinary structured `ProcessResult` values. CTest list operations use `--show-only=json-v1`; selected test names are escaped internally into one exact-match regex, so the API does not expose regex semantics. Process Runtime remains the sole owner of executable allow-listing, timeout, output-size limits, environment policy, process-tree cleanup, and safe logging.
+
+## Consequences
+
+Clients receive generator-independent structured target information and safe, bounded process results. Built-in lifecycle and tool registration are testable without an MCP SDK or installed CMake, using fake Process Runtime responses and File API fixtures. Projects can use conventional `build`, `build-*`, and `cmake-build-*` directories without weakening source-file policy.
+
+This feature is not a sandbox. Operators must treat the configured workspace as trusted code before calling configure, build, or test. Process Runtime prevents shell injection and constrains process lifecycle, but it does not make project-controlled CMake, compiler, generator, build, or test code safe to run. A future untrusted-project workflow requires OS-level isolation and a separate security decision.
+
+The MVP deliberately does not implement preset inheritance, conditions, macro expansion, arbitrary CMake/CTest arguments, build presets as an execution API, compiler diagnostics parsing, clangd, or DAP. CMake itself handles preset execution; ForgeMCP only returns safe summaries of preset documents and pins their effective build location with validated `-B`.

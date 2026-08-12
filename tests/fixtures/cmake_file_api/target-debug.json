@@ -1,0 +1,9 @@
+{
+  "name": "app",
+  "id": "app-debug",
+  "type": "EXECUTABLE",
+  "paths": {"source": ".", "build": "Debug"},
+  "artifacts": [{"path": "app.exe"}],
+  "sources": [{"path": "main.cpp"}],
+  "dependencies": []
+}

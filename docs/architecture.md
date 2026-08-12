@@ -10,7 +10,7 @@ The Core does **not** implement project-file reads or edits, configure or build 
 
 ## Domain models
 
-`forgemcp.models` is an independent, transport-neutral contract package for future Workspace, process-runtime, CMake, clangd, and debugger services. It depends only on Pydantic and the Python standard library; in particular, it does not import Core, MCP, CMake, LSP, DAP, or process-library types.
+`forgemcp.models` is an independent, transport-neutral contract package for Workspace, process-runtime, and future shared service models. It depends only on Pydantic and the Python standard library; in particular, it does not import Core, MCP, CMake, LSP, DAP, or process-library types. CMake-specific result and metadata models deliberately live in `forgemcp.cmake.models`, rather than making the shared package depend on one feature.
 
 The public API is exported from `forgemcp.models`:
 
@@ -24,7 +24,7 @@ Every model is immutable, rejects unknown fields, and has Pydantic field descrip
 
 ## Feature plugins
 
-`forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it accepts `builtin_plugins=` so ForgeMCP-owned feature plugins are registered explicitly during composition. There are no feature plugins enabled in the current MVP.
+`forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it registers ForgeMCP's `CMakePlugin` explicitly during composition and accepts `builtin_plugins=` for additional owned feature plugins. CMake's state belongs to that plugin instance and therefore to one application instance.
 
 Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`.
 
@@ -38,7 +38,9 @@ A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
 Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
 
-Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description; it has no MCP, FastMCP, LSP, CMake, or DAP type. `ToolRegistry` qualifies its local name as `<plugin_id>__<tool_name>`, rejects duplicates, and retains the immutable registration. After application startup, `server.py` wraps each contribution in a FastMCP handler. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects. There are no CMake, clangd, or debugger tool contributions yet.
+Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` qualifies its local name as `<plugin_id>__<tool_name>`, rejects duplicates, and retains the immutable registration. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
+
+The built-in CMake plugin owns the stable contributions `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local CMake service receives only the declared `workspace` and `process_runtime` services, never an application object or a transport object.
 
 External plugins use Python entry points in the `forgemcp.plugins` group. Discovery is disabled by default and is enabled only by both `ForgeConfig.external_plugins_enabled=True` (or `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true`) and a non-empty explicit `ForgeConfig.external_plugin_allowlist` (or comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`). The allow-list contains entry-point names, which must exactly equal the loaded plugin's `plugin_id`. ForgeMCP does not enumerate entry-point metadata while discovery is disabled and calls `EntryPoint.load()` only for listed names; all other advertised packages remain unimported.
 
@@ -62,16 +64,21 @@ Its public `WorkspaceService` API is:
 - `read_text(path) -> tuple[str, FileSnapshot]`
 - `get_snapshot(path) -> FileSnapshot`
 - `apply_unified_patch(patch, expected_snapshots) -> PatchResult`
+- `require_directory(path=".") -> str`
+- `open_generated_directory(path, create=False) -> GeneratedWorkspaceDirectory`
+- `validate_reported_path(path, relative_to=".") -> str`
 
 All supplied paths are workspace-relative strings. Absolute, drive-qualified, and parent-traversal paths are rejected. A requested path containing a symlink is rejected; directory listing does not follow and omits symlinks. The default immutable `WorkspacePolicy` excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories, and provides bounded UTF-8 reads and patch input. Callers can compose `WorkspaceService` with another policy when their generated-directory conventions differ.
 
 Every patch target must carry a compare-and-swap expectation: preferably the `FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file; `None` represents an expected absent file for creation. A snapshot conflict or hunk mismatch returns `PatchResult(applied=False)` before source files are changed. Patches are text-only unified diffs, staged beside their targets and committed with rollback backups; patch input and file content never enter Workspace log context. File change events are intentionally not implemented yet.
 
-Feature plugins now own discovery and dependency resolution. CMake, MCP Workspace tool adapters, clangd, and debug adapters remain intentionally unimplemented. Workspace I/O itself is isolated in the separately composed Workspace module.
+`GeneratedWorkspaceDirectory` is an intentionally narrow capability for a caller-declared generated directory: it can write and read bounded UTF-8 files, list direct non-symlink files, and snapshot generated files without exposing a `Path`. It applies the same workspace and symlink checks even when the directory matches the ordinary Workspace ignore policy. CMake uses it for `.cmake/api/v1/query/codemodel-v2` and File API replies; it does not directly manipulate build-tree paths.
+
+Workspace I/O itself is isolated in the separately composed Workspace module. MCP Workspace tool adapters, clangd, and debug adapters remain intentionally unimplemented.
 
 ## Process Runtime module
 
-`forgemcp.processes` owns safe asyncio execution for the later CMake, CTest, clangd, and DAP modules. It is transport-neutral and registers no MCP tools; `server.py` remains a thin stdio adapter. `ForgeApplication.create()` composes it under `application.services["process_runtime"]`.
+`forgemcp.processes` owns safe asyncio execution for CMake, CTest, and later clangd and DAP modules. It is transport-neutral and registers no MCP tools; `server.py` remains a thin stdio adapter. `ForgeApplication.create()` composes it under `application.services["process_runtime"]`.
 
 Its public API intentionally has two paths:
 
@@ -83,6 +90,16 @@ Every command is a non-empty NUL-free argv sequence and is launched only with `a
 Process output and complete argv/environment values are never logged. Completion logs contain only exit/timeout state and each stream's character count plus truncation bit. The runtime retains all live `ProcessHandle` instances; callers should await `ProcessRuntime.aclose()` during asynchronous host shutdown. `ForgeApplication.aclose()` provides the corresponding application-level hook. The MCP stdio adapter already awaits it in FastMCP's lifespan. `ForgeApplication.stop()` can bridge to the asynchronous lifecycle only when no event loop is active; async hosts must await `ForgeApplication.aclose()`.
 
 On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP` and is assigned a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE`; closing that job removes non-detached descendants even when the direct child has already exited. Graceful cleanup first sends `CTRL_BREAK_EVENT` with a direct-child terminate fallback; job closure is the forced tree kill. If Job assignment is refused by a host-owned job, forced cleanup falls back to the built-in `taskkill /PID <pid> /T /F` through asyncio with all helper streams discarded. This avoids a `psutil` runtime dependency. As on other process-management APIs, a tool that deliberately creates an independent process group/session or requests Job breakaway can escape its parent's tree boundary; adapters must not enable either.
+
+## CMake feature module
+
+`forgemcp.cmake` is a transport-neutral builtin feature plugin. `CMakeService` discovers `cmake` and `ctest`, parses versions, and supports CMake 3.23 or later. It lists safe summaries from `CMakePresets.json` and `CMakeUserPresets.json`, intentionally omitting `environment` and `cacheVariables`; CMake itself remains responsible for preset inheritance, conditions, and macro expansion.
+
+Every configure request supplies a workspace-contained `source_dir` and an explicitly selected workspace-contained generated `binary_dir`. Configure writes the File API `codemodel-v2` query via `GeneratedWorkspaceDirectory` and invokes `cmake -S ... -B ...` through Process Runtime. When a preset is selected, CMake receives `--preset`, but ForgeMCP still passes the validated `-B` value so the preset cannot direct execution to an external build tree. No raw shell command or generic extra-argument field is exposed. Optional cache values are restricted to CMake-style identifier keys and NUL-free scalar values.
+
+Targets come only from CMake File API codemodel v2 replies, never `--target help`. Missing, stale, malformed, unsupported-version, symlinked, or out-of-workspace replies return a CMake domain error. Reported source, artifact, and build paths are revalidated through Workspace before they are exposed as workspace-relative strings. Build preserves a non-zero CMake exit as a `ProcessResult`, with optional multi-config name and bounded `parallel_jobs`. CTest test discovery uses `ctest --show-only=json-v1`; execution supports all tests or a generated escaped exact-name selection and exposes no client-supplied regex or arbitrary CTest arguments. Timeout and output bounds are those of Process Runtime.
+
+Running configure, build, or tests is not sandboxing: CMake project scripts, custom commands, generators, build tools, and test executables may execute project-controlled code. The configured workspace is therefore a trust boundary, not an untrusted-input boundary. See ADR 0006.
 
 ## Error and logging policy
 

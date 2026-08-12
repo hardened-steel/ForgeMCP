@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic_core import PydanticUndefined
 
 from forgemcp.core.application import ForgeApplication
 from forgemcp.plugins import RegisteredToolContribution, ToolRegistry
@@ -63,6 +64,30 @@ def _tool_adapter(contribution: RegisteredToolContribution):
         if inspect.isawaitable(result):
             return await result
         return result
+
+    if contribution.input_model is not None:
+        parameters: list[inspect.Parameter] = []
+        for name, field in contribution.input_model.model_fields.items():
+            default = inspect.Parameter.empty if field.is_required() else field.default
+            if default is PydanticUndefined:
+                default = inspect.Parameter.empty
+            parameters.append(
+                inspect.Parameter(
+                    name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    default=default,
+                    annotation=field.annotation,
+                )
+            )
+
+        async def contributed_tool_with_schema(**arguments: object) -> object:
+            result = contribution.handler(arguments)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        contributed_tool_with_schema.__signature__ = inspect.Signature(parameters)  # type: ignore[attr-defined]
+        return contributed_tool_with_schema
 
     return contributed_tool
 

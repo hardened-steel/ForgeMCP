@@ -106,6 +106,37 @@ def test_read_text_is_utf8_bounded_and_returns_matching_snapshot(tmp_path):
         service.read_text("large.txt")
 
 
+def test_generated_directory_capability_creates_and_guards_file_api_style_files(tmp_path):
+    service = workspace(tmp_path)
+
+    generated = service.open_generated_directory("build", create=True)
+    generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
+    generated.write_text(".cmake/api/v1/reply/index-test.json", '{"reply": {}}')
+
+    assert generated.relative_path == "build"
+    assert generated.read_text(".cmake/api/v1/reply/index-test.json") == '{"reply": {}}'
+    assert generated.list_files(".cmake/api/v1/reply") == ("index-test.json",)
+    assert generated.get_snapshot(".cmake/api/v1/reply/index-test.json").exists is True
+    assert service.validate_reported_path(str(tmp_path / "build")) == "build"
+
+
+def test_generated_directory_and_reported_paths_reject_symlink_escape(tmp_path):
+    outside = tmp_path.parent / "generated-outside"
+    outside.mkdir()
+    link = tmp_path / "build-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Symbolic links are unavailable in this test environment: {error}")
+
+    service = workspace(tmp_path)
+
+    with pytest.raises(SymlinkWorkspacePathError):
+        service.open_generated_directory("build-link", create=True)
+    with pytest.raises(SymlinkWorkspacePathError):
+        service.validate_reported_path(str(link / "escape.txt"))
+
+
 def test_snapshot_conflict_returns_failed_result_and_preserves_external_change(tmp_path):
     target = tmp_path / "note.txt"
     target.write_text("before\n", encoding="utf-8")

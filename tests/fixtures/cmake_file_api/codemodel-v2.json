@@ -1,0 +1,14 @@
+{
+  "kind": "codemodel",
+  "version": {"major": 2, "minor": 8},
+  "paths": {"source": "src", "build": "."},
+  "configurations": [
+    {
+      "name": "",
+      "targets": [
+        {"name": "app", "id": "app::@1", "jsonFile": "target-app.json"},
+        {"name": "lib", "id": "lib::@1", "jsonFile": "target-lib.json"}
+      ]
+    }
+  ]
+}

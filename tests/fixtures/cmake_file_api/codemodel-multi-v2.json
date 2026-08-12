@@ -1,0 +1,9 @@
+{
+  "kind": "codemodel",
+  "version": {"major": 2, "minor": 8},
+  "paths": {"source": "src", "build": "."},
+  "configurations": [
+    {"name": "Debug", "targets": [{"name": "app", "id": "app-debug", "jsonFile": "target-debug.json"}]},
+    {"name": "Release", "targets": [{"name": "app", "id": "app-release", "jsonFile": "target-release.json"}]}
+  ]
+}

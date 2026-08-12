@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from forgemcp.plugins.errors import DuplicateToolNameError, ToolNamespaceError
 
 _TOOL_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -22,6 +24,7 @@ class ToolContribution:
     name: str
     description: str
     handler: ToolHandler = field(repr=False, compare=False)
+    input_model: type[BaseModel] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not _TOOL_IDENTIFIER.fullmatch(self.name):
@@ -30,6 +33,10 @@ class ToolContribution:
             )
         if not isinstance(self.description, str) or not self.description.strip():
             raise ValueError("Tool contribution descriptions must not be empty.")
+        if self.input_model is not None and (
+            not isinstance(self.input_model, type) or not issubclass(self.input_model, BaseModel)
+        ):
+            raise TypeError("Tool contribution input_model must be a Pydantic model class when supplied.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +60,11 @@ class RegisteredToolContribution:
     def handler(self) -> ToolHandler:
         """Return the contribution handler without exposing a transport object."""
         return self.contribution.handler
+
+    @property
+    def input_model(self) -> type[BaseModel] | None:
+        """Return the optional transport-neutral Pydantic input contract."""
+        return self.contribution.input_model
 
 
 class ToolRegistry:

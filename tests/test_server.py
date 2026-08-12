@@ -79,12 +79,12 @@ def test_mcp_lifespan_closes_a_long_lived_process_after_an_exception(tmp_path):
 def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_path):
     class ToolPlugin(ForgePlugin):
         def __init__(self) -> None:
-            super().__init__(PluginMetadata(plugin_id="cmake"))
+            super().__init__(PluginMetadata(plugin_id="example"))
 
         async def start(self, context: PluginContext) -> None:
             context.tools.register(
                 ToolContribution(
-                    name="configure",
+                    name="inspect",
                     description="Configure a build tree.",
                     handler=lambda _: {"configured": False},
                 )
@@ -100,7 +100,14 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
         server = create_server(lambda: application)
         async with server._mcp_server.lifespan(server._mcp_server):  # type: ignore[attr-defined]
             assert sorted(tool.name for tool in await server.list_tools()) == [
+                "cmake__build",
                 "cmake__configure",
+                "cmake__ctest_list_tests",
+                "cmake__ctest_run",
+                "cmake__list_presets",
+                "cmake__list_targets",
+                "cmake__status",
+                "example__inspect",
                 "server_status",
             ]
 

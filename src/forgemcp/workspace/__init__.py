@@ -16,10 +16,11 @@ from forgemcp.workspace.errors import (
     WorkspacePathError,
 )
 from forgemcp.workspace.policy import WorkspacePolicy
-from forgemcp.workspace.service import ExpectedSnapshot, WorkspaceService
+from forgemcp.workspace.service import ExpectedSnapshot, GeneratedWorkspaceDirectory, WorkspaceService
 
 __all__ = [
     "ExpectedSnapshot",
+    "GeneratedWorkspaceDirectory",
     "ExpectedSnapshotError",
     "IgnoredWorkspacePathError",
     "InvalidUnifiedPatchError",

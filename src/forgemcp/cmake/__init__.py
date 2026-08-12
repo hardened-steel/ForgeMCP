@@ -1,0 +1,59 @@
+"""CMake feature plugin and its transport-neutral public API."""
+
+from forgemcp.cmake.errors import (
+    CMakeError,
+    CMakeFileApiError,
+    CMakePresetError,
+    CMakeRequestError,
+    CMakeToolUnavailableError,
+    CMakeVersionError,
+    CTestJsonError,
+)
+from forgemcp.cmake.models import (
+    CMakeBuildPreset,
+    CMakeBuildResult,
+    CMakeConfigurationTargets,
+    CMakeConfigurePreset,
+    CMakeConfigureResult,
+    CMakePresetList,
+    CMakeStatus,
+    CMakeTargetList,
+    CMakeTargetMetadata,
+    CMakeTestPreset,
+    CMakeToolStatus,
+    CMakeVersion,
+    CTestRunResult,
+    CTestTest,
+    CTestTestList,
+)
+from forgemcp.cmake.plugin import CMakePlugin
+from forgemcp.cmake.service import CMakeService, MAX_PARALLEL_JOBS, MINIMUM_CMAKE_VERSION
+
+__all__ = [
+    "CMakeBuildPreset",
+    "CMakeBuildResult",
+    "CMakeConfigurationTargets",
+    "CMakeConfigurePreset",
+    "CMakeConfigureResult",
+    "CMakeError",
+    "CMakeFileApiError",
+    "CMakePlugin",
+    "CMakePresetError",
+    "CMakePresetList",
+    "CMakeRequestError",
+    "CMakeService",
+    "CMakeStatus",
+    "CMakeTargetList",
+    "CMakeTargetMetadata",
+    "CMakeTestPreset",
+    "CMakeToolStatus",
+    "CMakeToolUnavailableError",
+    "CMakeVersion",
+    "CMakeVersionError",
+    "CTestJsonError",
+    "CTestRunResult",
+    "CTestTest",
+    "CTestTestList",
+    "MAX_PARALLEL_JOBS",
+    "MINIMUM_CMAKE_VERSION",
+]

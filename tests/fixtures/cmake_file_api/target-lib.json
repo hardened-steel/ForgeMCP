@@ -1,0 +1,9 @@
+{
+  "name": "lib",
+  "id": "lib::@1",
+  "type": "STATIC_LIBRARY",
+  "paths": {"source": ".", "build": "."},
+  "artifacts": [{"path": "liblib.a"}],
+  "sources": [{"path": "lib.cpp"}],
+  "dependencies": []
+}

@@ -2,11 +2,18 @@
 
 ForgeMCP is an MCP server that will provide AI assistants with deep, structured integration for C++ development.
 
-## Current Core MVP
+## Current CMake vertical slice
 
-The initial server exposes a diagnostic MCP tool over the stdio transport:
+The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 
 - `server_status`
+- `cmake__status`
+- `cmake__list_presets`
+- `cmake__configure`
+- `cmake__list_targets`
+- `cmake__build`
+- `cmake__ctest_list_tests`
+- `cmake__ctest_run`
 
 `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
@@ -30,7 +37,9 @@ $env:FORGEMCP_WORKSPACE = "C:\path\to\cpp-project"
 forgemcp
 ```
 
-The next increments are a Workspace module, then CMake build/test, clangd, and Debug Adapter Protocol modules.
+CMake 3.23 or later is supported. Configure, build, and test intentionally run
+the selected project's CMake logic and test executables; run ForgeMCP only for
+workspaces whose project code you trust. See [ADR 0006](docs/adr/0006-cmake-file-api-build-directory-and-trust-boundary.md).
 
 ## Core structure
 
@@ -38,6 +47,7 @@ The next increments are a Workspace module, then CMake build/test, clangd, and D
 - `core/services.py` — explicit dependency registry for future modules.
 - `core/application.py` — application composition, lifecycle, and server status.
 - `plugins/` — versioned feature-plugin contract, lifecycle manager, tool registry, and opt-in entry-point discovery.
+- `cmake/` — built-in CMake/Ctest feature plugin, CMake-owned models, and File API parsing.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — structured, redacted stderr logging.
 

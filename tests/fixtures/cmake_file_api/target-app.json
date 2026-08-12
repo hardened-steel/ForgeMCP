@@ -1,0 +1,9 @@
+{
+  "name": "app",
+  "id": "app::@1",
+  "type": "EXECUTABLE",
+  "paths": {"source": ".", "build": "."},
+  "artifacts": [{"path": "app.exe"}],
+  "sources": [{"path": "main.cpp"}],
+  "dependencies": [{"id": "lib::@1"}]
+}

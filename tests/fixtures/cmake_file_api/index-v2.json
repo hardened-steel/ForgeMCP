@@ -1,0 +1,6 @@
+{
+  "cmake": {"generator": {"name": "Ninja"}},
+  "reply": {
+    "codemodel-v2": {"kind": "codemodel", "version": {"major": 2, "minor": 8}, "jsonFile": "codemodel-v2.json"}
+  }
+}

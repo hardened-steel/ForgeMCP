@@ -95,6 +95,35 @@ class _StagedChange:
     backup_path: Path | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedWorkspaceDirectory:
+    """Capability for one explicit, non-symlink generated workspace directory.
+
+    It deliberately exposes only the small set of generated-tree operations
+    needed by integrations such as CMake's File API.  It never exposes a
+    ``Path`` for a caller to use outside the Workspace boundary.
+    """
+
+    _service: "WorkspaceService"
+    relative_path: str
+
+    def write_text(self, path: str, text: str) -> None:
+        """Atomically write a UTF-8 generated file below this directory."""
+        self._service._write_generated_text(self.relative_path, path, text)
+
+    def read_text(self, path: str) -> str:
+        """Read one bounded UTF-8 generated file below this directory."""
+        return self._service._read_generated_text(self.relative_path, path)
+
+    def list_files(self, path: str = ".") -> tuple[str, ...]:
+        """List direct regular, non-symlink file names below one generated directory."""
+        return self._service._list_generated_files(self.relative_path, path)
+
+    def get_snapshot(self, path: str) -> FileSnapshot:
+        """Return metadata for one generated file without exposing its contents."""
+        return self._service._get_generated_snapshot(self.relative_path, path)
+
+
 class WorkspaceService:
     """Safely inspect and patch regular UTF-8 files below one workspace root.
 
@@ -165,6 +194,72 @@ class WorkspaceService:
     def get_snapshot(self, path: str) -> FileSnapshot:
         """Capture content-free metadata and SHA-256 for a regular file or absence."""
         return self._snapshot_path(self._resolve_path(path))
+
+    def require_directory(self, path: str = ".") -> str:
+        """Validate and normalize an existing ordinary workspace directory.
+
+        The returned path is always workspace-relative and can safely be passed
+        to another capability that accepts only workspace-relative paths.  The
+        ordinary Workspace ignore policy remains in force for this operation.
+        """
+        directory = self._resolve_path(path)
+        if not directory.exists():
+            raise WorkspaceFileNotFoundError("The requested workspace directory does not exist.")
+        if not directory.is_dir():
+            raise WorkspaceNotDirectoryError("The requested workspace path is not a directory.")
+        return self._relative_key(directory) or "."
+
+    def open_generated_directory(
+        self, path: str, *, create: bool = False
+    ) -> GeneratedWorkspaceDirectory:
+        """Open one explicit generated build directory inside this workspace.
+
+        Generated directories may match the normal Workspace ignore policy, but
+        still receive the exact same lexical workspace-boundary and symlink
+        checks.  ``create=True`` creates missing non-symlink ancestors below
+        the workspace; it never creates or follows a path outside it.
+        """
+        directory = self._resolve_path(path, apply_ignore_policy=False)
+        if create:
+            self._create_directory_without_symlinks(directory)
+        if not directory.exists():
+            raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
+        if directory.is_symlink():
+            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+        if not directory.is_dir():
+            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
+        return GeneratedWorkspaceDirectory(self, self._relative_key(directory) or ".")
+
+    def validate_reported_path(self, path: str, *, relative_to: str = ".") -> str:
+        """Validate an untrusted absolute or relative path reported by a tool.
+
+        Unlike normal caller-supplied workspace paths, a tool may report an
+        absolute path.  This method accepts it only when it resolves beneath
+        the configured workspace and neither its lexical path nor resolved
+        path crosses a symlink.  The safe result is a workspace-relative path.
+        """
+        base = self._resolve_path(relative_to, apply_ignore_policy=False)
+        if not base.exists() or not base.is_dir():
+            raise WorkspaceNotDirectoryError("The reported-path base must be an existing workspace directory.")
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise WorkspacePathError("Reported paths must be non-empty NUL-free strings.")
+        native = Path(path)
+        windows = PureWindowsPath(path)
+        posix = PurePosixPath(path)
+        if bool(windows.drive) and not windows.is_absolute():
+            raise WorkspacePathError("Drive-relative reported paths are not allowed.")
+        if windows.is_absolute() or posix.is_absolute() or native.is_absolute() or bool(native.anchor):
+            candidate = native
+        else:
+            candidate = base / native
+        self._assert_no_symlink_components(candidate)
+        try:
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(self._root)
+        except (OSError, ValueError) as error:
+            raise WorkspacePathError("The reported path is outside the configured workspace.") from error
+        self._assert_no_symlink_components(self._root / relative)
+        return relative.as_posix() or "."
 
     def apply_unified_patch(
         self,
@@ -238,7 +333,7 @@ class WorkspaceService:
             elif entry.is_file(follow_symlinks=False):
                 snapshots.append(self._snapshot_path(entry_path))
 
-    def _resolve_path(self, path: str) -> Path:
+    def _resolve_path(self, path: str, *, apply_ignore_policy: bool = True) -> Path:
         """Validate a relative path lexically and reject every symlink component."""
         if not isinstance(path, str) or not path or "\x00" in path:
             raise WorkspacePathError("Workspace paths must be non-empty relative strings.")
@@ -263,11 +358,136 @@ class WorkspaceService:
             candidate = candidate / part
             if candidate.is_symlink():
                 raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-            if index < len(parts) - 1 and self._policy.ignores_directory(part):
+            if apply_ignore_policy and index < len(parts) - 1 and self._policy.ignores_directory(part):
                 raise IgnoredWorkspacePathError("The requested path is excluded by workspace policy.")
-        if candidate != self._root and candidate.is_dir() and self._policy.ignores_directory(candidate.name):
+        if (
+            apply_ignore_policy
+            and candidate != self._root
+            and candidate.is_dir()
+            and self._policy.ignores_directory(candidate.name)
+        ):
             raise IgnoredWorkspacePathError("The requested path is excluded by workspace policy.")
         return candidate
+
+    def _create_directory_without_symlinks(self, directory: Path) -> None:
+        """Create a generated directory while rejecting every existing symlink component."""
+        relative = directory.relative_to(self._root)
+        candidate = self._root
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+            if not candidate.exists():
+                try:
+                    candidate.mkdir()
+                except FileExistsError:
+                    # A concurrent creator may have installed a symlink or a file.
+                    if candidate.is_symlink():
+                        raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+                    if not candidate.is_dir():
+                        raise WorkspaceNotDirectoryError(
+                            "A generated-directory path component is not a directory."
+                        )
+            elif not candidate.is_dir():
+                raise WorkspaceNotDirectoryError(
+                    "A generated-directory path component is not a directory."
+                )
+
+    def _resolve_generated_child(self, directory: str, path: str) -> Path:
+        """Resolve a relative child below a generated directory without policy bypasses."""
+        root = self._resolve_path(directory, apply_ignore_policy=False)
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise WorkspacePathError("Generated-file paths must be non-empty relative strings.")
+        native = Path(path)
+        windows = PureWindowsPath(path)
+        posix = PurePosixPath(path)
+        if (
+            native.is_absolute()
+            or bool(native.anchor)
+            or bool(windows.drive)
+            or bool(windows.root)
+            or windows.is_absolute()
+            or posix.is_absolute()
+        ):
+            raise WorkspacePathError("Generated-file paths must be relative to their generated directory.")
+        parts = tuple(part for part in native.parts if part not in {"", "."})
+        if any(part == ".." for part in parts):
+            raise WorkspacePathError("Generated-file paths must not contain parent traversal.")
+        candidate = root
+        for part in parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+        return candidate
+
+    def _write_generated_text(self, directory: str, path: str, text: str) -> None:
+        """Atomically replace one bounded UTF-8 generated file without logging content."""
+        if not isinstance(text, str):
+            raise WorkspaceEncodingError("Generated file contents must be UTF-8 text.")
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise WorkspaceEncodingError("Generated file contents must be valid UTF-8 text.") from error
+        if len(encoded) > self._policy.max_patch_bytes:
+            raise WorkspaceFileTooLargeError("Generated file contents exceed the configured size limit.")
+        target = self._resolve_generated_child(directory, path)
+        self._create_directory_without_symlinks(target.parent)
+        if target.is_symlink():
+            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".forgemcp-generated-", dir=target.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            if target.exists() and not target.is_file():
+                raise WorkspaceNotFileError("The generated path is not a regular file.")
+            os.replace(temporary, target)
+        finally:
+            if temporary.exists() and not temporary.is_symlink():
+                temporary.unlink()
+
+    def _read_generated_text(self, directory: str, path: str) -> str:
+        """Read one generated regular file using the standard Workspace limits."""
+        target = self._resolve_generated_child(directory, path)
+        snapshot = self._snapshot_path(target)
+        if not snapshot.exists:
+            raise WorkspaceFileNotFoundError("The requested generated file does not exist.")
+        data = self._read_bytes_limited(target, self._policy.max_read_bytes)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise WorkspaceEncodingError("The requested generated file is not valid UTF-8.") from error
+
+    def _list_generated_files(self, directory: str, path: str) -> tuple[str, ...]:
+        """List direct regular files in a generated directory without following links."""
+        target = self._resolve_generated_child(directory, path)
+        if not target.exists():
+            raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
+        if not target.is_dir():
+            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
+        with os.scandir(target) as entries:
+            return tuple(
+                entry.name
+                for entry in sorted(entries, key=lambda entry: entry.name)
+                if not entry.is_symlink() and entry.is_file(follow_symlinks=False)
+            )
+
+    def _get_generated_snapshot(self, directory: str, path: str) -> FileSnapshot:
+        """Capture metadata for one generated regular file with normal boundary checks."""
+        return self._snapshot_path(self._resolve_generated_child(directory, path))
+
+    @staticmethod
+    def _assert_no_symlink_components(candidate: Path) -> None:
+        """Reject a lexical path that names any existing symlink component."""
+        anchor = Path(candidate.anchor)
+        current = anchor
+        parts = candidate.parts[1:] if candidate.anchor else candidate.parts
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
 
     def _relative_key(self, target: Path) -> str:
         """Return the canonical forward-slash workspace-relative key for a safe path."""
