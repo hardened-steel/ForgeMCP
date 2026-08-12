@@ -10,11 +10,11 @@ The Core does **not** implement project-file reads or edits, configure or build 
 
 ## Domain models
 
-`forgemcp.models` is an independent, transport-neutral contract package for Workspace, process-runtime, and future shared service models. It depends only on Pydantic and the Python standard library; in particular, it does not import Core, MCP, CMake, LSP, DAP, or process-library types. CMake-specific result and metadata models deliberately live in `forgemcp.cmake.models`, rather than making the shared package depend on one feature.
+`forgemcp.models` is an independent, transport-neutral contract package for Workspace, process-runtime, and future shared service models. It depends only on Pydantic and the Python standard library; in particular, it does not import Core, MCP, CMake, LSP, DAP, or process-library types. CMake- and clangd-specific result and metadata models deliberately live in their feature packages, rather than making the shared package depend on one feature.
 
 The public API is exported from `forgemcp.models`:
 
-- `Position`, `Range`, and `Location` describe source coordinates. Lines and columns are zero-based; ranges are half-open and cannot run backwards. A location's URI is opaque to this package, so each adapter owns its path-to-URI mapping.
+- `Position`, `Range`, and `Location` describe source coordinates. Lines and columns are zero-based Unicode code points; ranges are half-open and cannot run backwards. A location's URI is opaque to this package, so each adapter owns its path-to-URI mapping and any protocol-specific encoding conversion.
 - `Severity` and `Diagnostic` describe bounded, user-facing findings without adopting any producer's wire format.
 - `TaskState` and terminal-only `TaskResult` describe the outcome of background work.
 - `ProcessOutput` and `ProcessResult` keep stdout and stderr separate. Each captured stream is capped at 65,536 Unicode code points and signals loss with `truncated`. Output is opaque text, so leading and trailing whitespace (including line terminators) is preserved.
@@ -26,7 +26,7 @@ Every model is immutable, rejects unknown fields, and has Pydantic field descrip
 
 `forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it registers ForgeMCP's `CMakePlugin` explicitly during composition and accepts `builtin_plugins=` for additional owned feature plugins. CMake's state belongs to that plugin instance and therefore to one application instance.
 
-Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`.
+Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`. The explicitly composed builtin plugins are CMake and clangd; clangd's plugin starts only its lightweight service at application startup, never a clangd process, so a missing executable does not prevent ForgeApplication from running.
 
 A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
@@ -74,7 +74,21 @@ Every patch target must carry a compare-and-swap expectation: preferably the `Fi
 
 `GeneratedWorkspaceDirectory` is an intentionally narrow capability for a caller-declared generated directory: it can write and read bounded UTF-8 files, list direct non-symlink files, and snapshot generated files without exposing a `Path`. It applies the same workspace and symlink checks even when the directory matches the ordinary Workspace ignore policy. CMake uses it for `.cmake/api/v1/query/codemodel-v2` and File API replies; it does not directly manipulate build-tree paths.
 
-Workspace I/O itself is isolated in the separately composed Workspace module. MCP Workspace tool adapters, clangd, and debug adapters remain intentionally unimplemented.
+Workspace I/O itself is isolated in the separately composed Workspace module. MCP Workspace tool adapters and debug adapters remain intentionally unimplemented.
+
+## LSP transport and clangd feature
+
+`forgemcp.lsp` is a transport-neutral JSON-RPC 2.0/LSP stream adapter. It has no MCP SDK, Core, Workspace, or Process Runtime imports. `LspClient` owns Content-Length framing, one reader task, a monotonically increasing request-ID table, out-of-order response delivery, bounded inbound messages, request timeout/cancellation with `$/cancelRequest`, and safe failure propagation on malformed messages or EOF. It answers only minimal server-to-client requests (`workspace/configuration`, progress creation, capability registration, and a denied `workspace/applyEdit`); it is not a general LSP proxy.
+
+`forgemcp.clangd` is an application-scoped builtin feature plugin with capability `clangd`. Its `ClangdService` receives only the declared `workspace` and `process_runtime` services through `PluginContext`; it does not receive FastMCP, ForgeApplication, or a raw registry. Every clangd child is launched through Process Runtime. `FORGEMCP_CLANGD` may set an absolute executable path; the default runtime adds that one path to its normal policy allow-list. Otherwise the permitted bare `clangd` name is discovered through the composition-time PATH captured by Process Runtime. No MCP argument can supply executable flags, `--query-driver`, or a path outside the workspace.
+
+`clangd__start` requires an explicit workspace-contained, non-symlink directory with `compile_commands.json`, then launches only `clangd --compile-commands-dir=<validated-relative-directory>`. It performs `initialize` followed by `initialized`. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed retention limit and discarded without raw logging.
+
+Document text is read only through WorkspaceService. On first use ForgeMCP sends `didOpen`; when a new `FileSnapshot` SHA-256 is observed, it sends a full `didChange` with a monotonically increasing version. Only snapshot, URI, version, and normalized diagnostics are retained, never a permanent source-text cache. `publishDiagnostics` is associated with the active snapshot/version. `clangd__diagnostics` reports completeness, timeout, and staleness; an empty current publication is a successful empty result.
+
+The public coordinate policy is Unicode code-point columns. LSP's negotiated `utf-8`, `utf-16`, or `utf-32` character offset is converted only at the LSP adapter boundary, rejecting positions that split an encoded character. Input document paths are workspace-relative and checked by WorkspaceService. Incoming file URIs are percent-decoded and revalidated through WorkspaceService; results outside the workspace are omitted and reported only through an omitted-result count. See [ADR 0007](adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md).
+
+Phase 1 exposes only ToolContributions: `clangd__status`, `clangd__start`, `clangd__stop`, `clangd__diagnostics`, `clangd__hover`, `clangd__definition`, `clangd__references`, `clangd__document_symbols`, and `clangd__workspace_symbols`. Their results are normalized, bounded domain models; raw LSP payloads are not exposed. Rename, WorkspaceEdit application, code actions, completion, signature help, formatting, hierarchies, semantic tokens, and inlay hints are deliberately absent.
 
 ## Process Runtime module
 

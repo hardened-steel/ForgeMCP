@@ -102,6 +102,15 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
         server = create_server(lambda: application)
         async with server._mcp_server.lifespan(server._mcp_server):  # type: ignore[attr-defined]
             assert sorted(tool.name for tool in await server.list_tools()) == [
+                "clangd__definition",
+                "clangd__diagnostics",
+                "clangd__document_symbols",
+                "clangd__hover",
+                "clangd__references",
+                "clangd__start",
+                "clangd__status",
+                "clangd__stop",
+                "clangd__workspace_symbols",
                 "cmake__build",
                 "cmake__configure",
                 "cmake__ctest_list_tests",

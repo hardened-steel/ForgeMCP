@@ -291,7 +291,15 @@ class ProcessRuntime:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        self._policy = ProcessPolicy() if policy is None else policy
+        self._policy = (
+            ProcessPolicy(
+                allowed_executable_paths=(
+                    frozenset({config.clangd_path}) if config.clangd_path is not None else frozenset()
+                )
+            )
+            if policy is None
+            else policy
+        )
         self._base_environment = dict(os.environ)
         self._executable_search_path = self._base_environment.get("PATH")
         self._handles: set[ProcessHandle] = set()

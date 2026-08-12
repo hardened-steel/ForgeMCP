@@ -18,6 +18,7 @@ class ForgeConfig:
     log_level: str = "INFO"
     external_plugins_enabled: bool = False
     external_plugin_allowlist: frozenset[str] = field(default_factory=frozenset)
+    clangd_path: Path | None = None
 
     def __post_init__(self) -> None:
         root = self.workspace_root.resolve()
@@ -37,9 +38,17 @@ class ForgeConfig:
             ) from error
         if any(not isinstance(name, str) or not name for name in allowlist):
             raise ConfigurationError("External plugin allow-list entries must be non-empty strings.")
+        clangd_path = self.clangd_path
+        if clangd_path is not None:
+            if not isinstance(clangd_path, Path):
+                raise ConfigurationError("FORGEMCP_CLANGD must be an absolute executable path.")
+            if not clangd_path.is_absolute():
+                raise ConfigurationError("FORGEMCP_CLANGD must be an absolute executable path.")
+            clangd_path = clangd_path.resolve(strict=False)
         object.__setattr__(self, "workspace_root", root)
         object.__setattr__(self, "log_level", self.log_level.upper())
         object.__setattr__(self, "external_plugin_allowlist", allowlist)
+        object.__setattr__(self, "clangd_path", clangd_path)
 
     @classmethod
     def from_environment(
@@ -61,11 +70,13 @@ class ForgeConfig:
             for name in values.get("FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST", "").split(",")
             if name.strip()
         )
+        raw_clangd_path = values.get("FORGEMCP_CLANGD", "").strip()
         return cls(
             workspace_root=workspace,
             log_level=values.get("FORGEMCP_LOG_LEVEL", "INFO"),
             external_plugins_enabled=external_plugins_enabled,
             external_plugin_allowlist=external_plugin_allowlist,
+            clangd_path=Path(raw_clangd_path) if raw_clangd_path else None,
         )
 
 

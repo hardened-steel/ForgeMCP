@@ -21,6 +21,7 @@ _EXPECTED_TOOLS = {
     "cmake__build",
     "cmake__ctest_list_tests",
     "cmake__ctest_run",
+    "clangd__status",
 }
 
 
@@ -64,6 +65,10 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert status.isError is False
                     status_payload = _json_tool_content(status)
                     assert {"available", "cmake", "ctest", "minimum_cmake_version"} <= status_payload.keys()
+
+                    clangd_status = await session.call_tool("clangd__status")
+                    assert clangd_status.isError is False
+                    assert {"available", "state", "executable"} <= _json_tool_content(clangd_status).keys()
 
                     # This error is raised before CMake is invoked, so it is stable
                     # whether the test host has CMake installed or not.
