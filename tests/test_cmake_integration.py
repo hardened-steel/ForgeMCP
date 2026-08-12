@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ import pytest
 
 from forgemcp.cmake import (
     CMakeFileApiError,
+    CMakePlugin,
     CMakePresetError,
     CMakeRequestError,
     CMakeService,
@@ -28,6 +30,76 @@ from forgemcp.workspace import SymlinkWorkspacePathError, WorkspacePathError, Wo
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "cmake_file_api"
+
+
+def _real_cmake_tools() -> tuple[Path, Path] | None:
+    """Find a matched CMake/CTest pair from PATH or common Windows installs."""
+    path_cmake = shutil.which("cmake")
+    path_ctest = shutil.which("ctest")
+    if path_cmake is not None and path_ctest is not None:
+        return Path(path_cmake), Path(path_ctest)
+
+    if os.name != "nt":
+        return None
+
+    program_files = tuple(
+        Path(value)
+        for value in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramW6432"),
+            os.environ.get("ProgramFiles(x86)"),
+        )
+        if value
+    )
+    directories = [root / "CMake" / "bin" for root in program_files]
+    for root in program_files:
+        for version in ("2019", "2022", "18"):
+            for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+                directories.append(
+                    root
+                    / "Microsoft Visual Studio"
+                    / version
+                    / edition
+                    / "Common7"
+                    / "IDE"
+                    / "CommonExtensions"
+                    / "Microsoft"
+                    / "CMake"
+                    / "CMake"
+                    / "bin"
+                )
+    for directory in directories:
+        cmake = directory / "cmake.exe"
+        ctest = directory / "ctest.exe"
+        if cmake.is_file() and ctest.is_file():
+            return cmake, ctest
+    return None
+
+
+def _runtime_with_real_cmake_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProcessRuntime:
+    tools = _real_cmake_tools()
+    if tools is None:
+        pytest.skip("requires CMake and CTest in PATH or a standard Windows installation")
+    cmake, ctest = tools
+    assert cmake.parent == ctest.parent
+    search_directories = [cmake.parent]
+    ninja = shutil.which("ninja")
+    if ninja is not None:
+        search_directories.append(Path(ninja).parent)
+    elif os.name == "nt":
+        bundled_ninja = cmake.parent.parent.parent / "Ninja" / "ninja.exe"
+        if bundled_ninja.is_file():
+            search_directories.append(bundled_ninja.parent)
+    existing_path = os.environ.get("PATH", "")
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join(str(directory) for directory in search_directories) + os.pathsep + existing_path
+    )
+    if len(search_directories) > 1:
+        # Avoid relying on a Visual Studio developer-shell environment for the
+        # no-language File API check. A normal developer shell can still make
+        # a C++ compiler available for the full test below.
+        monkeypatch.setenv("CMAKE_GENERATOR", "Ninja")
+    return ProcessRuntime(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL"))
 
 
 def process_result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ProcessResult:
@@ -119,6 +191,49 @@ def test_status_marks_old_cmake_unsupported(tmp_path):
     assert status.available is False
     assert status.cmake.supported is False
     assert status.cmake.error is not None and "supported minimum" in status.cmake.error
+
+
+def test_cmake_plugin_starts_and_stops_once_without_available_tools(tmp_path, monkeypatch):
+    """CMake absence is operational, not an application-startup failure."""
+    starts: list[CMakePlugin] = []
+    stops: list[CMakePlugin] = []
+    original_start = CMakePlugin.start
+    original_stop = CMakePlugin.stop
+
+    async def record_start(plugin: CMakePlugin, context) -> None:
+        starts.append(plugin)
+        await original_start(plugin, context)
+
+    async def record_stop(plugin: CMakePlugin) -> None:
+        stops.append(plugin)
+        await original_stop(plugin)
+
+    monkeypatch.setattr(CMakePlugin, "start", record_start)
+    monkeypatch.setattr(CMakePlugin, "stop", record_stop)
+
+    async def unavailable(*args, **kwargs):
+        raise ProcessExecutableError("missing")
+
+    async def exercise() -> None:
+        application = ForgeApplication.create(ForgeConfig(workspace_root=tmp_path))
+        runtime = application.services.get("process_runtime")
+        monkeypatch.setattr(runtime, "run", unavailable)
+
+        await application.start()
+        contributions = {tool.name: tool for tool in application.services.get("plugins").tools.contributions()}
+        status = await contributions["cmake__status"].handler({})
+        unavailable_operation = await contributions["cmake__configure"].handler({"binary_dir": "build"})
+        await application.aclose()
+        await application.aclose()
+
+        assert status["available"] is False
+        assert status["cmake"]["available"] is False
+        assert unavailable_operation["error"]["code"] == "cmake_tool_unavailable"
+
+    asyncio.run(exercise())
+
+    assert len(starts) == 1
+    assert len(stops) == 1
 
 
 def test_list_presets_omits_environment_and_cache_secrets_and_handles_absence(tmp_path):
@@ -217,6 +332,24 @@ def test_configure_rejects_workspace_escape_and_symlink_build_directory(tmp_path
         asyncio.run(service.configure(source_dir="src", binary_dir="build-link"))
 
 
+def test_configure_keeps_preset_binary_directory_within_the_explicit_generated_tree(tmp_path):
+    prepare_project(tmp_path)
+    (tmp_path / "CMakePresets.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "configurePresets": [{"name": "escape", "binaryDir": "../outside"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    service, runtime = cmake_service(tmp_path, [process_result()])
+
+    asyncio.run(service.configure(binary_dir="build", preset="escape"))
+
+    assert runtime.calls[0][0][:5] == ("cmake", "-S", ".", "-B", "build")
+
+
 def test_file_api_codemodel_v2_lists_single_and_multi_configuration_targets(tmp_path):
     prepare_project(tmp_path)
     install_file_api(tmp_path)
@@ -278,6 +411,13 @@ def test_file_api_rejects_missing_stale_malformed_and_outside_paths(tmp_path):
     bad_codemodel = json.loads((FIXTURES / "codemodel-v2.json").read_text(encoding="utf-8"))
     bad_codemodel["paths"]["source"] = str(outside)
     generated.write_text(".cmake/api/v1/reply/codemodel-v2.json", json.dumps(bad_codemodel))
+    with pytest.raises(CMakeFileApiError, match="outside"):
+        service.list_targets(binary_dir="build")
+
+    install_file_api(tmp_path)
+    bad_target = json.loads((FIXTURES / "target-app.json").read_text(encoding="utf-8"))
+    bad_target["artifacts"][0]["path"] = str(outside / "app.exe")
+    generated.write_text(".cmake/api/v1/reply/target-app.json", json.dumps(bad_target))
     with pytest.raises(CMakeFileApiError, match="outside"):
         service.list_targets(binary_dir="build")
 
@@ -357,30 +497,57 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
     asyncio.run(exercise())
 
 
-@pytest.mark.skipif(
-    shutil.which("cmake") is None or shutil.which("ctest") is None or shutil.which("c++") is None,
-    reason="requires CMake, CTest, and a C++ compiler on PATH",
-)
-def test_optional_real_cmake_vertical_slice(tmp_path):
-    """Exercise the real command path only on developer machines that provide CMake and a compiler."""
+def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
+    """Exercise configure and File API whenever CMake/CTest are available."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_file_api LANGUAGES NONE)\n",
+        encoding="utf-8",
+    )
+    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
+    service = CMakeService(
+        WorkspaceService(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL")), runtime
+    )
+
+    async def exercise() -> None:
+        try:
+            configured = await service.configure(binary_dir="build")
+            assert configured.process.exit_code == 0
+            targets = service.list_targets(binary_dir="build").configurations
+            assert len(targets) == 1
+            assert targets[0].name == ""
+            assert targets[0].targets == ()
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_optional_real_cmake_vertical_slice(tmp_path, monkeypatch):
+    """Exercise configure, File API, build, and CTest when a C++ compiler is usable."""
     (tmp_path / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_smoke LANGUAGES CXX)\nadd_executable(app main.cpp)\nenable_testing()\nadd_test(NAME app_runs COMMAND app)\n",
         encoding="utf-8",
     )
     (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
     config = ForgeConfig(workspace_root=tmp_path)
-    runtime = ProcessRuntime(config, create_logger("CRITICAL"))
+    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
     service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime)
 
     async def exercise() -> None:
-        configured = await service.configure(binary_dir="build")
-        assert configured.process.exit_code == 0
-        assert service.list_targets(binary_dir="build").configurations
-        built = await service.build(binary_dir="build", targets=("app",))
-        assert built.process.exit_code == 0
-        tests = await service.list_tests(binary_dir="build")
-        assert [test.name for test in tests.tests] == ["app_runs"]
-        assert (await service.run_tests(binary_dir="build")).process.exit_code == 0
-        await runtime.aclose()
+        try:
+            configured = await service.configure(binary_dir="build")
+            if configured.process.exit_code != 0:
+                combined_output = configured.process.stdout.text + configured.process.stderr.text
+                if "compiler" in combined_output.casefold():
+                    pytest.skip("CMake and CTest are available, but no usable C++ compiler was found")
+                pytest.fail("CMake could not configure the minimal C++ project")
+            assert service.list_targets(binary_dir="build").configurations
+            built = await service.build(binary_dir="build", targets=("app",))
+            assert built.process.exit_code == 0
+            tests = await service.list_tests(binary_dir="build")
+            assert [test.name for test in tests.tests] == ["app_runs"]
+            assert (await service.run_tests(binary_dir="build")).process.exit_code == 0
+        finally:
+            await runtime.aclose()
 
     asyncio.run(exercise())

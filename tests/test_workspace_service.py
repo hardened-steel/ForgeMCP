@@ -120,6 +120,18 @@ def test_generated_directory_capability_creates_and_guards_file_api_style_files(
     assert service.validate_reported_path(str(tmp_path / "build")) == "build"
 
 
+def test_generated_directory_capability_cannot_write_outside_its_build_tree(tmp_path):
+    service = workspace(tmp_path)
+    generated = service.open_generated_directory("build", create=True)
+
+    with pytest.raises(WorkspacePathError):
+        generated.write_text("../outside.txt", "blocked")
+    with pytest.raises(WorkspacePathError):
+        generated.write_text(str(tmp_path.parent / "outside.txt"), "blocked")
+
+    assert not (tmp_path.parent / "outside.txt").exists()
+
+
 def test_generated_directory_and_reported_paths_reject_symlink_escape(tmp_path):
     outside = tmp_path.parent / "generated-outside"
     outside.mkdir()

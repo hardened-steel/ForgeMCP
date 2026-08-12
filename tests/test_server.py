@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import BaseModel
 
 from forgemcp.core.application import ForgeApplication, LifecycleState
 from forgemcp.core.config import ForgeConfig
@@ -110,5 +112,41 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
                 "example__inspect",
                 "server_status",
             ]
+
+    asyncio.run(exercise())
+
+
+def test_tool_handler_exception_does_not_prevent_application_shutdown(tmp_path):
+    class NoArguments(BaseModel):
+        pass
+
+    class ExplodingPlugin(ForgePlugin):
+        def __init__(self) -> None:
+            super().__init__(PluginMetadata(plugin_id="explode"))
+
+        async def start(self, context: PluginContext) -> None:
+            context.tools.register(
+                ToolContribution(
+                    name="now",
+                    description="Raise an intentional test exception.",
+                    handler=lambda _: (_ for _ in ()).throw(RuntimeError("tool failure")),
+                    input_model=NoArguments,
+                )
+            )
+
+        async def stop(self) -> None:
+            return None
+
+    async def exercise() -> None:
+        application = ForgeApplication.create(
+            ForgeConfig(workspace_root=tmp_path), builtin_plugins=(ExplodingPlugin(),)
+        )
+        server = create_server(lambda: application)
+
+        with pytest.raises(ToolError, match="tool failure"):
+            async with server._mcp_server.lifespan(server._mcp_server):  # type: ignore[attr-defined]
+                await server.call_tool("explode__now", {})
+
+        assert application.state is LifecycleState.STOPPED
 
     asyncio.run(exercise())
