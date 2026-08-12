@@ -301,3 +301,63 @@ def test_apply_text_edits_rejects_overlaps_without_changing_the_file(tmp_path):
         )
 
     assert target.read_text(encoding="utf-8") == "abcdef\n"
+
+
+def test_apply_text_edits_handles_crlf_empty_eof_and_adjacent_insertions(tmp_path):
+    crlf_target = tmp_path / "crlf.cpp"
+    empty_target = tmp_path / "empty.cpp"
+    crlf_target.write_bytes(b"abcdef\r\n")
+    empty_target.write_text("", encoding="utf-8")
+    service = workspace(tmp_path)
+
+    result = service.apply_text_edits(
+        {
+            "crlf.cpp": (
+                WorkspaceTextEdit(
+                    Range(start=Position(line=0, column=1), end=Position(line=0, column=4)), "X"
+                ),
+                WorkspaceTextEdit(
+                    Range(start=Position(line=0, column=1), end=Position(line=0, column=1)), "["
+                ),
+                WorkspaceTextEdit(
+                    Range(start=Position(line=0, column=4), end=Position(line=0, column=4)), "]"
+                ),
+            ),
+            "empty.cpp": (
+                WorkspaceTextEdit(
+                    Range(start=Position(line=0, column=0), end=Position(line=0, column=0)), "created"
+                ),
+            ),
+        },
+        {
+            "crlf.cpp": service.get_snapshot("crlf.cpp"),
+            "empty.cpp": service.get_snapshot("empty.cpp"),
+        },
+    )
+
+    assert result.applied is True
+    assert crlf_target.read_bytes() == b"a[X]ef\r\n"
+    assert empty_target.read_text(encoding="utf-8") == "created"
+
+
+def test_apply_text_edits_rejects_ambiguous_same_boundary_insertions(tmp_path):
+    target = tmp_path / "source.cpp"
+    target.write_text("abc\n", encoding="utf-8")
+    service = workspace(tmp_path)
+
+    with pytest.raises(WorkspaceTextEditError, match="overlap"):
+        service.apply_text_edits(
+            {
+                "source.cpp": (
+                    WorkspaceTextEdit(
+                        Range(start=Position(line=0, column=1), end=Position(line=0, column=1)), "X"
+                    ),
+                    WorkspaceTextEdit(
+                        Range(start=Position(line=0, column=1), end=Position(line=0, column=1)), "Y"
+                    ),
+                )
+            },
+            {"source.cpp": service.get_snapshot("source.cpp")},
+        )
+
+    assert target.read_text(encoding="utf-8") == "abc\n"

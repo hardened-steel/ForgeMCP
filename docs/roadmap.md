@@ -19,14 +19,18 @@ irreversible choices belong in [adr/](adr/).
 - Builtin CMake/CTest vertical slice: status, preset summaries, configure,
   File API target inspection, build, and test execution.
 - clangd phase 1 and phase 2: managed LSP lifecycle, snapshot-based document
-  synchronization, diagnostics/navigation/symbols, safe atomic semantic edits,
+  synchronization, diagnostics/navigation/symbols, safe snapshot-guarded
+  semantic edits with best-effort I/O rollback,
   completion/signature help, code actions, formatting, and hierarchy handles
   through the builtin `clangd` feature plugin.
+- Security and integration audit for clangd phases 1–2: real stdio/MCP and
+  clangd gates, bounded WorkspaceEdit input, serialized mutation commits,
+  lifecycle cancellation, opaque-handle eviction, and regression coverage.
 
 ### In progress
 
-- Integration audit of the completed CMake and clangd phase-1 slices: real MCP
-  stdio, lifecycle, safety boundaries, and optional host-tool smoke paths.
+- DAP design only: define launch/attach policy, adapter discovery, and the
+  debug-binary trust boundary before any debugger implementation.
 
 ## Delivery sequence and dependencies
 
@@ -76,10 +80,11 @@ Delivered tools are `clangd__status`, `clangd__start`, `clangd__stop`,
 Phase 2 extends the same managed `forgemcp.lsp` and `ClangdService` layer; it
 does not introduce an arbitrary LSP proxy. `WorkspaceService.apply_text_edits`
 is the only file-writing path for clangd semantic edits. Rename, resolved pure
-code actions, and document/range formatting use its all-or-nothing snapshot
-transaction. Completion and signatures remain read-only; snippets are never
-applied automatically. Code-action and hierarchy server objects are held only
-behind bounded-lifetime opaque handles.
+code actions, and document/range formatting use its snapshot-guarded staged
+commit. Detected conflicts are all-or-nothing; I/O failure triggers best-effort
+rollback, not a crash-atomic filesystem transaction. Completion and signatures
+remain read-only; snippets are never applied automatically. Code-action and
+hierarchy server objects are held only behind bounded-lifetime opaque handles.
 
 The VS LLVM x64 clangd gate passed with an explicit `FORGEMCP_CLANGD` path for
 phase-1 start/diagnostics/hover/definition/references/stop and phase-2 rename.
@@ -87,14 +92,15 @@ The VS Code clangd extension path was visible to PowerShell but not to Python's
 filesystem view in this host, so it was not used as an executable. The normal
 PATH discovery was absent in this environment.
 
-## Next milestone: clangd phase 3 / DAP decision
+## Next milestone: DAP design decision
 
-Before enabling DAP, retain the current boundary: no debug adapter has been
-implemented, and clangd remains independent of any debugger lifecycle. A DAP
-proposal needs its own launch/attach trust policy and transport-neutral models.
-Remaining clangd candidates are semantic tokens, inlay hints, code lenses,
-refactor/rewrite actions beyond pure WorkspaceEdit, and richer completion
-resolve; each needs a bounded contract and safety review.
+The completed clangd audit permits DAP **design**, not DAP implementation. No
+debug adapter has been implemented, and clangd remains independent of any
+debugger lifecycle. A DAP proposal needs its own launch/attach trust policy,
+adapter discovery, cancellation/termination contract, and transport-neutral
+models. Remaining clangd candidates are semantic tokens, inlay hints, code
+lenses, refactor/rewrite actions beyond pure WorkspaceEdit, and richer
+completion resolve; each needs a bounded contract and safety review.
 
 ## Current MVP limitations
 

@@ -22,6 +22,8 @@ from forgemcp.clangd import (
     ClangdUnsupportedWorkspaceEditError,
     ClangdRequestCancelledError,
     ClangdContentModifiedError,
+    ClangdProtocolError,
+    TypeHierarchyPrepareResult,
 )
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ForgeConfig
@@ -153,6 +155,8 @@ class _FakeWriter:
             self._send({"jsonrpc": "2.0", "id": value["id"], "error": {"code": -32800, "message": "cancelled"}})
         elif method == "fake/modified":
             self._send({"jsonrpc": "2.0", "id": value["id"], "error": {"code": -32801, "message": "modified"}})
+        elif method == "fake/pending":
+            return
         elif method == "shutdown":
             self._send({"jsonrpc": "2.0", "id": value["id"], "result": None})
         elif method == "exit":
@@ -347,6 +351,7 @@ def test_clangd_phase_two_fake_tools_apply_only_atomic_workspace_edits_and_inval
         with pytest.raises(ClangdHandleExpiredError):
             await service.outgoing_calls(call.items[0].item_id)
         types = await service.prepare_type_hierarchy("main.cpp", Position(line=0, column=0))
+        assert isinstance(types, TypeHierarchyPrepareResult)
         assert (await service.supertypes(types.items[0].item_id)).items == ()
         assert (await service.switch_source_header("main.cpp")).path == "main.cpp"
         await service.aclose()
@@ -373,6 +378,226 @@ def test_workspace_edit_engine_rejects_stale_versions_external_uris_and_resource
     asyncio.run(exercise())
 
 
+def test_workspace_edit_engine_accepts_empty_edits_and_enforces_mutation_bounds(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "main.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+
+        assert (await service._apply_workspace_edit(None, anchor=document)).no_op is True
+        assert (
+            await service._apply_workspace_edit({"changes": {document.uri: []}}, anchor=document)
+        ).no_op is True
+        with pytest.raises(ClangdUnsupportedWorkspaceEditError):
+            await service._apply_workspace_edit(
+                {
+                    "changes": {
+                        document.uri: [],
+                        "file:///outside-workspace.cpp": [],
+                    }
+                },
+                anchor=document,
+            )
+
+        single_edit = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": ""}
+        with pytest.raises(ClangdProtocolError, match="more text edits"):
+            await service._apply_workspace_edit(
+                {"changes": {document.uri: [single_edit] * 1_001}}, anchor=document
+            )
+        with pytest.raises(ClangdProtocolError, match="size limit"):
+            await service._apply_workspace_edit(
+                {
+                    "changes": {
+                        document.uri: [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0},
+                                },
+                                "newText": "x" * 1_048_577,
+                            }
+                        ]
+                    }
+                },
+                anchor=document,
+            )
+
+        files = [source]
+        for index in range(100):
+            target = tmp_path / f"bounded-{index}.cpp"
+            target.write_text("x\n", encoding="utf-8")
+            files.append(target)
+        with pytest.raises(ClangdProtocolError, match="more files"):
+            await service._apply_workspace_edit(
+                {
+                    "changes": {
+                        target.as_uri(): [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0},
+                                },
+                                "newText": "",
+                            }
+                        ]
+                        for target in files
+                    }
+                },
+                anchor=document,
+            )
+        assert source.read_text(encoding="utf-8") == "name()\n"
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file URIs are case-insensitive by filesystem policy")
+def test_workspace_edit_coalesces_windows_case_variants_of_one_file_uri(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "MiXeD.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("MiXeD.cpp")
+        case_variant_uri = document.uri[: -len("MiXeD.cpp")] + "mixed.cpp"
+        result = await service._apply_workspace_edit(
+            {
+                "documentChanges": [
+                    {
+                        "textDocument": {"uri": document.uri, "version": document.version},
+                        "edits": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 1},
+                                },
+                                "newText": "N",
+                            }
+                        ],
+                    },
+                    {
+                        "textDocument": {"uri": case_variant_uri, "version": document.version},
+                        "edits": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 1},
+                                    "end": {"line": 0, "character": 2},
+                                },
+                                "newText": "A",
+                            }
+                        ],
+                    },
+                ]
+            },
+            anchor=document,
+        )
+        assert result.affected_files == 1
+        assert source.read_text(encoding="utf-8") == "NAme()\n"
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_renames_of_one_snapshot_commit_at_most_once(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "main.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        assert document.snapshot.sha256 is not None
+
+        outcomes = await asyncio.gather(
+            service.rename("main.cpp", Position(line=0, column=0), "first", expected_sha256=document.snapshot.sha256),
+            service.rename("main.cpp", Position(line=0, column=0), "second", expected_sha256=document.snapshot.sha256),
+            return_exceptions=True,
+        )
+
+        assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+        assert sum(isinstance(outcome, ClangdEditConflictError) for outcome in outcomes) == 1
+        assert source.read_text(encoding="utf-8") in {"first()\n", "second()\n"}
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_rename_conflicts_when_the_workspace_changes_while_clangd_responds(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "main.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        response_started = asyncio.Event()
+        response_continue = asyncio.Event()
+        original_request = service._request
+
+        async def delayed_request(method: str, params: dict[str, object]) -> object:
+            if method == "textDocument/rename":
+                response_started.set()
+                await response_continue.wait()
+                document = next(iter(service._documents.values()))
+                return {
+                    "changes": {
+                        document.uri: [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 4},
+                                },
+                                "newText": "renamed",
+                            }
+                        ]
+                    }
+                }
+            return await original_request(method, params)
+
+        service._request = delayed_request  # type: ignore[method-assign]
+        renamed = asyncio.create_task(service.rename("main.cpp", Position(line=0, column=0), "renamed"))
+        await response_started.wait()
+        source.write_text("external()\n", encoding="utf-8")
+        response_continue.set()
+
+        with pytest.raises(ClangdEditConflictError):
+            await renamed
+        assert source.read_text(encoding="utf-8") == "external()\n"
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_parallel_read_only_clangd_requests_share_one_synchronized_document(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "main.cpp").write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+
+        hover, definition, completion = await asyncio.gather(
+            service.hover("main.cpp", Position(line=0, column=0)),
+            service.definition("main.cpp", Position(line=0, column=0)),
+            service.completion("main.cpp", Position(line=0, column=0)),
+        )
+
+        assert hover.contents == "**hover**"
+        assert definition.locations
+        assert completion.items
+        assert len(service._documents) == 1
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_clangd_maps_request_cancelled_and_content_modified_errors_separately(tmp_path: Path):
     async def exercise() -> None:
         (tmp_path / "db").mkdir()
@@ -383,6 +608,111 @@ def test_clangd_maps_request_cancelled_and_content_modified_errors_separately(tm
             await service._request("fake/cancelled", {})
         with pytest.raises(ClangdContentModifiedError):
             await service._request("fake/modified", {})
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_stop_cancels_a_pending_lsp_request_without_leaking_client_state(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        service, runtime = _service(tmp_path)
+        await service.start("db")
+        client = service._client
+        assert client is not None
+        pending = asyncio.create_task(service._request("fake/pending", {}))
+        await asyncio.sleep(0)
+        await service.aclose()
+
+        with pytest.raises(ClangdProtocolError):
+            await pending
+        assert client._pending == {}
+        assert runtime.handle is not None and runtime.handle.returncode == 0
+        assert service.state is ClangdSessionState.STOPPED
+        assert service._client is None and service._handle is None
+        assert service._watch_task is None and service._stderr_task is None
+
+    asyncio.run(exercise())
+
+
+def test_code_action_resolve_is_invalidated_by_a_document_change(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "main.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        actions = await service.code_actions(
+            "main.cpp", Range(start=Position(line=0, column=0), end=Position(line=0, column=4))
+        )
+        action = next(item for item in actions.actions if item.requires_resolve)
+        resolve_started = asyncio.Event()
+        resolve_continue = asyncio.Event()
+        original_request = service._request
+
+        async def delayed_request(method: str, params: dict[str, object]) -> object:
+            if method == "codeAction/resolve":
+                resolve_started.set()
+                await resolve_continue.wait()
+                document = next(iter(service._documents.values()))
+                return {
+                    **params,
+                    "edit": {
+                        "changes": {
+                            document.uri: [
+                                {
+                                    "range": {
+                                        "start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 0},
+                                    },
+                                    "newText": "resolved ",
+                                }
+                            ]
+                        }
+                    },
+                }
+            return await original_request(method, params)
+
+        service._request = delayed_request  # type: ignore[method-assign]
+        applying = asyncio.create_task(service.apply_code_action(action.action_id))
+        await resolve_started.wait()
+        source.write_text("external()\n", encoding="utf-8")
+        await service.hover("main.cpp", Position(line=0, column=0))
+        resolve_continue.set()
+
+        with pytest.raises(ClangdHandleExpiredError):
+            await applying
+        assert source.read_text(encoding="utf-8") == "external()\n"
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_opaque_handle_cache_uses_fifo_eviction_payload_bounds_and_type_separation(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "main.cpp").write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+
+        first = service._cache_action({"title": "first"}, document)
+        assert first is not None
+        for index in range(100):
+            assert service._cache_action({"title": f"action-{index}"}, document) is not None
+        with pytest.raises(ClangdHandleExpiredError):
+            service._get_action(first.action_id)
+        assert service._cache_action({"title": "large", "data": "x" * 65_536}, document) is None
+
+        call = await service.prepare_call_hierarchy("main.cpp", Position(line=0, column=0))
+        type_item = await service.prepare_type_hierarchy("main.cpp", Position(line=0, column=0))
+        with pytest.raises(ClangdHandleExpiredError):
+            await service.supertypes(call.items[0].item_id)
+        with pytest.raises(ClangdHandleExpiredError):
+            await service.incoming_calls(type_item.items[0].item_id)
         await service.aclose()
 
     asyncio.run(exercise())
@@ -473,8 +803,37 @@ def test_builtin_clangd_plugin_registers_every_phase_one_tool_with_flat_schemas(
             }
             for name, properties in expected_properties.items():
                 assert set(tools[name].inputSchema["properties"]) == properties
-            assert tools["clangd__start"].inputSchema["required"] == ["compile_commands_dir"]
-            assert set(tools["clangd__code_actions"].inputSchema["required"]) == {"path", "range"}
+            expected_required = {
+                "clangd__status": set(),
+                "clangd__start": {"compile_commands_dir"},
+                "clangd__stop": set(),
+                "clangd__diagnostics": {"path"},
+                "clangd__hover": {"path", "position"},
+                "clangd__definition": {"path", "position"},
+                "clangd__references": {"path", "position"},
+                "clangd__document_symbols": {"path"},
+                "clangd__workspace_symbols": {"query"},
+                "clangd__completion": {"path", "position"},
+                "clangd__signature_help": {"path", "position"},
+                "clangd__declaration": {"path", "position"},
+                "clangd__type_definition": {"path", "position"},
+                "clangd__implementation": {"path", "position"},
+                "clangd__prepare_rename": {"path", "position"},
+                "clangd__rename": {"path", "position", "new_name"},
+                "clangd__code_actions": {"path", "range"},
+                "clangd__apply_code_action": {"action_id"},
+                "clangd__format_document": {"path"},
+                "clangd__format_range": {"path", "range"},
+                "clangd__prepare_call_hierarchy": {"path", "position"},
+                "clangd__incoming_calls": {"item_id"},
+                "clangd__outgoing_calls": {"item_id"},
+                "clangd__prepare_type_hierarchy": {"path", "position"},
+                "clangd__supertypes": {"item_id"},
+                "clangd__subtypes": {"item_id"},
+                "clangd__switch_source_header": {"path"},
+            }
+            for name, required in expected_required.items():
+                assert set(tools[name].inputSchema.get("required", ())) == required
 
     asyncio.run(exercise())
 

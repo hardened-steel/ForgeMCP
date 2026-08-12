@@ -32,12 +32,21 @@ the policy-allowed explicit absolute `FORGEMCP_CLANGD` value, if configured, or
 the policy-allowed bare `clangd` found using Process Runtime's captured PATH.
 There is no caller-provided argv and no `--query-driver` in phase 1.
 
+Treat clangd as an untrusted, fallible protocol peer rather than a trusted
+extension of the MCP client. LSP framing bounds message size; adapters expose
+only normalized, bounded domain models and never raw protocol payloads, source
+text, replacement text, compiler arguments, or stderr in MCP errors or logs.
+The client denies `workspace/applyEdit`; only the later, explicit
+WorkspaceEdit adapter may write files, and it never sends `workspace/executeCommand`.
+
 On shutdown ClangdService sends `didClose` for every known document, requests
 `shutdown`, sends `exit`, closes the protocol, and waits before ProcessHandle
 termination/kill escalation. It continuously drains stderr with a fixed
 discard limit and never emits raw stderr. Repeated close is idempotent. An EOF,
 protocol failure, or unexpected child exit moves the service to `failed`; phase
-1 has no restart loop.
+1 has no restart loop. Shutdown first marks the managed session closing, so an
+in-flight mutation response cannot enter its file-commit boundary after stop
+begins; read-only requests remain independently multiplexed.
 
 Documents are identified by WorkspaceService snapshots. ForgeMCP reads text
 only through WorkspaceService and sends `didOpen` once per session. A changed

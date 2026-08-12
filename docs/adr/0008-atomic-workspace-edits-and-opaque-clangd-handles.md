@@ -23,25 +23,36 @@ rename files.
 and `documentChanges` only when every entry is `TextDocumentEdit`, revalidates
 each URI through WorkspaceService, converts from the negotiated LSP position
 encoding, verifies an open-document version when supplied, and snapshots all
-targets immediately before atomic commit. Any external URI, resource operation,
-malformed edit, overlap, stale document version, or snapshot conflict cancels
-the entire edit. On success it synchronizes all changed open documents using
-full `didChange`, invalidates cached actions/hierarchy handles, and marks prior
-diagnostics stale. Request cancellation and content-modified LSP errors are
-separate client-visible clangd errors.
+targets immediately before commit. `null` and empty text-edit lists are valid
+no-ops; a non-empty request is limited to 100 files, 1,000 text edits, and 1
+MiB of UTF-8 replacement text. Any external URI, resource operation, malformed
+edit, overlap, stale document version, or snapshot conflict cancels the entire
+edit. A delayed rename or format response must still match its request-time
+anchor snapshot at the serialized commit boundary. On success it synchronizes
+all changed open documents using full `didChange`, invalidates cached
+actions/hierarchy handles, and marks prior diagnostics stale. Request
+cancellation and content-modified LSP errors are separate client-visible clangd
+errors.
 
 Code actions and call/type hierarchy items receive ForgeMCP-generated opaque
 handles. Their raw LSP objects remain in an in-memory cache with 100 entries
-per class and a two-minute TTL. The cache clears on stop, crash, and document
-change. Applying an action is restricted to a resolved pure WorkspaceEdit;
-command-only actions are intentionally rejected and ForgeMCP never sends
-`workspace/executeCommand`.
+per class, a 64 KiB maximum per cached payload, and a two-minute monotonic-clock
+TTL. Expired entries are purged first and capacity then evicts the oldest entry
+(FIFO). The cache clears on stop, crash, and document change. Applying an
+action is restricted to a resolved pure WorkspaceEdit and rechecks that its
+handle and anchor snapshot survived resolution; command-only actions are
+intentionally rejected and ForgeMCP never sends `workspace/executeCommand`.
 
 ## Consequences
 
-Semantic edits retain WorkspaceService's all-or-nothing and symlink-scoped
-guarantees. A multi-file rename cannot partially modify a workspace. Clients
-must retry an expired handle or snapshot conflict. Resource operations,
-external-source edits, command execution, arbitrary LSP calls, and DAP remain
-outside this phase. Later features must reuse this adapter and Workspace
-transaction rather than adding feature-specific file writers.
+For detected validation and snapshot conflicts, semantic edits are all-or-nothing
+and symlink-scoped: no target is changed. During ordinary I/O failure, the
+staged commit attempts best-effort rollback of earlier replacements. This is not
+a crash-atomic multi-file filesystem transaction: rollback can fail, including
+for a Windows-locked file; a crash or power loss can interrupt it; and another
+process can race between the final CAS check and `os.replace`. Clients must
+retry an expired handle or snapshot conflict and treat commit errors as an
+indeterminate I/O outcome. Resource operations, external-source edits, command
+execution, arbitrary LSP calls, and DAP remain outside this phase. Later
+features must reuse this adapter and Workspace transaction rather than adding
+feature-specific file writers.
