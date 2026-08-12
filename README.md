@@ -10,6 +10,8 @@ The initial server exposes a diagnostic MCP tool over the stdio transport:
 
 `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
+Feature integrations use the public `forgemcp.plugins` contract. None are enabled in the current MVP. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md) and [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md) before allowing third-party code.
+
 ## Setup
 
 Requires Python 3.11 or later.
@@ -35,6 +37,7 @@ The next increments are a Workspace module, then CMake build/test, clangd, and D
 - `core/config.py` — typed runtime configuration and workspace-root validation.
 - `core/services.py` — explicit dependency registry for future modules.
 - `core/application.py` — application composition, lifecycle, and server status.
+- `plugins/` — versioned feature-plugin contract, lifecycle manager, tool registry, and opt-in entry-point discovery.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — structured, redacted stderr logging.
 

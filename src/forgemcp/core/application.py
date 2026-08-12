@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -13,6 +14,7 @@ from forgemcp.core.errors import LifecycleError
 from forgemcp.core.logging import StructuredLogger, create_logger
 from forgemcp.core.services import ServiceRegistry
 from forgemcp.processes import ProcessRuntime
+from forgemcp.plugins import ForgePlugin, PluginManager
 from forgemcp.workspace import WorkspaceService
 
 
@@ -52,9 +54,13 @@ class ForgeApplication:
         self._logger = services.get("logger")
         if not isinstance(self._logger, StructuredLogger):
             raise TypeError("The 'logger' service must be a StructuredLogger.")
+        if not isinstance(services.get("plugins"), PluginManager):
+            raise TypeError("The 'plugins' service must be a PluginManager.")
 
     @classmethod
-    def create(cls, config: ForgeConfig) -> "ForgeApplication":
+    def create(
+        cls, config: ForgeConfig, *, builtin_plugins: Iterable[ForgePlugin] = ()
+    ) -> "ForgeApplication":
         """Compose Core services and registered domain services from validated configuration."""
         services = ServiceRegistry()
         services.register("config", config)
@@ -62,6 +68,10 @@ class ForgeApplication:
         services.register("logger", logger)
         services.register("workspace", WorkspaceService(config, logger))
         services.register("process_runtime", ProcessRuntime(config, logger))
+        plugins = PluginManager(config=config, services=services, logger=logger)
+        services.register("plugins", plugins)
+        for plugin in builtin_plugins:
+            plugins.register_builtin(plugin)
         return cls(config, services)
 
     @classmethod
@@ -78,37 +88,48 @@ class ForgeApplication:
     def state(self) -> LifecycleState:
         return self._state
 
-    def start(self) -> None:
-        """Enter the running state exactly once."""
+    async def start(self) -> None:
+        """Start feature plugins and enter the running state exactly once."""
         if self._state is not LifecycleState.CREATED:
             raise LifecycleError(f"Cannot start an application in state '{self._state}'.")
+        plugins = self.services.get("plugins")
+        if not isinstance(plugins, PluginManager):
+            raise TypeError("The 'plugins' service must be a PluginManager.")
+        await plugins.start()
         self._state = LifecycleState.RUNNING
         self._logger.info("application_started", workspace_root=str(self.config.workspace_root))
 
     def stop(self) -> None:
-        """Stop the application; repeated cleanup is harmless."""
-        if self._state is LifecycleState.STOPPED:
+        """Synchronously stop when no event loop is active; async hosts use ``aclose``."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.aclose())
             return
-        self._state = LifecycleState.STOPPED
-        process_runtime = self.services.get("process_runtime")
-        if isinstance(process_runtime, ProcessRuntime):
-            process_runtime.close()
-        self._logger.info("application_stopped")
+        raise LifecycleError("Use 'await application.aclose()' from an active event loop.")
 
     async def aclose(self) -> None:
         """Await shutdown of async domain services before marking the app stopped.
 
-        The current stdio adapter is synchronous, so ``stop`` retains its
-        immediate best-effort signal path.  Future adapters that retain
-        protocol process handles must use this method in their async lifespan.
+        Plugin cleanup runs before the Process Runtime, so protocol adapters
+        can release their handles before the runtime's final process cleanup.
+        Async hosts, including the stdio server, must use this method.
         """
-        process_runtime = self.services.get("process_runtime")
-        if isinstance(process_runtime, ProcessRuntime):
-            await process_runtime.aclose()
         if self._state is LifecycleState.STOPPED:
             return
-        self._state = LifecycleState.STOPPED
-        self._logger.info("application_stopped")
+        try:
+            plugins = self.services.get("plugins")
+            if not isinstance(plugins, PluginManager):
+                raise TypeError("The 'plugins' service must be a PluginManager.")
+            await plugins.aclose()
+        finally:
+            try:
+                process_runtime = self.services.get("process_runtime")
+                if isinstance(process_runtime, ProcessRuntime):
+                    await process_runtime.aclose()
+            finally:
+                self._state = LifecycleState.STOPPED
+                self._logger.info("application_stopped")
 
     def status(self) -> ServerStatus:
         """Return safe diagnostic state without inspecting project contents."""

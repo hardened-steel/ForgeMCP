@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import Context, FastMCP
 
 from forgemcp.core.application import ForgeApplication
+from forgemcp.plugins import RegisteredToolContribution, ToolRegistry
 
 
 def server_status(application: ForgeApplication) -> dict[str, object]:
@@ -24,7 +26,8 @@ def create_server(
     async def application_lifespan(_: FastMCP[ForgeApplication]) -> AsyncIterator[ForgeApplication]:
         application = application_factory()
         try:
-            application.start()
+            await application.start()
+            _register_contributed_tools(mcp, application.services.get("plugins").tools)
             yield application
         finally:
             await application.aclose()
@@ -40,6 +43,28 @@ def create_server(
         return server_status(application)
 
     return mcp
+
+
+def _register_contributed_tools(
+    mcp: FastMCP[ForgeApplication], registry: ToolRegistry
+) -> None:
+    """Adapt transport-neutral contributions after plugin startup, never exposing FastMCP to them."""
+    for contribution in registry.contributions():
+        mcp.tool(name=contribution.name, description=contribution.description)(
+            _tool_adapter(contribution)
+        )
+
+
+def _tool_adapter(contribution: RegisteredToolContribution):
+    """Create the SDK-facing wrapper for one generic mapping-based contribution."""
+
+    async def contributed_tool(arguments: dict[str, object]) -> object:
+        result = contribution.handler(arguments)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    return contributed_tool
 
 
 def main() -> None:

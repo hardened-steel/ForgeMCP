@@ -6,7 +6,7 @@
 
 The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
 
-`server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop.
+`server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool contributions to the MCP SDK, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop.
 
 ## Domain models
 
@@ -22,14 +22,35 @@ The public API is exported from `forgemcp.models`:
 
 Every model is immutable, rejects unknown fields, and has Pydantic field descriptions for JSON-schema consumers. All timestamps are timezone-aware `datetime` values normalized to UTC. Naive timestamps are invalid; `model_dump(mode="json")` and `model_dump_json()` render the UTC values as ISO-8601 strings. Models are value objects, not services, and must not inspect the workspace or execute processes.
 
+## Feature plugins
+
+`forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it accepts `builtin_plugins=` so ForgeMCP-owned feature plugins are registered explicitly during composition. There are no feature plugins enabled in the current MVP.
+
+Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`.
+
+A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
+
+- `plugin_id` is a unique lower-case stable identifier and its namespace for all contributed tools.
+- `api_version` must equal the stable `PLUGIN_API_VERSION` (`"1"`).
+- `requires` names other feature plugins; `requires_services` names Core services; and `provides` declares globally unique capabilities.
+- `async start(context)` receives a `PluginContext` with the immutable configuration, structured logger, a declaration-scoped service facade, and a plugin-scoped tool facade. It never receives `ForgeApplication` or the raw `ServiceRegistry`.
+- `async stop()` releases resources. `PluginManager` invokes it in reverse startup order.
+
+Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
+
+Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description; it has no MCP, FastMCP, LSP, CMake, or DAP type. `ToolRegistry` qualifies its local name as `<plugin_id>__<tool_name>`, rejects duplicates, and retains the immutable registration. After application startup, `server.py` wraps each contribution in a FastMCP handler. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects. There are no CMake, clangd, or debugger tool contributions yet.
+
+External plugins use Python entry points in the `forgemcp.plugins` group. Discovery is disabled by default and is enabled only by both `ForgeConfig.external_plugins_enabled=True` (or `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true`) and a non-empty explicit `ForgeConfig.external_plugin_allowlist` (or comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`). The allow-list contains entry-point names, which must exactly equal the loaded plugin's `plugin_id`. ForgeMCP does not enumerate entry-point metadata while discovery is disabled and calls `EntryPoint.load()` only for listed names; all other advertised packages remain unimported.
+
 ## Extension points
 
-A future module should expose a small service object and register it during application composition under a stable name. It obtains Core dependencies through `application.services`:
+Feature integrations use `PluginContext` rather than `application.services`. The always-present Core service names they can explicitly require are:
 
 - `config` — `ForgeConfig`
 - `logger` — `StructuredLogger`
 - `workspace` — `WorkspaceService`, the safe filesystem capability for the configured workspace
 - `process_runtime` — `ProcessRuntime`, the safe asynchronous external-tool capability for the configured workspace
+- `plugins` — `PluginManager`, when a future plugin has a valid reason to depend on manager-owned status or registry data
 
 ## Workspace module
 
@@ -46,7 +67,7 @@ All supplied paths are workspace-relative strings. Absolute, drive-qualified, an
 
 Every patch target must carry a compare-and-swap expectation: preferably the `FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file; `None` represents an expected absent file for creation. A snapshot conflict or hunk mismatch returns `PatchResult(applied=False)` before source files are changed. Patches are text-only unified diffs, staged beside their targets and committed with rollback backups; patch input and file content never enter Workspace log context. File change events are intentionally not implemented yet.
 
-Plugin discovery, dependency resolution, CMake, MCP Workspace tool adapters, clangd, debug adapters, and process execution are intentionally outside this initial Core boundary. Workspace I/O itself is isolated in the separately composed Workspace module.
+Feature plugins now own discovery and dependency resolution. CMake, MCP Workspace tool adapters, clangd, and debug adapters remain intentionally unimplemented. Workspace I/O itself is isolated in the separately composed Workspace module.
 
 ## Process Runtime module
 
@@ -59,7 +80,7 @@ Its public API intentionally has two paths:
 
 Every command is a non-empty NUL-free argv sequence and is launched only with `asyncio.create_subprocess_exec(..., shell=False)`. There is deliberately no `run_shell` API. The runtime resolves a bare executable against the environment captured at composition time, then invokes its resolved path; a per-launch `PATH` override cannot redirect the executable. The immutable `ProcessPolicy` controls executable names/absolute paths, workspace-relative CWD allow-list, default and maximum short-command timeouts, output limit (up to the domain-model maximum), termination grace period, and environment inheritance/override keys. Environment inheritance is enabled by default; overrides are denied unless the policy names their keys (or an explicitly trusted adapter chooses unrestricted overrides). CWD is required to exist beneath the configured workspace and cannot be absolute, traverse `..`, or cross a symlink.
 
-Process output and complete argv/environment values are never logged. Completion logs contain only exit/timeout state and each stream's character count plus truncation bit. The runtime retains all live `ProcessHandle` instances; callers should await `ProcessRuntime.aclose()` during asynchronous host shutdown. `ForgeApplication.aclose()` provides the corresponding application-level hook. The MCP stdio adapter already awaits it in FastMCP's lifespan; synchronous `close()` remains only an immediate best-effort fallback for other synchronous hosts.
+Process output and complete argv/environment values are never logged. Completion logs contain only exit/timeout state and each stream's character count plus truncation bit. The runtime retains all live `ProcessHandle` instances; callers should await `ProcessRuntime.aclose()` during asynchronous host shutdown. `ForgeApplication.aclose()` provides the corresponding application-level hook. The MCP stdio adapter already awaits it in FastMCP's lifespan. `ForgeApplication.stop()` can bridge to the asynchronous lifecycle only when no event loop is active; async hosts must await `ForgeApplication.aclose()`.
 
 On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP` and is assigned a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE`; closing that job removes non-detached descendants even when the direct child has already exited. Graceful cleanup first sends `CTRL_BREAK_EVENT` with a direct-child terminate fallback; job closure is the forced tree kill. If Job assignment is refused by a host-owned job, forced cleanup falls back to the built-in `taskkill /PID <pid> /T /F` through asyncio with all helper streams discarded. This avoids a `psutil` runtime dependency. As on other process-management APIs, a tool that deliberately creates an independent process group/session or requests Job breakaway can escape its parent's tree boundary; adapters must not enable either.
 

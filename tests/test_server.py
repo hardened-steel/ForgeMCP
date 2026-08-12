@@ -9,19 +9,20 @@ from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
 from forgemcp.core.services import ServiceRegistry
 from forgemcp.processes import ProcessPolicy, ProcessRuntime
+from forgemcp.plugins import ForgePlugin, PluginContext, PluginManager, PluginMetadata, ToolContribution
 from forgemcp.server import create_server, server_status
 from forgemcp.workspace import WorkspaceService
 
 
 def test_server_status_smoke_test(tmp_path):
     application = ForgeApplication.create(ForgeConfig(workspace_root=tmp_path))
-    application.start()
+    asyncio.run(application.start())
 
     status = server_status(application)
 
     assert status["workspace_root"] == str(tmp_path.resolve())
     assert status["state"] == LifecycleState.RUNNING.value
-    assert status["services"] == ["config", "logger", "process_runtime", "workspace"]
+    assert status["services"] == ["config", "logger", "plugins", "process_runtime", "workspace"]
     server = create_server(lambda: application)
     assert server.name == "ForgeMCP"
     assert [tool.name for tool in asyncio.run(server.list_tools())] == ["server_status"]
@@ -49,6 +50,7 @@ def application_with_test_process_runtime(root: Path) -> ForgeApplication:
             ),
         ),
     )
+    services.register("plugins", PluginManager(config=config, services=services, logger=logger))
     return ForgeApplication(config, services)
 
 
@@ -70,5 +72,36 @@ def test_mcp_lifespan_closes_a_long_lived_process_after_an_exception(tmp_path):
 
         assert application.state is LifecycleState.STOPPED
         assert handle.returncode is not None
+
+    asyncio.run(exercise())
+
+
+def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_path):
+    class ToolPlugin(ForgePlugin):
+        def __init__(self) -> None:
+            super().__init__(PluginMetadata(plugin_id="cmake"))
+
+        async def start(self, context: PluginContext) -> None:
+            context.tools.register(
+                ToolContribution(
+                    name="configure",
+                    description="Configure a build tree.",
+                    handler=lambda _: {"configured": False},
+                )
+            )
+
+        async def stop(self) -> None:
+            return None
+
+    async def exercise() -> None:
+        application = ForgeApplication.create(
+            ForgeConfig(workspace_root=tmp_path), builtin_plugins=(ToolPlugin(),)
+        )
+        server = create_server(lambda: application)
+        async with server._mcp_server.lifespan(server._mcp_server):  # type: ignore[attr-defined]
+            assert sorted(tool.name for tool in await server.list_tools()) == [
+                "cmake__configure",
+                "server_status",
+            ]
 
     asyncio.run(exercise())
