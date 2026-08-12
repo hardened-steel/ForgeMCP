@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -14,7 +14,7 @@ from typing import TypeAlias
 
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import StructuredLogger
-from forgemcp.models import FileChange, FileChangeKind, FileSnapshot, PatchResult
+from forgemcp.models import FileChange, FileChangeKind, FileSnapshot, PatchResult, Position, Range
 from forgemcp.workspace.errors import (
     ExpectedSnapshotError,
     IgnoredWorkspacePathError,
@@ -28,6 +28,7 @@ from forgemcp.workspace.errors import (
     WorkspaceNotDirectoryError,
     WorkspaceNotFileError,
     WorkspacePathError,
+    WorkspaceTextEditError,
 )
 from forgemcp.workspace.policy import WorkspacePolicy
 
@@ -40,6 +41,19 @@ _HUNK_HEADER = re.compile(
 _PATCH_METADATA_PREFIXES = ("diff --git ", "index ", "new file mode ", "deleted file mode ")
 
 ExpectedSnapshot: TypeAlias = FileSnapshot | str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceTextEdit:
+    """One replacement in public zero-based Unicode code-point coordinates.
+
+    This intentionally lives in the Workspace package rather than shared
+    domain models because ``new_text`` can contain source content and must not
+    be treated as log-safe structured data.
+    """
+
+    range: Range
+    new_text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +331,83 @@ class WorkspaceService:
         self._logger.info("workspace_patch_applied", changed_files=len(changes))
         return PatchResult(applied=True, changes=changes)
 
+    def apply_text_edits(
+        self,
+        edits_by_path: Mapping[str, Sequence[WorkspaceTextEdit]],
+        expected_snapshots: Mapping[str, ExpectedSnapshot],
+    ) -> PatchResult:
+        """Atomically apply non-overlapping source-coordinate replacements.
+
+        Every target must be an existing, ordinary workspace file with an
+        expected snapshot.  Ranges use Unicode code points, matching the
+        public location contract.  The entire batch is planned in memory and
+        committed through the same staged rollback mechanism as unified
+        patches, so any validation or compare-and-swap conflict leaves every
+        file unchanged.  Replacement text is never logged.
+        """
+        if not isinstance(edits_by_path, Mapping):
+            raise WorkspaceTextEditError("Text edits must be a mapping by workspace-relative path.")
+        expected_by_target = self._normalize_expected_snapshots(expected_snapshots)
+        targets: dict[str, tuple[Path, tuple[WorkspaceTextEdit, ...]]] = {}
+        for supplied_path, supplied_edits in edits_by_path.items():
+            if not isinstance(supplied_path, str):
+                raise WorkspaceTextEditError("Text-edit paths must be workspace-relative strings.")
+            target = self._resolve_path(supplied_path)
+            key = self._relative_key(target)
+            if key in targets:
+                raise WorkspaceTextEditError("Text edits must not name a file more than once.")
+            if isinstance(supplied_edits, (str, bytes)):
+                raise WorkspaceTextEditError("Text edits for a file must be a sequence of structured edits.")
+            try:
+                edits = tuple(supplied_edits)
+            except TypeError as error:
+                raise WorkspaceTextEditError(
+                    "Text edits for a file must be a sequence of structured edits."
+                ) from error
+            if not edits or any(not isinstance(edit, WorkspaceTextEdit) for edit in edits):
+                raise WorkspaceTextEditError("Every target file must contain one or more structured text edits.")
+            targets[key] = (target, edits)
+        if set(targets) != set(expected_by_target):
+            raise ExpectedSnapshotError("Expected snapshots must cover exactly the files in the text-edit batch.")
+
+        plans: list[_PlannedChange] = []
+        for key in sorted(targets):
+            target, edits = targets[key]
+            current = self._snapshot_path(target)
+            expected = expected_by_target[key]
+            if not self._matches_expected_snapshot(target, current, expected):
+                self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
+                return PatchResult(applied=False)
+            if not current.exists:
+                raise WorkspaceTextEditError("Text edits can only modify existing workspace files.")
+            source_text = self._read_text_for_snapshot(target, current)
+            replacement = self._apply_text_replacements(source_text, edits)
+            if replacement != source_text:
+                plans.append(
+                    _PlannedChange(
+                        target=target,
+                        before=current,
+                        kind=FileChangeKind.MODIFIED,
+                        after_text=replacement,
+                    )
+                )
+
+        if not plans:
+            return PatchResult(applied=True)
+        staged = self._stage_changes(plans)
+        try:
+            for item in staged:
+                current = self._snapshot_path(item.plan.target)
+                if not self._same_snapshot(current, item.plan.before):
+                    self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
+                    return PatchResult(applied=False)
+            self._commit_staged_changes(staged)
+        finally:
+            self._cleanup_staging(staged)
+        changes = tuple(self._to_file_change(plan) for plan in plans)
+        self._logger.info("workspace_text_edits_applied", changed_files=len(changes))
+        return PatchResult(applied=True, changes=changes)
+
     def _collect_files(self, directory: Path, recursive: bool, snapshots: list[FileSnapshot]) -> None:
         """Append a stable-order, non-following directory walk to ``snapshots``."""
         with os.scandir(directory) as entries:
@@ -536,6 +627,76 @@ class WorkspaceService:
         if len(data) > maximum:
             raise WorkspaceFileTooLargeError("The requested file exceeds the configured read limit.")
         return data
+
+    def _read_text_for_snapshot(self, target: Path, snapshot: FileSnapshot) -> str:
+        """Read source text only when it still matches a prevalidated snapshot."""
+        data = self._read_bytes_limited(target, self._policy.max_read_bytes)
+        if hashlib.sha256(data).hexdigest() != snapshot.sha256:
+            raise WorkspaceConcurrentModificationError(
+                "The file changed while text edits were being planned; retry the operation."
+            )
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise WorkspaceEncodingError("The requested file is not valid UTF-8.") from error
+
+    def _apply_text_replacements(
+        self, source_text: str, edits: tuple[WorkspaceTextEdit, ...]
+    ) -> str:
+        """Validate, order, and apply one non-overlapping batch without logging text."""
+        indexed: list[tuple[int, int, str]] = []
+        total_replacement_bytes = 0
+        for edit in edits:
+            if not isinstance(edit.new_text, str) or "\x00" in edit.new_text:
+                raise WorkspaceTextEditError("Text-edit replacements must be NUL-free UTF-8 text.")
+            try:
+                total_replacement_bytes += len(edit.new_text.encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise WorkspaceTextEditError("Text-edit replacements must be valid UTF-8 text.") from error
+            start = self._position_offset(source_text, edit.range.start)
+            end = self._position_offset(source_text, edit.range.end)
+            if end < start:
+                raise WorkspaceTextEditError("A text-edit range must not run backwards.")
+            indexed.append((start, end, edit.new_text))
+        if total_replacement_bytes > self._policy.max_patch_bytes:
+            raise WorkspaceFileTooLargeError("Text-edit replacement data exceeds the configured size limit.")
+        ordered = sorted(indexed, key=lambda item: (item[0], item[1], item[2]))
+        previous_start = -1
+        previous_end = -1
+        for start, end, _ in ordered:
+            if start < previous_end or (start == previous_start and end == previous_end):
+                raise WorkspaceTextEditError("Text edits for one file must not overlap.")
+            previous_start, previous_end = start, end
+        output = source_text
+        for start, end, replacement in reversed(ordered):
+            output = output[:start] + replacement + output[end:]
+        try:
+            if len(output.encode("utf-8")) > self._policy.max_patch_bytes:
+                raise WorkspaceFileTooLargeError("Text-edit output exceeds the configured size limit.")
+        except UnicodeEncodeError as error:
+            raise WorkspaceTextEditError("Text-edit output must be valid UTF-8 text.") from error
+        return output
+
+    @staticmethod
+    def _position_offset(source_text: str, position: Position) -> int:
+        """Translate a code-point line/column into a Python string offset."""
+        raw_lines = source_text.splitlines(keepends=True)
+        if not raw_lines:
+            raw_lines = [""]
+        elif source_text.endswith(("\n", "\r")):
+            raw_lines.append("")
+        if position.line >= len(raw_lines):
+            raise WorkspaceTextEditError("A text-edit line is outside the current document.")
+        line = raw_lines[position.line]
+        if line.endswith("\r\n"):
+            visible = line[:-2]
+        elif line.endswith(("\n", "\r")):
+            visible = line[:-1]
+        else:
+            visible = line
+        if position.column > len(visible):
+            raise WorkspaceTextEditError("A text-edit column is outside the current document line.")
+        return sum(len(item) for item in raw_lines[: position.line]) + position.column
 
     def _normalize_expected_snapshots(
         self, expected_snapshots: Mapping[str, ExpectedSnapshot]

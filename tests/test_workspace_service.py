@@ -8,7 +8,7 @@ import pytest
 
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
-from forgemcp.models import FileChangeKind
+from forgemcp.models import FileChangeKind, Position, Range
 import forgemcp.workspace.service as workspace_service_module
 from forgemcp.workspace import (
     PatchCommitError,
@@ -18,6 +18,8 @@ from forgemcp.workspace import (
     WorkspacePathError,
     WorkspacePolicy,
     WorkspaceService,
+    WorkspaceTextEdit,
+    WorkspaceTextEditError,
 )
 
 
@@ -230,3 +232,72 @@ def test_creation_requires_an_absent_snapshot_and_reports_existing_models(tmp_pa
     assert result.changes[0].before is None
     assert result.changes[0].after is not None
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created\n"
+
+
+def test_apply_text_edits_handles_multiple_code_point_edits_in_one_file(tmp_path):
+    target = tmp_path / "source.cpp"
+    target.write_text("A😀BC\none\n", encoding="utf-8")
+    service = workspace(tmp_path)
+    before = service.get_snapshot("source.cpp")
+
+    result = service.apply_text_edits(
+        {
+            "source.cpp": (
+                WorkspaceTextEdit(
+                    range=Range(start=Position(line=0, column=1), end=Position(line=0, column=2)),
+                    new_text="X",
+                ),
+                WorkspaceTextEdit(
+                    range=Range(start=Position(line=1, column=0), end=Position(line=1, column=3)),
+                    new_text="ONE",
+                ),
+            )
+        },
+        {"source.cpp": before},
+    )
+
+    assert result.applied is True
+    assert len(result.changes) == 1
+    assert target.read_text(encoding="utf-8") == "AXBC\nONE\n"
+
+
+def test_apply_text_edits_is_atomic_for_multiple_files_and_snapshot_conflicts(tmp_path):
+    first = tmp_path / "first.cpp"
+    second = tmp_path / "second.cpp"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+    service = workspace(tmp_path)
+    expected = {"first.cpp": service.get_snapshot("first.cpp"), "second.cpp": service.get_snapshot("second.cpp")}
+    second.write_text("external\n", encoding="utf-8")
+
+    result = service.apply_text_edits(
+        {
+            "first.cpp": (WorkspaceTextEdit(Range(start=Position(line=0, column=0), end=Position(line=0, column=3)), "ONE"),),
+            "second.cpp": (WorkspaceTextEdit(Range(start=Position(line=0, column=0), end=Position(line=0, column=3)), "TWO"),),
+        },
+        expected,
+    )
+
+    assert result.applied is False
+    assert result.changes == ()
+    assert first.read_text(encoding="utf-8") == "one\n"
+    assert second.read_text(encoding="utf-8") == "external\n"
+
+
+def test_apply_text_edits_rejects_overlaps_without_changing_the_file(tmp_path):
+    target = tmp_path / "source.cpp"
+    target.write_text("abcdef\n", encoding="utf-8")
+    service = workspace(tmp_path)
+
+    with pytest.raises(WorkspaceTextEditError, match="overlap"):
+        service.apply_text_edits(
+            {
+                "source.cpp": (
+                    WorkspaceTextEdit(Range(start=Position(line=0, column=1), end=Position(line=0, column=4)), "X"),
+                    WorkspaceTextEdit(Range(start=Position(line=0, column=3), end=Position(line=0, column=5)), "Y"),
+                )
+            },
+            {"source.cpp": service.get_snapshot("source.cpp")},
+        )
+
+    assert target.read_text(encoding="utf-8") == "abcdef\n"

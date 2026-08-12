@@ -45,3 +45,39 @@ class ClangdTimeoutError(ClangdError):
     """A bounded clangd request did not finish in time."""
 
     code = "clangd_timeout"
+
+
+class ClangdEditConflictError(ClangdError):
+    """A WorkspaceEdit no longer matches the snapshots it was computed from."""
+
+    code = "clangd_edit_conflict"
+
+
+class ClangdUnsupportedWorkspaceEditError(ClangdError):
+    """A server edit contains an unsafe resource operation or external target."""
+
+    code = "clangd_workspace_edit_unsupported"
+
+
+class ClangdUnsupportedActionError(ClangdError):
+    """A code action would require a command or unsupported execution path."""
+
+    code = "clangd_code_action_unsupported"
+
+
+class ClangdHandleExpiredError(ClangdError):
+    """An opaque action or hierarchy handle is stale, expired, or from another session."""
+
+    code = "clangd_handle_expired"
+
+
+class ClangdRequestCancelledError(ClangdError):
+    """clangd cancelled the request before producing a stable result."""
+
+    code = "clangd_request_cancelled"
+
+
+class ClangdContentModifiedError(ClangdError):
+    """clangd rejected a request because its document state changed."""
+
+    code = "clangd_content_modified"

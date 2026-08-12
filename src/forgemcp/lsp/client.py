@@ -215,7 +215,7 @@ class LspClient:
         if "error" in message:
             error = message["error"]
             code = error.get("code") if isinstance(error, Mapping) else None
-            future.set_exception(LspRpcError(f"The language server rejected a request (code {code!s})."))
+            future.set_exception(LspRpcError(code if isinstance(code, int) and not isinstance(code, bool) else None))
         elif "result" in message:
             future.set_result(message["result"])
         else:

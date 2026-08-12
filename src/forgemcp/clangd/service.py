@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import secrets
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,21 +14,48 @@ from urllib.parse import unquote, urlsplit
 
 from forgemcp.clangd.errors import (
     ClangdFailedError,
+    ClangdContentModifiedError,
+    ClangdEditConflictError,
+    ClangdHandleExpiredError,
     ClangdNotStartedError,
     ClangdProtocolError,
     ClangdRequestError,
+    ClangdRequestCancelledError,
     ClangdTimeoutError,
     ClangdUnavailableError,
+    ClangdUnsupportedActionError,
+    ClangdUnsupportedWorkspaceEditError,
 )
 from forgemcp.clangd.models import (
+    CallHierarchyItem,
+    CallHierarchyPrepareResult,
     ClangdSessionState,
     ClangdStartResult,
     ClangdStatus,
+    CodeActionResult,
+    CodeActionSummary,
+    CompletionInsertTextFormat,
+    CompletionItem,
+    CompletionResult,
     DocumentDiagnosticsResult,
     DocumentSymbol,
     DocumentSymbolsResult,
+    FormatResult,
     HoverResult,
+    IncomingCall,
+    IncomingCallsResult,
     NavigationResult,
+    OutgoingCall,
+    OutgoingCallsResult,
+    RenamePreparation,
+    RenameResult,
+    SignatureHelpResult,
+    SignatureInformation,
+    SwitchSourceHeaderResult,
+    TypeHierarchyItem,
+    TypeHierarchyPrepareResult,
+    TypeHierarchyResult,
+    WorkspaceEditSummary,
     WorkspaceLocation,
     WorkspaceSymbol,
     WorkspaceSymbolsResult,
@@ -38,13 +67,19 @@ from forgemcp.lsp import (
     LspCoordinateError,
     LspError,
     LspRequestTimeoutError,
+    LspRpcError,
     PositionEncoding,
     from_lsp_range,
     to_lsp_position,
 )
 from forgemcp.models import Diagnostic, FileSnapshot, Position, Range, Severity
 from forgemcp.processes import ProcessError, ProcessHandle, ProcessRuntime
-from forgemcp.workspace import WorkspaceError, WorkspaceService
+from forgemcp.workspace import (
+    WorkspaceError,
+    WorkspaceService,
+    WorkspaceTextEdit,
+    WorkspaceTextEditError,
+)
 
 
 MAX_NAVIGATION_RESULTS = 500
@@ -52,6 +87,8 @@ MAX_DOCUMENT_SYMBOLS = 1_000
 MAX_DIAGNOSTICS = 1_000
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_STDERR_CHARACTERS = 65_536
+MAX_CACHE_ENTRIES = 100
+HANDLE_TTL_SECONDS = 120.0
 _VERSION = re.compile(r"\bclangd version ([0-9][^\s]*)", re.IGNORECASE)
 _SYMBOL_KINDS = {
     1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
@@ -76,6 +113,26 @@ class _DocumentState:
     diagnostic_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedAction:
+    """A bounded-lifetime raw action kept only to request a safe WorkspaceEdit."""
+
+    payload: Mapping[str, object]
+    snapshots: tuple[FileSnapshot, ...]
+    document_uri: str
+    document_version: int
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedHierarchyItem:
+    """Opaque server item guarded by its owning clangd session and expiry."""
+
+    kind: str
+    payload: Mapping[str, object]
+    expires_at: float
+
+
 class ClangdService:
     """One application-owned, workspace-scoped clangd session.
 
@@ -97,6 +154,8 @@ class ClangdService:
         self._handle: ProcessHandle | None = None
         self._client: LspClient | None = None
         self._documents: dict[str, _DocumentState] = {}
+        self._actions: dict[str, _CachedAction] = {}
+        self._hierarchy_items: dict[str, _CachedHierarchyItem] = {}
         self._failure: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._document_lock = asyncio.Lock()
@@ -149,6 +208,7 @@ class ClangdService:
             self._failure = None
             self._closing = False
             self._documents.clear()
+            self._clear_caches()
             self._stderr_characters = 0
             self._stderr_truncated = False
             try:
@@ -199,6 +259,7 @@ class ClangdService:
                         with contextlib.suppress(LspError):
                             await client.notify("textDocument/didClose", {"textDocument": {"uri": document.uri}})
                 self._documents.clear()
+                self._clear_caches()
             if client is not None and client.state is LspClientState.RUNNING:
                 with contextlib.suppress(LspError):
                     await client.request("shutdown", {}, timeout_seconds=3.0)
@@ -345,6 +406,753 @@ class ClangdService:
             query=query, symbols=tuple(symbols), omitted_external_results=omitted, truncated=truncated
         )
 
+    async def completion(
+        self, path: str, position: Position, *, limit: int | None = None
+    ) -> CompletionResult:
+        """Return bounded completion proposals; no proposal is ever applied automatically."""
+        document, text = await self._synchronize_document(path)
+        result_limit = self._validate_limit(limit)
+        response = await self._request(
+            "textDocument/completion",
+            {
+                "textDocument": {"uri": document.uri},
+                "position": self._to_lsp_position(text, position),
+                "context": {"triggerKind": 1},
+            },
+        )
+        incomplete = False
+        if response is None:
+            raw_items: Sequence[object] = ()
+        elif isinstance(response, list):
+            raw_items = response
+        elif isinstance(response, Mapping) and isinstance(response.get("items"), list):
+            raw_items = response["items"]
+            incomplete = response.get("isIncomplete") is True
+        else:
+            raise ClangdProtocolError("clangd returned an invalid completion response.")
+        items: list[CompletionItem] = []
+        for value in raw_items:
+            if len(items) >= result_limit:
+                break
+            item = self._completion_item(value, text)
+            if item is not None:
+                items.append(item)
+        return CompletionResult(
+            path=document.path,
+            snapshot=document.snapshot,
+            document_version=document.version,
+            items=tuple(items),
+            is_incomplete=incomplete,
+            truncated=len(raw_items) > len(items),
+        )
+
+    async def signature_help(self, path: str, position: Position) -> SignatureHelpResult:
+        """Return normalized signature help for one synchronized document position."""
+        document, text = await self._synchronize_document(path)
+        response = await self._request(
+            "textDocument/signatureHelp",
+            {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
+        )
+        if response is None:
+            values: Sequence[object] = ()
+            active_signature = active_parameter = None
+        elif isinstance(response, Mapping) and isinstance(response.get("signatures"), list):
+            values = response["signatures"]
+            active_signature = self._valid_index(response.get("activeSignature"))
+            active_parameter = self._valid_index(response.get("activeParameter"))
+        else:
+            raise ClangdProtocolError("clangd returned an invalid signature-help response.")
+        signatures = tuple(
+            signature
+            for value in values[:100]
+            if (signature := self._signature_information(value)) is not None
+        )
+        return SignatureHelpResult(
+            path=document.path,
+            snapshot=document.snapshot,
+            document_version=document.version,
+            signatures=signatures,
+            active_signature=active_signature if active_signature is not None and active_signature < len(signatures) else None,
+            active_parameter=active_parameter,
+            truncated=len(values) > len(signatures),
+        )
+
+    async def declaration(self, path: str, position: Position) -> NavigationResult:
+        """Return bounded workspace-contained declaration locations."""
+        return await self._navigation("textDocument/declaration", path, position, include_declaration=None)
+
+    async def type_definition(self, path: str, position: Position) -> NavigationResult:
+        """Return bounded workspace-contained type definition locations."""
+        return await self._navigation("textDocument/typeDefinition", path, position, include_declaration=None)
+
+    async def implementation(self, path: str, position: Position) -> NavigationResult:
+        """Return bounded workspace-contained implementation locations."""
+        return await self._navigation("textDocument/implementation", path, position, include_declaration=None)
+
+    async def prepare_rename(self, path: str, position: Position) -> RenamePreparation:
+        """Ask clangd whether a source range can be renamed without mutating it."""
+        document, text = await self._synchronize_document(path)
+        response = await self._request(
+            "textDocument/prepareRename",
+            {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
+        )
+        if response is None:
+            return RenamePreparation(path=document.path, snapshot=document.snapshot, document_version=document.version)
+        raw_range = response.get("range") if isinstance(response, Mapping) else response
+        if not isinstance(raw_range, Mapping):
+            raise ClangdProtocolError("clangd returned an invalid prepare-rename response.")
+        placeholder = response.get("placeholder") if isinstance(response, Mapping) else None
+        return RenamePreparation(
+            path=document.path,
+            snapshot=document.snapshot,
+            document_version=document.version,
+            range=self._from_lsp_range(text, raw_range),
+            placeholder=placeholder if isinstance(placeholder, str) and placeholder else None,
+        )
+
+    async def rename(
+        self, path: str, position: Position, new_name: str, *, expected_sha256: str | None = None
+    ) -> RenameResult:
+        """Apply clangd's rename WorkspaceEdit atomically through WorkspaceService."""
+        if not isinstance(new_name, str) or not new_name.strip() or "\x00" in new_name or len(new_name) > 1_024:
+            raise ClangdRequestError("new_name must be non-empty NUL-free text up to 1024 characters.")
+        document, text = await self._synchronize_document(path)
+        self._require_expected_sha256(document.snapshot, expected_sha256)
+        response = await self._request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": document.uri},
+                "position": self._to_lsp_position(text, position),
+                "newName": new_name,
+            },
+        )
+        return RenameResult(edit=await self._apply_workspace_edit(response, anchor=document))
+
+    async def code_actions(
+        self,
+        path: str,
+        source_range: Range,
+        diagnostics: Sequence[Diagnostic] = (),
+        kinds: Sequence[str] = (),
+        *,
+        limit: int | None = None,
+    ) -> CodeActionResult:
+        """List opaque bounded-lifetime code-action handles, never executing commands."""
+        document, text = await self._synchronize_document(path)
+        result_limit = self._validate_action_limit(limit)
+        if isinstance(kinds, str) or not isinstance(kinds, Sequence) or any(
+            not isinstance(kind, str) or not kind or len(kind) > 256 for kind in kinds
+        ):
+            raise ClangdRequestError("kinds must be a bounded sequence of non-empty code-action kind strings.")
+        if isinstance(diagnostics, (str, bytes)) or len(diagnostics) > MAX_DIAGNOSTICS:
+            raise ClangdRequestError("diagnostics must be a bounded sequence of normalized diagnostics.")
+        if any(not isinstance(diagnostic, Diagnostic) for diagnostic in diagnostics):
+            raise ClangdRequestError("diagnostics must be normalized Diagnostic models.")
+        lsp_diagnostics = [
+            {
+                "range": self._to_lsp_range(text, diagnostic.location.range),
+                "message": diagnostic.message,
+                "severity": {Severity.ERROR: 1, Severity.WARNING: 2, Severity.INFORMATION: 3, Severity.HINT: 4}[diagnostic.severity],
+                **({"code": diagnostic.code} if diagnostic.code is not None else {}),
+                **({"source": diagnostic.source} if diagnostic.source is not None else {}),
+            }
+            for diagnostic in diagnostics
+            if diagnostic.location.uri == document.uri
+        ]
+        response = await self._request(
+            "textDocument/codeAction",
+            {
+                "textDocument": {"uri": document.uri},
+                "range": self._to_lsp_range(text, source_range),
+                "context": {
+                    "diagnostics": lsp_diagnostics,
+                    **({"only": list(kinds)} if kinds else {}),
+                },
+            },
+        )
+        if response is None:
+            values: Sequence[object] = ()
+        elif isinstance(response, list):
+            values = response
+        else:
+            raise ClangdProtocolError("clangd returned an invalid code-action response.")
+        self._purge_caches()
+        summaries: list[CodeActionSummary] = []
+        for value in values:
+            if len(summaries) >= result_limit:
+                break
+            summary = self._cache_action(value, document)
+            if summary is not None:
+                summaries.append(summary)
+        return CodeActionResult(
+            path=document.path,
+            snapshot=document.snapshot,
+            document_version=document.version,
+            actions=tuple(summaries),
+            truncated=len(values) > len(summaries),
+        )
+
+    async def apply_code_action(
+        self, action_id: str, *, expected_sha256: str | None = None
+    ) -> WorkspaceEditSummary:
+        """Resolve and apply only a pure WorkspaceEdit stored under an opaque action handle."""
+        entry = self._get_action(action_id)
+        document = self._documents.get(entry.document_uri)
+        if document is None or document.version != entry.document_version:
+            raise ClangdHandleExpiredError("The code action belongs to a stale document version.")
+        self._require_expected_sha256(document.snapshot, expected_sha256)
+        current = self._workspace.get_snapshot(document.path)
+        if not entry.snapshots or current.sha256 != entry.snapshots[0].sha256:
+            raise ClangdEditConflictError("The code action document changed since actions were listed.")
+        payload = entry.payload
+        if "command" in payload:
+            raise ClangdUnsupportedActionError("Code actions with commands are not supported in this MVP.")
+        if "edit" not in payload:
+            response = await self._request("codeAction/resolve", payload)
+            if not isinstance(response, Mapping):
+                raise ClangdProtocolError("clangd returned an invalid code-action resolve response.")
+            payload = response
+        raw_edit = payload.get("edit")
+        if raw_edit is None:
+            if "command" in payload:
+                raise ClangdUnsupportedActionError("Command-only code actions are not supported in this MVP.")
+            return WorkspaceEditSummary(applied=True, no_op=True, affected_files=0)
+        if not isinstance(raw_edit, Mapping):
+            raise ClangdProtocolError("clangd returned an invalid code-action WorkspaceEdit.")
+        result = await self._apply_workspace_edit(raw_edit, anchor=document)
+        self._actions.pop(action_id, None)
+        return result
+
+    async def format_document(self, path: str, *, expected_sha256: str | None = None) -> FormatResult:
+        """Apply document-formatting edits atomically through the common edit engine."""
+        document, _ = await self._synchronize_document(path)
+        self._require_expected_sha256(document.snapshot, expected_sha256)
+        response = await self._request(
+            "textDocument/formatting",
+            {"textDocument": {"uri": document.uri}, "options": {"tabSize": 4, "insertSpaces": True}},
+        )
+        return FormatResult(edit=await self._apply_text_edits_response(response, document))
+
+    async def format_range(
+        self, path: str, source_range: Range, *, expected_sha256: str | None = None
+    ) -> FormatResult:
+        """Apply range-formatting edits atomically through the common edit engine."""
+        document, text = await self._synchronize_document(path)
+        self._require_expected_sha256(document.snapshot, expected_sha256)
+        response = await self._request(
+            "textDocument/rangeFormatting",
+            {
+                "textDocument": {"uri": document.uri},
+                "range": self._to_lsp_range(text, source_range),
+                "options": {"tabSize": 4, "insertSpaces": True},
+            },
+        )
+        return FormatResult(edit=await self._apply_text_edits_response(response, document))
+
+    async def prepare_call_hierarchy(
+        self, path: str, position: Position
+    ) -> CallHierarchyPrepareResult:
+        """Prepare opaque workspace-only call-hierarchy handles."""
+        document, text = await self._synchronize_document(path)
+        response = await self._request(
+            "textDocument/prepareCallHierarchy",
+            {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
+        )
+        return self._prepare_hierarchy(response, hierarchy_kind="call", item_type="call")
+
+    async def incoming_calls(self, item_id: str, *, limit: int | None = None) -> IncomingCallsResult:
+        """Return bounded incoming call edges for an opaque prepared item."""
+        cached = self._get_hierarchy_item(item_id, "call")
+        result_limit = self._validate_limit(limit)
+        response = await self._request("callHierarchy/incomingCalls", {"item": cached.payload})
+        values = self._response_list(response, "incoming-call")
+        calls: list[IncomingCall] = []
+        omitted = 0
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            item = self._call_item(value.get("from"), cache=True)
+            ranges = self._ranges_for_item(value.get("fromRanges"), item)
+            if item is None:
+                omitted += 1
+            elif len(calls) < result_limit:
+                calls.append(IncomingCall(from_item=item, from_ranges=ranges))
+        return IncomingCallsResult(
+            item_id=item_id,
+            calls=tuple(calls),
+            omitted_external_results=omitted,
+            truncated=len(values) > len(calls) + omitted,
+        )
+
+    async def outgoing_calls(self, item_id: str, *, limit: int | None = None) -> OutgoingCallsResult:
+        """Return bounded outgoing call edges for an opaque prepared item."""
+        cached = self._get_hierarchy_item(item_id, "call")
+        result_limit = self._validate_limit(limit)
+        response = await self._request("callHierarchy/outgoingCalls", {"item": cached.payload})
+        values = self._response_list(response, "outgoing-call")
+        calls: list[OutgoingCall] = []
+        omitted = 0
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            item = self._call_item(value.get("to"), cache=True)
+            ranges = self._ranges_for_item(value.get("fromRanges"), item)
+            if item is None:
+                omitted += 1
+            elif len(calls) < result_limit:
+                calls.append(OutgoingCall(to_item=item, from_ranges=ranges))
+        return OutgoingCallsResult(
+            item_id=item_id,
+            calls=tuple(calls),
+            omitted_external_results=omitted,
+            truncated=len(values) > len(calls) + omitted,
+        )
+
+    async def prepare_type_hierarchy(
+        self, path: str, position: Position
+    ) -> TypeHierarchyPrepareResult:
+        """Prepare opaque workspace-only type-hierarchy handles."""
+        document, text = await self._synchronize_document(path)
+        response = await self._request(
+            "textDocument/prepareTypeHierarchy",
+            {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
+        )
+        values = self._response_list(response, "type-hierarchy")
+        items: list[TypeHierarchyItem] = []
+        omitted = 0
+        for value in values:
+            item = self._type_item(value, cache=True)
+            if item is None:
+                omitted += 1
+            elif len(items) < 100:
+                items.append(item)
+        return TypeHierarchyPrepareResult(
+            items=tuple(items),
+            omitted_external_results=omitted,
+            truncated=len(values) > len(items) + omitted,
+        )
+
+    async def supertypes(self, item_id: str, *, limit: int | None = None) -> TypeHierarchyResult:
+        """Return bounded workspace-only supertypes for one prepared item."""
+        return await self._type_hierarchy_relation("typeHierarchy/supertypes", item_id, limit)
+
+    async def subtypes(self, item_id: str, *, limit: int | None = None) -> TypeHierarchyResult:
+        """Return bounded workspace-only subtypes for one prepared item."""
+        return await self._type_hierarchy_relation("typeHierarchy/subtypes", item_id, limit)
+
+    async def switch_source_header(self, path: str) -> SwitchSourceHeaderResult:
+        """Return a workspace-only counterpart path from clangd's extension request."""
+        document, _ = await self._synchronize_document(path)
+        response = await self._request("textDocument/switchSourceHeader", {"uri": document.uri})
+        if response is None:
+            return SwitchSourceHeaderResult(omitted_external_results=0)
+        if not isinstance(response, str):
+            raise ClangdProtocolError("clangd returned an invalid source/header switch response.")
+        path_result = self._path_from_uri(response)
+        return SwitchSourceHeaderResult(path=path_result, omitted_external_results=0 if path_result else 1)
+
+    async def _apply_text_edits_response(
+        self, response: object, document: _DocumentState
+    ) -> WorkspaceEditSummary:
+        if response is None:
+            return WorkspaceEditSummary(applied=True, no_op=True, affected_files=0)
+        if not isinstance(response, list):
+            raise ClangdProtocolError("clangd returned an invalid formatting edit list.")
+        if not response:
+            return WorkspaceEditSummary(applied=True, no_op=True, affected_files=0)
+        return await self._apply_workspace_edit({"changes": {document.uri: response}}, anchor=document)
+
+    async def _apply_workspace_edit(
+        self, raw_edit: object, *, anchor: _DocumentState
+    ) -> WorkspaceEditSummary:
+        """Normalize and atomically apply only safe LSP TextDocumentEdit batches."""
+        if raw_edit is None:
+            return WorkspaceEditSummary(applied=True, no_op=True, affected_files=0)
+        if not isinstance(raw_edit, Mapping):
+            raise ClangdProtocolError("clangd returned an invalid WorkspaceEdit.")
+        entries = self._workspace_edit_entries(raw_edit)
+        if not entries:
+            return WorkspaceEditSummary(applied=True, no_op=True, affected_files=0)
+        expected: dict[str, FileSnapshot] = {}
+        normalized: dict[str, list[WorkspaceTextEdit]] = {}
+        versions: dict[str, int | None] = {}
+        for uri, raw_edits, version in entries:
+            path = self._path_from_uri(uri)
+            if path is None:
+                raise ClangdUnsupportedWorkspaceEditError(
+                    "WorkspaceEdit contains a URI outside the configured workspace."
+                )
+            if path in versions and versions[path] != version:
+                raise ClangdProtocolError("WorkspaceEdit names incompatible document versions for one file.")
+            versions[path] = version
+            try:
+                text, snapshot = self._workspace.read_text(path)
+            except WorkspaceError as error:
+                raise ClangdEditConflictError("A WorkspaceEdit target is no longer readable in the workspace.") from error
+            open_document = self._documents.get(uri)
+            if open_document is not None:
+                if snapshot.sha256 != open_document.snapshot.sha256:
+                    raise ClangdEditConflictError("A WorkspaceEdit target changed since clangd synchronized it.")
+                if version is not None and version != open_document.version:
+                    raise ClangdEditConflictError("A WorkspaceEdit targets a stale clangd document version.")
+            elif version is not None:
+                raise ClangdEditConflictError("A WorkspaceEdit version cannot be verified for an unopened document.")
+            expected[path] = snapshot
+            destination = normalized.setdefault(path, [])
+            for raw_text_edit in raw_edits:
+                if not isinstance(raw_text_edit, Mapping):
+                    raise ClangdProtocolError("WorkspaceEdit contains an invalid text edit.")
+                raw_range = raw_text_edit.get("range")
+                new_text = raw_text_edit.get("newText")
+                if not isinstance(raw_range, Mapping) or not isinstance(new_text, str):
+                    raise ClangdProtocolError("WorkspaceEdit text edits require a range and string replacement.")
+                destination.append(WorkspaceTextEdit(self._from_lsp_range(text, raw_range), new_text))
+        try:
+            result = self._workspace.apply_text_edits(normalized, expected)
+        except WorkspaceTextEditError as error:
+            raise ClangdProtocolError("clangd returned overlapping or invalid WorkspaceEdit coordinates.") from error
+        except WorkspaceError as error:
+            raise ClangdEditConflictError("WorkspaceEdit could not be applied because the workspace changed.") from error
+        if not result.applied:
+            raise ClangdEditConflictError("WorkspaceEdit did not match the current workspace snapshots.")
+        if result.changes:
+            await self._synchronize_changed_documents(result.changes)
+        return WorkspaceEditSummary(
+            applied=True,
+            no_op=not result.changes,
+            changes=result.changes,
+            affected_files=len(normalized),
+        )
+
+    @staticmethod
+    def _workspace_edit_entries(
+        raw_edit: Mapping[str, object],
+    ) -> tuple[tuple[str, Sequence[object], int | None], ...]:
+        """Accept only `changes` and TextDocumentEdit documentChanges, never resource operations."""
+        entries: list[tuple[str, Sequence[object], int | None]] = []
+        changes = raw_edit.get("changes")
+        if changes is not None:
+            if not isinstance(changes, Mapping):
+                raise ClangdProtocolError("WorkspaceEdit changes must be an object by URI.")
+            for uri, edits in changes.items():
+                if not isinstance(uri, str) or not isinstance(edits, list):
+                    raise ClangdProtocolError("WorkspaceEdit changes contains invalid URI edits.")
+                entries.append((uri, edits, None))
+        document_changes = raw_edit.get("documentChanges")
+        if document_changes is not None:
+            if not isinstance(document_changes, list):
+                raise ClangdProtocolError("WorkspaceEdit documentChanges must be an array.")
+            for change in document_changes:
+                if not isinstance(change, Mapping):
+                    raise ClangdProtocolError("WorkspaceEdit documentChanges contains an invalid entry.")
+                if change.get("kind") in {"create", "rename", "delete"} or "kind" in change:
+                    raise ClangdUnsupportedWorkspaceEditError(
+                        "WorkspaceEdit resource operations are not supported in this MVP."
+                    )
+                document = change.get("textDocument")
+                edits = change.get("edits")
+                if not isinstance(document, Mapping) or not isinstance(edits, list):
+                    raise ClangdProtocolError("WorkspaceEdit supports only TextDocumentEdit entries.")
+                uri = document.get("uri")
+                version = document.get("version")
+                if not isinstance(uri, str) or (version is not None and (not isinstance(version, int) or isinstance(version, bool))):
+                    raise ClangdProtocolError("WorkspaceEdit TextDocumentEdit has invalid document identity.")
+                entries.append((uri, edits, version))
+        return tuple(entries)
+
+    async def _synchronize_changed_documents(self, changes: Sequence[object]) -> None:
+        client = self._require_client()
+        async with self._document_lock:
+            for change in changes:
+                uri = getattr(change, "uri", None)
+                document = self._documents.get(uri) if isinstance(uri, str) else None
+                if document is None:
+                    continue
+                try:
+                    text, snapshot = self._workspace.read_text(document.path)
+                except WorkspaceError as error:
+                    self._set_failed("A changed open document could not be re-synchronized safely.")
+                    raise ClangdFailedError(self._failure) from error
+                document.snapshot = snapshot
+                document.version += 1
+                document.diagnostics = ()
+                document.diagnostics_snapshot_sha256 = None
+                document.stale_diagnostics = True
+                document.diagnostic_event = asyncio.Event()
+                await self._notify(
+                    client,
+                    "textDocument/didChange",
+                    {
+                        "textDocument": {"uri": document.uri, "version": document.version},
+                        "contentChanges": [{"text": text}],
+                    },
+                )
+        self._clear_caches()
+
+    def _completion_item(self, value: object, text: str) -> CompletionItem | None:
+        if not isinstance(value, Mapping):
+            return None
+        label = value.get("label")
+        if not isinstance(label, str) or not label:
+            return None
+        raw_edit = value.get("textEdit")
+        text_edit = None
+        if isinstance(raw_edit, Mapping):
+            raw_range = raw_edit.get("range")
+            new_text = raw_edit.get("newText")
+            if isinstance(raw_range, Mapping) and isinstance(new_text, str):
+                from forgemcp.clangd.models import CompletionTextEdit
+
+                text_edit = CompletionTextEdit(range=self._from_lsp_range(text, raw_range), new_text=new_text)
+        documentation = self._documentation_text(value.get("documentation"))
+        insert_text = value.get("insertText")
+        return CompletionItem(
+            label=label,
+            kind=self._completion_kind(value.get("kind")),
+            detail=value["detail"] if isinstance(value.get("detail"), str) and value["detail"] else None,
+            documentation=documentation,
+            insert_text=insert_text if isinstance(insert_text, str) else None,
+            insert_text_format=(
+                CompletionInsertTextFormat.SNIPPET
+                if value.get("insertTextFormat") == 2
+                else CompletionInsertTextFormat.PLAIN_TEXT
+            ),
+            text_edit=text_edit,
+        )
+
+    def _signature_information(self, value: object) -> SignatureInformation | None:
+        if not isinstance(value, Mapping) or not isinstance(value.get("label"), str) or not value["label"]:
+            return None
+        parameters = value.get("parameters", [])
+        labels: list[str] = []
+        if isinstance(parameters, list):
+            for parameter in parameters[:100]:
+                if not isinstance(parameter, Mapping):
+                    continue
+                label = parameter.get("label")
+                if isinstance(label, str):
+                    labels.append(label)
+                elif isinstance(label, list) and len(label) == 2 and all(isinstance(item, int) for item in label):
+                    start, end = label
+                    labels.append(value["label"][start:end])
+        return SignatureInformation(
+            label=value["label"],
+            documentation=self._documentation_text(value.get("documentation")),
+            parameters=tuple(labels),
+        )
+
+    @staticmethod
+    def _documentation_text(value: object) -> str | None:
+        if isinstance(value, str):
+            return value[:16_384] or None
+        if isinstance(value, Mapping) and isinstance(value.get("value"), str):
+            return value["value"][:16_384] or None
+        if isinstance(value, list):
+            joined = "\n\n".join(item for entry in value if (item := ClangdService._documentation_text(entry)))
+            return joined[:16_384] or None
+        return None
+
+    def _cache_action(self, value: object, document: _DocumentState) -> CodeActionSummary | None:
+        if not isinstance(value, Mapping) or not isinstance(value.get("title"), str) or not value["title"]:
+            return None
+        self._purge_caches()
+        if len(self._actions) >= MAX_CACHE_ENTRIES:
+            return None
+        action_id = self._new_handle_id()
+        payload = dict(value)
+        self._actions[action_id] = _CachedAction(
+            payload=payload,
+            snapshots=(document.snapshot,),
+            document_uri=document.uri,
+            document_version=document.version,
+            expires_at=time.monotonic() + HANDLE_TTL_SECONDS,
+        )
+        has_edit = isinstance(payload.get("edit"), Mapping)
+        has_command = "command" in payload
+        return CodeActionSummary(
+            action_id=action_id,
+            title=payload["title"],
+            kind=payload["kind"] if isinstance(payload.get("kind"), str) and payload["kind"] else None,
+            has_workspace_edit=has_edit,
+            requires_resolve=not has_edit and not has_command,
+            command_only=has_command and not has_edit,
+        )
+
+    def _get_action(self, action_id: str) -> _CachedAction:
+        if not isinstance(action_id, str) or not action_id:
+            raise ClangdHandleExpiredError("The code action handle is invalid or expired.")
+        self._purge_caches()
+        entry = self._actions.get(action_id)
+        if entry is None:
+            raise ClangdHandleExpiredError("The code action handle is invalid, expired, or belongs to another session.")
+        return entry
+
+    def _prepare_hierarchy(
+        self, response: object, *, hierarchy_kind: str, item_type: str
+    ) -> CallHierarchyPrepareResult:
+        values = self._response_list(response, f"{hierarchy_kind}-hierarchy")
+        items: list[CallHierarchyItem] = []
+        omitted = 0
+        for value in values:
+            item = self._call_item(value, cache=True) if item_type == "call" else self._type_item(value, cache=True)
+            if item is None:
+                omitted += 1
+            elif len(items) < 100:
+                items.append(item)  # Call and type items have the same fields; Type result converts at its boundary.
+        return CallHierarchyPrepareResult(
+            items=tuple(items), omitted_external_results=omitted, truncated=len(values) > len(items) + omitted
+        )
+
+    async def _type_hierarchy_relation(
+        self, method: str, item_id: str, limit: int | None
+    ) -> TypeHierarchyResult:
+        cached = self._get_hierarchy_item(item_id, "type")
+        result_limit = self._validate_limit(limit)
+        response = await self._request(method, {"item": cached.payload})
+        values = self._response_list(response, "type-hierarchy")
+        items: list[TypeHierarchyItem] = []
+        omitted = 0
+        for value in values:
+            item = self._type_item(value, cache=True)
+            if item is None:
+                omitted += 1
+            elif len(items) < result_limit:
+                items.append(item)
+        return TypeHierarchyResult(
+            item_id=item_id,
+            items=tuple(items),
+            omitted_external_results=omitted,
+            truncated=len(values) > len(items) + omitted,
+        )
+
+    @staticmethod
+    def _response_list(response: object, label: str) -> Sequence[object]:
+        if response is None:
+            return ()
+        if isinstance(response, list):
+            return response
+        raise ClangdProtocolError(f"clangd returned an invalid {label} response.")
+
+    def _call_item(self, value: object, *, cache: bool) -> CallHierarchyItem | None:
+        parsed = self._hierarchy_item_data(value)
+        if parsed is None:
+            return None
+        name, kind, detail, location, selection_range, payload = parsed
+        item_id = self._cache_hierarchy_item("call", payload) if cache else ""
+        return CallHierarchyItem(
+            item_id=item_id, name=name, kind=kind, detail=detail, location=location, selection_range=selection_range
+        )
+
+    def _type_item(self, value: object, *, cache: bool) -> TypeHierarchyItem | None:
+        parsed = self._hierarchy_item_data(value)
+        if parsed is None:
+            return None
+        name, kind, detail, location, selection_range, payload = parsed
+        item_id = self._cache_hierarchy_item("type", payload) if cache else ""
+        return TypeHierarchyItem(
+            item_id=item_id, name=name, kind=kind, detail=detail, location=location, selection_range=selection_range
+        )
+
+    def _hierarchy_item_data(
+        self, value: object
+    ) -> tuple[str, str, str | None, WorkspaceLocation, Range, Mapping[str, object]] | None:
+        if not isinstance(value, Mapping) or not isinstance(value.get("name"), str) or not value["name"]:
+            return None
+        uri = value.get("uri")
+        raw_range = value.get("range")
+        raw_selection = value.get("selectionRange")
+        if not isinstance(uri, str) or not isinstance(raw_range, Mapping) or not isinstance(raw_selection, Mapping):
+            return None
+        path = self._path_from_uri(uri)
+        if path is None:
+            return None
+        try:
+            text, _ = self._workspace.read_text(path)
+            source_range = self._from_lsp_range(text, raw_range)
+            selection_range = self._from_lsp_range(text, raw_selection)
+        except (WorkspaceError, ClangdProtocolError):
+            return None
+        detail = value.get("detail")
+        return (
+            value["name"],
+            self._symbol_kind(value.get("kind")),
+            detail if isinstance(detail, str) and detail else None,
+            WorkspaceLocation(path=path, range=source_range),
+            selection_range,
+            dict(value),
+        )
+
+    def _ranges_for_item(self, value: object, item: CallHierarchyItem | TypeHierarchyItem | None) -> tuple[Range, ...]:
+        if item is None or not isinstance(value, list):
+            return ()
+        try:
+            text, _ = self._workspace.read_text(item.location.path)
+        except WorkspaceError:
+            return ()
+        ranges: list[Range] = []
+        for raw_range in value[:100]:
+            if isinstance(raw_range, Mapping):
+                with contextlib.suppress(ClangdProtocolError):
+                    ranges.append(self._from_lsp_range(text, raw_range))
+        return tuple(ranges)
+
+    def _cache_hierarchy_item(self, kind: str, payload: Mapping[str, object]) -> str:
+        self._purge_caches()
+        if len(self._hierarchy_items) >= MAX_CACHE_ENTRIES:
+            raise ClangdHandleExpiredError("The bounded hierarchy-handle cache is full; prepare again later.")
+        item_id = self._new_handle_id()
+        self._hierarchy_items[item_id] = _CachedHierarchyItem(
+            kind=kind, payload=dict(payload), expires_at=time.monotonic() + HANDLE_TTL_SECONDS
+        )
+        return item_id
+
+    def _get_hierarchy_item(self, item_id: str, kind: str) -> _CachedHierarchyItem:
+        if not isinstance(item_id, str) or not item_id:
+            raise ClangdHandleExpiredError("The hierarchy handle is invalid or expired.")
+        self._purge_caches()
+        item = self._hierarchy_items.get(item_id)
+        if item is None or item.kind != kind:
+            raise ClangdHandleExpiredError("The hierarchy handle is invalid, expired, or belongs to another session.")
+        return item
+
+    def _purge_caches(self) -> None:
+        now = time.monotonic()
+        self._actions = {key: value for key, value in self._actions.items() if value.expires_at > now}
+        self._hierarchy_items = {
+            key: value for key, value in self._hierarchy_items.items() if value.expires_at > now
+        }
+
+    def _clear_caches(self) -> None:
+        self._actions.clear()
+        self._hierarchy_items.clear()
+
+    @staticmethod
+    def _new_handle_id() -> str:
+        return secrets.token_urlsafe(24)
+
+    @staticmethod
+    def _valid_index(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    @staticmethod
+    def _completion_kind(value: object) -> str:
+        kinds = {
+            1: "text", 2: "method", 3: "function", 4: "constructor", 5: "field", 6: "variable",
+            7: "class", 8: "interface", 9: "module", 10: "property", 11: "unit", 12: "value",
+            13: "enum", 14: "keyword", 15: "snippet", 16: "color", 17: "file", 18: "reference",
+            19: "folder", 20: "enum_member", 21: "constant", 22: "struct", 23: "event", 24: "operator",
+            25: "type_parameter",
+        }
+        return kinds.get(value, "unknown") if isinstance(value, int) and not isinstance(value, bool) else "unknown"
+
+    def _require_expected_sha256(self, snapshot: FileSnapshot, expected_sha256: str | None) -> None:
+        if expected_sha256 is None:
+            return
+        if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ClangdRequestError("expected_sha256 must be a lowercase SHA-256 digest when supplied.")
+        if snapshot.sha256 != expected_sha256:
+            raise ClangdEditConflictError("The requested document snapshot does not match expected_sha256.")
+
     @property
     def _executable(self) -> str:
         return str(self._config.clangd_path) if self._config.clangd_path is not None else "clangd"
@@ -381,7 +1189,16 @@ class ClangdService:
             "workspaceFolders": [{"uri": root_uri, "name": "workspace"}],
             "capabilities": {
                 "general": {"positionEncodings": ["utf-8", "utf-16", "utf-32"]},
-                "textDocument": {"publishDiagnostics": {"relatedInformation": False}},
+                "workspace": {"workspaceEdit": {"documentChanges": True}},
+                "textDocument": {
+                    "publishDiagnostics": {"relatedInformation": False},
+                    "completion": {"completionItem": {"snippetSupport": True}},
+                    "signatureHelp": {},
+                    "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": [""]}}, "resolveSupport": {"properties": ["edit"]}},
+                    "rename": {"prepareSupport": True},
+                    "callHierarchy": {},
+                    "typeHierarchy": {},
+                },
             },
         }
 
@@ -427,6 +1244,7 @@ class ClangdService:
     def _set_failed(self, error: str) -> None:
         self._state = ClangdSessionState.FAILED
         self._failure = error
+        self._clear_caches()
 
     async def _close_partial_session(self) -> None:
         if self._stderr_task is not None:
@@ -471,6 +1289,7 @@ class ClangdService:
                 document.diagnostics_snapshot_sha256 = None
                 document.stale_diagnostics = False
                 document.diagnostic_event = asyncio.Event()
+                self._clear_caches()
                 await self._notify(
                     client,
                     "textDocument/didChange",
@@ -564,6 +1383,12 @@ class ClangdService:
             return await client.request(method, params, timeout_seconds=15.0)
         except LspRequestTimeoutError as error:
             raise ClangdTimeoutError("clangd did not answer before the request timeout.") from error
+        except LspRpcError as error:
+            if error.code == -32800:
+                raise ClangdRequestCancelledError("clangd cancelled the request before it completed.") from error
+            if error.code == -32801:
+                raise ClangdContentModifiedError("clangd rejected the request because document content changed.") from error
+            raise ClangdProtocolError("clangd rejected the request.") from error
         except LspError as error:
             if client.state is LspClientState.FAILED:
                 self._set_failed("The managed clangd protocol stream failed.")
@@ -695,6 +1520,12 @@ class ClangdService:
         except LspCoordinateError as error:
             raise ClangdRequestError("position must be within the current source document using zero-based code-point columns.") from error
 
+    def _to_lsp_range(self, text: str, source_range: Range) -> dict[str, object]:
+        return {
+            "start": self._to_lsp_position(text, source_range.start),
+            "end": self._to_lsp_position(text, source_range.end),
+        }
+
     @staticmethod
     def _hover_contents(value: object) -> str | None:
         if isinstance(value, str):
@@ -735,4 +1566,11 @@ class ClangdService:
         limit = 100 if value is None else value
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_NAVIGATION_RESULTS:
             raise ClangdRequestError("limit must be an integer from 1 through 500.")
+        return limit
+
+    @staticmethod
+    def _validate_action_limit(value: int | None) -> int:
+        limit = 50 if value is None else value
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ClangdRequestError("limit must be an integer from 1 through 100 for code actions.")
         return limit

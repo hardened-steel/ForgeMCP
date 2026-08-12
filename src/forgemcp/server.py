@@ -68,7 +68,7 @@ def _tool_adapter(contribution: RegisteredToolContribution):
     if contribution.input_model is not None:
         parameters: list[inspect.Parameter] = []
         for name, field in contribution.input_model.model_fields.items():
-            default = inspect.Parameter.empty if field.is_required() else field.default
+            default = inspect.Parameter.empty if field.is_required() else field.get_default(call_default_factory=True)
             if default is PydanticUndefined:
                 default = inspect.Parameter.empty
             parameters.append(

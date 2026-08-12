@@ -22,6 +22,9 @@ _EXPECTED_TOOLS = {
     "cmake__ctest_list_tests",
     "cmake__ctest_run",
     "clangd__status",
+    "clangd__rename",
+    "clangd__code_actions",
+    "clangd__completion",
 }
 
 
@@ -69,6 +72,14 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     clangd_status = await session.call_tool("clangd__status")
                     assert clangd_status.isError is False
                     assert {"available", "state", "executable"} <= _json_tool_content(clangd_status).keys()
+
+                    for tool_name, arguments in (
+                        ("clangd__completion", {"path": "missing.cpp", "position": {"line": 0, "column": 0}}),
+                        ("clangd__rename", {"path": "missing.cpp", "position": {"line": 0, "column": 0}, "new_name": "renamed"}),
+                        ("clangd__code_actions", {"path": "missing.cpp", "range": {"start": {"line": 0, "column": 0}, "end": {"line": 0, "column": 0}}}),
+                    ):
+                        phase_two_prestart = await session.call_tool(tool_name, arguments)
+                        assert _json_tool_content(phase_two_prestart)["error"]["code"] == "clangd_not_started"
 
                     # This error is raised before CMake is invoked, so it is stable
                     # whether the test host has CMake installed or not.

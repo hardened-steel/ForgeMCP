@@ -18,9 +18,10 @@ irreversible choices belong in [adr/](adr/).
   discovery.
 - Builtin CMake/CTest vertical slice: status, preset summaries, configure,
   File API target inspection, build, and test execution.
-- clangd phase 1: managed LSP lifecycle, snapshot-based document
-  synchronization, diagnostics, hover, definition/references, and document/
-  workspace symbols through the builtin `clangd` feature plugin.
+- clangd phase 1 and phase 2: managed LSP lifecycle, snapshot-based document
+  synchronization, diagnostics/navigation/symbols, safe atomic semantic edits,
+  completion/signature help, code actions, formatting, and hierarchy handles
+  through the builtin `clangd` feature plugin.
 
 ### In progress
 
@@ -70,14 +71,30 @@ Delivered tools are `clangd__status`, `clangd__start`, `clangd__stop`,
 `clangd__references`, `clangd__document_symbols`, and
 `clangd__workspace_symbols`. See [ADR 0007](adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md) for the fixed lifecycle, coordinate, and URI policies.
 
-## Next milestone: clangd phase 2
+## Completed milestone: clangd phase 2
 
-Phase 2 may extend this same managed `forgemcp.lsp` and `ClangdService` layer;
-it must not introduce a parallel LSP transport or an arbitrary LSP proxy.
-Candidates, each requiring a bounded model and test plan, are rename with safe
-WorkspaceEdit application, code actions, completion/signature help, formatting,
-call/type hierarchy, semantic tokens, and inlay hints. None are exposed in
-phase 1.
+Phase 2 extends the same managed `forgemcp.lsp` and `ClangdService` layer; it
+does not introduce an arbitrary LSP proxy. `WorkspaceService.apply_text_edits`
+is the only file-writing path for clangd semantic edits. Rename, resolved pure
+code actions, and document/range formatting use its all-or-nothing snapshot
+transaction. Completion and signatures remain read-only; snippets are never
+applied automatically. Code-action and hierarchy server objects are held only
+behind bounded-lifetime opaque handles.
+
+The VS LLVM x64 clangd gate passed with an explicit `FORGEMCP_CLANGD` path for
+phase-1 start/diagnostics/hover/definition/references/stop and phase-2 rename.
+The VS Code clangd extension path was visible to PowerShell but not to Python's
+filesystem view in this host, so it was not used as an executable. The normal
+PATH discovery was absent in this environment.
+
+## Next milestone: clangd phase 3 / DAP decision
+
+Before enabling DAP, retain the current boundary: no debug adapter has been
+implemented, and clangd remains independent of any debugger lifecycle. A DAP
+proposal needs its own launch/attach trust policy and transport-neutral models.
+Remaining clangd candidates are semantic tokens, inlay hints, code lenses,
+refactor/rewrite actions beyond pure WorkspaceEdit, and richer completion
+resolve; each needs a bounded contract and safety review.
 
 ## Current MVP limitations
 
@@ -85,10 +102,9 @@ phase 1.
   tests are not an OS sandbox.
 - CMake preset inheritance, conditions, macro expansion, and arbitrary CMake
   or CTest arguments remain owned by CMake and are not reimplemented.
-- clangd phase 1 intentionally omits rename/WorkspaceEdit application, code
-  actions/fixes, completion, signature help, formatting, call/type hierarchy,
-  semantic tokens, and inlay hints. It exposes no arbitrary LSP method or argv
-  passthrough.
+- clangd intentionally omits semantic tokens, inlay hints, code lenses,
+  arbitrary LSP methods, arbitrary execute-command, resource operations
+  (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
 - There are no Workspace MCP editing tools, DAP tools, quality tools, Git
   integration, or aggregate `project_status` tool yet.
 - CMake and CTest are discovered through the Process Runtime environment; an

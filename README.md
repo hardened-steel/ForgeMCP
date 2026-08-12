@@ -23,6 +23,15 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `clangd__references`
 - `clangd__document_symbols`
 - `clangd__workspace_symbols`
+- `clangd__completion`
+- `clangd__signature_help`
+- `clangd__declaration`, `clangd__type_definition`, `clangd__implementation`
+- `clangd__prepare_rename`, `clangd__rename`
+- `clangd__code_actions`, `clangd__apply_code_action`
+- `clangd__format_document`, `clangd__format_range`
+- `clangd__prepare_call_hierarchy`, `clangd__incoming_calls`, `clangd__outgoing_calls`
+- `clangd__prepare_type_hierarchy`, `clangd__supertypes`, `clangd__subtypes`
+- `clangd__switch_source_header`
 
 `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
@@ -58,7 +67,7 @@ workspaces whose project code you trust. See [ADR 0006](docs/adr/0006-cmake-file
 - `plugins/` — versioned feature-plugin contract, lifecycle manager, tool registry, and opt-in entry-point discovery.
 - `cmake/` — built-in CMake/Ctest feature plugin, CMake-owned models, and File API parsing.
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
-- `clangd/` — managed read-only clangd feature plugin, models, and document synchronization.
+- `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — structured, redacted stderr logging.
 

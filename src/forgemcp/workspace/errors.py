@@ -81,3 +81,9 @@ class PatchCommitError(WorkspaceError):
     """A staged patch could not be committed without risking a partial result."""
 
     code = "patch_commit_error"
+
+
+class WorkspaceTextEditError(WorkspaceError):
+    """A structured text-edit batch has an invalid coordinate or overlap."""
+
+    code = "workspace_text_edit_error"

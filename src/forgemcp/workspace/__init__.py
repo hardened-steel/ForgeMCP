@@ -14,9 +14,10 @@ from forgemcp.workspace.errors import (
     WorkspaceNotDirectoryError,
     WorkspaceNotFileError,
     WorkspacePathError,
+    WorkspaceTextEditError,
 )
 from forgemcp.workspace.policy import WorkspacePolicy
-from forgemcp.workspace.service import ExpectedSnapshot, GeneratedWorkspaceDirectory, WorkspaceService
+from forgemcp.workspace.service import ExpectedSnapshot, GeneratedWorkspaceDirectory, WorkspaceService, WorkspaceTextEdit
 
 __all__ = [
     "ExpectedSnapshot",
@@ -34,6 +35,8 @@ __all__ = [
     "WorkspaceNotDirectoryError",
     "WorkspaceNotFileError",
     "WorkspacePathError",
+    "WorkspaceTextEdit",
+    "WorkspaceTextEditError",
     "WorkspacePolicy",
     "WorkspaceService",
 ]

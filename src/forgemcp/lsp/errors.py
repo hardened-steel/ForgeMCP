@@ -22,6 +22,10 @@ class LspRequestTimeoutError(LspError):
 class LspRpcError(LspError):
     """The language server returned a JSON-RPC error response."""
 
+    def __init__(self, code: int | None) -> None:
+        self.code = code
+        super().__init__(f"The language server rejected a request (code {code!s}).")
+
 
 class LspCoordinateError(LspError):
     """A coordinate cannot be represented in the negotiated LSP encoding."""
