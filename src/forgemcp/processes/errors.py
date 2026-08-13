@@ -23,6 +23,12 @@ class ProcessExecutableError(ProcessError):
     code = "process_executable_error"
 
 
+class ProcessOwnershipError(ProcessError):
+    """Required operating-system process-tree containment could not be established."""
+
+    code = "process_ownership_error"
+
+
 class ProcessWorkingDirectoryError(ProcessError):
     """The requested working directory is not an allowed workspace directory."""
 

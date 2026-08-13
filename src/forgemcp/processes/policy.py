@@ -3,10 +3,89 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from forgemcp.models import MAX_PROCESS_OUTPUT_CHARACTERS
+
+
+def _path_key(path: Path) -> str:
+    """Return the filesystem comparison key used for approved executable paths."""
+    value = str(path)
+    return value.casefold() if os.name == "nt" else value
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Return whether a path entry is a Windows reparse point without following it."""
+    try:
+        attributes = path.lstat().st_file_attributes  # type: ignore[attr-defined]
+    except (AttributeError, FileNotFoundError, OSError):
+        return False
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _contains_link_or_reparse_point(path: Path) -> bool:
+    """Reject a link/reparse point in the executable path rather than resolving through it."""
+    current = path
+    while True:
+        if current.is_symlink() or _is_reparse_point(current):
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutableApproval:
+    """Metadata captured for one exact executable approval at composition time."""
+
+    path: Path
+    device: int
+    inode: int
+    size: int
+    modified_nanoseconds: int
+
+    @classmethod
+    def create(cls, raw_path: Path) -> "_ExecutableApproval":
+        if "\x00" in str(raw_path):
+            raise ValueError("Allowed executable paths must be NUL-free.")
+        if not raw_path.is_absolute():
+            raise ValueError("Allowed executable paths must be absolute paths.")
+        if _contains_link_or_reparse_point(raw_path):
+            raise ValueError("Allowed executable paths must not traverse symlinks or reparse points.")
+        try:
+            resolved = raw_path.resolve(strict=True)
+            metadata = resolved.stat()
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("Allowed executable paths must exist.") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("Allowed executable paths must name regular files.")
+        if os.name != "nt" and not os.access(resolved, os.X_OK):
+            raise ValueError("Allowed executable paths must be executable regular files.")
+        return cls(
+            path=resolved,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            size=metadata.st_size,
+            modified_nanoseconds=metadata.st_mtime_ns,
+        )
+
+    def still_matches(self, path: Path) -> bool:
+        """Return whether an approved executable still names the approved file metadata."""
+        if _path_key(path) != _path_key(self.path) or _contains_link_or_reparse_point(path):
+            return False
+        try:
+            metadata = path.stat()
+        except (FileNotFoundError, OSError):
+            return False
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_dev == self.device
+            and metadata.st_ino == self.inode
+            and metadata.st_size == self.size
+            and metadata.st_mtime_ns == self.modified_nanoseconds
+        )
 
 
 def _normalise_relative_directory(value: str) -> str:
@@ -62,6 +141,9 @@ class ProcessPolicy:
     stream_close_timeout_seconds: float = 1.0
     allow_environment_inheritance: bool = True
     allowed_environment_overrides: frozenset[str] | None = field(default_factory=frozenset)
+    _executable_approvals: tuple[_ExecutableApproval, ...] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Reject ambiguous or unsafe policy values at composition time."""
@@ -77,10 +159,8 @@ class ProcessPolicy:
                 raise ValueError("Allowed executable names must be bare, NUL-free program names.")
 
         raw_executable_paths = tuple(Path(path) for path in self.allowed_executable_paths)
-        for path in raw_executable_paths:
-            if not path.is_absolute():
-                raise ValueError("Allowed executable paths must be absolute paths.")
-        executable_paths = frozenset(path.resolve() for path in raw_executable_paths)
+        approvals = tuple(_ExecutableApproval.create(path) for path in raw_executable_paths)
+        executable_paths = frozenset(approval.path for approval in approvals)
 
         working_directories = self.allowed_working_directories
         if working_directories is not None:
@@ -122,6 +202,7 @@ class ProcessPolicy:
 
         object.__setattr__(self, "allowed_executables", executable_names)
         object.__setattr__(self, "allowed_executable_paths", executable_paths)
+        object.__setattr__(self, "_executable_approvals", approvals)
         object.__setattr__(self, "allowed_working_directories", working_directories)
         object.__setattr__(self, "allowed_environment_overrides", allowed_environment_overrides)
         object.__setattr__(self, "default_timeout_seconds", default_timeout)
@@ -135,6 +216,15 @@ class ProcessPolicy:
             candidate = Path(name).stem.casefold()
             return any(Path(allowed).stem.casefold() == candidate for allowed in self.allowed_executables)
         return name in self.allowed_executables
+
+    def approves_exact_executable(self, path: Path) -> bool:
+        """Return whether a current path still matches a concrete approved executable.
+
+        An exact approval rejects symlink/reparse traversal and compares the
+        canonical path case-insensitively on Windows.  The metadata captured
+        at policy construction makes replacement after approval detectable.
+        """
+        return any(approval.still_matches(path) for approval in self._executable_approvals)
 
     def allows_working_directory(self, relative_directory: str) -> bool:
         """Return whether one normalised workspace-relative directory is allowed."""

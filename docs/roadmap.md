@@ -12,8 +12,9 @@ irreversible choices belong in [adr/](adr/).
   stderr logging.
 - Transport-neutral domain models.
 - Workspace service and generated-directory capability.
-- Process Runtime with bounded output, process-tree cleanup, and scoped
-  execution policy.
+- Process Runtime with bounded output, process-tree cleanup, scoped execution
+  policy, and a trusted-adapter path with required ownership, exact executable
+  approval, and scrubbed environment.
 - Versioned Plugin System with builtin composition and guarded external
   discovery.
 - Builtin CMake/CTest vertical slice: status, preset summaries, configure,
@@ -29,9 +30,9 @@ irreversible choices belong in [adr/](adr/).
 
 ### In progress
 
-- DAP architecture is decided in ADR 0009; implementation remains deliberately
-  blocked on a runnable, policy-approved standalone `lldb-dap` and the listed
-  Process Runtime ownership/configuration gaps.
+- DAP architecture is decided in ADR 0009. Phase-0 Process Runtime hardening
+  and read-only `lldb-dap` qualification are complete; implementation remains
+  deliberately blocked on a runnable, policy-approved standalone `lldb-dap`.
 
 ## Delivery sequence and dependencies
 
@@ -96,10 +97,11 @@ PATH discovery was absent in this environment.
 ## Next milestone: DAP phase 1 admission and implementation
 
 The DAP design is fixed in
-[ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md); no
-debug adapter client, tool, plugin, or Core/Process Runtime change is included
-in this design milestone.  clangd remains fully independent of the debugger
-lifecycle.
+[ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md).
+Phase 0 added only Process Runtime hardening, `FORGEMCP_LLDB_DAP`
+configuration, and an internal qualification helper; it added no debug adapter
+client, tool, plugin, or debugger service. clangd remains fully independent of
+the debugger lifecycle.
 
 Phase 1 scope, once admitted:
 
@@ -118,17 +120,17 @@ Phase 1 scope, once admitted:
 
 The gate to start implementation is:
 
-- obtain a compatible runnable standalone `lldb-dap`; the Visual Studio copy
-  detected on the current host exits before `--version`, so it is not a gate
-  candidate yet;
-- add Process Runtime support for required strong tree ownership, exact
-  approved-adapter configuration/discovery, scrubbed adapter environments, and
-  test-visible cleanup assurance;
+- obtain a compatible runnable standalone `lldb-dap`. The Phase-0 strict gate
+  found no PATH/standalone candidate. Visual Studio 2022 and 18 x64 copies
+  fail with loader status `0xC0000135` because `liblldb.dll` is absent from the
+  inspected approved companion directories; ARM64 copies cannot run on this
+  x64 host. No DLLs were copied or modified;
 - add fake-stream/fake-adapter tests for DAP framing, sequencing, events,
   reverse-request denial, cancellation, EOF, malformed input, state races,
   output bounds, and stale handles; and
-- pass a real adapter launch/stop gate for the declared Windows DWARF target.
-  Claiming an MSVC/PDB configuration requires a separate exact-toolchain gate.
+- pass a real adapter launch/stop gate for the declared Windows DWARF target
+  after the runnable-adapter prerequisite is supplied. Claiming an MSVC/PDB
+  configuration requires a separate exact-toolchain gate.
 
 Phase 2 is intentionally separate: modules, read-memory, disassembly,
 set-variable, write-memory, restart, and attach.  It requires individual DAP
@@ -152,8 +154,8 @@ resolve; each needs a bounded contract and safety review.
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
 - There are no Workspace MCP editing tools, DAP tools, quality tools, Git
-  integration, or aggregate `project_status` tool yet. DAP Phase 1 also lacks
-  a runnable approved adapter and Process Runtime admission changes.
+  integration, or aggregate `project_status` tool yet. DAP Phase 1 still lacks
+  a runnable approved adapter; its Process Runtime admission changes are done.
 - CMake and CTest are discovered through the Process Runtime environment; an
   installation outside `PATH` must be deliberately made available by the host
   policy/environment.

@@ -24,8 +24,10 @@ broker, an arbitrary debugger-command executor, or a symbol-download client.
 
 ### Investigated backends
 
-The investigation used filesystem discovery plus `--help`/`--version` only;
-it did not launch a debug session or copy an adapter into this repository.
+The investigation uses read-only filesystem discovery and fixed `--help`/`--version`
+probes only; it never copies an adapter into this repository. Phase 0 also performs
+a controlled adapter-process start/close through Process Runtime, but it does not
+create a DAP client, send `initialize`, or launch a debuggee.
 The DAP protocol itself specifies stdin/stdout single-session and optional
 TCP multi-session modes, but ForgeMCP uses only the former for the MVP
 ([DAP overview](https://microsoft.github.io/debug-adapter-protocol/overview)).
@@ -45,6 +47,37 @@ found:
   VS Code-extension, Windows Kits, MSYS2, MinGW, Chocolatey, or WindowsApps
   locations.  The Windows Kits Debuggers directory exists but did not contain
   a DAP adapter.
+
+### Phase-0 qualification update
+
+`FORGEMCP_LLDB_DAP` is now a declarative absolute-path configuration candidate;
+it is not an MCP input and does not by itself authorize execution. The internal,
+transport-neutral `LldbDapQualifier` discovers it first, then PATH, standalone
+LLVM, Visual Studio LLVM, VS Code LLVM/CodeLLDB locations (read-only), and
+other known local LLVM locations. Every candidate is exact-approved as an
+existing non-link regular executable, launched with Process Runtime's required
+tree ownership and scrubbed environment, probed with fixed `--version`/`--help`,
+then started and closed. `AdapterQualification` records only parsed/safe
+metadata and distinguishes runnable process facts from unverified DAP and
+debug-format capabilities.
+
+On this host the final strict probe found no runnable adapter. No PATH or
+standalone LLVM candidate exists. The four Visual Studio LLVM files below are
+discovered but rejected:
+
+- Visual Studio 2022 Community: `x64\bin\lldb-dap.exe` exits with loader
+  status `0xC0000135`; its bounded read-only PE-import diagnostic identifies
+  `liblldb.dll` as absent from the executable, approved companion directories,
+  and Windows system directory. The ARM64 binary cannot start on this x64 host.
+- Visual Studio 18 Community: `x64\bin\lldb-dap.exe` has the same missing
+  `liblldb.dll` loader diagnostic; its ARM64 binary cannot start on this host.
+
+The inspected Visual Studio LLVM toolchain directories contain no `liblldb.dll`.
+The qualifier did construct the smallest permitted PATH from the adapter and
+installed companion directories; it did not copy DLLs, alter Visual Studio, or
+inherit a Developer Shell. Therefore these files are unavailable, not a usable
+fallback backend. No PE/COFF, DWARF, MSVC/PDB, DAP-initialize, launch, or
+debuggee capability is claimed from a version/help or process-start probe.
 
 The matrix distinguishes an adapter's upstream capability from a ForgeMCP
 promise.  `yes*` means capability discovery plus a real adapter integration
@@ -486,39 +519,39 @@ pipe deadlock, counted up to 64 KiB, then discarded; raw stderr never becomes
 an event.  On final close, the terminal status retains counters and last
 sequence only; the event and all handle caches are cleared.
 
-### Process Runtime gaps and required admission criteria
+### Process Runtime Phase-0 completion and remaining admission criteria
 
 The existing `ProcessHandle` is sufficient for basic DAP stdin/stdout/stderr:
 it exposes `StreamWriter`/`StreamReader`s, provides wait/terminate/kill, and
 is owned by Process Runtime.  The debugger must use it; it must not call
 `subprocess` or `asyncio.create_subprocess_exec` directly.
 
-However, the current runtime needs the following minimal changes before a
-launch backend is admitted:
+Phase 0 closes the runtime prerequisites without adding a DAP transport or
+debugger plugin:
 
-1. **Strong ownership result.** Add a public `ProcessTreeOwnership` result to
-   `ProcessHandle` and a `require_strong_tree_ownership=True` start mode.  On
-   Windows it must mean the adapter was assigned to a kill-on-close Job Object;
-   if Job assignment fails, terminate the adapter and reject a launch session.
-   The present `taskkill` fallback is valuable cleanup but cannot prove it can
-   kill a debuggee if the adapter already exited/orphaned it.  POSIX requires a
-   newly created session/process group.
-2. **Explicit approved-adapter discovery policy.** Extend configuration and
-   ProcessPolicy composition with named, exact absolute DAP adapter paths and
-   expected backend IDs.  The generic default allow-list currently has CMake,
-   CTest, and clangd only; a plugin cannot safely widen it at request time.
-3. **Scrubbed adapter environment.** Support a configuration-owned minimal
-   environment profile (including the adapter's required DLL/Python lookup
-   values) rather than only inherited environment plus additive overrides.
-   It must remove symbol/source-server and debugger-script auto-load values by
-   default.  Debuggee environment remains a separately validated DAP payload.
-4. **Deterministic adapter probe.** Add a Process Runtime-supported bounded
-   version/help probe that discards/does not log raw output and returns only
-   parsed metadata to backend discovery.  It must not run an arbitrary probe
-   supplied by MCP.
-5. **Test observability.** Expose enough safe state to assert a Job/process
-   group was established and that close reaped the adapter.  Do not expose a
-   broad process enumeration API.
+1. **Required ownership is now observable.** `start_trusted_adapter` returns
+   only after the Windows kill-on-close Job assignment succeeds (with no
+   breakaway flags), or after POSIX session/process-group creation. Its handle
+   exposes `required_ownership` and `ownership_established`. Job failure kills
+   the unreturned direct process and raises `ProcessOwnershipError`; `taskkill`
+   is retained only for ordinary best-effort callers.
+2. **Exact adapter approval is enforced.** `ProcessPolicy` captures a
+   canonical, case-aware Windows path and regular-file metadata at approval,
+   rejects NUL/link/reparse paths, and rechecks it at launch. A bare-name
+   allow-list cannot turn an adapter PATH lookup into an exact approval.
+3. **Adapter environment is scrubbed.** It inherits no ForgeMCP environment
+   (therefore no common secret, symbol, source-server, or Developer Shell
+   variables), carries only an explicit bounded system-variable allow-list,
+   and builds PATH from the exact adapter/approved companion directories.
+   Debuggee environment remains a future DAP launch-policy payload.
+4. **Qualification is deterministic and bounded.** Fixed `--version`/`--help`
+   probes and a controlled start/close use only `run_trusted_adapter` and
+   `start_trusted_adapter`; raw argv, environment, stderr, and probe output are
+   not logged or returned through MCP.
+5. **Tests cover the boundary.** Exact approval/replacement/PATH-spoof/link
+   rejection, scrubbed environment/PATH, legacy caller behavior, strict
+   adapter descendant cleanup, timeout/cancellation/idempotence, Windows Job
+   assignment failure, and fake candidate qualification are regression-tested.
 
 No safe `runInTerminal` broker exists.  Building one later would require a
 separate ADR covering exact executable/cwd/env validation, console handles,
@@ -526,7 +559,7 @@ Windows Job assignment, stdin mediation, output limits, terminal lifecycle,
 and the fact that a terminal may create a process outside the adapter tree.
 It is not a small addition to `DapClient`.
 
-The Phase 1 test admission gate is therefore:
+The remaining Phase 1 admission gate is therefore:
 
 - fake-stream `DapClient` tests for fragmented framing, out-of-order
   responses, reverse-request denial, timeout/cancellation, malformed JSON,

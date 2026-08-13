@@ -12,6 +12,7 @@ import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
@@ -22,14 +23,29 @@ from forgemcp.processes.errors import (
     ProcessArgumentError,
     ProcessEnvironmentError,
     ProcessExecutableError,
+    ProcessOwnershipError,
     ProcessPolicyError,
     ProcessRuntimeClosedError,
     ProcessWorkingDirectoryError,
 )
-from forgemcp.processes.policy import ProcessPolicy
+from forgemcp.processes.policy import ProcessPolicy, _contains_link_or_reparse_point
 
 if TYPE_CHECKING:
     from asyncio.streams import StreamReader, StreamWriter
+
+
+class ProcessTreeOwnership(StrEnum):
+    """Requested operating-system containment strength for one launch."""
+
+    BEST_EFFORT = "best_effort"
+    REQUIRED = "required"
+
+
+class ProcessEnvironmentMode(StrEnum):
+    """Environment construction mode for one launch."""
+
+    INHERIT = "inherit"
+    SCRUBBED = "scrubbed"
 
 
 class _WindowsProcessJob:
@@ -42,8 +58,8 @@ class _WindowsProcessJob:
         self._handle = handle
 
     @classmethod
-    def try_attach(cls, process: asyncio.subprocess.Process) -> "_WindowsProcessJob | None":
-        """Attach a child to a kill-on-close job, keeping a taskkill fallback on failure."""
+    def create(cls) -> "_WindowsProcessJob | None":
+        """Create a non-breakaway kill-on-close job before launching its member."""
         if os.name != "nt":
             return None
         try:
@@ -109,16 +125,28 @@ class _WindowsProcessJob:
             ):
                 kernel32.CloseHandle(job_handle)
                 return None
-            popen = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
-            process_handle = getattr(popen, "_handle", None)
-            if process_handle is None or not kernel32.AssignProcessToJobObject(
-                job_handle, int(process_handle)
-            ):
-                kernel32.CloseHandle(job_handle)
-                return None
             return cls(int(job_handle))
         except (AttributeError, OSError, TypeError, ValueError):
             return None
+
+    def attach(self, process: asyncio.subprocess.Process) -> bool:
+        """Assign a just-created child and report assignment success exactly."""
+        if not self._handle:
+            return False
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            popen = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
+            process_handle = getattr(popen, "_handle", None)
+            return bool(
+                process_handle is not None
+                and kernel32.AssignProcessToJobObject(
+                    wintypes.HANDLE(self._handle), wintypes.HANDLE(int(process_handle))
+                )
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
 
     def close(self) -> None:
         """Close the job once; Windows terminates remaining member processes."""
@@ -187,11 +215,18 @@ class ProcessHandle:
         runtime: "ProcessRuntime",
         process: asyncio.subprocess.Process,
         job: _WindowsProcessJob | None = None,
+        *,
+        required_ownership: bool = False,
+        ownership_established: bool = False,
+        environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
     ) -> None:
         self._runtime = runtime
         self._process = process
         self._job = job
         self._closed = False
+        self._required_ownership = required_ownership
+        self._ownership_established = ownership_established
+        self._environment_mode = environment_mode
 
     @property
     def pid(self) -> int:
@@ -202,6 +237,21 @@ class ProcessHandle:
     def returncode(self) -> int | None:
         """Return the exit status once the process has ended."""
         return self._process.returncode
+
+    @property
+    def required_ownership(self) -> bool:
+        """Return whether this launch required containment before the handle was returned."""
+        return self._required_ownership
+
+    @property
+    def ownership_established(self) -> bool:
+        """Return whether the platform containment primitive was configured for this handle."""
+        return self._ownership_established
+
+    @property
+    def environment_mode(self) -> ProcessEnvironmentMode:
+        """Return whether this child inherited or received a scrubbed environment."""
+        return self._environment_mode
 
     @property
     def stdin(self) -> "StreamWriter":
@@ -291,11 +341,14 @@ class ProcessRuntime:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
+        configured_clangd_paths = (
+            frozenset({config.clangd_path})
+            if config.clangd_path is not None and config.clangd_path.is_file()
+            else frozenset()
+        )
         self._policy = (
             ProcessPolicy(
-                allowed_executable_paths=(
-                    frozenset({config.clangd_path}) if config.clangd_path is not None else frozenset()
-                )
+                allowed_executable_paths=configured_clangd_paths
             )
             if policy is None
             else policy
@@ -324,6 +377,10 @@ class ProcessRuntime:
         environment: Mapping[str, str] | None = None,
         inherit_environment: bool | None = None,
         timeout_seconds: float | None = None,
+        ownership: ProcessTreeOwnership = ProcessTreeOwnership.BEST_EFFORT,
+        environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
+        approved_path_directories: Sequence[Path] = (),
+        require_exact_executable: bool = False,
     ) -> ProcessResult:
         """Run one bounded short command and return its completed result.
 
@@ -337,6 +394,10 @@ class ProcessRuntime:
             cwd=cwd,
             environment=environment,
             inherit_environment=inherit_environment,
+            ownership=ownership,
+            environment_mode=environment_mode,
+            approved_path_directories=approved_path_directories,
+            require_exact_executable=require_exact_executable,
         )
         started_at = datetime.now(UTC)
         stdout_capture = _BoundedTextCapture(self._policy.max_output_characters)
@@ -394,15 +455,63 @@ class ProcessRuntime:
         cwd: str = ".",
         environment: Mapping[str, str] | None = None,
         inherit_environment: bool | None = None,
+        ownership: ProcessTreeOwnership = ProcessTreeOwnership.BEST_EFFORT,
+        environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
+        approved_path_directories: Sequence[Path] = (),
+        require_exact_executable: bool = False,
     ) -> ProcessHandle:
-        """Start an allow-listed protocol process with streaming stdin/stdout/stderr."""
+        """Start an allow-listed protocol process with streaming stdin/stdout/stderr.
+
+        Normal callers retain the inherited environment and best-effort tree
+        cleanup.  Trusted protocol adapters opt into ``REQUIRED`` ownership,
+        a scrubbed environment, and an exact approved executable through
+        :meth:`start_trusted_adapter`.
+        """
         if self._closed:
             raise ProcessRuntimeClosedError("The process runtime is closing and cannot start processes.")
-        executable_argv = self._prepare_argv(argv)
+        requested_ownership = self._normalise_ownership(ownership)
+        requested_environment_mode = self._normalise_environment_mode(environment_mode)
+        if not isinstance(require_exact_executable, bool):
+            raise ProcessPolicyError("Exact executable enforcement must be a boolean.")
+        executable_argv = self._prepare_argv(argv, require_exact_executable=require_exact_executable)
         working_directory = self._resolve_working_directory(cwd)
-        child_environment = self._prepare_environment(environment, inherit_environment)
-        process = await self._create_process(executable_argv, working_directory, child_environment)
-        handle = ProcessHandle(self, process, _WindowsProcessJob.try_attach(process))
+        child_environment = self._prepare_environment(
+            environment,
+            inherit_environment,
+            mode=requested_environment_mode,
+            executable=Path(executable_argv[0]),
+            approved_path_directories=approved_path_directories,
+        )
+        job = _WindowsProcessJob.create()
+        if os.name == "nt" and requested_ownership is ProcessTreeOwnership.REQUIRED and job is None:
+            raise ProcessOwnershipError("Required process-tree ownership could not be established.")
+        try:
+            process = await self._create_process(executable_argv, working_directory, child_environment)
+        except BaseException:
+            if job is not None:
+                job.close()
+            raise
+
+        ownership_established = os.name != "nt"
+        if os.name == "nt":
+            if job is None or not job.attach(process):
+                if job is not None:
+                    job.close()
+                job = None
+                if requested_ownership is ProcessTreeOwnership.REQUIRED:
+                    await self._terminate_uncontained_process(process)
+                    raise ProcessOwnershipError("Required process-tree ownership could not be established.")
+            else:
+                ownership_established = True
+
+        handle = ProcessHandle(
+            self,
+            process,
+            job,
+            required_ownership=requested_ownership is ProcessTreeOwnership.REQUIRED,
+            ownership_established=ownership_established,
+            environment_mode=requested_environment_mode,
+        )
         if self._closed:
             # Shutdown may begin while create_subprocess_exec is awaiting the
             # operating system.  Do not let that race orphan the new child.
@@ -411,6 +520,46 @@ class ProcessRuntime:
         self._handles.add(handle)
         self._logger.info("process_started", pid=process.pid)
         return handle
+
+    async def start_trusted_adapter(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        environment: Mapping[str, str] | None = None,
+        approved_path_directories: Sequence[Path] = (),
+    ) -> ProcessHandle:
+        """Start a trusted protocol adapter only after strict containment is ready."""
+        return await self.start(
+            argv,
+            cwd=cwd,
+            environment=environment,
+            ownership=ProcessTreeOwnership.REQUIRED,
+            environment_mode=ProcessEnvironmentMode.SCRUBBED,
+            approved_path_directories=approved_path_directories,
+            require_exact_executable=True,
+        )
+
+    async def run_trusted_adapter(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        environment: Mapping[str, str] | None = None,
+        approved_path_directories: Sequence[Path] = (),
+        timeout_seconds: float | None = None,
+    ) -> ProcessResult:
+        """Run a bounded adapter probe with exact approval and strict containment."""
+        return await self.run(
+            argv,
+            cwd=cwd,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            ownership=ProcessTreeOwnership.REQUIRED,
+            environment_mode=ProcessEnvironmentMode.SCRUBBED,
+            approved_path_directories=approved_path_directories,
+            require_exact_executable=True,
+        )
 
     async def aclose(self) -> None:
         """Await clean shutdown of every live process handle owned by this runtime."""
@@ -458,7 +607,9 @@ class ProcessRuntime:
         except (FileNotFoundError, PermissionError, OSError) as error:
             raise ProcessExecutableError("The approved executable could not be started.") from error
 
-    def _prepare_argv(self, argv: Sequence[str]) -> tuple[str, ...]:
+    def _prepare_argv(
+        self, argv: Sequence[str], *, require_exact_executable: bool = False
+    ) -> tuple[str, ...]:
         if isinstance(argv, str) or not isinstance(argv, Sequence) or not argv:
             raise ProcessArgumentError("Commands must be a non-empty argv sequence, never a shell string.")
         values = tuple(argv)
@@ -468,8 +619,11 @@ class ProcessRuntime:
             raise ProcessArgumentError("The executable argv value must not be empty.")
 
         requested = values[0]
+        requested_path = Path(requested)
+        if require_exact_executable and not requested_path.is_absolute():
+            raise ProcessExecutableError("Trusted adapters must use an exact approved absolute executable path.")
         resolved = self._resolve_executable(requested)
-        if not self._is_allowed_executable(requested, resolved):
+        if not self._is_allowed_executable(requested, requested_path, resolved):
             raise ProcessExecutableError("The requested executable is not allowed by process policy.")
         return (str(resolved), *values[1:])
 
@@ -493,8 +647,8 @@ class ProcessRuntime:
             raise ProcessExecutableError("The requested executable is not available.")
         return Path(discovered).resolve()
 
-    def _is_allowed_executable(self, requested: str, resolved: Path) -> bool:
-        if resolved in self._policy.allowed_executable_paths:
+    def _is_allowed_executable(self, requested: str, requested_path: Path, resolved: Path) -> bool:
+        if requested_path.is_absolute() and self._policy.approves_exact_executable(requested_path):
             return True
         if "/" in requested or "\\" in requested or Path(requested).is_absolute():
             return False
@@ -541,7 +695,21 @@ class ProcessRuntime:
         self,
         environment: Mapping[str, str] | None,
         inherit_environment: bool | None,
+        *,
+        mode: ProcessEnvironmentMode,
+        executable: Path,
+        approved_path_directories: Sequence[Path],
     ) -> dict[str, str]:
+        if mode is ProcessEnvironmentMode.SCRUBBED:
+            if inherit_environment is not None:
+                raise ProcessEnvironmentError(
+                    "Scrubbed adapter environments cannot inherit the host environment."
+                )
+            return self._prepare_scrubbed_environment(
+                environment,
+                executable=executable,
+                approved_path_directories=approved_path_directories,
+            )
         inherit = True if inherit_environment is None else inherit_environment
         if not isinstance(inherit, bool):
             raise ProcessEnvironmentError("Environment inheritance must be a boolean.")
@@ -568,6 +736,97 @@ class ProcessRuntime:
         values = dict(self._base_environment) if inherit else {}
         values.update(overrides)
         return values
+
+    def _prepare_scrubbed_environment(
+        self,
+        environment: Mapping[str, str] | None,
+        *,
+        executable: Path,
+        approved_path_directories: Sequence[Path],
+    ) -> dict[str, str]:
+        """Construct the small adapter environment without inheriting host secrets."""
+        overrides = self._validate_environment_overrides(environment)
+        if any(key.casefold() == "path" for key in overrides):
+            raise ProcessEnvironmentError("Adapter PATH is constructed only from approved directories.")
+
+        if os.name == "nt":
+            system_keys = ("SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP", "PATHEXT")
+        else:
+            system_keys = ("TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
+        values = {
+            key: value
+            for key in system_keys
+            if (value := self._base_environment_value(key)) is not None
+        }
+        directories = (executable.parent, *approved_path_directories)
+        approved = self._normalise_adapter_path_directories(directories)
+        values["PATH"] = os.pathsep.join(str(directory) for directory in approved)
+        values.update(overrides)
+        return values
+
+    def _validate_environment_overrides(
+        self, environment: Mapping[str, str] | None
+    ) -> dict[str, str]:
+        if environment is not None and not isinstance(environment, Mapping):
+            raise ProcessEnvironmentError("Environment overrides must be a string mapping.")
+        overrides = {} if environment is None else dict(environment)
+        for key, value in overrides.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or "\x00" in key
+                or "=" in key
+                or not isinstance(value, str)
+                or "\x00" in value
+            ):
+                raise ProcessEnvironmentError(
+                    "Environment names and values must be NUL-free strings."
+                )
+            allowed = self._policy.allowed_environment_overrides
+            if allowed is not None and key not in allowed:
+                raise ProcessEnvironmentError("An environment override is not allowed by process policy.")
+        return overrides
+
+    def _base_environment_value(self, key: str) -> str | None:
+        if os.name != "nt":
+            return self._base_environment.get(key)
+        wanted = key.casefold()
+        return next(
+            (value for name, value in self._base_environment.items() if name.casefold() == wanted),
+            None,
+        )
+
+    def _normalise_adapter_path_directories(self, directories: Sequence[Path]) -> tuple[Path, ...]:
+        normalised: list[Path] = []
+        keys: set[str] = set()
+        for directory in directories:
+            if not isinstance(directory, Path) or not directory.is_absolute():
+                raise ProcessEnvironmentError("Adapter PATH directories must be approved absolute directories.")
+            try:
+                resolved = directory.resolve(strict=True)
+            except (FileNotFoundError, OSError) as error:
+                raise ProcessEnvironmentError("Adapter PATH directories must exist.") from error
+            if _contains_link_or_reparse_point(directory) or not resolved.is_dir():
+                raise ProcessEnvironmentError("Adapter PATH directories must be non-symlink directories.")
+            key = str(resolved).casefold() if os.name == "nt" else str(resolved)
+            if key not in keys:
+                keys.add(key)
+                normalised.append(resolved)
+        return tuple(normalised)
+
+    @staticmethod
+    def _normalise_ownership(value: ProcessTreeOwnership) -> ProcessTreeOwnership:
+        try:
+            return ProcessTreeOwnership(value)
+        except (TypeError, ValueError) as error:
+            raise ProcessPolicyError("Process ownership must be best_effort or required.") from error
+
+    @staticmethod
+    def _normalise_environment_mode(value: ProcessEnvironmentMode) -> ProcessEnvironmentMode:
+        try:
+            return ProcessEnvironmentMode(value)
+        except (TypeError, ValueError) as error:
+            raise ProcessPolicyError("Process environment mode must be inherit or scrubbed.") from error
 
     def _validate_run_timeout(self, timeout_seconds: float | None) -> float:
         timeout = self._policy.default_timeout_seconds if timeout_seconds is None else timeout_seconds
@@ -632,12 +891,38 @@ class ProcessRuntime:
         job: _WindowsProcessJob | None,
     ) -> None:
         self._signal_process_group_nowait(process, force=False)
+        if os.name != "nt":
+            # The direct adapter may exit after TERM while a descendant keeps
+            # the group (and protocol pipes) alive.  Required POSIX cleanup is
+            # therefore group-based, never inferred from the parent exit.
+            if not await self._wait_for_posix_group(process.pid, self._policy.termination_grace_seconds):
+                self._signal_process_group_nowait(process, force=True)
+            await self._wait_for_direct_process(process)
+            return
         if await self._wait_for_process(process, self._policy.termination_grace_seconds):
             if job is not None:
                 job.close()
             return
         await self._force_kill_process_tree(process, job)
         await self._wait_for_direct_process(process)
+
+    @staticmethod
+    async def _terminate_uncontained_process(process: asyncio.subprocess.Process) -> None:
+        """Immediately reap a child when required Windows Job assignment failed.
+
+        This deliberately does not claim descendant cleanup: without a Job
+        Object, ``taskkill`` is not a substitute for required ownership.  The
+        process is never exposed through a handle in this failure path.
+        """
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await process.wait()
+        except ProcessLookupError:
+            return
 
     async def _force_kill_process_tree(
         self,
@@ -724,6 +1009,19 @@ class ProcessRuntime:
             await process.wait()
         except ProcessLookupError:
             return
+
+    @staticmethod
+    async def _wait_for_posix_group(pid: int, timeout: float) -> bool:
+        """Wait briefly for every process in one session-created group to exit."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(min(0.05, max(0.0, deadline - asyncio.get_running_loop().time())))
 
     def _forget(self, handle: ProcessHandle) -> None:
         self._handles.discard(handle)
