@@ -111,6 +111,50 @@ Process output and complete argv/environment values are never logged. Completion
 
 On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP` and is assigned a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE`; closing that job removes non-detached descendants even when the direct child has already exited. Graceful cleanup first sends `CTRL_BREAK_EVENT` with a direct-child terminate fallback; job closure is the forced tree kill. If Job assignment is refused by a host-owned job, forced cleanup falls back to the built-in `taskkill /PID <pid> /T /F` through asyncio with all helper streams discarded. This avoids a `psutil` runtime dependency. As on other process-management APIs, a tool that deliberately creates an independent process group/session or requests Job breakaway can escape its parent's tree boundary; adapters must not enable either.
 
+## Planned DAP debugger feature
+
+DAP is designed as a separate transport-neutral subsystem, not an extension of
+`forgemcp.lsp`: it uses the same `Content-Length` envelope but has DAP request
+sequences, reverse requests, an event-driven debuggee lifecycle, and ephemeral
+stopped-state references.  The approved design is [ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md); no DAP client, debugger
+service, tool, or plugin has been implemented yet.
+
+The future `forgemcp.dap` owns only bounded DAP framing, wire validation,
+request/response matching, events, reverse requests, cancellation, EOF, and a
+single reader/sequential writer.  `forgemcp.debugger` owns backend discovery,
+the application-scoped session state machine, Workspace/launch policy, opaque
+handle lifetime, normalized debug models, event buffering, and the builtin
+`DebuggerPlugin`.  It will receive only the declared Workspace and Process
+Runtime services and will not receive FastMCP or a raw registry.  As with
+clangd, every adapter process must be launched via Process Runtime and stderr
+must be drained without logging raw output.
+
+The primary Phase 1 backend is a separately installed, policy-approved LLVM
+`lldb-dap` executable over stdio.  The default Windows source-debugging target
+is a compatible PE/COFF build with DWARF; a particular MSVC/PDB combination is
+not promised until it passes its own real-adapter integration gate.  The
+Microsoft `cppvsdbg`/`OpenDebugAD7` adapter is a later optional Windows PDB
+backend that must be discovered from a compatible installed C/C++ extension
+and never redistributed.  GDB DAP and CodeLLDB are deferred; WinDbg has no
+verified standalone DAP adapter in this design.
+
+Phase 1 permits one active launch session per application, workspace-contained
+build-tree executable/CWD, validated argv and environment allow-list, initial
+source breakpoints, execution control, paused threads/stack/scopes/variables,
+and watch/hover evaluation.  It deliberately denies `runInTerminal` and
+`startDebugging`, attach, arbitrary debugger commands/adapter args, source or
+symbol download, external source file access, memory mutation, variable
+mutation, restart, and remote/dump modes.  Stack/variable/memory/output data
+are sensitive and never log-safe.  Native DAP IDs are always translated to
+bounded opaque application/session/stop-generation handles; frame, scope, and
+variable handles are invalid as soon as execution may resume.
+
+Before a launch backend can ship, Process Runtime must expose and require
+strong process-tree ownership (a Windows Job Object, not merely a later
+`taskkill` fallback), support exact approved adapter paths and a scrubbed
+adapter environment, and provide a bounded deterministic discovery probe.  A
+terminal broker needs its own security decision; it is not part of DAP Phase 1.
+
 ## CMake feature module
 
 `forgemcp.cmake` is a transport-neutral builtin feature plugin. `CMakeService` discovers `cmake` and `ctest`, parses versions, and supports CMake 3.23 or later. It lists safe summaries from `CMakePresets.json` and `CMakeUserPresets.json`, intentionally omitting `environment` and `cacheVariables`; CMake itself remains responsible for preset inheritance, conditions, and macro expansion.

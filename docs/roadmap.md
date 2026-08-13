@@ -29,8 +29,9 @@ irreversible choices belong in [adr/](adr/).
 
 ### In progress
 
-- DAP design only: define launch/attach policy, adapter discovery, and the
-  debug-binary trust boundary before any debugger implementation.
+- DAP architecture is decided in ADR 0009; implementation remains deliberately
+  blocked on a runnable, policy-approved standalone `lldb-dap` and the listed
+  Process Runtime ownership/configuration gaps.
 
 ## Delivery sequence and dependencies
 
@@ -38,7 +39,7 @@ irreversible choices belong in [adr/](adr/).
 | --- | --- | --- |
 | CMake vertical slice | Core, Models, Workspace, Process Runtime, Plugin System | Complete; its integration audit passes. |
 | clangd | Audited Core, Models, Workspace, Process Runtime, Plugin System | A managed LSP session can be started, initialized, stopped, and mapped to transport-neutral diagnostics without escaping the workspace. |
-| DAP debugger | Audited Process Runtime, Plugin System, and workspace path policy | A managed debug-adapter session can launch or attach within policy, terminate descendants, and expose transport-neutral debug state. |
+| DAP debugger | ADR 0009, audited Process Runtime, Plugin System, workspace path policy, a runnable approved adapter | A managed debug-adapter session can launch within policy, prove strong tree ownership, terminate descendants, and expose bounded transport-neutral debug state. |
 | Quality tools | CMake target/build metadata and Process Runtime | Tool discovery, bounded execution, and diagnostics normalization work without exposing shell access or secrets. |
 | Git and `project_status` | Workspace snapshots plus CMake/quality summaries | Read-only repository/project aggregation reports bounded, safe status with explicit freshness and failure states. |
 
@@ -92,15 +93,54 @@ The VS Code clangd extension path was visible to PowerShell but not to Python's
 filesystem view in this host, so it was not used as an executable. The normal
 PATH discovery was absent in this environment.
 
-## Next milestone: DAP design decision
+## Next milestone: DAP phase 1 admission and implementation
 
-The completed clangd audit permits DAP **design**, not DAP implementation. No
-debug adapter has been implemented, and clangd remains independent of any
-debugger lifecycle. A DAP proposal needs its own launch/attach trust policy,
-adapter discovery, cancellation/termination contract, and transport-neutral
-models. Remaining clangd candidates are semantic tokens, inlay hints, code
-lenses, refactor/rewrite actions beyond pure WorkspaceEdit, and richer
-completion resolve; each needs a bounded contract and safety review.
+The DAP design is fixed in
+[ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md); no
+debug adapter client, tool, plugin, or Core/Process Runtime change is included
+in this design milestone.  clangd remains fully independent of the debugger
+lifecycle.
+
+Phase 1 scope, once admitted:
+
+- a new bounded `forgemcp.dap` transport/client, separate from LSP;
+- an application-scoped builtin debugger plugin and exactly one active launch
+  session per application;
+- policy-approved direct stdio `lldb-dap`, starting only a workspace-contained
+  build-tree executable with validated argv, CWD, and allow-listed environment;
+- source breakpoints, continue/pause/step, threads, stack/scopes/variables,
+  and watch/hover evaluation while paused; and
+- `debugger__status`, `debugger__list_adapters`, `debugger__launch`,
+  `debugger__stop`, `debugger__set_breakpoints`, `debugger__continue`,
+  `debugger__pause`, `debugger__step_over`, `debugger__step_in`,
+  `debugger__step_out`, `debugger__threads`, `debugger__stack_trace`,
+  `debugger__scopes`, `debugger__variables`, and `debugger__evaluate`.
+
+The gate to start implementation is:
+
+- obtain a compatible runnable standalone `lldb-dap`; the Visual Studio copy
+  detected on the current host exits before `--version`, so it is not a gate
+  candidate yet;
+- add Process Runtime support for required strong tree ownership, exact
+  approved-adapter configuration/discovery, scrubbed adapter environments, and
+  test-visible cleanup assurance;
+- add fake-stream/fake-adapter tests for DAP framing, sequencing, events,
+  reverse-request denial, cancellation, EOF, malformed input, state races,
+  output bounds, and stale handles; and
+- pass a real adapter launch/stop gate for the declared Windows DWARF target.
+  Claiming an MSVC/PDB configuration requires a separate exact-toolchain gate.
+
+Phase 2 is intentionally separate: modules, read-memory, disassembly,
+set-variable, write-memory, restart, and attach.  It requires individual DAP
+capability checks and policy grants.  `cppvsdbg`/`OpenDebugAD7` is a later,
+operator-installed Windows PDB backend; CodeLLDB/GDB are later optional
+backends.  `runInTerminal`, `startDebugging`, arbitrary commands/adapter args,
+remote/dump modes, source/symbol auto-download, and arbitrary external source
+access are out of scope.
+
+Remaining clangd candidates are semantic tokens, inlay hints, code lenses,
+refactor/rewrite actions beyond pure WorkspaceEdit, and richer completion
+resolve; each needs a bounded contract and safety review.
 
 ## Current MVP limitations
 
@@ -112,15 +152,20 @@ completion resolve; each needs a bounded contract and safety review.
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
 - There are no Workspace MCP editing tools, DAP tools, quality tools, Git
-  integration, or aggregate `project_status` tool yet.
+  integration, or aggregate `project_status` tool yet. DAP Phase 1 also lacks
+  a runnable approved adapter and Process Runtime admission changes.
 - CMake and CTest are discovered through the Process Runtime environment; an
   installation outside `PATH` must be deliberately made available by the host
   policy/environment.
 
 ## Open architecture decisions
 
-- Define DAP launch/attach policy, adapter discovery, and debug-binary trust
-  boundary before exposing a debugger tool.
+- Decide the exact supported `lldb-dap` version floor and Windows DWARF
+  toolchain, then pass the ADR 0009 real-adapter admission gates. Decide
+  separately whether an MSVC/PDB tier uses tested LLDB-DAP or optional
+  Microsoft `OpenDebugAD7` under its extension licensing.
+- Define the separate security and process-tree design for any future
+  `runInTerminal` broker before enabling terminal-dependent debuggees.
 - Decide which quality-tool result schema can be shared without making domain
   models depend on any individual tool format.
 - Define Git status freshness, ignored-file treatment, and repository nesting
