@@ -15,6 +15,7 @@ from forgemcp.workspace import (
     SymlinkWorkspacePathError,
     WorkspaceEncodingError,
     WorkspaceFileTooLargeError,
+    WorkspaceNotDirectoryError,
     WorkspacePathError,
     WorkspacePolicy,
     WorkspaceService,
@@ -120,6 +121,24 @@ def test_generated_directory_capability_creates_and_guards_file_api_style_files(
     assert generated.list_files(".cmake/api/v1/reply") == ("index-test.json",)
     assert generated.get_snapshot(".cmake/api/v1/reply/index-test.json").exists is True
     assert service.validate_reported_path(str(tmp_path / "build")) == "build"
+
+
+def test_execution_paths_allow_existing_ignored_build_tree_without_exposing_pathlib(tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    program = build / "demo.exe"
+    program.write_bytes(b"native-program")
+    service = workspace(tmp_path)
+
+    executable = service.validate_execution_path("build/demo.exe", kind="file")
+    cwd = service.validate_execution_path("build", kind="directory")
+
+    assert executable.relative_path == "build/demo.exe"
+    assert executable.native_path == str(program.resolve())
+    assert executable.kind == "file"
+    assert cwd.relative_path == "build"
+    with pytest.raises(WorkspaceNotDirectoryError):
+        service.validate_execution_path("build/demo.exe", kind="directory")
 
 
 def test_generated_directory_capability_cannot_write_outside_its_build_tree(tmp_path):

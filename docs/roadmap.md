@@ -31,13 +31,16 @@ irreversible choices belong in [adr/](adr/).
   approval, scrubbed adapter environment, and local `lldb-dap` qualification.
   Standalone LLVM `lldb-dap` 22.1.8 passes version/start/close and an opt-in
   test-only `initialize`/`disconnect` stdio gate on this Windows host.
+- DAP Phase 1: production bounded DAP transport; launch-only debugger plugin;
+  opaque stopped-data handles; source breakpoints, execution control,
+  inspection/evaluate, cursor events, fake-adapter lifecycle tests, and real
+  standalone LLVM 22.1.8 PE/COFF + DWARF service/MCP stdio gates.
 
 ### In progress
 
-- DAP architecture is decided in ADR 0009. Phase-0 Process Runtime hardening
-  and adapter admission are complete. Phase 1 may begin with the exact
-  standalone LLVM 22.1.8 installation qualified on this host; it has no
-  production DAP client, debugger plugin, or MCP tool yet.
+- Phase 1 audit review: preserve the passing standalone LLVM 22.1.8
+  PE/COFF + DWARF gate and maintain the intentionally narrow launch-only
+  policy. MSVC/PDB compatibility remains unclaimed.
 
 ## Delivery sequence and dependencies
 
@@ -99,29 +102,34 @@ The VS Code clangd extension path was visible to PowerShell but not to Python's
 filesystem view in this host, so it was not used as an executable. The normal
 PATH discovery was absent in this environment.
 
-## Next milestone: DAP phase 1 admission and implementation
+## Completed milestone: DAP phase 1
 
 The DAP design is fixed in
 [ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md).
-Phase 0 added only Process Runtime hardening, `FORGEMCP_LLDB_DAP`
-configuration, and an internal qualification helper; it added no debug adapter
-client, tool, plugin, or debugger service. clangd remains fully independent of
-the debugger lifecycle.
+Phase 0 supplied the strict adapter admission boundary. Phase 1 now adds a
+production `forgemcp.dap` framing/protocol/client implementation, an
+application-scoped `DebuggerService`, a constrained `LldbDapBackend`, and the
+builtin debugger plugin. clangd remains fully independent of debugger
+lifecycle.
 
-Phase 1 scope, once admitted:
+Delivered scope:
 
-- a new bounded `forgemcp.dap` transport/client, separate from LSP;
+- a bounded `forgemcp.dap` transport/client, separate from LSP, with partial
+  framing, concurrent out-of-order responses, events, reverse-request denial,
+  capability-gated cancel, EOF/malformed failure, and sequential writes;
 - an application-scoped builtin debugger plugin and exactly one active launch
   session per application;
 - policy-approved direct stdio `lldb-dap`, starting only a workspace-contained
-  build-tree executable with validated argv, CWD, and allow-listed environment;
+  build-tree executable with validated argv/CWD. The debuggee environment map
+  is disabled until an explicit allow-list is configured;
 - source breakpoints, continue/pause/step, threads, stack/scopes/variables,
   and watch/hover evaluation while paused; and
 - `debugger__status`, `debugger__list_adapters`, `debugger__launch`,
   `debugger__stop`, `debugger__set_breakpoints`, `debugger__continue`,
   `debugger__pause`, `debugger__step_over`, `debugger__step_in`,
   `debugger__step_out`, `debugger__threads`, `debugger__stack_trace`,
-  `debugger__scopes`, `debugger__variables`, and `debugger__evaluate`.
+  `debugger__scopes`, `debugger__variables`, `debugger__evaluate`, and
+  `debugger__events`.
 
 The Phase-0 gate to start implementation has passed:
 
@@ -135,14 +143,19 @@ The Phase-0 gate to start implementation has passed:
   directories; their ARM64 copies cannot start on this x64 host. No DLLs were
   copied or modified;
 
-The remaining Phase-1 delivery gates are:
+The Phase-1 delivery gates have passed on this host:
 
-- add fake-stream/fake-adapter tests for DAP framing, sequencing, events,
-  reverse-request denial, cancellation, EOF, malformed input, state races,
-  output bounds, and stale handles; and
-- pass a real adapter launch/stop gate for the declared Windows DWARF target
-  after the runnable-adapter prerequisite is supplied. Claiming an MSVC/PDB
-  configuration requires a separate exact-toolchain gate.
+- deterministic fake transport and fake-adapter tests cover fragmented frames,
+  out-of-order responses, events, reverse-request denial, timeout/cancellation,
+  malformed input/EOF, deferred launch configuration, event cursors, handles,
+  stale invalidation, and shutdown;
+- the standalone LLVM `C:\Program Files\LLVM\bin\lldb-dap.exe` 22.1.8 gate
+  builds a local `-O0 -g -gdwarf-4` PE/COFF executable, confirms `.debug_info`
+  via `llvm-readobj`, then passes initialize/launch/breakpoint/stopped/threads/
+  stack/scopes/variables/evaluate/step/continue/disconnect cleanup; and
+- the real MCP stdio vertical slice passes tools/list, adapter listing, launch,
+  breakpoint/stop, threads through variables, continue, events, stop, and
+  transport shutdown.
 
 Phase 2 is intentionally separate: modules, read-memory, disassembly,
 set-variable, write-memory, restart, and attach.  It requires individual DAP
@@ -165,20 +178,19 @@ resolve; each needs a bounded contract and safety review.
 - clangd intentionally omits semantic tokens, inlay hints, code lenses,
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
-- There are no Workspace MCP editing tools, DAP tools, quality tools, Git
-  integration, or aggregate `project_status` tool yet. DAP Phase 1 has a
-  qualified adapter prerequisite, but its DAP client, debugger plugin, and
-  real PE/COFF+DWARF debuggee compatibility gate remain unimplemented.
+- There are no Workspace MCP editing tools, quality tools, Git integration, or
+  aggregate `project_status` tool yet. DAP Phase 1 is launch-only LLDB-DAP
+  source debugging for the passed standalone LLVM/DWARF gate; it is not an
+  MSVC/PDB compatibility claim.
 - CMake and CTest are discovered through the Process Runtime environment; an
   installation outside `PATH` must be deliberately made available by the host
   policy/environment.
 
 ## Open architecture decisions
 
-- Decide the exact supported `lldb-dap` version floor and Windows DWARF
-  toolchain, then pass the ADR 0009 real-adapter admission gates. Decide
-  separately whether an MSVC/PDB tier uses tested LLDB-DAP or optional
-  Microsoft `OpenDebugAD7` under its extension licensing.
+- Decide a wider supported `lldb-dap` version floor and Windows DWARF
+  toolchain matrix. Decide separately whether an MSVC/PDB tier uses tested
+  LLDB-DAP or optional Microsoft `OpenDebugAD7` under its extension licensing.
 - Define the separate security and process-tree design for any future
   `runInTerminal` broker before enabling terminal-dependent debuggees.
 - Decide which quality-tool result schema can be shared without making domain

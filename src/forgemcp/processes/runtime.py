@@ -349,14 +349,14 @@ class ProcessRuntime:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        configured_clangd_paths = (
-            frozenset({config.clangd_path})
-            if config.clangd_path is not None and config.clangd_path.is_file()
-            else frozenset()
+        configured_exact_paths = frozenset(
+            path
+            for path in (config.clangd_path, config.lldb_dap_path)
+            if path is not None and path.is_file() and not path.is_symlink()
         )
         self._policy = (
             ProcessPolicy(
-                allowed_executable_paths=configured_clangd_paths
+                allowed_executable_paths=configured_exact_paths
             )
             if policy is None
             else policy

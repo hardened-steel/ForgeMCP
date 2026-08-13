@@ -74,7 +74,11 @@ Every patch target must carry a compare-and-swap expectation: preferably the `Fi
 
 `GeneratedWorkspaceDirectory` is an intentionally narrow capability for a caller-declared generated directory: it can write and read bounded UTF-8 files, list direct non-symlink files, and snapshot generated files without exposing a `Path`. It applies the same workspace and symlink checks even when the directory matches the ordinary Workspace ignore policy. CMake uses it for `.cmake/api/v1/query/codemodel-v2` and File API replies; it does not directly manipulate build-tree paths.
 
-Workspace I/O itself is isolated in the separately composed Workspace module. MCP Workspace tool adapters and debug adapters remain intentionally unimplemented.
+Workspace I/O itself is isolated in the separately composed Workspace module.
+MCP Workspace tool adapters remain intentionally unimplemented. The debugger
+uses only `validate_execution_path`, a separate validation-only capability for
+workspace-contained generated execution paths; it grants neither file reads
+nor writes.
 
 ## LSP transport and clangd feature
 
@@ -114,23 +118,27 @@ On POSIX each child starts a new session and process group. Graceful cleanup sig
 
 `LldbDapQualifier` is a transport-neutral, internal Phase-0 helper, not a DAP client or MCP tool. It reads a declarative `FORGEMCP_LLDB_DAP` path first, then local PATH/LLVM/Visual Studio/VS Code/local-toolchain candidates, and accepts an adapter only after fixed `--version`/`--help` probes and a start/close cycle succeed through `run_trusted_adapter`/`start_trusted_adapter`. Its `AdapterQualification` separates runnable-process facts from unverified DAP, object-format, and debug-information capabilities, and retains only safe probe exit statuses and a parsed version. An opt-in test-local `initialize`/`disconnect` gate can check a real installed adapter without introducing a second production DAP transport. Debuggee environment is intentionally not part of this adapter environment; a future DAP launch policy owns it.
 
-## Planned DAP debugger feature
+## DAP debugger feature
 
-DAP is designed as a separate transport-neutral subsystem, not an extension of
-`forgemcp.lsp`: it uses the same `Content-Length` envelope but has DAP request
-sequences, reverse requests, an event-driven debuggee lifecycle, and ephemeral
-stopped-state references.  The approved design is [ADR 0009](adr/0009-dap-architecture-backend-and-debugger-trust-model.md); no DAP client, debugger
-service, tool, or plugin has been implemented yet.
+`forgemcp.dap` is a production, transport-neutral DAP client, separate from
+`forgemcp.lsp`. Its `framing`, `protocol`, and `client` modules own bounded
+`Content-Length` parsing (8 KiB headers/1 MiB bodies), sequential outbound
+frames, monotonic client sequences, concurrent out-of-order response routing,
+events, timeout/cancellation, and safe EOF/malformed-message failure. The
+client never owns a process or imports Core, Workspace, MCP, or LLDB code.
+It denies every reverse request: `runInTerminal` and `startDebugging` have
+explicit policy failures and all other reverse requests are unsupported.
 
-The future `forgemcp.dap` owns only bounded DAP framing, wire validation,
-request/response matching, events, reverse requests, cancellation, EOF, and a
-single reader/sequential writer.  `forgemcp.debugger` owns backend discovery,
-the application-scoped session state machine, Workspace/launch policy, opaque
-handle lifetime, normalized debug models, event buffering, and the builtin
-`DebuggerPlugin`.  It will receive only the declared Workspace and Process
-Runtime services and will not receive FastMCP or a raw registry.  As with
-clangd, every adapter process must be launched via Process Runtime and stderr
-must be drained without logging raw output.
+`forgemcp.debugger` owns the one-session state machine, workspace launch
+validation, opaque-handle lifetime, normalized debug models, event buffering,
+and builtin `DebuggerPlugin`. It receives only declared Workspace and Process
+Runtime services; it never receives FastMCP or a raw registry. Every adapter
+starts only through `ProcessRuntime.start_trusted_adapter` after exact
+executable approval, scrubbed environment construction, and required process
+tree ownership. The service continuously drains adapter stderr into a bounded
+discard counter; no raw DAP, stdout, stderr, argv, environment value, source
+contents, variable value, evaluation expression, or evaluation result is
+logged.
 
 The primary Phase 1 backend is a separately installed, policy-approved LLVM
 `lldb-dap` executable over stdio.  The default Windows source-debugging target
@@ -141,20 +149,47 @@ backend that must be discovered from a compatible installed C/C++ extension
 and never redistributed.  GDB DAP and CodeLLDB are deferred; WinDbg has no
 verified standalone DAP adapter in this design.
 
-Phase 1 permits one active launch session per application, workspace-contained
-build-tree executable/CWD, validated argv and environment allow-list, initial
-source breakpoints, execution control, paused threads/stack/scopes/variables,
-and watch/hover evaluation.  It deliberately denies `runInTerminal` and
-`startDebugging`, attach, arbitrary debugger commands/adapter args, source or
-symbol download, external source file access, memory mutation, variable
-mutation, restart, and remote/dump modes.  Stack/variable/memory/output data
-are sensitive and never log-safe.  Native DAP IDs are always translated to
-bounded opaque application/session/stop-generation handles; frame, scope, and
-variable handles are invalid as soon as execution may resume.
+Phase 1 implements `UNAVAILABLE → STOPPED → STARTING → INITIALIZED →
+CONFIGURING → RUNNING/PAUSED → TERMINATING → TERMINATED`, with `FAILED` as a
+safe terminal failure path. `initialized` is awaited before initial source
+breakpoints and `configurationDone`; the launch response is awaited afterwards,
+which avoids LLDB-DAP's configuration-sequence deadlock. `stopped`,
+`continued`, `exited`, `terminated`, `output`, and breakpoint events enter a
+256-record/512-KiB normalized cursor ring. `debugger__events` returns only
+bounded normalized events, `next_cursor`, eviction count, and truncation.
+Final close clears the ring and all handles.
 
-Before a launch backend can ship, it must use the now-available trusted-adapter
-runtime path and a runnable adapter qualification. A terminal broker still
-needs its own security decision; it is not part of DAP Phase 1.
+Only workspace-relative existing program, CWD, and source breakpoint paths are
+accepted. `WorkspaceService.validate_execution_path` is a validation-only
+capability that safely includes ignored generated build trees while refusing
+links/reparse traversal; executable replacement after validation is the
+documented residual race. A launch has at most 64 separate NUL-free arguments,
+always uses LLDB `console="internalConsole"`, and currently accepts only an
+empty debuggee environment map because no environment allow-list is configured.
+Source breakpoint sets are full replacements and accept only zero-based
+line/column positions. Adapter-reported external sources are returned only as
+omitted metadata; their contents are never read.
+
+Native DAP IDs never leave the service. Random bounded-TTL opaque handles are
+typed (`thread`, `frame`, `scope`, `variables`, `breakpoint`), bound to the
+application session and, for paused data, stop generation. Continue/step,
+pause/continued events, stop, crash, or session exit invalidate stopped-data
+handles and cancel pending paused reads. Read-only inspection runs only while
+paused and confirms its captured stop generation before returning. Evaluate
+uses `context="hover"` and a conservative variable/member/index grammar;
+backticks, semicolons, assignments, calls, REPL/watch contexts, and LLDB
+command escape are unavailable. Attach, PDB claims, terminal brokering,
+memory/disassembly/mutation, restart, conditional/function/data breakpoints,
+source/symbol download, and arbitrary adapter/LLDB commands remain unsupported.
+
+The builtin tool surface is `debugger__status`, `debugger__list_adapters`,
+`debugger__launch`, `debugger__stop`, `debugger__set_breakpoints`,
+`debugger__continue`, `debugger__pause`, `debugger__step_over`,
+`debugger__step_in`, `debugger__step_out`, `debugger__threads`,
+`debugger__stack_trace`, `debugger__scopes`, `debugger__variables`,
+`debugger__evaluate`, and `debugger__events`. All source coordinates exposed
+by ForgeMCP are zero-based; DAP's one-based coordinates are translated only at
+the LLDB/backend boundary.
 
 ## CMake feature module
 

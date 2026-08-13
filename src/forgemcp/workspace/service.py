@@ -43,6 +43,17 @@ _PATCH_METADATA_PREFIXES = ("diff --git ", "index ", "new file mode ", "deleted 
 ExpectedSnapshot: TypeAlias = FileSnapshot | str | None
 
 
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """Return whether a path is a symlink or Windows reparse point without traversal."""
+    if path.is_symlink():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, FileNotFoundError, OSError):
+        return False
+    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceTextEdit:
     """One replacement in public zero-based Unicode code-point coordinates.
@@ -136,6 +147,21 @@ class GeneratedWorkspaceDirectory:
     def get_snapshot(self, path: str) -> FileSnapshot:
         """Return metadata for one generated file without exposing its contents."""
         return self._service._get_generated_snapshot(self.relative_path, path)
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedExecutionPath:
+    """A checked execution location without exposing a public ``pathlib.Path``.
+
+    The capability has no read or write operations.  It deliberately permits
+    generated build directories that ordinary workspace listing ignores.
+    Replacement between validation and adapter launch remains a documented
+    residual OS race.
+    """
+
+    relative_path: str
+    native_path: str
+    kind: str
 
 
 class WorkspaceService:
@@ -274,6 +300,36 @@ class WorkspaceService:
             raise WorkspacePathError("The reported path is outside the configured workspace.") from error
         self._assert_no_symlink_components(self._root / relative)
         return relative.as_posix() or "."
+
+    def validate_execution_path(self, path: str, *, kind: str) -> ValidatedExecutionPath:
+        """Validate an existing workspace file or directory for debugger launch.
+
+        This bypasses only the normal listing ignore policy, so a generated
+        build tree can be launched while all lexical, containment, symlink, and
+        Windows reparse-point restrictions remain in force.
+        """
+        if kind not in {"file", "directory"}:
+            raise WorkspacePathError("Execution paths must request file or directory validation.")
+        candidate = self._resolve_path(path, apply_ignore_policy=False)
+        self._assert_no_symlink_components(candidate)
+        if not candidate.exists():
+            raise WorkspaceFileNotFoundError("The requested execution path does not exist.")
+        if _is_link_or_reparse_point(candidate):
+            raise SymlinkWorkspacePathError("Execution paths must not be links or reparse points.")
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self._root)
+        except (FileNotFoundError, OSError, ValueError) as error:
+            raise WorkspacePathError("The requested execution path is not safely inside the workspace.") from error
+        if kind == "file" and not resolved.is_file():
+            raise WorkspaceNotFileError("The requested execution path is not a regular file.")
+        if kind == "directory" and not resolved.is_dir():
+            raise WorkspaceNotDirectoryError("The requested execution path is not a directory.")
+        return ValidatedExecutionPath(
+            relative_path=self._relative_key(resolved) or ".",
+            native_path=str(resolved),
+            kind=kind,
+        )
 
     def apply_unified_patch(
         self,
@@ -447,7 +503,7 @@ class WorkspaceService:
         candidate = self._root
         for index, part in enumerate(parts):
             candidate = candidate / part
-            if candidate.is_symlink():
+            if _is_link_or_reparse_point(candidate):
                 raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
             if apply_ignore_policy and index < len(parts) - 1 and self._policy.ignores_directory(part):
                 raise IgnoredWorkspacePathError("The requested path is excluded by workspace policy.")
@@ -466,14 +522,14 @@ class WorkspaceService:
         candidate = self._root
         for part in relative.parts:
             candidate = candidate / part
-            if candidate.is_symlink():
+            if _is_link_or_reparse_point(candidate):
                 raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
             if not candidate.exists():
                 try:
                     candidate.mkdir()
                 except FileExistsError:
                     # A concurrent creator may have installed a symlink or a file.
-                    if candidate.is_symlink():
+                    if _is_link_or_reparse_point(candidate):
                         raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
                     if not candidate.is_dir():
                         raise WorkspaceNotDirectoryError(
@@ -507,7 +563,7 @@ class WorkspaceService:
         candidate = root
         for part in parts:
             candidate = candidate / part
-            if candidate.is_symlink():
+            if _is_link_or_reparse_point(candidate):
                 raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
         return candidate
 
@@ -577,7 +633,7 @@ class WorkspaceService:
         parts = candidate.parts[1:] if candidate.anchor else candidate.parts
         for part in parts:
             current = current / part
-            if current.is_symlink():
+            if _is_link_or_reparse_point(current):
                 raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
 
     def _relative_key(self, target: Path) -> str:

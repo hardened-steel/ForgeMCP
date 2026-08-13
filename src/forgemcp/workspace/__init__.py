@@ -17,11 +17,18 @@ from forgemcp.workspace.errors import (
     WorkspaceTextEditError,
 )
 from forgemcp.workspace.policy import WorkspacePolicy
-from forgemcp.workspace.service import ExpectedSnapshot, GeneratedWorkspaceDirectory, WorkspaceService, WorkspaceTextEdit
+from forgemcp.workspace.service import (
+    ExpectedSnapshot,
+    GeneratedWorkspaceDirectory,
+    ValidatedExecutionPath,
+    WorkspaceService,
+    WorkspaceTextEdit,
+)
 
 __all__ = [
     "ExpectedSnapshot",
     "GeneratedWorkspaceDirectory",
+    "ValidatedExecutionPath",
     "ExpectedSnapshotError",
     "IgnoredWorkspacePathError",
     "InvalidUnifiedPatchError",

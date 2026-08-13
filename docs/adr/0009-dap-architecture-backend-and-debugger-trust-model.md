@@ -567,22 +567,29 @@ Windows Job assignment, stdin mediation, output limits, terminal lifecycle,
 and the fact that a terminal may create a process outside the adapter tree.
 It is not a small addition to `DapClient`.
 
-The remaining Phase 1 admission gate is therefore:
+The Phase 1 admission and implementation gates are now recorded as passed:
 
-- fake-stream `DapClient` tests for fragmented framing, out-of-order
+- fake-stream `DapClient` tests cover fragmented framing, out-of-order
   responses, reverse-request denial, timeout/cancellation, malformed JSON,
   EOF, sequential writing, and all pending-future cleanup;
-- a fake DAP adapter launched only through Process Runtime for state,
+- a fake DAP adapter launched only through Process Runtime covers state,
   event/race, handle-expiration, output/stderr, and close behaviour;
-- a real independently installed `lldb-dap` stdio gate that launches a
+- a real independently installed `lldb-dap` stdio gate launches a
   workspace-contained minimal native binary, sets a source breakpoint, stops,
   lists threads/stack/scopes/variables, evaluates a watch expression, steps,
   and proves shutdown removes the adapter/debuggee tree; and
-- per supported Windows toolchain a real PE/debug-information gate.  The
-  baseline is a compatible MinGW/LLVM DWARF executable.  MSVC/PDB is an
-  additional compatibility claim only after an explicit passing gate; if it
-  requires `OpenDebugAD7`, it is tested under that optional backend and its
-  extension/license constraints.
+- the current host gate uses standalone LLVM 22.1.8 to compile a local
+  `-O0 -g -gdwarf-4` PE/COFF executable, confirms `.debug_info` with
+  `llvm-readobj`, and passes initialize, launch, source breakpoint, stopped,
+  threads, stack/scopes/variables, safe hover evaluate, step, continue,
+  disconnect, and process cleanup; and
+- a real MCP stdio vertical slice passes tool listing, backend listing, launch,
+  inspection, continue, event cursor reading, stop, and transport shutdown.
+
+This passes exactly the installed LLVM/DWARF host combination. MSVC/PDB is an
+additional compatibility claim only after an explicit passing gate; if it
+requires `OpenDebugAD7`, it is tested under that optional backend and its
+extension/license constraints.
 
 ## Consequences
 
@@ -597,11 +604,28 @@ The cost is intentional.  Interactive stdin, external/integrated terminals,
 attach, remote debugging, dump/core debugging, symbol/source download,
 arbitrary backend configuration, terminal nesting, REPL commands, source
 mapping, and process mutation are unavailable until separately designed.
-The standalone LLVM 22.1.8 adapter now passes the process and minimal-stdio
-admission prerequisite on this host. Phase 1 implementation may begin with
-that exact approved installation, but release-quality Windows DWARF support
-still requires the real debuggee gate above. The Visual Studio-bundled copies
-remain unavailable and are not a fallback backend.
+The standalone LLVM 22.1.8 adapter now passes the strict process, production
+DAP, PE/COFF + DWARF debuggee, and MCP vertical-slice gates on this host. The
+Visual Studio-bundled copies remain unavailable and are not a fallback backend.
+
+The implemented state machine is `UNAVAILABLE`, `STOPPED`, `STARTING`,
+`INITIALIZED`, `CONFIGURING`, `RUNNING`, `PAUSED`, `TERMINATING`,
+`TERMINATED`, and `FAILED`. The service waits for `initialized`, installs
+initial source breakpoints, sends `configurationDone`, then awaits the launch
+response so LLDB-DAP's configuration sequencing cannot deadlock. It sends
+`disconnect(terminateDebuggee=true)` before closing the DAP transport and uses
+the ProcessHandle fallback cleanup path.
+
+Program, CWD, and breakpoint paths are workspace-relative; generated build
+trees use the narrow validation-only execution-path capability. Debuggee
+environment overrides are unavailable until an explicit key allow-list exists.
+External sources are metadata-only/omitted and are never read. Native DAP IDs
+are replaced by random typed TTL handles bound to application/session and,
+for stopped data, stop generation; continued/step/stop/crash invalidates them.
+Events use an in-session monotonic cursor and a bounded 256-event/512-KiB ring.
+Safe evaluate is hover-context conservative variable/member/index lookup only;
+LLDB command escape, calls, assignment, semicolons, and REPL contexts remain
+denied.
 
 Open questions retained for the implementation review are the exact supported
 LLVM/LLDB version floor; the build-tree allow-list representation; which
