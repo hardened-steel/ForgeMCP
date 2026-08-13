@@ -37,6 +37,16 @@ class LldbDapCandidate:
     source: str
     companion_directories: tuple[Path, ...] = ()
 
+    @property
+    def canonical_path(self) -> Path:
+        """Return a display/diagnostic canonical path without approving links.
+
+        ``path`` deliberately preserves the lexical configured path because
+        exact approval must be able to reject a configured symlink or reparse
+        point rather than resolving through it first.
+        """
+        return self.path.resolve(strict=False)
+
 
 @dataclass(frozen=True, slots=True)
 class AdapterQualification:
@@ -53,6 +63,9 @@ class AdapterQualification:
     confirmed_debug_information_formats: tuple[str, ...]
     unverified_capabilities: tuple[str, ...]
     unavailable_reason: str | None = None
+    version_probe_exit_code: int | None = None
+    help_probe_exit_code: int | None = None
+    controlled_start_exit_code: int | None = None
 
 
 class LldbDapQualifier:
@@ -106,7 +119,10 @@ class LldbDapQualifier:
 
     async def discover_and_qualify(self) -> tuple[AdapterQualification, ...]:
         """Discover then run each local candidate through the strict adapter policy."""
-        return tuple(await self.qualify(candidate) for candidate in self.discover())
+        qualifications: list[AdapterQualification] = []
+        for candidate in self.discover():
+            qualifications.append(await self.qualify(candidate))
+        return tuple(qualifications)
 
     async def qualify(self, candidate: LldbDapCandidate) -> AdapterQualification:
         """Qualify a candidate using only the Process Runtime adapter launch path."""
@@ -122,19 +138,26 @@ class LldbDapQualifier:
             return self._unavailable(candidate, path, "not an approved existing regular executable")
 
         runtime = self._runtime_factory(policy)
+        version: str | None = None
+        version_probe_exit_code: int | None = None
+        help_probe_exit_code: int | None = None
+        controlled_start_exit_code: int | None = None
         try:
             version_result = await runtime.run_trusted_adapter(
                 [str(configured_path), "--version"],
                 approved_path_directories=candidate.companion_directories,
                 timeout_seconds=5.0,
             )
+            version_probe_exit_code = version_result.exit_code
             version = self._version_from_result(version_result.stdout.text, version_result.stderr.text)
+            help_result = None
             if version_result.timed_out or version_result.exit_code != 0 or version is None:
                 help_result = await runtime.run_trusted_adapter(
                     [str(configured_path), "--help"],
                     approved_path_directories=candidate.companion_directories,
                     timeout_seconds=5.0,
                 )
+                help_probe_exit_code = help_result.exit_code
                 help_version = self._version_from_result(help_result.stdout.text, help_result.stderr.text)
                 if help_result.timed_out or help_result.exit_code != 0 or help_version is None:
                     reason = self._probe_failure_reason(version_result.exit_code, help_result.exit_code)
@@ -146,6 +169,9 @@ class LldbDapQualifier:
                         candidate,
                         path,
                         reason,
+                        version=version,
+                        version_probe_exit_code=version_probe_exit_code,
+                        help_probe_exit_code=help_probe_exit_code,
                     )
                 version = help_version
 
@@ -157,12 +183,35 @@ class LldbDapQualifier:
                 # real adapter process reaches a controlled running state and
                 # is reaped through the same strict path Phase 1 will use.
                 await asyncio.sleep(0.05)
-                if handle.returncode not in {None, 0}:
-                    return self._unavailable(candidate, path, "adapter exited during controlled start")
+                controlled_start_exit_code = handle.returncode
+                if controlled_start_exit_code is not None:
+                    return self._unavailable(
+                        candidate,
+                        path,
+                        "adapter exited during controlled start",
+                        version=version,
+                        version_probe_exit_code=version_probe_exit_code,
+                        help_probe_exit_code=help_probe_exit_code,
+                        controlled_start_exit_code=controlled_start_exit_code,
+                    )
                 if not handle.required_ownership or not handle.ownership_established:
-                    return self._unavailable(candidate, path, "required process-tree ownership was not established")
+                    return self._unavailable(
+                        candidate,
+                        path,
+                        "required process-tree ownership was not established",
+                        version=version,
+                        version_probe_exit_code=version_probe_exit_code,
+                        help_probe_exit_code=help_probe_exit_code,
+                    )
                 if handle.environment_mode is not ProcessEnvironmentMode.SCRUBBED:
-                    return self._unavailable(candidate, path, "adapter environment isolation was not established")
+                    return self._unavailable(
+                        candidate,
+                        path,
+                        "adapter environment isolation was not established",
+                        version=version,
+                        version_probe_exit_code=version_probe_exit_code,
+                        help_probe_exit_code=help_probe_exit_code,
+                    )
             finally:
                 await handle.aclose()
 
@@ -183,9 +232,20 @@ class LldbDapQualifier:
                     "DWARF debug-information support",
                     "all debugger capabilities",
                 ),
+                version_probe_exit_code=version_probe_exit_code,
+                help_probe_exit_code=help_probe_exit_code,
+                controlled_start_exit_code=controlled_start_exit_code,
             )
         except ProcessError:
-            return self._unavailable(candidate, path, "could not start through the strict adapter policy")
+            return self._unavailable(
+                candidate,
+                path,
+                "could not start through the strict adapter policy",
+                version=version,
+                version_probe_exit_code=version_probe_exit_code,
+                help_probe_exit_code=help_probe_exit_code,
+                controlled_start_exit_code=controlled_start_exit_code,
+            )
         finally:
             await runtime.aclose()
 
@@ -208,11 +268,18 @@ class LldbDapQualifier:
 
     @staticmethod
     def _unavailable(
-        candidate: LldbDapCandidate, path: Path, reason: str
+        candidate: LldbDapCandidate,
+        path: Path,
+        reason: str,
+        *,
+        version: str | None = None,
+        version_probe_exit_code: int | None = None,
+        help_probe_exit_code: int | None = None,
+        controlled_start_exit_code: int | None = None,
     ) -> AdapterQualification:
         return AdapterQualification(
             adapter_id="lldb-dap",
-            version=None,
+            version=version,
             executable_path=path if path.exists() else None,
             source=candidate.source,
             available=False,
@@ -222,6 +289,9 @@ class LldbDapQualifier:
             confirmed_debug_information_formats=(),
             unverified_capabilities=("all debugger capabilities",),
             unavailable_reason=reason,
+            version_probe_exit_code=version_probe_exit_code,
+            help_probe_exit_code=help_probe_exit_code,
+            controlled_start_exit_code=controlled_start_exit_code,
         )
 
     def _standalone_llvm_paths(self) -> tuple[Path, ...]:
@@ -279,12 +349,34 @@ class LldbDapQualifier:
         return self._executables_in(directories)
 
     def _companion_directories(self, path: Path) -> tuple[Path, ...]:
-        directories = [path.parent]
-        parent = path.parent
-        for _ in range(3):
-            parent = parent.parent
-            directories.append(parent / "bin")
-        return self._existing_directories(directories)
+        """Find only local loader directories that contain a static dependency.
+
+        LLVM layouts commonly keep an adapter in ``bin`` and a dependency in a
+        sibling ``lib`` directory.  The executable directory is always needed;
+        every other selected directory must contain a bounded, read-only PE
+        import.  This avoids inheriting a broad toolchain or Developer Shell
+        PATH while still allowing an installed companion DLL directory.
+        """
+        adapter_directory = path.parent
+        architecture_root = adapter_directory.parent
+        toolchain_root = architecture_root.parent
+        candidate_directories = (
+            adapter_directory,
+            architecture_root / "bin",
+            architecture_root / "lib",
+            toolchain_root / "bin",
+            toolchain_root / "lib",
+        )
+        imports = set(_pe_imports(path)) if os.name == "nt" else set()
+        existing = self._existing_directories(candidate_directories)
+        if not imports:
+            return tuple(directory for directory in existing if directory == adapter_directory.resolve(strict=False))
+        return tuple(
+            directory
+            for directory in existing
+            if directory == adapter_directory.resolve(strict=False)
+            or any((directory / imported).is_file() for imported in imports)
+        )
 
     def _program_files_roots(self) -> tuple[Path, ...]:
         values = [

@@ -26,14 +26,22 @@ broker, an arbitrary debugger-command executor, or a symbol-download client.
 
 The investigation uses read-only filesystem discovery and fixed `--help`/`--version`
 probes only; it never copies an adapter into this repository. Phase 0 also performs
-a controlled adapter-process start/close through Process Runtime, but it does not
-create a DAP client, send `initialize`, or launch a debuggee.
+a controlled adapter-process start/close through Process Runtime. An opt-in,
+test-local gate sends fixed `initialize` and `disconnect` messages only; it is not a
+DAP client, exposes no production transport, and never launches a debuggee.
 The DAP protocol itself specifies stdin/stdout single-session and optional
 TCP multi-session modes, but ForgeMCP uses only the former for the MVP
 ([DAP overview](https://microsoft.github.io/debug-adapter-protocol/overview)).
 
-On the development host, no candidate is on `PATH`.  The following files were
-found:
+On the development host, no candidate is on `PATH`. The following files were
+found and checked read-only:
+
+- Standalone LLVM `C:\Program Files\LLVM\bin\lldb-dap.exe` returns
+  `lldb-dap version 22.1.8` with exit code 0 in its scrubbed environment. It
+  passes required Job Object ownership, controlled start/close, and the
+  opt-in test-only stdio `initialize`/`disconnect` probe. It is the accepted
+  Phase-1 adapter prerequisite for this host; it is not an MSVC/PDB or
+  PE/COFF+DWARF debuggee compatibility claim.
 
 - `lldb-dap.exe` in both Visual Studio 2022 and Visual Studio 18 Community
   LLVM x64/ARM64 toolchain directories.  The x64 executable currently exits
@@ -61,9 +69,8 @@ then started and closed. `AdapterQualification` records only parsed/safe
 metadata and distinguishes runnable process facts from unverified DAP and
 debug-format capabilities.
 
-On this host the final strict probe found no runnable adapter. No PATH or
-standalone LLVM candidate exists. The four Visual Studio LLVM files below are
-discovered but rejected:
+On this host the final strict probe accepts the standalone LLVM adapter above.
+The four Visual Studio LLVM files below are discovered but rejected:
 
 - Visual Studio 2022 Community: `x64\bin\lldb-dap.exe` exits with loader
   status `0xC0000135`; its bounded read-only PE-import diagnostic identifies
@@ -76,8 +83,9 @@ The inspected Visual Studio LLVM toolchain directories contain no `liblldb.dll`.
 The qualifier did construct the smallest permitted PATH from the adapter and
 installed companion directories; it did not copy DLLs, alter Visual Studio, or
 inherit a Developer Shell. Therefore these files are unavailable, not a usable
-fallback backend. No PE/COFF, DWARF, MSVC/PDB, DAP-initialize, launch, or
-debuggee capability is claimed from a version/help or process-start probe.
+fallback backend. The accepted standalone adapter has a test-only
+`initialize`/`disconnect` result; no PE/COFF, DWARF, MSVC/PDB, launch, or
+debuggee capability is claimed until its respective real-adapter gate passes.
 
 The matrix distinguishes an adapter's upstream capability from a ForgeMCP
 promise.  `yes*` means capability discovery plus a real adapter integration
@@ -589,10 +597,11 @@ The cost is intentional.  Interactive stdin, external/integrated terminals,
 attach, remote debugging, dump/core debugging, symbol/source download,
 arbitrary backend configuration, terminal nesting, REPL commands, source
 mapping, and process mutation are unavailable until separately designed.
-Current Visual Studio-bundled `lldb-dap` discovery does not pass the real
-adapter prerequisite, so Phase 1 implementation must begin only after a
-compatible runnable standalone LLVM distribution or an approved repaired
-toolchain is supplied.
+The standalone LLVM 22.1.8 adapter now passes the process and minimal-stdio
+admission prerequisite on this host. Phase 1 implementation may begin with
+that exact approved installation, but release-quality Windows DWARF support
+still requires the real debuggee gate above. The Visual Studio-bundled copies
+remain unavailable and are not a fallback backend.
 
 Open questions retained for the implementation review are the exact supported
 LLVM/LLDB version floor; the build-tree allow-list representation; which

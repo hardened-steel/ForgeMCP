@@ -27,12 +27,17 @@ irreversible choices belong in [adr/](adr/).
 - Security and integration audit for clangd phases 1–2: real stdio/MCP and
   clangd gates, bounded WorkspaceEdit input, serialized mutation commits,
   lifecycle cancellation, opaque-handle eviction, and regression coverage.
+- DAP Phase 0: strict trusted-adapter process ownership, exact executable
+  approval, scrubbed adapter environment, and local `lldb-dap` qualification.
+  Standalone LLVM `lldb-dap` 22.1.8 passes version/start/close and an opt-in
+  test-only `initialize`/`disconnect` stdio gate on this Windows host.
 
 ### In progress
 
 - DAP architecture is decided in ADR 0009. Phase-0 Process Runtime hardening
-  and read-only `lldb-dap` qualification are complete; implementation remains
-  deliberately blocked on a runnable, policy-approved standalone `lldb-dap`.
+  and adapter admission are complete. Phase 1 may begin with the exact
+  standalone LLVM 22.1.8 installation qualified on this host; it has no
+  production DAP client, debugger plugin, or MCP tool yet.
 
 ## Delivery sequence and dependencies
 
@@ -118,13 +123,20 @@ Phase 1 scope, once admitted:
   `debugger__step_out`, `debugger__threads`, `debugger__stack_trace`,
   `debugger__scopes`, `debugger__variables`, and `debugger__evaluate`.
 
-The gate to start implementation is:
+The Phase-0 gate to start implementation has passed:
 
-- obtain a compatible runnable standalone `lldb-dap`. The Phase-0 strict gate
-  found no PATH/standalone candidate. Visual Studio 2022 and 18 x64 copies
-  fail with loader status `0xC0000135` because `liblldb.dll` is absent from the
-  inspected approved companion directories; ARM64 copies cannot run on this
-  x64 host. No DLLs were copied or modified;
+- standalone LLVM `C:\Program Files\LLVM\bin\lldb-dap.exe` version 22.1.8
+  passed fixed `--version` (exit code 0), required Windows Job ownership,
+  scrubbed-environment controlled start/close, and a test-only
+  `initialize`/`disconnect` stdio probe. The qualifier confirms no object or
+  debug-information format yet;
+- Visual Studio 2022 and 18 x64 copies fail with loader status `0xC0000135`
+  because `liblldb.dll` is absent from the inspected approved companion
+  directories; their ARM64 copies cannot start on this x64 host. No DLLs were
+  copied or modified;
+
+The remaining Phase-1 delivery gates are:
+
 - add fake-stream/fake-adapter tests for DAP framing, sequencing, events,
   reverse-request denial, cancellation, EOF, malformed input, state races,
   output bounds, and stale handles; and
@@ -154,8 +166,9 @@ resolve; each needs a bounded contract and safety review.
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
 - There are no Workspace MCP editing tools, DAP tools, quality tools, Git
-  integration, or aggregate `project_status` tool yet. DAP Phase 1 still lacks
-  a runnable approved adapter; its Process Runtime admission changes are done.
+  integration, or aggregate `project_status` tool yet. DAP Phase 1 has a
+  qualified adapter prerequisite, but its DAP client, debugger plugin, and
+  real PE/COFF+DWARF debuggee compatibility gate remain unimplemented.
 - CMake and CTest are discovered through the Process Runtime environment; an
   installation outside `PATH` must be deliberately made available by the host
   policy/environment.

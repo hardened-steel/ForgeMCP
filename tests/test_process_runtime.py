@@ -197,6 +197,46 @@ def test_streaming_handle_supports_stdin_stdout_and_shutdown_without_leaking_pro
     asyncio.run(exercise())
 
 
+def test_completed_handle_cleanup_is_idempotent_and_does_not_resignal_its_old_group(tmp_path):
+    async def exercise() -> None:
+        service = runtime(tmp_path)
+        handle = await service.start([sys.executable, "-c", "pass"])
+
+        assert await handle.wait(timeout_seconds=1.0) == 0
+        await handle.terminate()
+        await handle.kill()
+        await handle.aclose()
+
+        assert service._handles == set()
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows closes the Job Object when its adapter exits")
+def test_wait_reaps_a_posix_adapter_grandchild_after_its_parent_exits(tmp_path):
+    async def exercise() -> None:
+        service = runtime(tmp_path)
+        marker = tmp_path / "grandchild-after-parent-exit.txt"
+        child_code = (
+            "import pathlib, time; "
+            f"time.sleep(0.5); pathlib.Path({str(marker)!r}).write_text('escaped', encoding='utf-8')"
+        )
+        parent_code = (
+            "import subprocess, sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])"
+        )
+        handle = await service.start([sys.executable, "-c", parent_code])
+
+        assert await handle.wait(timeout_seconds=1.0) == 0
+        await asyncio.sleep(0.7)
+        assert not marker.exists()
+        assert service._handles == set()
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_runtime_shutdown_terminates_a_non_detached_child_process(tmp_path):
     async def exercise() -> None:
         service = runtime(tmp_path)

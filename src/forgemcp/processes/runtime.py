@@ -278,6 +278,11 @@ class ProcessHandle:
             exit_code = await self._process.wait()
         else:
             exit_code = await asyncio.wait_for(self._process.wait(), timeout=timeout)
+        # A session leader can exit before one of its descendants.  Windows
+        # closes the Job Object below; POSIX must explicitly remove the still
+        # live session/process group before this handle is forgotten.
+        if os.name != "nt" and self._runtime._posix_group_exists(self._process.pid):
+            await self._runtime._force_kill_process_tree(self._process, self._job)
         self._runtime._forget(self)
         return exit_code
 
@@ -298,7 +303,9 @@ class ProcessHandle:
             return
         self._closed = True
         self._close_stdin()
-        if self._process.returncode is None:
+        if self._process.returncode is None or (
+            os.name != "nt" and self._runtime._posix_group_exists(self._process.pid)
+        ):
             await self._runtime._terminate_process_tree(self._process, self._job)
         self._runtime._forget(self)
 
@@ -308,7 +315,8 @@ class ProcessHandle:
             return
         self._closed = True
         self._close_stdin()
-        self._runtime._signal_process_group_nowait(self._process, force=False)
+        if os.name == "nt" or self._runtime._posix_group_exists(self._process.pid):
+            self._runtime._signal_process_group_nowait(self._process, force=False)
         self._runtime._forget(self)
 
     async def _wait_for_direct_process(self) -> None:
@@ -417,6 +425,8 @@ class ProcessRuntime:
             await self._finish_captures(
                 capture_tasks, (stdout_capture, stderr_capture), handle._process, handle._job
             )
+            if os.name != "nt" and self._posix_group_exists(handle.pid):
+                await self._force_kill_process_tree(handle._process, handle._job)
         except asyncio.CancelledError:
             await asyncio.shield(self._terminate_process_tree(handle._process, handle._job))
             await asyncio.shield(
@@ -890,6 +900,8 @@ class ProcessRuntime:
         process: asyncio.subprocess.Process,
         job: _WindowsProcessJob | None,
     ) -> None:
+        if os.name != "nt" and not self._posix_group_exists(process.pid):
+            return
         self._signal_process_group_nowait(process, force=False)
         if os.name != "nt":
             # The direct adapter may exit after TERM while a descendant keeps
@@ -934,7 +946,7 @@ class ProcessRuntime:
                 job.close()
             else:
                 await self._taskkill_tree(process.pid)
-        else:
+        elif self._posix_group_exists(process.pid):
             self._signal_process_group_nowait(process, force=True)
         if process.returncode is None:
             try:
@@ -1011,13 +1023,20 @@ class ProcessRuntime:
             return
 
     @staticmethod
+    def _posix_group_exists(pid: int) -> bool:
+        """Return whether the session-created POSIX group still exists."""
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @staticmethod
     async def _wait_for_posix_group(pid: int, timeout: float) -> bool:
         """Wait briefly for every process in one session-created group to exit."""
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
-            try:
-                os.killpg(pid, 0)
-            except ProcessLookupError:
+            if not ProcessRuntime._posix_group_exists(pid):
                 return True
             if asyncio.get_running_loop().time() >= deadline:
                 return False

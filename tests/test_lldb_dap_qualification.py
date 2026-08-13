@@ -87,6 +87,7 @@ def test_discovery_orders_explicit_configuration_before_path(tmp_path: Path):
         (explicit.absolute(), "FORGEMCP_LLDB_DAP"),
         (path_candidate.absolute(), "PATH"),
     ]
+    assert discovered[0].canonical_path == explicit.resolve()
 
 
 def test_qualification_uses_exact_strict_runtime_and_closes_a_runnable_candidate(tmp_path: Path):
@@ -112,12 +113,70 @@ def test_qualification_uses_exact_strict_runtime_and_closes_a_runnable_candidate
         assert result.executable_path == executable.resolve()
         assert result.process_tree_ownership is True
         assert result.environment_isolated is True
+        assert result.version_probe_exit_code == 0
+        assert result.help_probe_exit_code is None
+        assert result.controlled_start_exit_code is None
         assert result.confirmed_object_formats == ()
         assert "PE/COFF object support" in result.unverified_capabilities
         assert fake_runtime.run_calls == [((str(executable), "--version"), (companion,))]
         assert fake_runtime.start_calls == [((str(executable),), (companion,))]
         assert fake_runtime.handle.closed is True
         assert fake_runtime.closed is True
+
+    asyncio.run(exercise())
+
+
+def test_discover_and_qualify_uses_the_async_qualification_path(tmp_path: Path, monkeypatch):
+    async def exercise() -> None:
+        executable = tmp_path / ("lldb-dap.exe" if os.name == "nt" else "lldb-dap")
+        executable.write_bytes(b"candidate")
+        executable.chmod(0o755)
+        fake_runtime = _FakeRuntime([_result(stdout="lldb-dap version 19.1.0\n")])
+        qualifier = LldbDapQualifier(
+            ForgeConfig(workspace_root=tmp_path, lldb_dap_path=executable),
+            create_logger("CRITICAL"),
+            environment={"PATH": ""},
+            runtime_factory=lambda policy: fake_runtime,  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr(
+            qualifier,
+            "discover",
+            lambda: (LldbDapCandidate(executable, "test"),),
+        )
+
+        results = await qualifier.discover_and_qualify()
+
+        assert len(results) == 1
+        assert results[0].available is True
+        assert fake_runtime.closed is True
+
+    asyncio.run(exercise())
+
+
+def test_qualification_rejects_an_adapter_that_exits_zero_during_controlled_start(tmp_path: Path):
+    class _ExitedHandle(_FakeHandle):
+        returncode = 0
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def exercise() -> None:
+        executable = tmp_path / ("lldb-dap.exe" if os.name == "nt" else "lldb-dap")
+        executable.write_bytes(b"candidate")
+        executable.chmod(0o755)
+        fake_runtime = _FakeRuntime([_result(stdout="lldb-dap version 19.1.0\n")])
+        fake_runtime.handle = _ExitedHandle()
+        qualifier = LldbDapQualifier(
+            ForgeConfig(workspace_root=tmp_path),
+            create_logger("CRITICAL"),
+            runtime_factory=lambda policy: fake_runtime,  # type: ignore[arg-type]
+        )
+
+        result = await qualifier.qualify(LldbDapCandidate(executable, "test"))
+
+        assert result.available is False
+        assert result.unavailable_reason == "adapter exited during controlled start"
+        assert result.controlled_start_exit_code == 0
 
     asyncio.run(exercise())
 
@@ -139,6 +198,8 @@ def test_qualification_rejects_a_broken_candidate_after_version_and_help_probes(
         assert result.available is False
         assert result.version is None
         assert result.unavailable_reason == "adapter did not return a recognized successful version banner"
+        assert result.version_probe_exit_code == 1
+        assert result.help_probe_exit_code == 1
         assert [call[0][1] for call in fake_runtime.run_calls] == ["--version", "--help"]
         assert fake_runtime.start_calls == []
         assert fake_runtime.closed is True
