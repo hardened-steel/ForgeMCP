@@ -25,6 +25,7 @@ class ToolContribution:
     description: str
     handler: ToolHandler = field(repr=False, compare=False)
     input_model: type[BaseModel] | None = field(default=None, repr=False, compare=False)
+    namespace: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not _TOOL_IDENTIFIER.fullmatch(self.name):
@@ -37,6 +38,10 @@ class ToolContribution:
             not isinstance(self.input_model, type) or not issubclass(self.input_model, BaseModel)
         ):
             raise TypeError("Tool contribution input_model must be a Pydantic model class when supplied.")
+        if self.namespace is not None and (
+            not isinstance(self.namespace, str) or not _PLUGIN_IDENTIFIER.fullmatch(self.namespace)
+        ):
+            raise ToolNamespaceError("Tool contribution namespaces must be lower-case plugin-style identifiers.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +52,14 @@ class RegisteredToolContribution:
     contribution: ToolContribution
 
     @property
+    def namespace(self) -> str:
+        """Return the fixed public tool namespace selected by the contribution."""
+        return self.contribution.namespace or self.plugin_id
+
+    @property
     def name(self) -> str:
         """Return the MCP-safe stable qualified name, e.g. ``cmake__configure``."""
-        return f"{self.plugin_id}__{self.contribution.name}"
+        return f"{self.namespace}__{self.contribution.name}"
 
     @property
     def description(self) -> str:
@@ -99,12 +109,17 @@ class ToolRegistry:
 class PluginToolRegistry:
     """Plugin-scoped write facade that cannot claim another plugin's namespace."""
 
-    __slots__ = ("_plugin_id", "_registry")
+    __slots__ = ("_plugin_id", "_registry", "_allowed_namespaces")
 
-    def __init__(self, plugin_id: str, registry: ToolRegistry) -> None:
+    def __init__(
+        self, plugin_id: str, registry: ToolRegistry, extra_namespaces: tuple[str, ...] = ()
+    ) -> None:
         self._plugin_id = plugin_id
         self._registry = registry
+        self._allowed_namespaces = frozenset((plugin_id, *extra_namespaces))
 
     def register(self, contribution: ToolContribution) -> RegisteredToolContribution:
-        """Register a tool under this context's plugin identifier."""
+        """Register a tool under this plugin's declared public namespace set."""
+        if contribution.namespace is not None and contribution.namespace not in self._allowed_namespaces:
+            raise ToolNamespaceError("Tool contribution namespace was not declared by its plugin metadata.")
         return self._registry.register(self._plugin_id, contribution)

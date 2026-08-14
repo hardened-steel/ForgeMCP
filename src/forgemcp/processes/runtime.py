@@ -34,6 +34,34 @@ if TYPE_CHECKING:
     from asyncio.streams import StreamReader, StreamWriter
 
 
+def _known_llvm_quality_tools() -> tuple[Path, ...]:
+    """Return fixed conventional LLVM quality-tool locations for policy approval.
+
+    This intentionally does not scan arbitrary directories.  A candidate is
+    still required to be an existing regular, non-link executable by
+    ``ProcessPolicy`` before it becomes usable.
+    """
+    roots: list[Path] = []
+    if os.name == "nt":
+        roots.extend(
+            Path(value)
+            for value in (
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramW6432"),
+                os.environ.get("ProgramFiles(x86)"),
+            )
+            if value
+        )
+        suffix = ".exe"
+    else:
+        return tuple(
+            path
+            for directory in (Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/llvm/bin"))
+            for path in (directory / "clang-format", directory / "clang-tidy")
+        )
+    return tuple(root / "LLVM" / "bin" / f"{name}{suffix}" for root in roots for name in ("clang-format", "clang-tidy"))
+
+
 class ProcessTreeOwnership(StrEnum):
     """Requested operating-system containment strength for one launch."""
 
@@ -351,7 +379,13 @@ class ProcessRuntime:
         self._logger = logger
         configured_exact_paths = frozenset(
             path
-            for path in (config.clangd_path, config.lldb_dap_path)
+            for path in (
+                config.clangd_path,
+                config.lldb_dap_path,
+                config.clang_format_path,
+                config.clang_tidy_path,
+                *_known_llvm_quality_tools(),
+            )
             if path is not None and path.is_file() and not path.is_symlink()
         )
         self._policy = (
@@ -376,6 +410,15 @@ class ProcessRuntime:
     def policy(self) -> ProcessPolicy:
         """Return the immutable policy active for this runtime."""
         return self._policy
+
+    def resolve_executable(self, executable: str) -> str:
+        """Return the policy-qualified canonical executable path without launching it.
+
+        Feature modules use this only for status metadata after selecting a
+        fixed tool name or operator-configured path; it never accepts MCP
+        input and retains the same basename/exact approval checks as ``run``.
+        """
+        return self._prepare_argv((executable,))[0]
 
     async def run(
         self,

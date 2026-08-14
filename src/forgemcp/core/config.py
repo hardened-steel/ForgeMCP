@@ -20,6 +20,8 @@ class ForgeConfig:
     external_plugin_allowlist: frozenset[str] = field(default_factory=frozenset)
     clangd_path: Path | None = None
     lldb_dap_path: Path | None = None
+    clang_format_path: Path | None = None
+    clang_tidy_path: Path | None = None
 
     def __post_init__(self) -> None:
         root = self.workspace_root.resolve()
@@ -55,11 +57,28 @@ class ForgeConfig:
             # Preserve the configured lexical path so ProcessPolicy can
             # explicitly reject a symlink/reparse-point adapter at approval.
             lldb_dap_path = lldb_dap_path.absolute()
+        clang_format_path = self._normalise_quality_tool_path(
+            self.clang_format_path, "FORGEMCP_CLANG_FORMAT"
+        )
+        clang_tidy_path = self._normalise_quality_tool_path(
+            self.clang_tidy_path, "FORGEMCP_CLANG_TIDY"
+        )
         object.__setattr__(self, "workspace_root", root)
         object.__setattr__(self, "log_level", self.log_level.upper())
         object.__setattr__(self, "external_plugin_allowlist", allowlist)
         object.__setattr__(self, "clangd_path", clangd_path)
         object.__setattr__(self, "lldb_dap_path", lldb_dap_path)
+        object.__setattr__(self, "clang_format_path", clang_format_path)
+        object.__setattr__(self, "clang_tidy_path", clang_tidy_path)
+
+    @staticmethod
+    def _normalise_quality_tool_path(path: Path | None, variable_name: str) -> Path | None:
+        """Keep an explicit quality-tool path lexical for strict runtime approval."""
+        if path is None:
+            return None
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise ConfigurationError(f"{variable_name} must be an absolute executable path.")
+        return path.absolute()
 
     @classmethod
     def from_environment(
@@ -83,6 +102,8 @@ class ForgeConfig:
         )
         raw_clangd_path = values.get("FORGEMCP_CLANGD", "").strip()
         raw_lldb_dap_path = values.get("FORGEMCP_LLDB_DAP", "").strip()
+        raw_clang_format_path = values.get("FORGEMCP_CLANG_FORMAT", "").strip()
+        raw_clang_tidy_path = values.get("FORGEMCP_CLANG_TIDY", "").strip()
         return cls(
             workspace_root=workspace,
             log_level=values.get("FORGEMCP_LOG_LEVEL", "INFO"),
@@ -90,6 +111,8 @@ class ForgeConfig:
             external_plugin_allowlist=external_plugin_allowlist,
             clangd_path=Path(raw_clangd_path) if raw_clangd_path else None,
             lldb_dap_path=Path(raw_lldb_dap_path) if raw_lldb_dap_path else None,
+            clang_format_path=Path(raw_clang_format_path) if raw_clang_format_path else None,
+            clang_tidy_path=Path(raw_clang_tidy_path) if raw_clang_tidy_path else None,
         )
 
 

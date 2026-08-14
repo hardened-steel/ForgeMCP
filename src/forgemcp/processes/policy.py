@@ -130,7 +130,7 @@ class ProcessPolicy:
     """
 
     allowed_executables: frozenset[str] = field(
-        default_factory=lambda: frozenset({"cmake", "ctest", "clangd"})
+        default_factory=lambda: frozenset({"cmake", "ctest", "clangd", "clang-format", "clang-tidy"})
     )
     allowed_executable_paths: frozenset[Path] = field(default_factory=frozenset)
     allowed_working_directories: frozenset[str] | None = None

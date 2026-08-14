@@ -26,7 +26,7 @@ Every model is immutable, rejects unknown fields, and has Pydantic field descrip
 
 `forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it registers ForgeMCP's `CMakePlugin` explicitly during composition and accepts `builtin_plugins=` for additional owned feature plugins. CMake's state belongs to that plugin instance and therefore to one application instance.
 
-Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`. The explicitly composed builtin plugins are CMake and clangd; clangd's plugin starts only its lightweight service at application startup, never a clangd process, so a missing executable does not prevent ForgeApplication from running.
+Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`. The explicitly composed builtin plugins are CMake, clangd, debugger, and Quality. clangd and Quality start only lightweight services at application startup, never a tool process, so a missing executable does not prevent ForgeApplication from running.
 
 A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
@@ -38,7 +38,7 @@ A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
 Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
 
-Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` qualifies its local name as `<plugin_id>__<tool_name>`, rejects duplicates, and retains the immutable registration. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
+Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` normally qualifies its local name as `<plugin_id>__<tool_name>` and rejects duplicates. A contribution may use another validated stable namespace only when its plugin metadata declares it; Quality uses `quality`, `clang_format`, `clang_tidy`, and `sanitizer` under one lifecycle. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
 
 The built-in CMake plugin owns the stable contributions `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local CMake service receives only the declared `workspace` and `process_runtime` services, never an application object or a transport object.
 
@@ -221,3 +221,49 @@ Running configure, build, or tests is not sandboxing: CMake project scripts, cus
 Expected operational errors inherit from `ForgeMCPError` and are converted with `to_mcp_error_response`. The response includes only a stable code and an intentional public message.
 
 Logs are JSON records written to stderr, so they do not corrupt the MCP stdio protocol. Context keys related to file contents, credentials, tokens, cookies, and secrets are redacted.
+
+## Quality feature
+
+`forgemcp.quality` is a transport-neutral builtin feature module containing
+`ClangFormatService`, `ClangTidyService`, `SanitizerReportParser`, immutable
+Quality models, and `QualityPlugin`. It receives only Workspace and Process
+Runtime through `PluginContext`; it neither imports FastMCP nor receives
+ForgeApplication. Its tools are `quality__status`, `clang_format__check`,
+`clang_format__apply`, `clang_tidy__list_checks`, `clang_tidy__run`, and
+`sanitizer__parse_report`.
+
+Quality executable selection is fixed by server configuration: an explicit
+absolute `FORGEMCP_CLANG_FORMAT` or `FORGEMCP_CLANG_TIDY` is considered first,
+followed by the normal Process Runtime basename policy and a small conventional
+installed LLVM location. Qualification uses a bounded fixed `--version` argv
+probe through Process Runtime and returns availability in status instead of
+failing startup. Executable paths, argv values, environment values, source text,
+replacement data, and raw tool output are never logged. No MCP argument can
+select an executable.
+
+Formatter checks use `clang-format --output-replacements-xml` rather than
+stdout full-file output or `-i`. The XML is parsed strictly, its byte ranges are
+converted to Workspace Unicode positions, and formatted SHA-256 is calculated
+only in memory. Apply first formats every requested file, requires a SHA-256 for
+each source snapshot, rejects a process/parse failure before calling Workspace,
+then sends one non-overlapping `apply_text_edits` batch. Detected snapshot
+conflict therefore changes no file; Workspace retains its documented
+best-effort rollback limitation for an I/O failure, crash, or external final
+replacement race.
+
+clang-tidy accepts explicit source paths and one validated generated workspace
+directory containing `compile_commands.json`. ForgeMCP supplies only fixed `-p`,
+optional bounded `--checks=<pattern>`, and source arguments. It never publishes
+fixes, plugin loading, extra compiler arguments, arbitrary config/header
+filters, or a generic runner. Phase 1 parses compiler-style diagnostic output
+strictly instead of adding a YAML dependency or applying export-fixes
+replacements. Drive-colon paths and multiline continuations are handled;
+locations outside the workspace are omitted, never read or exposed. The
+workspace project and its CMake-generated compilation database are trusted
+inputs, not a sandbox boundary: compiler arguments can affect frontend behavior.
+
+The sanitizer parser consumes bounded supplied text only. It recognizes
+AddressSanitizer, UndefinedBehaviorSanitizer, and an unknown fallback; returns
+bounded workspace-only frames with opaque addresses; and marks partial or
+truncated parsing. It performs no process launch, source/symbol download, or
+instrumented-binary execution.

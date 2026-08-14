@@ -35,6 +35,10 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `debugger__status`, `debugger__list_adapters`, `debugger__launch`, `debugger__stop`
 - `debugger__set_breakpoints`, `debugger__continue`, `debugger__pause`, `debugger__step_over`, `debugger__step_in`, `debugger__step_out`
 - `debugger__threads`, `debugger__stack_trace`, `debugger__scopes`, `debugger__variables`, `debugger__evaluate`, `debugger__events`
+- `quality__status`
+- `clang_format__check`, `clang_format__apply`
+- `clang_tidy__list_checks`, `clang_tidy__run`
+- `sanitizer__parse_report`
 
 `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
@@ -46,6 +50,19 @@ breakpoints, execution control, paused inspection, one-identifier hover lookup
 (which may still execute debugger/inferior evaluation semantics), and bounded events. Attach, MSVC/PDB compatibility claims, terminals, arbitrary
 LLDB commands, and source/symbol downloads are intentionally unsupported; see
 [ADR 0009](docs/adr/0009-dap-architecture-backend-and-debugger-trust-model.md).
+
+Quality Phase 1 is a builtin, non-persistent feature plugin. It discovers
+`clang-format` and `clang-tidy` from explicit absolute
+`FORGEMCP_CLANG_FORMAT` / `FORGEMCP_CLANG_TIDY` configuration first, then the
+policy-controlled PATH and conventional installed LLVM location. Missing tools
+do not prevent server startup. Formatting only accepts explicitly listed
+workspace C/C++ files and uses snapshot-CAS with one staged Workspace commit;
+ForgeMCP never invokes `clang-format -i`. `clang-tidy` accepts only a validated
+workspace build directory containing `compile_commands.json`, exposes no fixes,
+plugin loading, compiler-argument, config, or arbitrary-flag surface, and treats
+the workspace/CMake compilation database as trusted project input. The
+sanitizer tool parses supplied ASan/UBSan text read-only and never runs a binary.
+See [ADR 0010](docs/adr/0010-quality-tools-formatting-analysis-and-trust-boundary.md).
 
 ## Setup
 
@@ -78,6 +95,7 @@ workspaces whose project code you trust. See [ADR 0006](docs/adr/0006-cmake-file
 - `cmake/` — built-in CMake/Ctest feature plugin, CMake-owned models, and File API parsing.
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
 - `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
+- `quality/` — clang-format CAS edits, read-only clang-tidy diagnostics, and sanitizer report parsing.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — structured, redacted stderr logging.
 

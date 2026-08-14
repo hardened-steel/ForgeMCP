@@ -157,7 +157,9 @@ class PluginManager:
                     self._services, record.plugin.metadata.requires_services
                 ),
                 logger=self._logger,
-                tools=PluginToolRegistry(plugin_id, self._tools),
+                tools=PluginToolRegistry(
+                    plugin_id, self._tools, record.plugin.metadata.tool_namespaces
+                ),
             )
             try:
                 await record.plugin.start(context)

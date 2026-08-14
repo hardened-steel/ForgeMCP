@@ -15,6 +15,8 @@ def test_config_is_created_from_explicit_environment(tmp_path):
             "FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST": "cmake, clangd ",
             "FORGEMCP_CLANGD": str(tmp_path / "tools" / "clangd.exe"),
             "FORGEMCP_LLDB_DAP": str(tmp_path / "tools" / "lldb-dap.exe"),
+            "FORGEMCP_CLANG_FORMAT": str(tmp_path / "tools" / "clang-format.exe"),
+            "FORGEMCP_CLANG_TIDY": str(tmp_path / "tools" / "clang-tidy.exe"),
         },
         cwd=Path("unused"),
     )
@@ -25,6 +27,8 @@ def test_config_is_created_from_explicit_environment(tmp_path):
     assert config.external_plugin_allowlist == frozenset({"cmake", "clangd"})
     assert config.clangd_path == (tmp_path / "tools" / "clangd.exe").resolve(strict=False)
     assert config.lldb_dap_path == (tmp_path / "tools" / "lldb-dap.exe").absolute()
+    assert config.clang_format_path == (tmp_path / "tools" / "clang-format.exe").absolute()
+    assert config.clang_tidy_path == (tmp_path / "tools" / "clang-tidy.exe").absolute()
 
 
 def test_config_rejects_missing_workspace(tmp_path):
@@ -55,3 +59,9 @@ def test_config_rejects_relative_clangd_path(tmp_path):
 def test_config_rejects_relative_lldb_dap_path(tmp_path):
     with pytest.raises(ConfigurationError, match="FORGEMCP_LLDB_DAP"):
         ForgeConfig(workspace_root=tmp_path, lldb_dap_path=Path("lldb-dap"))
+
+
+@pytest.mark.parametrize("field, value", [("clang_format_path", Path("clang-format")), ("clang_tidy_path", Path("clang-tidy"))])
+def test_config_rejects_relative_quality_tool_paths(tmp_path, field, value):
+    with pytest.raises(ConfigurationError):
+        ForgeConfig(workspace_root=tmp_path, **{field: value})

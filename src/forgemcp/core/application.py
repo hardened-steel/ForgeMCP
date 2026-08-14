@@ -12,6 +12,7 @@ from forgemcp import __version__
 from forgemcp.cmake import CMakePlugin
 from forgemcp.clangd import ClangdPlugin
 from forgemcp.debugger import DebuggerPlugin
+from forgemcp.quality import QualityPlugin
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import LifecycleError
 from forgemcp.core.logging import StructuredLogger, create_logger
@@ -73,7 +74,7 @@ class ForgeApplication:
         services.register("process_runtime", ProcessRuntime(config, logger))
         plugins = PluginManager(config=config, services=services, logger=logger)
         services.register("plugins", plugins)
-        for plugin in (CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), *tuple(builtin_plugins)):
+        for plugin in (CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), QualityPlugin(), *tuple(builtin_plugins)):
             plugins.register_builtin(plugin)
         return cls(config, services)
 

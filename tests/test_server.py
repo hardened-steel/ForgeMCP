@@ -102,6 +102,10 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
         server = create_server(lambda: application)
         async with server._mcp_server.lifespan(server._mcp_server):  # type: ignore[attr-defined]
             assert sorted(tool.name for tool in await server.list_tools()) == [
+                "clang_format__apply",
+                "clang_format__check",
+                "clang_tidy__list_checks",
+                "clang_tidy__run",
                 "clangd__apply_code_action",
                 "clangd__code_actions",
                 "clangd__completion",
@@ -153,6 +157,8 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
                 "debugger__threads",
                 "debugger__variables",
                 "example__inspect",
+                "quality__status",
+                "sanitizer__parse_report",
                 "server_status",
             ]
 

@@ -42,6 +42,7 @@ class PluginMetadata:
     requires: tuple[str, ...] = ()
     requires_services: tuple[str, ...] = ()
     provides: frozenset[str] = field(default_factory=frozenset)
+    tool_namespaces: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.plugin_id, str) or not _PLUGIN_IDENTIFIER.fullmatch(self.plugin_id):
@@ -55,9 +56,11 @@ class PluginMetadata:
             self.requires_services, field_name="requires_services"
         )
         capabilities = _normalise_identifiers(self.provides, field_name="provides")
+        tool_namespaces = _normalise_identifiers(self.tool_namespaces, field_name="tool_namespaces")
         object.__setattr__(self, "requires", requires)
         object.__setattr__(self, "requires_services", required_services)
         object.__setattr__(self, "provides", frozenset(capabilities))
+        object.__setattr__(self, "tool_namespaces", tool_namespaces)
 
 
 class PluginLogger(Protocol):

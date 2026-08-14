@@ -41,11 +41,16 @@ irreversible choices belong in [adr/](adr/).
   gated `configurationDone`, terminal-event retention, and minimal
   side-effect-possible identifier evaluate policy. Fake, real LLDB-DAP, MCP
   stdio, CMake, clangd, and full-suite regression pass on the audited host.
+- Quality Tools Phase 1: builtin QualityPlugin with lazy fixed executable
+  qualification, `clang-format` replacement-XML checks and snapshot-CAS
+  multi-file applies, bounded read-only `clang-tidy` check/diagnostic parsing,
+  and bounded ASan/UBSan report parsing. No `-i`, auto-fix, arbitrary tool
+  arguments, plugin loading, or sanitizer binary execution is exposed.
 
 ### In progress
 
-- No DAP Phase 1 work is in progress. MSVC/PDB compatibility remains
-  unclaimed and requires a separate adapter/toolchain gate.
+- No quality-tool work is in progress. Real local LLVM gates remain conditional
+  on a separately installed policy-qualified clang-format and clang-tidy.
 
 ## Delivery sequence and dependencies
 
@@ -54,7 +59,7 @@ irreversible choices belong in [adr/](adr/).
 | CMake vertical slice | Core, Models, Workspace, Process Runtime, Plugin System | Complete; its integration audit passes. |
 | clangd | Audited Core, Models, Workspace, Process Runtime, Plugin System | A managed LSP session can be started, initialized, stopped, and mapped to transport-neutral diagnostics without escaping the workspace. |
 | DAP debugger | ADR 0009, audited Process Runtime, Plugin System, workspace path policy, a runnable approved adapter | A managed debug-adapter session can launch within policy, prove strong tree ownership, terminate descendants, and expose bounded transport-neutral debug state. |
-| Quality tools | CMake target/build metadata and Process Runtime | Tool discovery, bounded execution, and diagnostics normalization work without exposing shell access or secrets. |
+| Quality tools | CMake target/build metadata and Process Runtime | Complete: lazy fixed-tool discovery, CAS formatting, bounded read-only diagnostics, and sanitizer parsing without shell access or secrets. |
 | Git and `project_status` | Workspace snapshots plus CMake/quality summaries | Read-only repository/project aggregation reports bounded, safe status with explicit freshness and failure states. |
 
 ## Completed milestone: clangd phase 1
@@ -186,13 +191,14 @@ resolve; each needs a bounded contract and safety review.
 - clangd intentionally omits semantic tokens, inlay hints, code lenses,
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
-- There are no Workspace MCP editing tools, quality tools, Git integration, or
+- There are no generic Workspace MCP editing tools, Git integration, or
   aggregate `project_status` tool yet. DAP Phase 1 is launch-only LLDB-DAP
   source debugging for the passed standalone LLVM/DWARF gate; it is not an
   MSVC/PDB compatibility claim.
 - CMake and CTest are discovered through the Process Runtime environment; an
   installation outside `PATH` must be deliberately made available by the host
-  policy/environment.
+  policy/environment. Quality tools additionally accept their two explicit
+  absolute environment paths and conventional installed LLVM candidates.
 
 ## Open architecture decisions
 

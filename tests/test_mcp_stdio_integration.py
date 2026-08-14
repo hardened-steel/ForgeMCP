@@ -29,6 +29,12 @@ _EXPECTED_TOOLS = {
     "clangd__completion",
     "debugger__status",
     "debugger__list_adapters",
+    "quality__status",
+    "clang_format__check",
+    "clang_format__apply",
+    "clang_tidy__list_checks",
+    "clang_tidy__run",
+    "sanitizer__parse_report",
 }
 
 _DEBUGGER_TOOLS = {
@@ -98,6 +104,15 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     clangd_status = await session.call_tool("clangd__status")
                     assert clangd_status.isError is False
                     assert {"available", "state", "executable"} <= _json_tool_content(clangd_status).keys()
+
+                    quality_status = _json_tool_content(await session.call_tool("quality__status", {}))
+                    assert {"clang_format", "clang_tidy", "sanitizer_parsers", "platform_limitations"} <= quality_status.keys()
+                    sanitizer = _json_tool_content(await session.call_tool(
+                        "sanitizer__parse_report", {"output": "runtime error: signed integer overflow\n"}
+                    ))
+                    assert sanitizer["findings"][0]["kind"] == "undefined_behavior_sanitizer"
+                    invalid_quality = await session.call_tool("clang_format__check", {"paths": ["missing.cpp"], "unexpected": True})
+                    assert invalid_quality.isError is True
 
                     debugger_status = _json_tool_content(await session.call_tool("debugger__status"))
                     assert {"state", "session_generation", "stop_generation", "last_event_sequence"} <= debugger_status.keys()
