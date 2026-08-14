@@ -15,6 +15,9 @@ MAX_COMPONENTS = 64
 MAX_CAPABILITIES = 128
 MAX_FACTS = 32
 MAX_WARNINGS = 32
+MAX_STATUS_JSON_BYTES = 100_000
+MIN_FACT_INTEGER = -(1 << 63)
+MAX_FACT_INTEGER = (1 << 63) - 1
 
 Identifier = Annotated[
     str,
@@ -75,6 +78,8 @@ class StatusFact(ForgeModel):
     def bound_string_value(cls, value: FactValue) -> FactValue:
         if isinstance(value, str) and (not value or len(value) > 256):
             raise ValueError("String fact values must contain from one through 256 characters.")
+        if isinstance(value, int) and not isinstance(value, bool) and not MIN_FACT_INTEGER <= value <= MAX_FACT_INTEGER:
+            raise ValueError("Integer fact values must fit the signed 64-bit status bound.")
         return value
 
 
@@ -137,9 +142,22 @@ class ProjectStatus(ForgeModel):
     warnings: tuple[WarningCode, ...] = Field(
         max_length=MAX_WARNINGS, description="Safe aggregate categories; no raw exceptions or output."
     )
-    partial: bool = Field(description="Whether any provider failed or exceeded a deadline.")
+    partial: bool = Field(
+        description="Whether provider loss, a missing critical component, or deterministic truncation made the result partial."
+    )
+    failed_components: tuple[Identifier, ...] = Field(
+        max_length=MAX_COMPONENTS,
+        description="Stable identifiers whose provider failed validation or execution.",
+    )
     timed_out_components: tuple[Identifier, ...] = Field(
         max_length=MAX_COMPONENTS, description="Stable identifiers whose provider deadline expired."
+    )
+    omitted_components: tuple[Identifier, ...] = Field(
+        max_length=MAX_COMPONENTS,
+        description="Stable identifiers deterministically omitted to enforce the response-size budget.",
+    )
+    response_truncated: bool = Field(
+        description="Whether bounded aggregate fields or components were deterministically omitted."
     )
 
     @field_validator("generated_at")

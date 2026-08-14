@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
+from datetime import timedelta
+from math import isfinite
 from typing import Protocol, runtime_checkable
 
 from pydantic import ValidationError
@@ -12,11 +15,15 @@ from forgemcp.project.errors import (
     DuplicateProjectStatusProviderError,
     ProjectStatusRegistryClosedError,
 )
-from forgemcp.project.models import MAX_COMPONENTS, ComponentStatus
+from forgemcp.project.models import MAX_COMPONENTS, ComponentStatus, utc_now
 
 
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 0.25
 DEFAULT_TOTAL_TIMEOUT_SECONDS = 1.0
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 0.05
+MAX_OBSERVATION_AGE = timedelta(days=1)
+STALE_OBSERVATION_AGE = timedelta(minutes=5)
+MAX_FUTURE_CLOCK_SKEW = timedelta(seconds=5)
 
 
 @runtime_checkable
@@ -38,6 +45,7 @@ class ProjectStatusSnapshot:
     components: tuple[ComponentStatus, ...]
     failed_components: tuple[str, ...]
     timed_out_components: tuple[str, ...]
+    provider_ids: tuple[str, ...]
 
 
 class ProjectStatusRegistry:
@@ -47,6 +55,8 @@ class ProjectStatusRegistry:
         self._providers: dict[str, ProjectStatusProvider] = {}
         self._closed = False
         self._active_tasks: set[asyncio.Task[ComponentStatus]] = set()
+        self._snapshot_task: asyncio.Task[ProjectStatusSnapshot] | None = None
+        self._singleflight_lock = asyncio.Lock()
 
     @property
     def closed(self) -> bool:
@@ -99,11 +109,49 @@ class ProjectStatusRegistry:
     ) -> ProjectStatusSnapshot:
         """Snapshot all current providers with bounded individual and total deadlines."""
 
-        if self._closed:
-            raise ProjectStatusRegistryClosedError("Project status is unavailable during shutdown.")
-        if provider_timeout_seconds <= 0 or total_timeout_seconds <= 0:
+        if (
+            isinstance(provider_timeout_seconds, bool)
+            or isinstance(total_timeout_seconds, bool)
+            or not isinstance(provider_timeout_seconds, (int, float))
+            or not isinstance(total_timeout_seconds, (int, float))
+            or not isfinite(provider_timeout_seconds)
+            or not isfinite(total_timeout_seconds)
+            or provider_timeout_seconds <= 0
+            or total_timeout_seconds <= 0
+        ):
             raise ValueError("Project status deadlines must be positive.")
-        providers = tuple(sorted(self._providers.items()))
+        async with self._singleflight_lock:
+            if self._closed:
+                raise ProjectStatusRegistryClosedError("Project status is unavailable during shutdown.")
+            if self._snapshot_task is None or self._snapshot_task.done():
+                providers = tuple(sorted(self._providers.items()))
+                self._snapshot_task = asyncio.create_task(
+                    self._snapshot_all_once(
+                        providers=providers,
+                        provider_timeout_seconds=provider_timeout_seconds,
+                        total_timeout_seconds=total_timeout_seconds,
+                    ),
+                    name="forgemcp-project-status-snapshot",
+                )
+                self._snapshot_task.add_done_callback(self._consume_task_result)
+            snapshot_task = self._snapshot_task
+
+        # One caller cancelling must not cancel the shared snapshot used by peers.
+        result = await asyncio.shield(snapshot_task)
+        async with self._singleflight_lock:
+            if self._snapshot_task is snapshot_task:
+                self._snapshot_task = None
+        return result
+
+    async def _snapshot_all_once(
+        self,
+        *,
+        providers: tuple[tuple[str, ProjectStatusProvider], ...],
+        provider_timeout_seconds: float,
+        total_timeout_seconds: float,
+    ) -> ProjectStatusSnapshot:
+        """Run one shared collection; overlapping callers await this immutable result."""
+
         tasks: dict[str, asyncio.Task[ComponentStatus]] = {}
         for provider_id, provider in providers:
             task = asyncio.create_task(
@@ -112,11 +160,12 @@ class ProjectStatusRegistry:
             )
             tasks[provider_id] = task
             self._active_tasks.add(task)
-            task.add_done_callback(self._active_tasks.discard)
+            task.add_done_callback(self._provider_task_done)
 
         try:
             done, pending = await asyncio.wait(
-                tuple(tasks.values()), timeout=total_timeout_seconds
+                tuple(tasks.values()),
+                timeout=min(provider_timeout_seconds, total_timeout_seconds),
             ) if tasks else (set(), set())
         except asyncio.CancelledError:
             await self._cancel_and_join(tuple(tasks.values()))
@@ -144,6 +193,7 @@ class ProjectStatusRegistry:
             components=tuple(sorted(components, key=lambda item: item.id)),
             failed_components=tuple(sorted(failed)),
             timed_out_components=tuple(sorted(set(timed_out))),
+            provider_ids=tuple(provider_id for provider_id, _ in providers),
         )
 
     async def aclose(self) -> None:
@@ -152,7 +202,10 @@ class ProjectStatusRegistry:
         if self._closed:
             return
         self._closed = True
-        await self._cancel_and_join(tuple(self._active_tasks))
+        tasks: set[asyncio.Task[object]] = set(self._active_tasks)
+        if self._snapshot_task is not None and not self._snapshot_task.done():
+            tasks.add(self._snapshot_task)
+        await self._cancel_and_join(tuple(tasks))
 
     @staticmethod
     async def _snapshot_one(
@@ -160,22 +213,45 @@ class ProjectStatusRegistry:
         provider: ProjectStatusProvider,
         timeout_seconds: float,
     ) -> ComponentStatus:
-        result = await asyncio.wait_for(provider.snapshot_status(), timeout=timeout_seconds)
+        del timeout_seconds  # the shared collector enforces the common provider deadline
+        result = await provider.snapshot_status()
         if not isinstance(result, ComponentStatus):
             # Validate only typed public models. Dict payloads are deliberately rejected.
             raise TypeError("Project status providers must return ComponentStatus.")
         try:
-            result = ComponentStatus.model_validate(result.model_dump())
+            result = ComponentStatus.model_validate(result.model_dump(warnings=False))
         except ValidationError as error:
             raise TypeError("Project status provider returned invalid bounded data.") from error
         if result.id != provider_id:
             raise ValueError("Project status provider result id does not match its registration.")
+        now = utc_now()
+        age = now - result.observed_at
+        if age < -MAX_FUTURE_CLOCK_SKEW:
+            raise ValueError("Project status provider observation is too far in the future.")
+        if age > MAX_OBSERVATION_AGE:
+            raise ValueError("Project status provider observation is too old.")
+        if age > STALE_OBSERVATION_AGE and not result.stale:
+            payload = result.model_dump(warnings=False)
+            payload["stale"] = True
+            result = ComponentStatus.model_validate(payload)
         return result
 
     @staticmethod
-    async def _cancel_and_join(tasks: tuple[asyncio.Task[ComponentStatus], ...]) -> None:
+    async def _cancel_and_join(tasks: tuple[asyncio.Task[object], ...]) -> None:
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # A trusted in-process provider may suppress cancellation. Never let
+            # cleanup extend the public deadline without a bound; unfinished
+            # tasks remain tracked until their done callback consumes the result.
+            await asyncio.wait(tasks, timeout=DEFAULT_CLEANUP_TIMEOUT_SECONDS)
+
+    def _provider_task_done(self, task: asyncio.Task[ComponentStatus]) -> None:
+        self._active_tasks.discard(task)
+        self._consume_task_result(task)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[object]) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.exception()

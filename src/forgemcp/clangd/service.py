@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from itertools import islice
 import json
 import re
 import secrets
@@ -86,6 +87,7 @@ from forgemcp.workspace import (
 MAX_NAVIGATION_RESULTS = 500
 MAX_DOCUMENT_SYMBOLS = 1_000
 MAX_DIAGNOSTICS = 1_000
+MAX_PROJECT_STATUS_DOCUMENTS = 64
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_STDERR_CHARACTERS = 65_536
 MAX_CACHE_ENTRIES = 100
@@ -135,6 +137,7 @@ class ClangdProjectStatusCache:
     diagnostic_information_count: int
     diagnostic_hint_count: int
     stale_diagnostic_count: int
+    counts_truncated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,8 +238,22 @@ class ClangdService:
         """Copy cached session/diagnostic counters without synchronizing a document."""
 
         async with self._document_lock:
-            documents = tuple(self._documents.values())
-            diagnostics = tuple(item for document in documents for item in document.diagnostics)
+            sampled_documents = tuple(islice(self._documents.values(), MAX_PROJECT_STATUS_DOCUMENTS))
+            diagnostic_count = 0
+            diagnostic_error_count = 0
+            diagnostic_warning_count = 0
+            diagnostic_information_count = 0
+            diagnostic_hint_count = 0
+            stale_diagnostic_count = 0
+            for document in sampled_documents:
+                if document.stale_diagnostics:
+                    stale_diagnostic_count += len(document.diagnostics)
+                for diagnostic in document.diagnostics:
+                    diagnostic_count += 1
+                    diagnostic_error_count += diagnostic.severity is Severity.ERROR
+                    diagnostic_warning_count += diagnostic.severity is Severity.WARNING
+                    diagnostic_information_count += diagnostic.severity is Severity.INFORMATION
+                    diagnostic_hint_count += diagnostic.severity is Severity.HINT
             return ClangdProjectStatusCache(
                 state=self._state,
                 availability_observed=self._availability_observed,
@@ -244,15 +261,14 @@ class ClangdService:
                 explicitly_configured=self._config.clangd_path is not None,
                 version=self._cached_version,
                 compile_commands_dir=self._compile_commands_dir,
-                open_document_count=len(documents),
-                diagnostic_count=len(diagnostics),
-                diagnostic_error_count=sum(item.severity is Severity.ERROR for item in diagnostics),
-                diagnostic_warning_count=sum(item.severity is Severity.WARNING for item in diagnostics),
-                diagnostic_information_count=sum(item.severity is Severity.INFORMATION for item in diagnostics),
-                diagnostic_hint_count=sum(item.severity is Severity.HINT for item in diagnostics),
-                stale_diagnostic_count=sum(
-                    len(document.diagnostics) for document in documents if document.stale_diagnostics
-                ),
+                open_document_count=len(self._documents),
+                diagnostic_count=diagnostic_count,
+                diagnostic_error_count=diagnostic_error_count,
+                diagnostic_warning_count=diagnostic_warning_count,
+                diagnostic_information_count=diagnostic_information_count,
+                diagnostic_hint_count=diagnostic_hint_count,
+                stale_diagnostic_count=stale_diagnostic_count,
+                counts_truncated=len(self._documents) > MAX_PROJECT_STATUS_DOCUMENTS,
             )
 
     async def start(self, compile_commands_dir: str) -> ClangdStartResult:

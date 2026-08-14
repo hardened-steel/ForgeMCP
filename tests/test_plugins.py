@@ -183,13 +183,13 @@ def test_start_failure_rolls_back_already_started_plugins_and_tools(tmp_path):
     with pytest.raises(PluginStartError, match="beta"):
         asyncio.run(manager.start())
 
-    assert events == ["start:alpha", "start:beta", "stop:alpha"]
+    assert events == ["start:alpha", "start:beta", "stop:beta", "stop:alpha"]
     assert manager.tools.contributions() == ()
     statuses = {status.plugin_id: status for status in manager.statuses()}
     assert statuses["alpha"].state is PluginState.STOPPED
     assert statuses["beta"].state is PluginState.FAILED
     asyncio.run(manager.aclose())
-    assert events == ["start:alpha", "start:beta", "stop:alpha"]
+    assert events == ["start:alpha", "start:beta", "stop:beta", "stop:alpha"]
 
 
 @dataclass

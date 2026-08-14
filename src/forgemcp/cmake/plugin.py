@@ -90,11 +90,14 @@ class _CMakeStatusProvider:
             StatusFact(name="configured", value=cached.configured_binary_dir is not None),
             StatusFact(name="active_operations", value=cached.active_operations),
         ]
+        warnings: list[str] = []
         if tool is not None and tool.cmake.version is not None:
             facts.append(StatusFact(name="version", value=tool.cmake.version.full))
         if cached.configured_binary_dir is not None:
-            facts.append(StatusFact(name="build_directory", value=cached.configured_binary_dir))
-        warnings: list[str] = []
+            if len(cached.configured_binary_dir) <= 256:
+                facts.append(StatusFact(name="build_directory", value=cached.configured_binary_dir))
+            else:
+                warnings.append("workspace_relative_path_omitted")
         for operation in (cached.last_configure, cached.last_build, cached.last_test):
             if operation is None:
                 continue
@@ -105,9 +108,12 @@ class _CMakeStatusProvider:
                     StatusFact(name=f"{prefix}_duration", value=operation.duration_milliseconds, unit="milliseconds"),
                     StatusFact(name=f"{prefix}_item_count", value=operation.item_count),
                     StatusFact(name=f"{prefix}_observed_at", value=operation.observed_at.isoformat()),
-                    StatusFact(name=f"{prefix}_directory", value=operation.binary_dir),
                 )
             )
+            if len(operation.binary_dir) <= 256:
+                facts.append(StatusFact(name=f"{prefix}_directory", value=operation.binary_dir))
+            else:
+                warnings.append("workspace_relative_path_omitted")
             if operation.exit_code is not None:
                 facts.append(StatusFact(name=f"{prefix}_exit_code", value=operation.exit_code))
             if operation.outcome != "success":

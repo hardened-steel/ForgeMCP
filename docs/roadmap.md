@@ -60,11 +60,16 @@ irreversible choices belong in [adr/](adr/).
   cancellation cleanup. It performs no process, source, protocol, qualification,
   analysis, or lifecycle action. Git and aggregated diagnostic messages remain
   outside this phase.
+- Project Intelligence Phase 1 security/integration audit: strict provider
+  revalidation and timestamp policy, single-flight concurrent calls, bounded
+  timeout/shutdown cleanup when cancellation is suppressed, deterministic
+  100,000-byte response truncation metadata, critical-provider health rules,
+  failed-start provider rollback, and real MCP SDK stdio failure/timeout/race
+  coverage.
 
 ### In progress
 
-- Project Intelligence Phase 1 is ready for its dedicated status audit. Real
-  LLVM feature gates remain portable conditional tests on hosts without
+- Real LLVM feature gates remain portable conditional tests on hosts without
   separately installed qualified tools.
 
 ## Delivery sequence and dependencies

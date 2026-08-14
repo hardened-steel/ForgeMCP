@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 
 from pydantic import Field, ValidationError
 
@@ -63,6 +64,7 @@ class _QualityOperationCache:
     operation: str
     outcome: str
     item_count: int
+    duration_milliseconds: int
     observed_at: datetime
 
 
@@ -115,6 +117,7 @@ class _QualityStatusProvider:
                 (
                     StatusFact(name=f"{prefix}_outcome", value=item.outcome),
                     StatusFact(name=f"{prefix}_item_count", value=item.item_count),
+                    StatusFact(name=f"{prefix}_duration", value=item.duration_milliseconds, unit="milliseconds"),
                     StatusFact(name=f"{prefix}_observed_at", value=item.observed_at.isoformat()),
                 )
             )
@@ -263,60 +266,64 @@ class QualityPlugin(ForgePlugin):
 
     async def _check(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _FormatCheckArguments)
+        started = monotonic()
         self._active_operations += 1
         try:
             result = await self.clang_format.check(request.paths)
         except asyncio.CancelledError:
-            self._last_format = _QualityOperationCache("format", "cancelled", len(request.paths), datetime.now(UTC))
+            self._last_format = self._operation_cache("format", "cancelled", len(request.paths), started)
             raise
         except Exception:
-            self._last_format = _QualityOperationCache("format", "failure", len(request.paths), datetime.now(UTC))
+            self._last_format = self._operation_cache("format", "failure", len(request.paths), started)
             raise
         finally:
             self._active_operations -= 1
-        self._last_format = _QualityOperationCache(
+        self._last_format = self._operation_cache(
             "format", "success" if all(item.error is None for item in result.files) else "failure",
-            len(result.files), datetime.now(UTC)
+            len(result.files), started
         )
         return result
 
     async def _apply(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _FormatApplyArguments)
+        started = monotonic()
         self._active_operations += 1
         try:
             result = await self.clang_format.apply(tuple((item.path, item.expected_sha256) for item in request.files))
         except asyncio.CancelledError:
-            self._last_format = _QualityOperationCache("format", "cancelled", len(request.files), datetime.now(UTC))
+            self._last_format = self._operation_cache("format", "cancelled", len(request.files), started)
             raise
         except Exception:
-            self._last_format = _QualityOperationCache("format", "failure", len(request.files), datetime.now(UTC))
+            self._last_format = self._operation_cache("format", "failure", len(request.files), started)
             raise
         finally:
             self._active_operations -= 1
-        self._last_format = _QualityOperationCache(
-            "format", "success" if result.applied else "failure", len(result.files), datetime.now(UTC)
+        self._last_format = self._operation_cache(
+            "format", "success" if result.applied else "failure", len(result.files), started
         )
         return result
 
     async def _list_checks(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _TidyChecksArguments)
+        started = monotonic()
         self._active_operations += 1
         try:
             result = await self.clang_tidy.list_checks(request.checks)
         except asyncio.CancelledError:
-            self._last_tidy = _QualityOperationCache("tidy", "cancelled", 0, datetime.now(UTC))
+            self._last_tidy = self._operation_cache("tidy", "cancelled", 0, started)
             raise
         except Exception:
-            self._last_tidy = _QualityOperationCache("tidy", "failure", 0, datetime.now(UTC))
+            self._last_tidy = self._operation_cache("tidy", "failure", 0, started)
             raise
         finally:
             self._active_operations -= 1
         outcome = "success" if result.process.exit_code == 0 and not result.process.timed_out else "failure"
-        self._last_tidy = _QualityOperationCache("tidy", outcome, len(result.checks), datetime.now(UTC))
+        self._last_tidy = self._operation_cache("tidy", outcome, len(result.checks), started)
         return result
 
     async def _run_tidy(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _TidyRunArguments)
+        started = monotonic()
         self._active_operations += 1
         try:
             result = await self.clang_tidy.run(
@@ -326,16 +333,31 @@ class QualityPlugin(ForgePlugin):
                 timeout_seconds=request.timeout_seconds,
             )
         except asyncio.CancelledError:
-            self._last_tidy = _QualityOperationCache("tidy", "cancelled", len(request.paths), datetime.now(UTC))
+            self._last_tidy = self._operation_cache("tidy", "cancelled", len(request.paths), started)
             raise
         except Exception:
-            self._last_tidy = _QualityOperationCache("tidy", "failure", len(request.paths), datetime.now(UTC))
+            self._last_tidy = self._operation_cache("tidy", "failure", len(request.paths), started)
             raise
         finally:
             self._active_operations -= 1
         outcome = "success" if result.execution_state.value == "completed" else "failure"
-        self._last_tidy = _QualityOperationCache("tidy", outcome, len(result.diagnostics), datetime.now(UTC))
+        self._last_tidy = self._operation_cache("tidy", outcome, len(result.diagnostics), started)
         return result
+
+    @staticmethod
+    def _operation_cache(
+        operation: str,
+        outcome: str,
+        item_count: int,
+        started: float,
+    ) -> _QualityOperationCache:
+        return _QualityOperationCache(
+            operation=operation,
+            outcome=outcome,
+            item_count=max(0, item_count),
+            duration_milliseconds=max(0, int((monotonic() - started) * 1000)),
+            observed_at=datetime.now(UTC),
+        )
 
     async def _parse_report(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _SanitizerArguments)

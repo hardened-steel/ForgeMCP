@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from time import monotonic
 from pathlib import Path
 
 import pytest
@@ -178,6 +179,118 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
     server_errors = asyncio.run(exercise())
 
     assert '"event": "application_stopped"' in server_errors
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_health", "expected_activity", "expected_component"),
+    [
+        ("failure", "degraded", "idle", "fixture_failure"),
+        ("timeout", "degraded", "idle", "fixture_timeout"),
+        ("active", "healthy", "paused", None),
+        ("configured_unavailable", "degraded", "idle", None),
+    ],
+)
+def test_stdio_mcp_project_status_failure_timeout_activity_and_unavailable(
+    tmp_path: Path,
+    mode: str,
+    expected_health: str,
+    expected_activity: str,
+    expected_component: str | None,
+):
+    """Exercise Project Phase 1 boundary cases through the real SDK client."""
+
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "project_status_stdio_server.py"
+        environment = {
+            **os.environ,
+            "FORGEMCP_WORKSPACE": str(tmp_path),
+            "FORGEMCP_PROJECT_STATUS_FIXTURE": mode,
+        }
+        if mode == "configured_unavailable":
+            environment["FORGEMCP_CLANGD"] = str(tmp_path / "missing-clangd.exe")
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env=environment,
+        )
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                assert tools["project__status"].inputSchema["additionalProperties"] is False
+                started = monotonic()
+                result = await session.call_tool("project__status", {})
+                assert monotonic() - started < 2.0
+                payload = _json_tool_content(result)
+                assert payload["health"] == expected_health
+                assert payload["activity"] == expected_activity
+                assert "stdio-secret" not in json.dumps(payload)
+                if mode == "failure":
+                    assert expected_component in payload["failed_components"]
+                if mode == "timeout":
+                    assert expected_component in payload["timed_out_components"]
+                invalid = await session.call_tool("project__status", {"refresh": True})
+                assert invalid.isError is True
+
+    asyncio.run(exercise())
+
+
+def test_stdio_mcp_concurrent_project_status_calls_are_single_flight(tmp_path: Path):
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "project_status_stdio_server.py"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env={
+                **os.environ,
+                "FORGEMCP_WORKSPACE": str(tmp_path),
+                "FORGEMCP_PROJECT_STATUS_FIXTURE": "concurrent",
+            },
+        )
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                results = await asyncio.gather(
+                    *(session.call_tool("project__status", {}) for _ in range(24))
+                )
+                payloads = [_json_tool_content(result) for result in results]
+                for payload in payloads:
+                    component = next(
+                        item for item in payload["components"] if item["id"] == "fixture_concurrent"
+                    )
+                    facts = {item["name"]: item["value"] for item in component["facts"]}
+                    assert facts["snapshot_calls"] == 1
+
+    asyncio.run(exercise())
+
+
+def test_stdio_mcp_shutdown_during_project_snapshot_is_bounded(tmp_path: Path):
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "project_status_stdio_server.py"
+        errors_path = tmp_path / "project-shutdown-stderr.log"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env={
+                **os.environ,
+                "FORGEMCP_WORKSPACE": str(tmp_path),
+                "FORGEMCP_PROJECT_STATUS_FIXTURE": "shutdown",
+            },
+        )
+        started = monotonic()
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    pending = asyncio.create_task(session.call_tool("project__status", {}))
+                    await asyncio.sleep(0.02)
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+        assert monotonic() - started < 3.0
+        assert '"event": "application_stopped"' in errors_path.read_text(encoding="utf-8")
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.skipif(

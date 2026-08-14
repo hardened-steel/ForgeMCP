@@ -64,9 +64,15 @@ Feature integrations use `PluginContext` rather than `application.services`. The
 `ForgeApplication` remains the one-workspace session boundary; there is no
 `ProjectSession`. `ProjectStatusRegistry` owns uniquely identified providers and
 collects them concurrently in deterministic order with bounded per-provider and
-aggregate deadlines. It cancels and joins pending calls on timeout,
-cancellation, or shutdown. A provider failure produces a safe partial result
-and cannot fail the complete `project__status` response.
+aggregate deadlines. Overlapping requests share exactly one in-flight snapshot;
+one client's cancellation does not cancel it, and a call after completion starts
+a fresh snapshot. Timeout and shutdown cancel providers and attempt a 50 ms
+bounded join. A provider that suppresses cancellation remains tracked until
+completion and its eventual exception is consumed. Cooperative async providers
+therefore cannot extend the response indefinitely; CPU-blocking or malicious
+in-process code cannot be safely pre-empted by asyncio. A provider failure
+produces a safe partial result and cannot fail the complete `project__status`
+response.
 
 The builtin provider IDs are `core`, `workspace`, `process_runtime`,
 `plugin_manager`, `cmake`, `clangd`, `debugger`, and `quality`. Feature plugins
@@ -84,14 +90,34 @@ diagnostic messages, source/patch content, PIDs, debugger data, executable and
 external-plugin paths, and raw exceptions. Build and compilation-database paths
 are workspace-relative; only the configured root is absolute.
 
-Health and activity are independent. A failed foundational component makes
-health failed; provider loss, failed optional sessions/plugins, and observed
-unavailable explicitly configured capabilities make it degraded. Optional
+External providers are trusted in-process extensions, not sandboxed code, but
+their result is still revalidated at the MCP boundary. The registry accepts only
+`ComponentStatus`, revalidates its serialized fields, requires the registered
+and returned IDs to match, rejects observations over five seconds in the future
+or over 24 hours old, and forces age-based staleness after five minutes.
+Construction bypasses, unknown fields, invalid enums/scalars, duplicate facts or
+capabilities, naive timestamps, and oversize fields become fixed failed-provider
+categories without exception text.
+
+Health and activity are independent. A failed, missing, or invalid foundational
+component makes health failed; optional provider loss/timeouts, failed optional
+sessions/plugins, and observed unavailable explicitly configured capabilities
+make it degraded. Optional
 unconfigured tools and unsuccessful project operations do not mean ForgeMCP is
 unhealthy. A paused debugger wins activity, active CMake/Quality/debugger work
 or clangd startup is busy, and all other cases are idle. Component timestamps
-make the bounded result explicitly partial/non-transactional. See
+make the bounded result explicitly partial/non-transactional. Capacity is 64
+providers/components, 128 aggregate capabilities, 32 facts and 32 warnings per
+component, and 32 aggregate warnings. The complete response is capped at
+100,000 UTF-8 bytes; overflow omits components in reverse lexical order and
+reports `response_truncated` and sorted `omitted_components`. See
 [ADR 0011](adr/0011-project-status-provider-and-health-model.md).
+
+clangd status counts at most 64 cached document records (each already bounded
+to 1,000 diagnostics) while holding its document-state lock. If more documents
+are open, the exact open-document count remains available but diagnostic counts
+are marked `diagnostic_counts_truncated` and the component is stale; status does
+not scan an unbounded cache or acquire the WorkspaceEdit mutation lock.
 
 ## Workspace module
 

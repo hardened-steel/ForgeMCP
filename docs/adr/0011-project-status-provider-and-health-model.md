@@ -27,11 +27,17 @@ The registry rejects duplicate IDs, unregisters idempotently, captures providers
 in lexical ID order, executes them concurrently, and enforces both a 250 ms
 default per-provider timeout and a one-second default aggregate deadline.
 Provider failure or invalid/oversized output becomes a fixed safe component
-failure category; exception messages and types are not returned. Caller
-cancellation, aggregate timeout, and registry shutdown cancel and join all
-spawned tasks. Shutdown closes the registry before feature teardown, so no new
-provider call starts after shutdown begins. Unregister affects future snapshots;
-an already captured provider call may complete under the same deadlines.
+failure category; exception messages and types are not returned. Overlapping
+calls use one single-flight snapshot. Cancellation of one caller does not cancel
+the shared work, completion is not cached, and the next non-overlapping call
+starts a fresh snapshot. Aggregate/provider timeout and registry shutdown cancel
+spawned tasks and attempt a bounded 50 ms cleanup join. A coroutine that
+suppresses cancellation remains registry-tracked until completion and its
+eventual exception is consumed. This bounds cooperative async providers without
+claiming that asyncio can pre-empt CPU-blocking or malicious in-process plugin
+code. Shutdown closes the registry before feature teardown, so no new provider
+call starts after shutdown begins. Unregister affects future snapshots; an
+already captured provider call may complete under the same deadlines.
 
 Feature plugins optionally obtain `project_status_registry` through the existing
 declaration-scoped `PluginContext.services` facade. The plugin contract shape and
@@ -55,8 +61,20 @@ last CMake and Quality operations do not affect operation results. Each
 aggregate is explicitly partial and non-transactional, not a consistent
 cross-component transaction.
 
-All public status values use strict immutable Pydantic models. Facts are named
-string/integer/boolean scalars only. Strings and collections are bounded and
+clangd diagnostic counters scan at most 64 cached documents while holding the
+document-state lock. Additional documents set a fixed truncation fact/warning
+and staleness; status never acquires clangd's mutation lock or performs a
+protocol request.
+
+All public status values use strict immutable Pydantic models. Returning a model
+instance is not sufficient trust: the registry dumps and strictly revalidates
+every `ComponentStatus`, then checks its ID and observation time. Constructed
+models cannot bypass unknown-field, enum, collection, scalar, uniqueness, or
+timestamp rules. Observations more than five seconds ahead are invalid;
+observations over 24 hours old are invalid; otherwise an age over five minutes
+forces `stale=true`. Provider-declared staleness may additionally represent
+stale underlying cached domain data. Facts are named string/integer/boolean
+scalars only. Strings and collections are bounded and
 unknown fields are forbidden. There is no raw/custom JSON payload. Status omits
 source/file/patch content, diagnostic messages, compiler/debugger/tool output,
 argv, environment, PIDs, variables, stack frames, expressions/evaluate results,
@@ -64,10 +82,18 @@ sanitizer symbols, raw exceptions, external plugin module paths, and executable
 paths. Workspace/build/compilation-database directories are workspace-relative;
 only `ProjectStatus.workspace_root` is absolute.
 
+Registry capacity is 64 providers. A component has at most 128 capabilities, 32
+facts, and 32 warnings; aggregate capabilities have a 128-item limit and
+aggregate warnings a 32-item limit. Signed integer facts are limited to 64-bit
+range. The final JSON is limited to 100,000 UTF-8 bytes. If otherwise-valid
+components exceed it, reverse-lexical components are deterministically omitted
+and `response_truncated`, `omitted_components`, and `partial` describe the loss.
+`failed_components` and `timed_out_components` retain bounded sorted IDs.
+
 Health is deterministic and separate from activity:
 
 - `FAILED` when Core, Workspace, Process Runtime, or Plugin Manager reports
-  `FAILED`;
+  `FAILED`, is absent, or its provider fails validation/execution;
 - otherwise `DEGRADED` for a failed/timed-out/invalid provider, any optional
   component in `FAILED`/`DEGRADED`, a failed clangd/debugger session, plugin
   startup failure, or an explicitly configured capability observed unavailable;
@@ -88,7 +114,9 @@ Clients get one bounded side-effect-free cached overview that remains useful
 when optional LLVM tools are unavailable or one provider fails. Concurrent
 mutating operations take only their existing locks; status providers use short
 state-lock copies where needed and never hold a mutation lock for external work.
-Several concurrent status calls are independent and bounded.
+Several concurrent status calls share one immutable in-flight result and are
+bounded. The result remains a partial, non-transactional collection of
+independently observed cached states, never a cross-service transaction.
 
 The view can be slightly inconsistent and cached observations can be unknown or
 stale; those conditions are explicit. Phase 1 deliberately has no Git status or

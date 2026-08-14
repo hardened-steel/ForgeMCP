@@ -167,6 +167,18 @@ class PluginManager:
                 record.state = PluginState.FAILED
                 record.error = type(error).__name__
                 self._tools.unregister_plugin(plugin_id)
+                try:
+                    # start() may already have registered status providers or
+                    # acquired other application-scoped resources. Give the
+                    # failing plugin the same idempotent partial-start cleanup
+                    # opportunity before rolling back its dependencies.
+                    await record.plugin.stop()
+                except Exception as cleanup_error:  # pragma: no cover - defensive cleanup path
+                    self._logger.warning(
+                        "plugin_failed_start_cleanup_failed",
+                        plugin_id=plugin_id,
+                        error=type(cleanup_error).__name__,
+                    )
                 await self._rollback_started()
                 self._closed = True
                 raise PluginStartError(f"Plugin failed to start: {plugin_id}") from error

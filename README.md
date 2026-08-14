@@ -50,7 +50,10 @@ concurrently aggregates bounded cached snapshots for Core, Workspace, Process
 Runtime, Plugin Manager, CMake, clangd, debugger, and Quality. It never refreshes
 tools, reads source, starts a process/session, runs a build/test/analysis, or
 changes lifecycle. Provider failure yields an explicit partial response without
-raw exceptions. Health is separate from activity and the per-component
+raw exceptions. Overlapping calls share one in-flight snapshot, cancellation
+cleanup is bounded, and the UTF-8 JSON response is capped at 100,000 bytes with
+deterministic omission metadata. Provider models are strictly revalidated at
+the registry boundary, including timestamp freshness. Health is separate from activity and the per-component
 timestamps make the result intentionally non-transactional. Git, diagnostic
 messages, raw output, persistent history, and multi-workspace aggregation are
 not part of Phase 1; see [ADR 0011](docs/adr/0011-project-status-provider-and-health-model.md).

@@ -12,7 +12,7 @@ from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import ForgePlugin, PluginContext, PluginManager, PluginMetadata, ToolContribution
 from forgemcp.processes import ProcessRuntime
 from forgemcp.project.errors import ProjectStatusError, ProjectStatusRequestError
-from forgemcp.project.models import ComponentState, ComponentStatus, StatusFact, utc_now
+from forgemcp.project.models import MAX_CAPABILITIES, ComponentState, ComponentStatus, StatusFact, utc_now
 from forgemcp.project.registry import ProjectStatusProvider, ProjectStatusRegistry
 from forgemcp.project.service import ProjectStatusService
 from forgemcp.workspace import WorkspaceService
@@ -116,11 +116,25 @@ class PluginManagerStatusProvider:
         for status in statuses:
             counts[status.state.value] += 1
         failed = counts["failed"] > 0
-        capabilities = tuple(sorted({capability for status in statuses for capability in status.provides}))
+        declared_capabilities = {capability for status in statuses for capability in status.provides}
+        safe_capabilities = sorted(
+            capability
+            for capability in declared_capabilities
+            if len(capability) <= 64
+            and capability[0] in "abcdefghijklmnopqrstuvwxyz"
+            and all(character in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for character in capability)
+        )
+        capabilities = tuple(safe_capabilities[:MAX_CAPABILITIES])
+        omitted_capability_count = len(declared_capabilities) - len(capabilities)
+        warnings = []
+        if failed:
+            warnings.append("plugin_startup_failure")
+        if omitted_capability_count:
+            warnings.append("capabilities_truncated")
         return ComponentStatus(
             id=self.id,
             display_name="Plugin Manager",
-            state=ComponentState.DEGRADED if failed else ComponentState.AVAILABLE,
+            state=ComponentState.FAILED if failed else ComponentState.AVAILABLE,
             capabilities=capabilities,
             summary="Plugin lifecycle and declared capability cache is available.",
             facts=(
@@ -128,8 +142,9 @@ class PluginManagerStatusProvider:
                 StatusFact(name="failed_plugins", value=counts["failed"]),
                 StatusFact(name="stopped_plugins", value=counts["stopped"]),
                 StatusFact(name="external_plugins_enabled", value=self._external_enabled),
+                StatusFact(name="omitted_capabilities", value=omitted_capability_count),
             ),
-            warnings=("plugin_startup_failure",) if failed else (),
+            warnings=tuple(warnings),
             observed_at=utc_now(),
         )
 

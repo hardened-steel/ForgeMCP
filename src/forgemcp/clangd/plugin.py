@@ -119,11 +119,24 @@ class _ClangdStatusProvider:
             StatusFact(name="diagnostic_information", value=cached.diagnostic_information_count),
             StatusFact(name="diagnostic_hints", value=cached.diagnostic_hint_count),
             StatusFact(name="stale_diagnostics", value=cached.stale_diagnostic_count),
+            StatusFact(name="diagnostic_counts_truncated", value=cached.counts_truncated),
         ]
         if cached.version is not None:
             facts.append(StatusFact(name="version", value=cached.version))
-        if cached.compile_commands_dir is not None:
+        path_omitted = cached.compile_commands_dir is not None and len(cached.compile_commands_dir) > 256
+        if cached.compile_commands_dir is not None and not path_omitted:
             facts.append(StatusFact(name="compile_commands_directory", value=cached.compile_commands_dir))
+        warnings = list(
+            ("required_capability_unavailable",)
+            if state is ComponentState.DEGRADED
+            else ("tool_availability_not_observed",)
+            if not cached.availability_observed
+            else ()
+        )
+        if path_omitted:
+            warnings.append("workspace_relative_path_omitted")
+        if cached.counts_truncated:
+            warnings.append("cached_counts_truncated")
         return ComponentStatus(
             id=self.id,
             display_name="clangd",
@@ -131,14 +144,8 @@ class _ClangdStatusProvider:
             capabilities=("clangd", "lsp.navigation", "lsp.diagnostics", "lsp.workspace_edit"),
             summary="Cached clangd lifecycle and normalized diagnostic counters.",
             facts=tuple(facts),
-            warnings=(
-                ("required_capability_unavailable",)
-                if state is ComponentState.DEGRADED
-                else ("tool_availability_not_observed",)
-                if not cached.availability_observed
-                else ()
-            ),
-            stale=cached.stale_diagnostic_count > 0,
+            warnings=tuple(warnings),
+            stale=cached.stale_diagnostic_count > 0 or cached.counts_truncated,
             observed_at=utc_now(),
         )
 
