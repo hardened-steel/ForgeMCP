@@ -13,6 +13,8 @@ from forgemcp.debugger.models import DebugBreakpointSpec, DebugLaunchRequest
 from forgemcp.debugger.service import DebuggerService
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
+from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.workspace import WorkspaceService
 
@@ -75,14 +77,70 @@ class _EvaluateArguments(_FrameArguments):
 ToolOperation = Callable[[DebuggerService, ForgeModel], Awaitable[object]]
 
 
+class _DebuggerStatusProvider:
+    id = "debugger"
+
+    def __init__(self, service: DebuggerService, *, explicitly_configured: bool) -> None:
+        self._service = service
+        self._explicitly_configured = explicitly_configured
+
+    async def snapshot_status(self) -> ComponentStatus:
+        cached = await self._service.cached_project_status()
+        native_state = cached.session.state.value
+        state = (
+            ComponentState.UNAVAILABLE
+            if native_state == "unavailable"
+            else ComponentState.STOPPED
+            if native_state in {"stopped", "terminated"}
+            else ComponentState.STARTING
+            if native_state in {"starting", "initialized", "configuring"}
+            else ComponentState.ACTIVE
+            if native_state in {"running", "terminating"}
+            else ComponentState.PAUSED
+            if native_state == "paused"
+            else ComponentState.FAILED
+        )
+        if state is ComponentState.UNAVAILABLE and self._explicitly_configured:
+            state = ComponentState.DEGRADED
+        facts = [
+            StatusFact(name="adapter_available", value=cached.adapter.available),
+            StatusFact(name="session_state", value=native_state),
+            StatusFact(name="unread_events", value=cached.unread_event_count),
+            StatusFact(name="dropped_events", value=cached.dropped_event_count),
+        ]
+        if cached.adapter.version is not None:
+            facts.append(StatusFact(name="adapter_version", value=cached.adapter.version))
+        if cached.stop_reason is not None:
+            facts.append(StatusFact(name="stop_reason", value=cached.stop_reason.value))
+        if cached.thread_count is not None:
+            facts.append(StatusFact(name="thread_count", value=cached.thread_count))
+        return ComponentStatus(
+            id=self.id,
+            display_name="Native Debugger",
+            state=state,
+            capabilities=("debugger.launch", "debugger.execution", "debugger.paused_inspection"),
+            summary="Cached debugger adapter, session, and bounded event counters.",
+            facts=tuple(facts),
+            warnings=(
+                ("debugger_session_failed",)
+                if state is ComponentState.FAILED
+                else ("required_capability_unavailable",)
+                if state is ComponentState.DEGRADED
+                else ()
+            ),
+            observed_at=utc_now(),
+        )
+
+
 class DebuggerPlugin(ForgePlugin):
     """Application-scoped debugger plugin with no FastMCP or raw DAP access."""
 
-    __slots__ = ("_service",)
+    __slots__ = ("_service", "_status_registry")
 
     def __init__(self) -> None:
-        super().__init__(PluginMetadata(plugin_id="debugger", requires_services=("workspace", "process_runtime"), provides=frozenset({"debugger"})))
+        super().__init__(PluginMetadata(plugin_id="debugger", requires_services=("workspace", "process_runtime", "project_status_registry"), provides=frozenset({"debugger"})))
         self._service: DebuggerService | None = None
+        self._status_registry: ProjectStatusRegistry | None = None
 
     @property
     def service(self) -> DebuggerService:
@@ -93,12 +151,24 @@ class DebuggerPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         runtime = context.services.get("process_runtime")
+        status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(runtime, ProcessRuntime):
             raise TypeError("The debugger plugin requires WorkspaceService and ProcessRuntime.")
+        if not isinstance(status_registry, ProjectStatusRegistry):
+            raise TypeError("The debugger plugin requires ProjectStatusRegistry.")
         self._service = DebuggerService(workspace, runtime, LldbDapBackend(context.config, context.logger, runtime))
+        self._status_registry = status_registry
+        status_registry.register(
+            _DebuggerStatusProvider(
+                self._service, explicitly_configured=context.config.lldb_dap_path is not None
+            )
+        )
         self._register_tools(context)
 
     async def stop(self) -> None:
+        if self._status_registry is not None:
+            self._status_registry.unregister("debugger")
+            self._status_registry = None
         if self._service is not None:
             await self._service.aclose()
             self._service = None

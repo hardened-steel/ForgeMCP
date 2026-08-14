@@ -140,6 +140,10 @@ class _EventStore:
     def last_sequence(self) -> int:
         return self._next_sequence - 1
 
+    @property
+    def retained_count(self) -> int:
+        return len(self._events)
+
     def append(self, *, kind: str, **fields: Any) -> DebugEvent:
         event = DebugEvent(sequence=self._next_sequence, kind=kind, **fields)
         self._next_sequence += 1
@@ -179,6 +183,18 @@ class _EventStore:
         self.truncated = False
 
 
+@dataclass(frozen=True, slots=True)
+class DebuggerProjectStatusCache:
+    """Safe cached debugger metadata with no handles, frames, values, output, or PIDs."""
+
+    adapter: DebugAdapterInfo
+    session: DebugSessionStatus
+    stop_reason: DebugStoppedReason | None
+    thread_count: int | None
+    unread_event_count: int
+    dropped_event_count: int
+
+
 class DebuggerService:
     """Own one safe LLDB-DAP launch session per ForgeApplication instance."""
 
@@ -212,11 +228,27 @@ class DebuggerService:
         self._terminal_event_recorded = False
         self._exited_event_recorded = False
         self._launch_operation: asyncio.Task[object] | None = None
+        self._last_stop_reason: DebugStoppedReason | None = None
+        self._cached_thread_count: int | None = None
+        self._last_read_event_sequence = 0
 
     async def status(self) -> DebugSessionStatus:
         """Return status without launching, probing, or exposing raw protocol data."""
         async with self._state_lock:
             return self._status_locked()
+
+    async def cached_project_status(self) -> DebuggerProjectStatusCache:
+        """Return existing state only; never issue a DAP request or discovery probe."""
+
+        async with self._state_lock:
+            return DebuggerProjectStatusCache(
+                adapter=self._adapter_info,
+                session=self._status_locked(),
+                stop_reason=self._last_stop_reason,
+                thread_count=self._cached_thread_count,
+                unread_event_count=max(0, self._events.last_sequence - self._last_read_event_sequence),
+                dropped_event_count=self._events.dropped_count,
+            )
 
     async def list_adapters(self) -> tuple[DebugAdapterInfo, ...]:
         """Return read-only backend discovery; it never starts an adapter."""
@@ -226,7 +258,12 @@ class DebuggerService:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _MAX_EVENT_COUNT:
             raise DebuggerRequestError("Event limit must be between 1 and 256.")
         async with self._state_lock:
-            return self._events.page(after_sequence, limit)
+            page = self._events.page(after_sequence, limit)
+            if page.events:
+                self._last_read_event_sequence = max(
+                    self._last_read_event_sequence, page.events[-1].sequence
+                )
+            return page
 
     async def launch(self, request: DebugLaunchRequest) -> DebugSessionStatus:
         """Initialize, configure, and launch one workspace-contained debuggee."""
@@ -376,6 +413,7 @@ class DebuggerService:
                 self._active_thread_id = token
             result.append(DebugThread(thread_id=token, name=_text(item.get("name"), "Thread", 1024)[0], is_current=current))
         self._check_stop_generation(generation)
+        self._cached_thread_count = len(result)
         return tuple(result)
 
     async def stack_trace(self, thread_id: str, *, start_frame: int = 0, levels: int = 100) -> tuple[DebugStackFrame, ...]:
@@ -540,11 +578,13 @@ class DebuggerService:
                 native_thread = body.get("threadId")
                 self._active_thread_id = self._handles.put("thread", int(native_thread), self._session_generation, self._stop_generation) if _positive_int(native_thread) else None
                 reason = _STOPPED_REASONS.get(str(body.get("reason", "")).casefold(), DebugStoppedReason.UNKNOWN)
+                self._last_stop_reason = reason
                 self._events.append(kind="stopped", reason=reason, thread_id=self._active_thread_id, description=_text_or_none(body.get("description"), 1024))
                 if self._state not in {DebuggerState.TERMINATING, DebuggerState.TERMINATED, DebuggerState.FAILED}:
                     self._state = DebuggerState.PAUSED
             elif event == "continued":
                 await self._invalidate_stopped_data_locked()
+                self._cached_thread_count = None
                 self._events.append(kind="continued")
                 if self._state not in {DebuggerState.TERMINATING, DebuggerState.TERMINATED, DebuggerState.FAILED}:
                     self._state = DebuggerState.RUNNING
@@ -573,6 +613,7 @@ class DebuggerService:
     async def _invalidate_stopped_data_locked(self) -> None:
         self._handles.clear_stop()
         self._active_thread_id = None
+        self._cached_thread_count = None
         for task in tuple(self._read_dap_tasks):
             task.cancel()
 

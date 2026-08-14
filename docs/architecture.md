@@ -53,6 +53,45 @@ Feature integrations use `PluginContext` rather than `application.services`. The
 - `workspace` — `WorkspaceService`, the safe filesystem capability for the configured workspace
 - `process_runtime` — `ProcessRuntime`, the safe asynchronous external-tool capability for the configured workspace
 - `plugins` — `PluginManager`, when a future plugin has a valid reason to depend on manager-owned status or registry data
+- `project_status_registry` — `ProjectStatusRegistry`, optionally declared by a
+  feature plugin that can expose a bounded cached `ComponentStatus`
+- `project_status_service` — `ProjectStatusService`, consumed only by the
+  builtin ProjectPlugin that contributes `project__status`
+
+## Project Intelligence Phase 1
+
+`forgemcp.project` is transport-neutral and application-scoped. One
+`ForgeApplication` remains the one-workspace session boundary; there is no
+`ProjectSession`. `ProjectStatusRegistry` owns uniquely identified providers and
+collects them concurrently in deterministic order with bounded per-provider and
+aggregate deadlines. It cancels and joins pending calls on timeout,
+cancellation, or shutdown. A provider failure produces a safe partial result
+and cannot fail the complete `project__status` response.
+
+The builtin provider IDs are `core`, `workspace`, `process_runtime`,
+`plugin_manager`, `cmake`, `clangd`, `debugger`, and `quality`. Feature plugins
+register adapters through the declaration-scoped `project_status_registry`
+service and unregister on stop; the aggregator has no imports of concrete
+feature services. This uses the existing PluginContext/service mechanism and
+does not change plugin API version 1. External plugins may optionally declare
+and use the registry; not providing status does not affect plugin startup.
+
+Every provider copies only cached state. Status performs no filesystem/source
+read, process/version probe, build/test/configure, format/tidy, clangd/debugger
+start or request, lifecycle mutation, polling, or refresh. Strict immutable
+models allow bounded scalar facts only and omit argv/environment, output,
+diagnostic messages, source/patch content, PIDs, debugger data, executable and
+external-plugin paths, and raw exceptions. Build and compilation-database paths
+are workspace-relative; only the configured root is absolute.
+
+Health and activity are independent. A failed foundational component makes
+health failed; provider loss, failed optional sessions/plugins, and observed
+unavailable explicitly configured capabilities make it degraded. Optional
+unconfigured tools and unsuccessful project operations do not mean ForgeMCP is
+unhealthy. A paused debugger wins activity, active CMake/Quality/debugger work
+or clangd startup is busy, and all other cases are idle. Component timestamps
+make the bounded result explicitly partial/non-transactional. See
+[ADR 0011](adr/0011-project-status-provider-and-health-model.md).
 
 ## Workspace module
 

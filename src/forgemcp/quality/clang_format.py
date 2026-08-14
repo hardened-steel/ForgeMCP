@@ -103,14 +103,23 @@ class ClangFormatService:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._cached_status: QualityToolInfo | None = None
+
+    @property
+    def cached_status(self) -> QualityToolInfo | None:
+        """Return the last qualification result without launching a probe."""
+
+        return self._cached_status
 
     async def status(self) -> QualityToolInfo:
         """Probe the fixed policy-approved executable without making startup depend on it."""
         try:
             selected = await self._qualify()
         except QualityToolUnavailableError as error:
-            return QualityToolInfo(available=False, error=error.message)
-        return QualityToolInfo(executable=selected.canonical, available=True, version=selected.version)
+            self._cached_status = QualityToolInfo(available=False, error=error.message)
+            return self._cached_status
+        self._cached_status = QualityToolInfo(executable=selected.canonical, available=True, version=selected.version)
+        return self._cached_status
 
     async def check(self, paths: Iterable[str]) -> FormatCheckResult:
         """Return one content-free comparison result per explicit workspace source file."""
@@ -201,7 +210,15 @@ class ClangFormatService:
                 or "--assume-filename" not in help_text
             ):
                 continue
-            return _ToolSelection(canonical, version)
+            selection = _ToolSelection(canonical, version)
+            self._cached_status = QualityToolInfo(
+                executable=selection.canonical, available=True, version=selection.version
+            )
+            return selection
+        self._cached_status = QualityToolInfo(
+            available=False,
+            error="clang-format is not available through the configured Process Runtime.",
+        )
         raise QualityToolUnavailableError("clang-format is not available through the configured Process Runtime.")
 
     def _canonical(self, candidate: str) -> str | None:

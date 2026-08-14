@@ -7,6 +7,7 @@ ForgeMCP is an MCP server that will provide AI assistants with deep, structured 
 The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 
 - `server_status`
+- `project__status`
 - `cmake__status`
 - `cmake__list_presets`
 - `cmake__configure`
@@ -43,6 +44,16 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
 Feature integrations use the public `forgemcp.plugins` contract. CMake and clangd are built-in plugins; clangd does not start a process until `clangd__start` receives an explicit workspace-contained directory with `compile_commands.json`. `FORGEMCP_CLANGD` optionally names an absolute clangd executable; otherwise the Process Runtime uses its policy-approved PATH discovery. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md), [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md), and [ADR 0007](docs/adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md) before allowing third-party code or extending clangd.
+
+`project__status {}` is the sole Project Intelligence Phase 1 operation. It
+concurrently aggregates bounded cached snapshots for Core, Workspace, Process
+Runtime, Plugin Manager, CMake, clangd, debugger, and Quality. It never refreshes
+tools, reads source, starts a process/session, runs a build/test/analysis, or
+changes lifecycle. Provider failure yields an explicit partial response without
+raw exceptions. Health is separate from activity and the per-component
+timestamps make the result intentionally non-transactional. Git, diagnostic
+messages, raw output, persistent history, and multi-workspace aggregation are
+not part of Phase 1; see [ADR 0011](docs/adr/0011-project-status-provider-and-health-model.md).
 
 Debugger Phase 1 is launch-only source debugging through a separately installed
 exact `FORGEMCP_LLDB_DAP` path. It supports workspace-contained PE/COFF + DWARF launch, source
@@ -103,6 +114,7 @@ workspaces whose project code you trust. See [ADR 0006](docs/adr/0006-cmake-file
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
 - `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
 - `quality/` — clang-format CAS edits, read-only clang-tidy diagnostics, and sanitizer report parsing.
+- `project/` — strict status models, provider registry, health/activity aggregation, and ProjectPlugin contribution.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — structured, redacted stderr logging.
 

@@ -11,6 +11,13 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.project import (
+    ComponentState,
+    ComponentStatus,
+    ProjectStatusRegistry,
+    StatusFact,
+)
+from forgemcp.project.models import utc_now
 from forgemcp.workspace import WorkspaceService
 
 
@@ -60,20 +67,80 @@ class _RunTestsArguments(ForgeModel):
 ToolOperation = Callable[[CMakeService, ForgeModel], Awaitable[ForgeModel]]
 
 
+class _CMakeStatusProvider:
+    id = "cmake"
+
+    def __init__(self, service: CMakeService) -> None:
+        self._service = service
+
+    async def snapshot_status(self) -> ComponentStatus:
+        cached = self._service.cached_project_status()
+        tool = cached.tool_status
+        available = tool.available if tool is not None else None
+        state = (
+            ComponentState.ACTIVE
+            if cached.active_operations
+            else ComponentState.UNAVAILABLE
+            if available is False
+            else ComponentState.IDLE
+        )
+        facts: list[StatusFact] = [
+            StatusFact(name="availability_observed", value=tool is not None),
+            StatusFact(name="available", value=available if available is not None else False),
+            StatusFact(name="configured", value=cached.configured_binary_dir is not None),
+            StatusFact(name="active_operations", value=cached.active_operations),
+        ]
+        if tool is not None and tool.cmake.version is not None:
+            facts.append(StatusFact(name="version", value=tool.cmake.version.full))
+        if cached.configured_binary_dir is not None:
+            facts.append(StatusFact(name="build_directory", value=cached.configured_binary_dir))
+        warnings: list[str] = []
+        for operation in (cached.last_configure, cached.last_build, cached.last_test):
+            if operation is None:
+                continue
+            prefix = f"last_{operation.operation}"
+            facts.extend(
+                (
+                    StatusFact(name=f"{prefix}_outcome", value=operation.outcome),
+                    StatusFact(name=f"{prefix}_duration", value=operation.duration_milliseconds, unit="milliseconds"),
+                    StatusFact(name=f"{prefix}_item_count", value=operation.item_count),
+                    StatusFact(name=f"{prefix}_observed_at", value=operation.observed_at.isoformat()),
+                    StatusFact(name=f"{prefix}_directory", value=operation.binary_dir),
+                )
+            )
+            if operation.exit_code is not None:
+                facts.append(StatusFact(name=f"{prefix}_exit_code", value=operation.exit_code))
+            if operation.outcome != "success":
+                warnings.append(f"{prefix}_{operation.outcome}")
+        if tool is None:
+            warnings.append("tool_availability_not_observed")
+        return ComponentStatus(
+            id=self.id,
+            display_name="CMake and CTest",
+            state=state,
+            capabilities=("cmake.configure", "cmake.file-api-v2", "ctest.run"),
+            summary="Cached CMake lifecycle and operation metadata; no command was executed for this snapshot.",
+            facts=tuple(facts),
+            warnings=tuple(warnings),
+            observed_at=utc_now(),
+        )
+
+
 class CMakePlugin(ForgePlugin):
     """Application-scoped builtin plugin exposing CMake and CTest tool contributions."""
 
-    __slots__ = ("_service",)
+    __slots__ = ("_service", "_status_registry")
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="cmake",
-                requires_services=("workspace", "process_runtime"),
+                requires_services=("workspace", "process_runtime", "project_status_registry"),
                 provides=frozenset({"cmake.configure", "cmake.file-api-v2", "ctest.run"}),
             )
         )
         self._service: CMakeService | None = None
+        self._status_registry: ProjectStatusRegistry | None = None
 
     @property
     def service(self) -> CMakeService:
@@ -85,9 +152,14 @@ class CMakePlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
+        status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService):
             raise TypeError("The CMake plugin requires WorkspaceService under the 'workspace' service name.")
+        if not isinstance(status_registry, ProjectStatusRegistry):
+            raise TypeError("The CMake plugin requires ProjectStatusRegistry.")
         self._service = CMakeService(workspace, process_runtime)  # type: ignore[arg-type]
+        self._status_registry = status_registry
+        status_registry.register(_CMakeStatusProvider(self._service))
         context.tools.register(
             ToolContribution(
                 name="status",
@@ -153,6 +225,9 @@ class CMakePlugin(ForgePlugin):
 
     async def stop(self) -> None:
         """Release application-owned service state; the registry removes contributions."""
+        if self._status_registry is not None:
+            self._status_registry.unregister("cmake")
+            self._status_registry = None
         self._service = None
 
     async def _dispatch(

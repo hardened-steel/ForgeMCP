@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol, TypeAlias
 
 from forgemcp.cmake.errors import (
@@ -54,6 +58,31 @@ _FAILED_TEST_LINE = re.compile(r"^\s*\d+\s*-\s*(?P<name>.+?)\s+\([^)]*\)\s*$")
 CacheValue: TypeAlias = str | int | bool
 
 
+@dataclass(frozen=True, slots=True)
+class CMakeOperationStatusCache:
+    """Safe content-free metadata retained after one CMake/CTest operation."""
+
+    operation: str
+    outcome: str
+    binary_dir: str
+    exit_code: int | None
+    duration_milliseconds: int
+    item_count: int
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CMakeProjectStatusCache:
+    """Only already-observed CMake state used by project status."""
+
+    tool_status: CMakeStatus | None
+    configured_binary_dir: str | None
+    active_operations: int
+    last_configure: CMakeOperationStatusCache | None
+    last_build: CMakeOperationStatusCache | None
+    last_test: CMakeOperationStatusCache | None
+
+
 class ProcessRunner(Protocol):
     """The short-command portion of ProcessRuntime required by CMakeService."""
 
@@ -80,17 +109,37 @@ class CMakeService:
     def __init__(self, workspace: WorkspaceService, process_runtime: ProcessRunner) -> None:
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._cached_tool_status: CMakeStatus | None = None
+        self._configured_binary_dir: str | None = None
+        self._active_operations = 0
+        self._last_configure: CMakeOperationStatusCache | None = None
+        self._last_build: CMakeOperationStatusCache | None = None
+        self._last_test: CMakeOperationStatusCache | None = None
+
+    def cached_project_status(self) -> CMakeProjectStatusCache:
+        """Return content-free metadata without filesystem access or tool probes."""
+
+        return CMakeProjectStatusCache(
+            tool_status=self._cached_tool_status,
+            configured_binary_dir=self._configured_binary_dir,
+            active_operations=self._active_operations,
+            last_configure=self._last_configure,
+            last_build=self._last_build,
+            last_test=self._last_test,
+        )
 
     async def status(self) -> CMakeStatus:
         """Discover CMake and CTest and report their parseable, supported versions."""
         cmake = await self._tool_status("cmake", requires_minimum=True)
         ctest = await self._tool_status("ctest", requires_minimum=False)
-        return CMakeStatus(
+        status = CMakeStatus(
             available=cmake.available and cmake.supported and ctest.available,
             minimum_cmake_version=MINIMUM_CMAKE_VERSION,
             cmake=cmake,
             ctest=ctest,
         )
+        self._cached_tool_status = status
+        return status
 
     async def list_presets(self, *, source_dir: str = ".") -> CMakePresetList:
         """Return safe preset summaries without evaluating CMake inheritance or macros."""
@@ -127,26 +176,45 @@ class CMakeService:
         cache_variables: Mapping[str, CacheValue] | None = None,
     ) -> CMakeConfigureResult:
         """Configure a safe generated build directory using a preset or direct mode."""
-        source = self._workspace.require_directory(source_dir)
-        generated = self._workspace.open_generated_directory(binary_dir, create=True)
-        if generated.relative_path == source:
-            raise CMakeRequestError("CMake source_dir and binary_dir must be different directories.")
-        preset_name = self._validate_optional_name(preset, label="preset")
-        generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
+        started = monotonic()
+        self._active_operations += 1
+        normalised_binary = "."
+        try:
+            source = self._workspace.require_directory(source_dir)
+            generated = self._workspace.open_generated_directory(binary_dir, create=True)
+            normalised_binary = generated.relative_path
+            if generated.relative_path == source:
+                raise CMakeRequestError("CMake source_dir and binary_dir must be different directories.")
+            preset_name = self._validate_optional_name(preset, label="preset")
+            generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
 
-        argv = ["cmake", "-S", source, "-B", generated.relative_path]
-        if preset_name is not None:
-            # CMake owns preset inheritance, conditions, and macro expansion.
-            # -B is intentionally explicit so a preset cannot choose an external tree.
-            argv.extend(["--preset", preset_name])
-        argv.extend(self._cache_arguments(cache_variables))
-        result = await self._run_required("cmake", argv)
-        return CMakeConfigureResult(
-            source_dir=source,
-            binary_dir=generated.relative_path,
-            preset=preset_name,
-            process=result,
-        )
+            argv = ["cmake", "-S", source, "-B", generated.relative_path]
+            if preset_name is not None:
+                argv.extend(["--preset", preset_name])
+            argv.extend(self._cache_arguments(cache_variables))
+            result = await self._run_required("cmake", argv)
+            response = CMakeConfigureResult(
+                source_dir=source,
+                binary_dir=generated.relative_path,
+                preset=preset_name,
+                process=result,
+            )
+        except asyncio.CancelledError:
+            self._last_configure = self._operation_cache("configure", "cancelled", normalised_binary, started)
+            raise
+        except Exception:
+            self._last_configure = self._operation_cache("configure", "failure", normalised_binary, started)
+            raise
+        else:
+            outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
+            self._last_configure = self._operation_cache(
+                "configure", outcome, generated.relative_path, started, exit_code=result.exit_code
+            )
+            if outcome == "success":
+                self._configured_binary_dir = generated.relative_path
+            return response
+        finally:
+            self._active_operations -= 1
 
     def list_targets(self, *, binary_dir: str) -> CMakeTargetList:
         """Read target metadata solely from CMake File API codemodel v2."""
@@ -164,24 +232,42 @@ class CMakeService:
         parallel_jobs: int | None = None,
     ) -> CMakeBuildResult:
         """Build the default project or explicit target names without invoking a shell."""
-        generated = self._workspace.open_generated_directory(binary_dir)
-        target_names = self._validate_names(targets, label="target")
-        selected_configuration = self._validate_optional_name(configuration, label="configuration")
-        jobs = self._validate_parallel_jobs(parallel_jobs)
-        argv = ["cmake", "--build", generated.relative_path]
-        if target_names:
-            argv.extend(["--target", *target_names])
-        if selected_configuration is not None:
-            argv.extend(["--config", selected_configuration])
-        if jobs is not None:
-            argv.extend(["--parallel", str(jobs)])
-        result = await self._run_required("cmake", argv)
-        return CMakeBuildResult(
-            binary_dir=generated.relative_path,
-            targets=target_names,
-            configuration=selected_configuration,
-            process=result,
-        )
+        started = monotonic()
+        self._active_operations += 1
+        normalised_binary = "."
+        target_names: tuple[str, ...] = ()
+        try:
+            generated = self._workspace.open_generated_directory(binary_dir)
+            normalised_binary = generated.relative_path
+            target_names = self._validate_names(targets, label="target")
+            selected_configuration = self._validate_optional_name(configuration, label="configuration")
+            jobs = self._validate_parallel_jobs(parallel_jobs)
+            argv = ["cmake", "--build", generated.relative_path]
+            if target_names:
+                argv.extend(["--target", *target_names])
+            if selected_configuration is not None:
+                argv.extend(["--config", selected_configuration])
+            if jobs is not None:
+                argv.extend(["--parallel", str(jobs)])
+            result = await self._run_required("cmake", argv)
+            response = CMakeBuildResult(
+                binary_dir=generated.relative_path,
+                targets=target_names,
+                configuration=selected_configuration,
+                process=result,
+            )
+        except asyncio.CancelledError:
+            self._last_build = self._operation_cache("build", "cancelled", normalised_binary, started, item_count=len(target_names))
+            raise
+        except Exception:
+            self._last_build = self._operation_cache("build", "failure", normalised_binary, started, item_count=len(target_names))
+            raise
+        else:
+            outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
+            self._last_build = self._operation_cache("build", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(target_names))
+            return response
+        finally:
+            self._active_operations -= 1
 
     async def list_tests(self, *, binary_dir: str) -> CTestTestList:
         """List tests through CTest's documented ``json-v1`` output format."""
@@ -203,22 +289,60 @@ class CMakeService:
         timeout_seconds: float | None = None,
     ) -> CTestRunResult:
         """Run all tests or an exact-name subset, with ProcessRuntime limits in force."""
-        generated = self._workspace.open_generated_directory(binary_dir)
-        names = self._validate_names(test_names, label="test name")
-        selected_configuration = self._validate_optional_name(configuration, label="configuration")
-        argv = ["ctest", "--test-dir", generated.relative_path, "--output-on-failure"]
-        if selected_configuration is not None:
-            argv.extend(["--build-config", selected_configuration])
-        if names:
-            # The client never supplies a regex: exact names are escaped here.
-            argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
-        result = await self._run_required("ctest", argv, timeout_seconds=timeout_seconds)
-        return CTestRunResult(
-            binary_dir=generated.relative_path,
-            test_names=names,
-            configuration=selected_configuration,
-            failed_tests=self._failed_tests(result),
-            process=result,
+        started = monotonic()
+        self._active_operations += 1
+        normalised_binary = "."
+        names: tuple[str, ...] = ()
+        try:
+            generated = self._workspace.open_generated_directory(binary_dir)
+            normalised_binary = generated.relative_path
+            names = self._validate_names(test_names, label="test name")
+            selected_configuration = self._validate_optional_name(configuration, label="configuration")
+            argv = ["ctest", "--test-dir", generated.relative_path, "--output-on-failure"]
+            if selected_configuration is not None:
+                argv.extend(["--build-config", selected_configuration])
+            if names:
+                argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
+            result = await self._run_required("ctest", argv, timeout_seconds=timeout_seconds)
+            failed_tests = self._failed_tests(result)
+            response = CTestRunResult(
+                binary_dir=generated.relative_path,
+                test_names=names,
+                configuration=selected_configuration,
+                failed_tests=failed_tests,
+                process=result,
+            )
+        except asyncio.CancelledError:
+            self._last_test = self._operation_cache("test", "cancelled", normalised_binary, started, item_count=len(names))
+            raise
+        except Exception:
+            self._last_test = self._operation_cache("test", "failure", normalised_binary, started, item_count=len(names))
+            raise
+        else:
+            outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
+            self._last_test = self._operation_cache("test", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(names) if names else len(failed_tests))
+            return response
+        finally:
+            self._active_operations -= 1
+
+    @staticmethod
+    def _operation_cache(
+        operation: str,
+        outcome: str,
+        binary_dir: str,
+        started: float,
+        *,
+        exit_code: int | None = None,
+        item_count: int = 0,
+    ) -> CMakeOperationStatusCache:
+        return CMakeOperationStatusCache(
+            operation=operation,
+            outcome=outcome,
+            binary_dir=binary_dir[:4096] or ".",
+            exit_code=exit_code,
+            duration_milliseconds=max(0, int((monotonic() - started) * 1000)),
+            item_count=item_count,
+            observed_at=datetime.now(UTC),
         )
 
     async def _tool_status(self, executable: str, *, requires_minimum: bool) -> CMakeToolStatus:

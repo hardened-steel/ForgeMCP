@@ -119,6 +119,25 @@ class _DocumentState:
 
 
 @dataclass(frozen=True, slots=True)
+class ClangdProjectStatusCache:
+    """Safe cached session metadata used by project status."""
+
+    state: ClangdSessionState
+    availability_observed: bool
+    available: bool
+    explicitly_configured: bool
+    version: str | None
+    compile_commands_dir: str | None
+    open_document_count: int
+    diagnostic_count: int
+    diagnostic_error_count: int
+    diagnostic_warning_count: int
+    diagnostic_information_count: int
+    diagnostic_hint_count: int
+    stale_diagnostic_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _CachedAction:
     """A bounded-lifetime raw action kept only to request a safe WorkspaceEdit."""
 
@@ -162,6 +181,9 @@ class ClangdService:
         self._actions: dict[str, _CachedAction] = {}
         self._hierarchy_items: dict[str, _CachedHierarchyItem] = {}
         self._failure: str | None = None
+        self._availability_observed = False
+        self._available = False
+        self._cached_version: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._document_lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
@@ -180,23 +202,58 @@ class ClangdService:
         """Report a safe status and probe availability only when no session exists."""
         executable = self._executable
         if self._state is ClangdSessionState.RUNNING:
+            self._availability_observed = True
+            self._available = True
             return self._make_status(available=True)
         if self._state is ClangdSessionState.FAILED:
+            self._availability_observed = True
+            self._available = False
             return self._make_status(available=False, error=self._failure)
         try:
             result = await self._process_runtime.run([executable, "--version"], cwd=".")
         except ProcessError:
+            self._availability_observed = True
+            self._available = False
             return self._make_status(
                 available=False,
                 error="clangd was not found or is not permitted by the process policy.",
             )
         if result.timed_out or result.exit_code != 0:
+            self._availability_observed = True
+            self._available = False
             return self._make_status(available=False, error="clangd could not report its version successfully.")
         version_match = _VERSION.search(result.stdout.text) or _VERSION.search(result.stderr.text)
+        self._availability_observed = True
+        self._available = True
+        self._cached_version = version_match.group(1) if version_match is not None else None
         return self._make_status(
             available=True,
-            version=version_match.group(1) if version_match is not None else None,
+            version=self._cached_version,
         )
+
+    async def cached_project_status(self) -> ClangdProjectStatusCache:
+        """Copy cached session/diagnostic counters without synchronizing a document."""
+
+        async with self._document_lock:
+            documents = tuple(self._documents.values())
+            diagnostics = tuple(item for document in documents for item in document.diagnostics)
+            return ClangdProjectStatusCache(
+                state=self._state,
+                availability_observed=self._availability_observed,
+                available=self._available or self._state is ClangdSessionState.RUNNING,
+                explicitly_configured=self._config.clangd_path is not None,
+                version=self._cached_version,
+                compile_commands_dir=self._compile_commands_dir,
+                open_document_count=len(documents),
+                diagnostic_count=len(diagnostics),
+                diagnostic_error_count=sum(item.severity is Severity.ERROR for item in diagnostics),
+                diagnostic_warning_count=sum(item.severity is Severity.WARNING for item in diagnostics),
+                diagnostic_information_count=sum(item.severity is Severity.INFORMATION for item in diagnostics),
+                diagnostic_hint_count=sum(item.severity is Severity.HINT for item in diagnostics),
+                stale_diagnostic_count=sum(
+                    len(document.diagnostics) for document in documents if document.stale_diagnostics
+                ),
+            )
 
     async def start(self, compile_commands_dir: str) -> ClangdStartResult:
         """Start clangd with a validated explicit compilation database directory."""
@@ -235,6 +292,8 @@ class ClangdService:
                 self._client = client
                 self._compile_commands_dir = directory
                 self._state = ClangdSessionState.RUNNING
+                self._availability_observed = True
+                self._available = True
                 self._watch_task = asyncio.create_task(self._watch_process(handle), name="forgemcp-clangd-watch")
                 return ClangdStartResult(status=self._make_status(available=True))
             except ProcessError as error:

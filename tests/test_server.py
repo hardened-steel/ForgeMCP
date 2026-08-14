@@ -24,7 +24,10 @@ def test_server_status_smoke_test(tmp_path):
 
     assert status["workspace_root"] == str(tmp_path.resolve())
     assert status["state"] == LifecycleState.RUNNING.value
-    assert status["services"] == ["config", "logger", "plugins", "process_runtime", "workspace"]
+    assert status["services"] == [
+        "config", "logger", "plugins", "process_runtime", "project_status_registry",
+        "project_status_service", "workspace",
+    ]
     server = create_server(lambda: application)
     assert server.name == "ForgeMCP"
     assert [tool.name for tool in asyncio.run(server.list_tools())] == ["server_status"]
@@ -156,8 +159,9 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
                 "debugger__stop",
                 "debugger__threads",
                 "debugger__variables",
-                "example__inspect",
-                "quality__status",
+                    "example__inspect",
+                    "project__status",
+                    "quality__status",
                 "sanitizer__parse_report",
                 "server_status",
             ]

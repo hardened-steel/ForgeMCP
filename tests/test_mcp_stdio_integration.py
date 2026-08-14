@@ -16,6 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 _EXPECTED_TOOLS = {
     "server_status",
+    "project__status",
     "cmake__status",
     "cmake__list_presets",
     "cmake__configure",
@@ -97,6 +98,21 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert {"program", "args", "environment", "initial_breakpoints", "stop_on_entry"} <= launch_schema["properties"].keys()
                     assert launch_schema["additionalProperties"] is False
                     assert tool_by_name["debugger__events"].inputSchema["properties"]["limit"]["default"] == 100
+                    assert tool_by_name["project__status"].inputSchema["properties"] == {}
+                    assert tool_by_name["project__status"].inputSchema["additionalProperties"] is False
+
+                    project_status_result = await session.call_tool("project__status", {})
+                    assert project_status_result.isError is False
+                    project_status = _json_tool_content(project_status_result)
+                    assert project_status["partial"] is False
+                    assert project_status["health"] in {"healthy", "degraded", "failed"}
+                    assert project_status["activity"] in {"idle", "busy", "paused"}
+                    assert len(project_status["components"]) == 8
+                    assert len(json.dumps(project_status)) < 100_000
+                    invalid_project_status = await session.call_tool(
+                        "project__status", {"refresh": True}
+                    )
+                    assert invalid_project_status.isError is True
 
                     status = await session.call_tool("cmake__status")
                     assert status.isError is False

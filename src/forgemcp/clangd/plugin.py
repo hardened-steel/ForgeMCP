@@ -12,6 +12,8 @@ from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import Diagnostic, Position, Range
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
+from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.workspace import WorkspaceService
 
@@ -86,20 +88,76 @@ class _HierarchyItemArguments(ForgeModel):
 ToolOperation = Callable[[ClangdService, ForgeModel], Awaitable[ForgeModel | None]]
 
 
+class _ClangdStatusProvider:
+    id = "clangd"
+
+    def __init__(self, service: ClangdService) -> None:
+        self._service = service
+
+    async def snapshot_status(self) -> ComponentStatus:
+        cached = await self._service.cached_project_status()
+        state = {
+            "stopped": ComponentState.STOPPED,
+            "starting": ComponentState.STARTING,
+            "running": ComponentState.ACTIVE,
+            "failed": ComponentState.FAILED,
+        }[cached.state.value]
+        if (
+            state is ComponentState.STOPPED
+            and cached.explicitly_configured
+            and cached.availability_observed
+            and not cached.available
+        ):
+            state = ComponentState.DEGRADED
+        facts = [
+            StatusFact(name="availability_observed", value=cached.availability_observed),
+            StatusFact(name="available", value=cached.available),
+            StatusFact(name="open_documents", value=cached.open_document_count),
+            StatusFact(name="diagnostics", value=cached.diagnostic_count),
+            StatusFact(name="diagnostic_errors", value=cached.diagnostic_error_count),
+            StatusFact(name="diagnostic_warnings", value=cached.diagnostic_warning_count),
+            StatusFact(name="diagnostic_information", value=cached.diagnostic_information_count),
+            StatusFact(name="diagnostic_hints", value=cached.diagnostic_hint_count),
+            StatusFact(name="stale_diagnostics", value=cached.stale_diagnostic_count),
+        ]
+        if cached.version is not None:
+            facts.append(StatusFact(name="version", value=cached.version))
+        if cached.compile_commands_dir is not None:
+            facts.append(StatusFact(name="compile_commands_directory", value=cached.compile_commands_dir))
+        return ComponentStatus(
+            id=self.id,
+            display_name="clangd",
+            state=state,
+            capabilities=("clangd", "lsp.navigation", "lsp.diagnostics", "lsp.workspace_edit"),
+            summary="Cached clangd lifecycle and normalized diagnostic counters.",
+            facts=tuple(facts),
+            warnings=(
+                ("required_capability_unavailable",)
+                if state is ComponentState.DEGRADED
+                else ("tool_availability_not_observed",)
+                if not cached.availability_observed
+                else ()
+            ),
+            stale=cached.stale_diagnostic_count > 0,
+            observed_at=utc_now(),
+        )
+
+
 class ClangdPlugin(ForgePlugin):
     """Application-scoped clangd plugin; it creates no server until ``start`` tool use."""
 
-    __slots__ = ("_service",)
+    __slots__ = ("_service", "_status_registry")
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="clangd",
-                requires_services=("workspace", "process_runtime"),
+                requires_services=("workspace", "process_runtime", "project_status_registry"),
                 provides=frozenset({"clangd"}),
             )
         )
         self._service: ClangdService | None = None
+        self._status_registry: ProjectStatusRegistry | None = None
 
     @property
     def service(self) -> ClangdService:
@@ -111,13 +169,21 @@ class ClangdPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
+        status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(process_runtime, ProcessRuntime):
             raise TypeError("The clangd plugin requires WorkspaceService and ProcessRuntime.")
+        if not isinstance(status_registry, ProjectStatusRegistry):
+            raise TypeError("The clangd plugin requires ProjectStatusRegistry.")
         self._service = ClangdService(context.config, workspace, process_runtime)
+        self._status_registry = status_registry
+        status_registry.register(_ClangdStatusProvider(self._service))
         self._register_tools(context)
 
     async def stop(self) -> None:
         """Stop the managed server before Process Runtime closes its child handles."""
+        if self._status_registry is not None:
+            self._status_registry.unregister("clangd")
+            self._status_registry = None
         if self._service is not None:
             await self._service.aclose()
             self._service = None

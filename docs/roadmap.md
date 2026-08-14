@@ -53,11 +53,19 @@ irreversible choices belong in [adr/](adr/).
   sanitizer, CAS/concurrency/lifecycle, and real MCP stdio gates pass. The
   compilation database and parent/project tool configuration remain explicitly
   trusted input, not a sandbox.
+- Project Intelligence Phase 1: application-scoped provider registry and
+  transport-neutral health/activity aggregation exposed only as
+  `project__status {}`. Eight builtin providers report bounded cached state;
+  collection has per-provider/aggregate deadlines, safe partial failures, and
+  cancellation cleanup. It performs no process, source, protocol, qualification,
+  analysis, or lifecycle action. Git and aggregated diagnostic messages remain
+  outside this phase.
 
 ### In progress
 
-- No quality-tool work is in progress. Real LLVM quality gates remain portable
-  conditional tests on hosts without separately installed qualified tools.
+- Project Intelligence Phase 1 is ready for its dedicated status audit. Real
+  LLVM feature gates remain portable conditional tests on hosts without
+  separately installed qualified tools.
 
 ## Delivery sequence and dependencies
 
@@ -67,7 +75,8 @@ irreversible choices belong in [adr/](adr/).
 | clangd | Audited Core, Models, Workspace, Process Runtime, Plugin System | A managed LSP session can be started, initialized, stopped, and mapped to transport-neutral diagnostics without escaping the workspace. |
 | DAP debugger | ADR 0009, audited Process Runtime, Plugin System, workspace path policy, a runnable approved adapter | A managed debug-adapter session can launch within policy, prove strong tree ownership, terminate descendants, and expose bounded transport-neutral debug state. |
 | Quality tools | CMake target/build metadata and Process Runtime | Complete: lazy fixed-tool discovery, CAS formatting, bounded read-only diagnostics, and sanitizer parsing without shell access or secrets. |
-| Git and `project_status` | Workspace snapshots plus CMake/quality summaries | Read-only repository/project aggregation reports bounded, safe status with explicit freshness and failure states. |
+| Project Intelligence Phase 1 | Audited Core, Workspace, Process Runtime, plugins, and feature caches | Complete: bounded cached provider aggregation with explicit partial/freshness and no refresh side effects. |
+| Git intelligence | Separate Git freshness, ignored-file, nesting, and trust design | Not started; intentionally absent from `project__status` Phase 1. |
 
 ## Completed milestone: clangd phase 1
 
@@ -198,8 +207,9 @@ resolve; each needs a bounded contract and safety review.
 - clangd intentionally omits semantic tokens, inlay hints, code lenses,
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
-- There are no generic Workspace MCP editing tools, Git integration, or
-  aggregate `project_status` tool yet. DAP Phase 1 is launch-only LLDB-DAP
+- There are no generic Workspace MCP editing tools or Git integration.
+  `project__status` reports cached safe component metadata only and deliberately
+  has no aggregated diagnostic messages or refresh. DAP Phase 1 is launch-only LLDB-DAP
   source debugging for the passed standalone LLVM/DWARF gate; it is not an
   MSVC/PDB compatibility claim.
 - CMake and CTest are discovered through the Process Runtime environment; an
@@ -216,5 +226,5 @@ resolve; each needs a bounded contract and safety review.
   `runInTerminal` broker before enabling terminal-dependent debuggees.
 - Decide which quality-tool result schema can be shared without making domain
   models depend on any individual tool format.
-- Define Git status freshness, ignored-file treatment, and repository nesting
-  policy before adding `project_status`.
+- Define Git status freshness, ignored-file treatment, repository nesting, and
+  trust policy before any separate Git provider is added.

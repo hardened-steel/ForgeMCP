@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -32,6 +33,17 @@ from forgemcp.processes.policy import ProcessPolicy, _contains_link_or_reparse_p
 
 if TYPE_CHECKING:
     from asyncio.streams import StreamReader, StreamWriter
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessRuntimeCachedStatus:
+    """Content-free counters already owned by ProcessRuntime."""
+
+    closed: bool
+    active_processes: int
+    active_persistent_adapters: int
+    best_effort_ownership: bool
+    required_ownership: bool
 
 
 def _known_llvm_quality_tools() -> tuple[Path, ...]:
@@ -466,6 +478,7 @@ class ProcessRuntime:
             else policy
         )
         self._handles: set[ProcessHandle] = set()
+        self._short_handles: set[ProcessHandle] = set()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -478,6 +491,19 @@ class ProcessRuntime:
     def policy(self) -> ProcessPolicy:
         """Return the immutable policy active for this runtime."""
         return self._policy
+
+    def cached_status(self) -> ProcessRuntimeCachedStatus:
+        """Return in-memory lifecycle counters without process inspection or probes."""
+
+        handles = tuple(self._handles)
+        persistent = tuple(handle for handle in handles if handle not in self._short_handles)
+        return ProcessRuntimeCachedStatus(
+            closed=self._closed,
+            active_processes=len(handles),
+            active_persistent_adapters=len(persistent),
+            best_effort_ownership=any(not handle.required_ownership for handle in handles),
+            required_ownership=any(handle.required_ownership for handle in handles),
+        )
 
     def resolve_executable(self, executable: str) -> str:
         """Return the policy-qualified canonical executable path without launching it.
@@ -520,6 +546,7 @@ class ProcessRuntime:
             approved_path_directories=approved_path_directories,
             require_exact_executable=require_exact_executable,
         )
+        self._short_handles.add(handle)
         started_at = datetime.now(UTC)
         stdout_capture = _BoundedTextCapture(self._policy.max_output_characters)
         stderr_capture = _BoundedTextCapture(self._policy.max_output_characters)
@@ -551,6 +578,7 @@ class ProcessRuntime:
             )
             raise
         finally:
+            self._short_handles.discard(handle)
             self._forget(handle)
 
         finished_at = datetime.now(UTC)
@@ -1198,6 +1226,7 @@ class ProcessRuntime:
             await asyncio.sleep(min(0.05, max(0.0, deadline - asyncio.get_running_loop().time())))
 
     def _forget(self, handle: ProcessHandle) -> None:
+        self._short_handles.discard(handle)
         self._handles.discard(handle)
         if handle._job is not None:
             handle._job.close()

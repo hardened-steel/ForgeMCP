@@ -72,13 +72,22 @@ class ClangTidyService:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._cached_status: QualityToolInfo | None = None
+
+    @property
+    def cached_status(self) -> QualityToolInfo | None:
+        """Return the last qualification result without launching a probe."""
+
+        return self._cached_status
 
     async def status(self) -> QualityToolInfo:
         try:
             tool = await self._qualify()
         except QualityToolUnavailableError as error:
-            return QualityToolInfo(available=False, error=error.message)
-        return QualityToolInfo(executable=tool.canonical, available=True, version=tool.version)
+            self._cached_status = QualityToolInfo(available=False, error=error.message)
+            return self._cached_status
+        self._cached_status = QualityToolInfo(executable=tool.canonical, available=True, version=tool.version)
+        return self._cached_status
 
     async def list_checks(self, checks: str | None = None) -> TidyCheckList:
         pattern = self._validate_checks(checks)
@@ -182,7 +191,15 @@ class ClangTidyService:
                 or "--checks" not in help_text
             ):
                 continue
-            return _ToolSelection(canonical, version)
+            selection = _ToolSelection(canonical, version)
+            self._cached_status = QualityToolInfo(
+                executable=selection.canonical, available=True, version=selection.version
+            )
+            return selection
+        self._cached_status = QualityToolInfo(
+            available=False,
+            error="clang-tidy is not available through the configured Process Runtime.",
+        )
         raise QualityToolUnavailableError("clang-tidy is not available through the configured Process Runtime.")
 
     def _canonical(self, candidate: str) -> str | None:

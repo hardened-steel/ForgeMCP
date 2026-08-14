@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from pydantic import Field, ValidationError
 
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
+from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.quality.clang_format import ClangFormatService
 from forgemcp.quality.clang_tidy import ClangTidyService
@@ -53,16 +58,98 @@ class _SanitizerArguments(ForgeModel):
 ToolOperation = Callable[["QualityPlugin", ForgeModel], Awaitable[ForgeModel]]
 
 
+@dataclass(frozen=True, slots=True)
+class _QualityOperationCache:
+    operation: str
+    outcome: str
+    item_count: int
+    observed_at: datetime
+
+
+class _QualityStatusProvider:
+    id = "quality"
+
+    def __init__(self, plugin: "QualityPlugin") -> None:
+        self._plugin = plugin
+
+    async def snapshot_status(self) -> ComponentStatus:
+        format_info = self._plugin._format_info or self._plugin.clang_format.cached_status
+        tidy_info = self._plugin._tidy_info or self._plugin.clang_tidy.cached_status
+        state = ComponentState.ACTIVE if self._plugin._active_operations else ComponentState.IDLE
+        if (
+            format_info is not None
+            and tidy_info is not None
+            and not format_info.available
+            and not tidy_info.available
+        ):
+            state = ComponentState.UNAVAILABLE
+        required_unavailable = (
+            self._plugin._format_required
+            and format_info is not None
+            and not format_info.available
+        ) or (
+            self._plugin._tidy_required
+            and tidy_info is not None
+            and not tidy_info.available
+        )
+        if required_unavailable:
+            state = ComponentState.DEGRADED
+        facts = [
+            StatusFact(name="clang_format_observed", value=format_info is not None),
+            StatusFact(name="clang_format_available", value=format_info.available if format_info else False),
+            StatusFact(name="clang_tidy_observed", value=tidy_info is not None),
+            StatusFact(name="clang_tidy_available", value=tidy_info.available if tidy_info else False),
+            StatusFact(name="active_operations", value=self._plugin._active_operations),
+            StatusFact(name="sanitizer_parser_count", value=3),
+        ]
+        if format_info is not None and format_info.version is not None:
+            facts.append(StatusFact(name="clang_format_version", value=format_info.version))
+        if tidy_info is not None and tidy_info.version is not None:
+            facts.append(StatusFact(name="clang_tidy_version", value=tidy_info.version))
+        warnings: list[str] = []
+        for item in (self._plugin._last_format, self._plugin._last_tidy):
+            if item is None:
+                continue
+            prefix = f"last_{item.operation}"
+            facts.extend(
+                (
+                    StatusFact(name=f"{prefix}_outcome", value=item.outcome),
+                    StatusFact(name=f"{prefix}_item_count", value=item.item_count),
+                    StatusFact(name=f"{prefix}_observed_at", value=item.observed_at.isoformat()),
+                )
+            )
+            if item.outcome != "success":
+                warnings.append(f"{prefix}_{item.outcome}")
+        if format_info is None or tidy_info is None:
+            warnings.append("tool_availability_not_observed")
+        if required_unavailable:
+            warnings.append("required_capability_unavailable")
+        return ComponentStatus(
+            id=self.id,
+            display_name="Quality Tools",
+            state=state,
+            capabilities=("clang-format", "clang-tidy", "sanitizer-report"),
+            summary="Cached quality-tool qualification and last-operation metadata.",
+            facts=tuple(facts),
+            warnings=tuple(warnings),
+            observed_at=utc_now(),
+        )
+
+
 class QualityPlugin(ForgePlugin):
     """Builtin, non-persistent quality capability for formatting, analysis, and report parsing."""
 
-    __slots__ = ("_format", "_tidy", "_sanitizer")
+    __slots__ = (
+        "_format", "_tidy", "_sanitizer", "_status_registry", "_active_operations",
+        "_format_info", "_tidy_info", "_last_format", "_last_tidy",
+        "_format_required", "_tidy_required",
+    )
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="quality",
-                requires_services=("workspace", "process_runtime"),
+                requires_services=("workspace", "process_runtime", "project_status_registry"),
                 provides=frozenset({"clang-format", "clang-tidy", "sanitizer-report"}),
                 tool_namespaces=("clang_format", "clang_tidy", "sanitizer"),
             )
@@ -70,6 +157,14 @@ class QualityPlugin(ForgePlugin):
         self._format: ClangFormatService | None = None
         self._tidy: ClangTidyService | None = None
         self._sanitizer: SanitizerReportParser | None = None
+        self._status_registry: ProjectStatusRegistry | None = None
+        self._active_operations = 0
+        self._format_info = None
+        self._tidy_info = None
+        self._last_format: _QualityOperationCache | None = None
+        self._last_tidy: _QualityOperationCache | None = None
+        self._format_required = False
+        self._tidy_required = False
 
     @property
     def clang_format(self) -> ClangFormatService:
@@ -92,15 +187,25 @@ class QualityPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         runtime = context.services.get("process_runtime")
+        status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(runtime, ProcessRuntime):
             raise TypeError("The Quality plugin requires WorkspaceService and ProcessRuntime.")
+        if not isinstance(status_registry, ProjectStatusRegistry):
+            raise TypeError("The Quality plugin requires ProjectStatusRegistry.")
         self._format = ClangFormatService(context.config, workspace, runtime)
         self._tidy = ClangTidyService(context.config, workspace, runtime)
         self._sanitizer = SanitizerReportParser(workspace)
+        self._format_required = context.config.clang_format_path is not None
+        self._tidy_required = context.config.clang_tidy_path is not None
+        self._status_registry = status_registry
+        status_registry.register(_QualityStatusProvider(self))
         self._register_tools(context)
 
     async def stop(self) -> None:
         """Release only in-memory service references; no persistent process is owned."""
+        if self._status_registry is not None:
+            self._status_registry.unregister("quality")
+            self._status_registry = None
         self._sanitizer = None
         self._tidy = None
         self._format = None
@@ -135,9 +240,17 @@ class QualityPlugin(ForgePlugin):
         return result.model_dump(mode="json")
 
     async def _status(self, _: ForgeModel) -> QualityStatus:
+        self._active_operations += 1
+        try:
+            format_info = await self.clang_format.status()
+            tidy_info = await self.clang_tidy.status()
+            self._format_info = format_info
+            self._tidy_info = tidy_info
+        finally:
+            self._active_operations -= 1
         return QualityStatus(
-            clang_format=await self.clang_format.status(),
-            clang_tidy=await self.clang_tidy.status(),
+            clang_format=format_info,
+            clang_tidy=tidy_info,
             sanitizer_parsers=("address_sanitizer", "undefined_behavior_sanitizer", "unknown"),
             platform_limitations=(
                 "Quality tools are qualified lazily; missing executables do not prevent startup.",
@@ -150,24 +263,79 @@ class QualityPlugin(ForgePlugin):
 
     async def _check(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _FormatCheckArguments)
-        return await self.clang_format.check(request.paths)
+        self._active_operations += 1
+        try:
+            result = await self.clang_format.check(request.paths)
+        except asyncio.CancelledError:
+            self._last_format = _QualityOperationCache("format", "cancelled", len(request.paths), datetime.now(UTC))
+            raise
+        except Exception:
+            self._last_format = _QualityOperationCache("format", "failure", len(request.paths), datetime.now(UTC))
+            raise
+        finally:
+            self._active_operations -= 1
+        self._last_format = _QualityOperationCache(
+            "format", "success" if all(item.error is None for item in result.files) else "failure",
+            len(result.files), datetime.now(UTC)
+        )
+        return result
 
     async def _apply(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _FormatApplyArguments)
-        return await self.clang_format.apply(tuple((item.path, item.expected_sha256) for item in request.files))
+        self._active_operations += 1
+        try:
+            result = await self.clang_format.apply(tuple((item.path, item.expected_sha256) for item in request.files))
+        except asyncio.CancelledError:
+            self._last_format = _QualityOperationCache("format", "cancelled", len(request.files), datetime.now(UTC))
+            raise
+        except Exception:
+            self._last_format = _QualityOperationCache("format", "failure", len(request.files), datetime.now(UTC))
+            raise
+        finally:
+            self._active_operations -= 1
+        self._last_format = _QualityOperationCache(
+            "format", "success" if result.applied else "failure", len(result.files), datetime.now(UTC)
+        )
+        return result
 
     async def _list_checks(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _TidyChecksArguments)
-        return await self.clang_tidy.list_checks(request.checks)
+        self._active_operations += 1
+        try:
+            result = await self.clang_tidy.list_checks(request.checks)
+        except asyncio.CancelledError:
+            self._last_tidy = _QualityOperationCache("tidy", "cancelled", 0, datetime.now(UTC))
+            raise
+        except Exception:
+            self._last_tidy = _QualityOperationCache("tidy", "failure", 0, datetime.now(UTC))
+            raise
+        finally:
+            self._active_operations -= 1
+        outcome = "success" if result.process.exit_code == 0 and not result.process.timed_out else "failure"
+        self._last_tidy = _QualityOperationCache("tidy", outcome, len(result.checks), datetime.now(UTC))
+        return result
 
     async def _run_tidy(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _TidyRunArguments)
-        return await self.clang_tidy.run(
-            paths=request.paths,
-            compile_commands_dir=request.compile_commands_dir,
-            checks=request.checks,
-            timeout_seconds=request.timeout_seconds,
-        )
+        self._active_operations += 1
+        try:
+            result = await self.clang_tidy.run(
+                paths=request.paths,
+                compile_commands_dir=request.compile_commands_dir,
+                checks=request.checks,
+                timeout_seconds=request.timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            self._last_tidy = _QualityOperationCache("tidy", "cancelled", len(request.paths), datetime.now(UTC))
+            raise
+        except Exception:
+            self._last_tidy = _QualityOperationCache("tidy", "failure", len(request.paths), datetime.now(UTC))
+            raise
+        finally:
+            self._active_operations -= 1
+        outcome = "success" if result.execution_state.value == "completed" else "failure"
+        self._last_tidy = _QualityOperationCache("tidy", outcome, len(result.diagnostics), datetime.now(UTC))
+        return result
 
     async def _parse_report(self, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _SanitizerArguments)

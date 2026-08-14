@@ -15,6 +15,7 @@ from forgemcp.processes.runtime import (
     ProcessEnvironmentMode,
     ProcessHandle,
     ProcessRuntime,
+    ProcessRuntimeCachedStatus,
     ProcessTreeOwnership,
 )
 from forgemcp.processes.lldb_dap import AdapterQualification, LldbDapCandidate, LldbDapQualifier
@@ -33,6 +34,7 @@ __all__ = [
     "ProcessPolicy",
     "ProcessPolicyError",
     "ProcessRuntime",
+    "ProcessRuntimeCachedStatus",
     "ProcessRuntimeClosedError",
     "ProcessTreeOwnership",
     "ProcessWorkingDirectoryError",

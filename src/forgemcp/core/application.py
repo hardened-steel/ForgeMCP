@@ -19,6 +19,15 @@ from forgemcp.core.logging import StructuredLogger, create_logger
 from forgemcp.core.services import ServiceRegistry
 from forgemcp.processes import ProcessRuntime
 from forgemcp.plugins import ForgePlugin, PluginManager
+from forgemcp.project import (
+    CoreStatusProvider,
+    PluginManagerStatusProvider,
+    ProcessRuntimeStatusProvider,
+    ProjectPlugin,
+    ProjectStatusRegistry,
+    ProjectStatusService,
+    WorkspaceStatusProvider,
+)
 from forgemcp.workspace import WorkspaceService
 
 
@@ -70,13 +79,33 @@ class ForgeApplication:
         services.register("config", config)
         logger = create_logger(config.log_level)
         services.register("logger", logger)
-        services.register("workspace", WorkspaceService(config, logger))
-        services.register("process_runtime", ProcessRuntime(config, logger))
+        workspace = WorkspaceService(config, logger)
+        process_runtime = ProcessRuntime(config, logger)
+        services.register("workspace", workspace)
+        services.register("process_runtime", process_runtime)
+        project_status_registry = ProjectStatusRegistry()
+        services.register("project_status_registry", project_status_registry)
+        services.register(
+            "project_status_service",
+            ProjectStatusService(project_status_registry, config.workspace_root),
+        )
         plugins = PluginManager(config=config, services=services, logger=logger)
         services.register("plugins", plugins)
-        for plugin in (CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), QualityPlugin(), *tuple(builtin_plugins)):
+        for plugin in (
+            CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), ProjectPlugin(), QualityPlugin(),
+            *tuple(builtin_plugins),
+        ):
             plugins.register_builtin(plugin)
-        return cls(config, services)
+        application = cls(config, services)
+        project_status_registry.register(CoreStatusProvider(lambda: application.state.value))
+        project_status_registry.register(WorkspaceStatusProvider(workspace))
+        project_status_registry.register(ProcessRuntimeStatusProvider(process_runtime))
+        project_status_registry.register(
+            PluginManagerStatusProvider(
+                plugins, external_enabled=config.external_plugins_enabled
+            )
+        )
+        return application
 
     @classmethod
     def from_environment(
@@ -122,6 +151,10 @@ class ForgeApplication:
         if self._state is LifecycleState.STOPPED:
             return
         try:
+            if "project_status_registry" in self.services:
+                project_registry = self.services.get("project_status_registry")
+                if isinstance(project_registry, ProjectStatusRegistry):
+                    await project_registry.aclose()
             plugins = self.services.get("plugins")
             if not isinstance(plugins, PluginManager):
                 raise TypeError("The 'plugins' service must be a PluginManager.")
