@@ -62,6 +62,58 @@ def _known_llvm_quality_tools() -> tuple[Path, ...]:
     return tuple(root / "LLVM" / "bin" / f"{name}{suffix}" for root in roots for name in ("clang-format", "clang-tidy"))
 
 
+_FIXED_QUALITY_EXECUTABLES = ("clang-format", "clang-tidy")
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """Return whether one resolved path is inside the configured workspace."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_quality_path_candidate(path: Path, workspace_root: Path) -> Path | None:
+    """Canonicalize an operator-controlled quality executable, never a workspace file."""
+    if not path.is_absolute() or _contains_link_or_reparse_point(path):
+        return None
+    try:
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if not resolved.is_file() or _is_within(resolved, workspace_root):
+        return None
+    if os.name != "nt" and not os.access(resolved, os.X_OK):
+        return None
+    return resolved
+
+
+def _discover_quality_on_path(
+    tool_name: str, search_path: str | None, workspace_root: Path
+) -> Path | None:
+    """Search only absolute PATH directories and skip workspace/current-directory entries.
+
+    ``shutil.which`` deliberately follows platform executable-search semantics,
+    which can include the current directory on Windows.  Quality tools use this
+    narrower discovery because their path becomes a security approval.
+    """
+    if not search_path:
+        return None
+    names = (f"{tool_name}.exe",) if os.name == "nt" else (tool_name,)
+    for raw_directory in search_path.split(os.pathsep):
+        value = raw_directory.strip().strip('"')
+        if not value:
+            continue
+        directory = Path(value)
+        if not directory.is_absolute():
+            continue
+        for name in names:
+            if (candidate := _safe_quality_path_candidate(directory / name, workspace_root)) is not None:
+                return candidate
+    return None
+
+
 class ProcessTreeOwnership(StrEnum):
     """Requested operating-system containment strength for one launch."""
 
@@ -377,26 +429,42 @@ class ProcessRuntime:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        configured_exact_paths = frozenset(
+        self._base_environment = dict(os.environ)
+        self._executable_search_path = self._base_environment.get("PATH")
+        self._fixed_quality_executables: dict[str, Path] = {}
+        for tool_name in _FIXED_QUALITY_EXECUTABLES:
+            configured = (
+                config.clang_format_path if tool_name == "clang-format" else config.clang_tidy_path
+            )
+            if configured is None:
+                discovered = _discover_quality_on_path(
+                    tool_name, self._executable_search_path, self._root
+                )
+                if discovered is not None:
+                    self._fixed_quality_executables[tool_name] = discovered
+        configured_exact_paths: set[Path] = {
             path
+            for path in (config.clangd_path, config.lldb_dap_path)
+            if path is not None and path.is_file() and not path.is_symlink()
+        }
+        configured_exact_paths.update(
+            candidate
             for path in (
-                config.clangd_path,
-                config.lldb_dap_path,
                 config.clang_format_path,
                 config.clang_tidy_path,
                 *_known_llvm_quality_tools(),
+                *self._fixed_quality_executables.values(),
             )
-            if path is not None and path.is_file() and not path.is_symlink()
+            if path is not None
+            and (candidate := _safe_quality_path_candidate(path, self._root)) is not None
         )
         self._policy = (
             ProcessPolicy(
-                allowed_executable_paths=configured_exact_paths
+                allowed_executable_paths=frozenset(configured_exact_paths)
             )
             if policy is None
             else policy
         )
-        self._base_environment = dict(os.environ)
-        self._executable_search_path = self._base_environment.get("PATH")
         self._handles: set[ProcessHandle] = set()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -428,6 +496,7 @@ class ProcessRuntime:
         environment: Mapping[str, str] | None = None,
         inherit_environment: bool | None = None,
         timeout_seconds: float | None = None,
+        input_data: bytes | None = None,
         ownership: ProcessTreeOwnership = ProcessTreeOwnership.BEST_EFFORT,
         environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
         approved_path_directories: Sequence[Path] = (),
@@ -440,6 +509,7 @@ class ProcessRuntime:
         cleanup so the caller retains normal asyncio cancellation semantics.
         """
         timeout = self._validate_run_timeout(timeout_seconds)
+        process_input = self._validate_input_data(input_data)
         handle = await self.start(
             argv,
             cwd=cwd,
@@ -461,7 +531,9 @@ class ProcessRuntime:
 
         try:
             try:
-                exit_code = await asyncio.wait_for(handle._process.wait(), timeout=timeout)
+                exit_code = await asyncio.wait_for(
+                    self._feed_stdin_and_wait(handle, process_input), timeout=timeout
+                )
             except TimeoutError:
                 timed_out = True
                 await self._terminate_process_tree(handle._process, handle._job)
@@ -695,6 +767,12 @@ class ProcessRuntime:
 
         if "/" in requested or "\\" in requested:
             raise ProcessExecutableError("Executable paths must be explicitly allow-listed absolute paths.")
+        fixed_name = Path(requested).stem.casefold() if os.name == "nt" else requested
+        if fixed_name in _FIXED_QUALITY_EXECUTABLES:
+            discovered = self._fixed_quality_executables.get(fixed_name)
+            if discovered is None:
+                raise ProcessExecutableError("The requested executable is not available.")
+            return discovered
         discovered = shutil.which(requested, path=self._executable_search_path)
         if discovered is None:
             raise ProcessExecutableError("The requested executable is not available.")
@@ -705,7 +783,41 @@ class ProcessRuntime:
             return True
         if "/" in requested or "\\" in requested or Path(requested).is_absolute():
             return False
+        fixed_name = Path(requested).stem.casefold() if os.name == "nt" else requested
+        if fixed_name in _FIXED_QUALITY_EXECUTABLES:
+            return self._policy.allows_executable_name(requested) and self._policy.approves_exact_executable(
+                resolved
+            )
         return self._policy.allows_executable_name(requested)
+
+    def _validate_input_data(self, input_data: bytes | None) -> bytes:
+        """Validate bounded opaque stdin bytes without decoding or logging them."""
+        if input_data is None:
+            return b""
+        if not isinstance(input_data, bytes):
+            raise ProcessArgumentError("Process input must be bounded bytes.")
+        if len(input_data) > self._policy.max_input_bytes:
+            raise ProcessArgumentError("Process input exceeds the configured byte limit.")
+        return input_data
+
+    @staticmethod
+    async def _feed_stdin_and_wait(handle: ProcessHandle, input_data: bytes) -> int:
+        """Feed one bounded short-command input, close stdin, and await completion."""
+        writer = handle.stdin
+        try:
+            if input_data:
+                writer.write(input_data)
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            if not writer.is_closing():
+                writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+        return await handle._process.wait()
 
     def _resolve_working_directory(self, cwd: str) -> Path:
         if not isinstance(cwd, str) or not cwd or "\x00" in cwd:

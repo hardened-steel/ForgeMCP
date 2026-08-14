@@ -81,6 +81,38 @@ def test_run_bounds_each_stream_independently(tmp_path):
     asyncio.run(exercise())
 
 
+def test_run_feeds_bounded_opaque_stdin_and_closes_it(tmp_path):
+    async def exercise() -> None:
+        service = runtime(tmp_path, max_input_bytes=4)
+        result = await service.run(
+            [sys.executable, "-c", "import sys; print(sys.stdin.buffer.read().hex())"],
+            input_data=b"\x00\xffab",
+        )
+        assert result.exit_code == 0
+        assert result.stdout.text.strip() == "00ff6162"
+
+        with pytest.raises(ProcessArgumentError, match="input exceeds"):
+            await service.run(
+                [sys.executable, "-c", "pass"], input_data=b"12345"
+            )
+        assert service._handles == set()
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_run_without_input_closes_stdin_instead_of_leaving_a_reader_blocked(tmp_path):
+    async def exercise() -> None:
+        service = runtime(tmp_path)
+        result = await service.run(
+            [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"]
+        )
+        assert result.stdout.text.strip() == "0"
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_run_timeout_terminates_the_child_and_returns_timeout_model(tmp_path):
     async def exercise() -> None:
         service = runtime(tmp_path)

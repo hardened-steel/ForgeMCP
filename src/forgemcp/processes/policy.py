@@ -121,8 +121,10 @@ def _validate_positive_seconds(value: float, name: str) -> float:
 class ProcessPolicy:
     """Limits and explicit allow-lists for one :class:`ProcessRuntime`.
 
-    The default admits only the conventional CMake, CTest, and clangd program
-    names resolved from the environment present when the runtime is composed.
+    The default admits only the conventional CMake, CTest, clangd, and quality
+    program names resolved from the environment present when the runtime is
+    composed.  Quality names additionally require a captured exact-path
+    approval and never retain basename-only launch authority.
     DAP adapters and test executables need an explicit name or absolute-path
     entry.  Environment overrides are denied by default; a module must name
     the exact override keys it needs.  ``None`` deliberately opts a trusted
@@ -136,6 +138,7 @@ class ProcessPolicy:
     allowed_working_directories: frozenset[str] | None = None
     default_timeout_seconds: float = 300.0
     maximum_timeout_seconds: float = 900.0
+    max_input_bytes: int = 1_048_576
     max_output_characters: int = MAX_PROCESS_OUTPUT_CHARACTERS
     termination_grace_seconds: float = 5.0
     stream_close_timeout_seconds: float = 1.0
@@ -189,6 +192,12 @@ class ProcessPolicy:
         stream_close_timeout = _validate_positive_seconds(
             self.stream_close_timeout_seconds, "stream_close_timeout_seconds"
         )
+        if (
+            not isinstance(self.max_input_bytes, int)
+            or isinstance(self.max_input_bytes, bool)
+            or self.max_input_bytes <= 0
+        ):
+            raise ValueError("max_input_bytes must be greater than zero.")
         if (
             not isinstance(self.max_output_characters, int)
             or isinstance(self.max_output_characters, bool)

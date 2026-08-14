@@ -239,6 +239,57 @@ def test_commit_failure_restores_previously_replaced_files(tmp_path, monkeypatch
     assert second.read_text(encoding="utf-8") == "two\n"
 
 
+def test_text_edit_commit_io_failure_attempts_best_effort_multi_file_rollback(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "first.cpp"
+    second = tmp_path / "second.cpp"
+    first.write_bytes(b"one\n")
+    second.write_bytes(b"two\n")
+    service = workspace(tmp_path)
+    expected = {
+        "first.cpp": service.get_snapshot("first.cpp"),
+        "second.cpp": service.get_snapshot("second.cpp"),
+    }
+    real_replace = workspace_service_module.os.replace
+    replacement_calls = 0
+
+    def fail_second_target_replace(source, destination):
+        nonlocal replacement_calls
+        replacement_calls += 1
+        if replacement_calls == 4:
+            raise OSError("simulated locked target")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(workspace_service_module.os, "replace", fail_second_target_replace)
+    with pytest.raises(PatchCommitError):
+        service.apply_text_edits(
+            {
+                "first.cpp": (
+                    WorkspaceTextEdit(
+                        Range(
+                            start=Position(line=0, column=0),
+                            end=Position(line=0, column=3),
+                        ),
+                        "ONE",
+                    ),
+                ),
+                "second.cpp": (
+                    WorkspaceTextEdit(
+                        Range(
+                            start=Position(line=0, column=0),
+                            end=Position(line=0, column=3),
+                        ),
+                        "TWO",
+                    ),
+                ),
+            },
+            expected,
+        )
+    assert first.read_bytes() == b"one\n"
+    assert second.read_bytes() == b"two\n"
+
+
 def test_creation_requires_an_absent_snapshot_and_reports_existing_models(tmp_path):
     service = workspace(tmp_path)
     absent = service.get_snapshot("created.txt")

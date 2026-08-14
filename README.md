@@ -54,14 +54,21 @@ LLDB commands, and source/symbol downloads are intentionally unsupported; see
 Quality Phase 1 is a builtin, non-persistent feature plugin. It discovers
 `clang-format` and `clang-tidy` from explicit absolute
 `FORGEMCP_CLANG_FORMAT` / `FORGEMCP_CLANG_TIDY` configuration first, then the
-policy-controlled PATH and conventional installed LLVM location. Missing tools
-do not prevent server startup. Formatting only accepts explicitly listed
-workspace C/C++ files and uses snapshot-CAS with one staged Workspace commit;
-ForgeMCP never invokes `clang-format -i`. `clang-tidy` accepts only a validated
-workspace build directory containing `compile_commands.json`, exposes no fixes,
-plugin loading, compiler-argument, config, or arbitrary-flag surface, and treats
-the workspace/CMake compilation database as trusted project input. The
-sanitizer tool parses supplied ASan/UBSan text read-only and never runs a binary.
+policy-controlled PATH and conventional installed LLVM location. Relative,
+empty, current-directory, and workspace PATH candidates are not quality-tool
+approvals. Discovery records one canonical regular non-link executable with
+metadata and every probe/run rechecks and launches that exact path. Missing tools
+do not prevent server startup. Formatting sends the captured UTF-8 snapshot on
+stdin with a validated `--assume-filename`, parses bounded replacement XML byte
+offsets into Unicode code-point edits, and uses snapshot-CAS with one staged
+Workspace commit; ForgeMCP never invokes `clang-format -i`. UTF-8 BOM is
+supported and preserved. `clang-tidy` accepts only a validated workspace build
+directory containing regular non-link `compile_commands.json`, exposes no fixes,
+plugin loading, compiler-argument, config, response-file, or arbitrary-flag MCP
+surface, and treats the workspace/CMake compilation database as trusted project
+input. The database can itself contain frontend/plugin flags and external include
+paths; ForgeMCP is not a sandbox. The sanitizer tool parses supplied ASan/UBSan
+text read-only and never runs a binary or symbolizer.
 See [ADR 0010](docs/adr/0010-quality-tools-formatting-analysis-and-trust-boundary.md).
 
 ## Setup

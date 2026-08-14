@@ -46,11 +46,18 @@ irreversible choices belong in [adr/](adr/).
   multi-file applies, bounded read-only `clang-tidy` check/diagnostic parsing,
   and bounded ASan/UBSan report parsing. No `-i`, auto-fix, arbitrary tool
   arguments, plugin loading, or sanitizer binary execution is exposed.
+- Quality Tools Phase 1 security/integration audit: canonical exact executable
+  approval excludes workspace/current-directory PATH spoofing and detects
+  replacement; formatter stdin snapshots and UTF-8 byte-offset conversion pass
+  real LLVM 22.1.8 UTF-8/BOM/CRLF/multi-file gates; adversarial XML, diagnostics,
+  sanitizer, CAS/concurrency/lifecycle, and real MCP stdio gates pass. The
+  compilation database and parent/project tool configuration remain explicitly
+  trusted input, not a sandbox.
 
 ### In progress
 
-- No quality-tool work is in progress. Real local LLVM gates remain conditional
-  on a separately installed policy-qualified clang-format and clang-tidy.
+- No quality-tool work is in progress. Real LLVM quality gates remain portable
+  conditional tests on hosts without separately installed qualified tools.
 
 ## Delivery sequence and dependencies
 

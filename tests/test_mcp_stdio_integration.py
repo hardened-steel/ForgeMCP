@@ -46,6 +46,8 @@ _DEBUGGER_TOOLS = {
 
 _DEFAULT_LLDB_DAP = Path(r"C:\Program Files\LLVM\bin\lldb-dap.exe")
 _DEFAULT_CLANG = Path(r"C:\Program Files\LLVM\bin\clang.exe")
+_DEFAULT_CLANG_FORMAT = Path(r"C:\Program Files\LLVM\bin\clang-format.exe")
+_DEFAULT_CLANG_TIDY = Path(r"C:\Program Files\LLVM\bin\clang-tidy.exe")
 
 
 def _json_tool_content(result: object) -> dict[str, object]:
@@ -160,6 +162,205 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
     server_errors = asyncio.run(exercise())
 
     assert '"event": "application_stopped"' in server_errors
+
+
+@pytest.mark.skipif(
+    _local_llvm_path("FORGEMCP_CLANG_FORMAT_LIVE_TEST", _DEFAULT_CLANG_FORMAT) is None
+    or _local_llvm_path("FORGEMCP_CLANG_TIDY_LIVE_TEST", _DEFAULT_CLANG_TIDY) is None,
+    reason="real MCP quality gate requires local clang-format and clang-tidy",
+)
+def test_stdio_mcp_real_quality_security_vertical_slice(tmp_path: Path):
+    """Verify schemas, CAS, real tools, safe failures, and stdio shutdown."""
+    formatter = _local_llvm_path("FORGEMCP_CLANG_FORMAT_LIVE_TEST", _DEFAULT_CLANG_FORMAT)
+    tidy = _local_llvm_path("FORGEMCP_CLANG_TIDY_LIVE_TEST", _DEFAULT_CLANG_TIDY)
+    assert formatter is not None and tidy is not None
+    clang_driver = tidy.parent / ("clang++.exe" if os.name == "nt" else "clang++")
+    if not clang_driver.is_file():
+        pytest.skip("real MCP quality gate requires the matching clang++ driver")
+    source = tmp_path / "main.cpp"
+    source.write_bytes(b"int main(){return 0;}\n")
+    tidy_source = tmp_path / "tidy.cpp"
+    tidy_source.write_bytes(b"int main() { int unused; return 0; }\n")
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "compile_commands.json").write_text(json.dumps([{
+        "directory": str(tmp_path),
+        "file": str(tidy_source),
+        "arguments": [str(clang_driver), "-Wall", "-Wextra", "-c", str(tidy_source)],
+    }]), encoding="utf-8")
+    (tmp_path / ".clang-tidy").write_text("Checks: ''\n", encoding="utf-8")
+
+    async def exercise() -> str:
+        errors_path = tmp_path / "quality-server-stderr.log"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "forgemcp.server"],
+            cwd=Path.cwd(),
+            env={
+                **os.environ,
+                "FORGEMCP_WORKSPACE": str(tmp_path),
+                "FORGEMCP_CLANG_FORMAT": str(formatter),
+                "FORGEMCP_CLANG_TIDY": str(tidy),
+                "FORGEMCP_LOG_LEVEL": "INFO",
+            },
+        )
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                    quality_tool_names = {
+                        "quality__status",
+                        "clang_format__check",
+                        "clang_format__apply",
+                        "clang_tidy__list_checks",
+                        "clang_tidy__run",
+                        "sanitizer__parse_report",
+                    }
+                    assert quality_tool_names <= tools.keys()
+                    for tool_name in quality_tool_names:
+                        assert tools[tool_name].inputSchema["additionalProperties"] is False
+                    assert tools["quality__status"].inputSchema.get("required", []) == []
+                    list_checks_schema = tools["clang_tidy__list_checks"].inputSchema
+                    assert list_checks_schema.get("required", []) == []
+                    assert list_checks_schema["properties"]["checks"]["anyOf"][0][
+                        "maxLength"
+                    ] == 1024
+                    sanitizer_schema = tools["sanitizer__parse_report"].inputSchema
+                    assert sanitizer_schema["required"] == ["output"]
+                    assert sanitizer_schema["properties"]["output"]["maxLength"] == 65_536
+                    check_schema = tools["clang_format__check"].inputSchema
+                    apply_schema = tools["clang_format__apply"].inputSchema
+                    tidy_schema = tools["clang_tidy__run"].inputSchema
+                    assert check_schema["required"] == ["paths"]
+                    assert check_schema["properties"]["paths"]["minItems"] == 1
+                    assert check_schema["properties"]["paths"]["maxItems"] == 64
+                    assert check_schema["additionalProperties"] is False
+                    assert apply_schema["required"] == ["files"]
+                    item_schema = apply_schema["properties"]["files"]["items"]
+                    if "$ref" in item_schema:
+                        item_schema = apply_schema["$defs"][item_schema["$ref"].rsplit("/", 1)[-1]]
+                    assert set(item_schema["required"]) == {"path", "expected_sha256"}
+                    assert item_schema["additionalProperties"] is False
+                    assert set(tidy_schema["required"]) == {"paths", "compile_commands_dir"}
+                    assert {"checks", "timeout_seconds"} <= tidy_schema["properties"].keys()
+                    assert tidy_schema["additionalProperties"] is False
+
+                    checked = _json_tool_content(
+                        await session.call_tool("clang_format__check", {"paths": ["main.cpp"]})
+                    )
+                    assert checked["clean"] is False
+                    snapshot = checked["files"][0]["snapshot_sha256"]
+                    assert source.read_bytes() == b"int main(){return 0;}\n"
+                    assert "source" not in checked["files"][0]
+                    assert "replacements" not in checked["files"][0]
+
+                    stale = _json_tool_content(await session.call_tool(
+                        "clang_format__apply",
+                        {"files": [{"path": "main.cpp", "expected_sha256": "0" * 64}]},
+                    ))
+                    assert stale["applied"] is False
+                    assert stale["conflict"] is True
+                    assert source.read_bytes() == b"int main(){return 0;}\n"
+
+                    applied = _json_tool_content(await session.call_tool(
+                        "clang_format__apply",
+                        {"files": [{"path": "main.cpp", "expected_sha256": snapshot}]},
+                    ))
+                    assert applied["applied"] is True
+                    assert _json_tool_content(await session.call_tool(
+                        "clang_format__check", {"paths": ["main.cpp"]}
+                    ))["clean"] is True
+
+                    tidy_run = _json_tool_content(await session.call_tool(
+                        "clang_tidy__run",
+                        {
+                            "paths": ["tidy.cpp"],
+                            "compile_commands_dir": "build",
+                            "checks": "-*,clang-analyzer-core.*,clang-diagnostic-unused-variable",
+                            "timeout_seconds": 30,
+                        },
+                    ))
+                    assert tidy_run["execution_state"] == "completed"
+                    assert any(
+                        item.get("code") == "clang-diagnostic-unused-variable"
+                        for item in tidy_run["diagnostics"]
+                    )
+                    assert not {"stdout", "stderr", "compile_command", "environment"} & tidy_run.keys()
+
+                    tidy_source.write_bytes(b"int main( {\n")
+                    failed_tidy = _json_tool_content(await session.call_tool(
+                        "clang_tidy__run",
+                        {
+                            "paths": ["tidy.cpp"],
+                            "compile_commands_dir": "build",
+                            "checks": "clang-analyzer-core.*",
+                        },
+                    ))
+                    assert failed_tidy["execution_state"] == "tool_failure"
+                    assert not {"stdout", "stderr", "compile_command", "environment"} & failed_tidy.keys()
+
+                    malformed = _json_tool_content(await session.call_tool(
+                        "sanitizer__parse_report", {"output": "unrecognized TOP_SECRET"}
+                    ))
+                    assert malformed["findings"][0]["kind"] == "unknown"
+                    assert "TOP_SECRET" not in json.dumps(malformed)
+
+                    external_source = str(tmp_path.parent / "external-secret.cpp")
+                    external_result = await session.call_tool(
+                        "clang_format__check", {"paths": [external_source]}
+                    )
+                    external_payload = _json_tool_content(external_result)
+                    assert external_payload["error"]["code"] == "quality_request_error"
+                    assert external_source not in getattr(external_result.content[0], "text")
+
+                    for tool_name, arguments in (
+                        ("clang_format__check", {"paths": []}),
+                        ("clang_format__check", {"paths": ["main.cpp"], "unknown": True}),
+                        ("clang_format__check", {"paths": "main.cpp"}),
+                        ("clang_format__check", {"paths": ["main.cpp"] * 65}),
+                        ("clang_format__apply", {"files": [{"path": "main.cpp"}]}),
+                        ("sanitizer__parse_report", {"output": 1}),
+                        ("sanitizer__parse_report", {"output": "x" * 65_537}),
+                    ):
+                        invalid = await session.call_tool(tool_name, arguments)
+                        assert invalid.isError is True
+                        assert "Traceback" not in getattr(invalid.content[0], "text")
+        return errors_path.read_text(encoding="utf-8")
+
+    server_errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in server_errors
+    assert "int main" not in server_errors
+    assert "TOP_SECRET" not in server_errors
+
+
+def test_stdio_mcp_quality_unavailable_tool_is_structured(tmp_path: Path):
+    """An explicit missing executable returns a stable domain response, not a traceback."""
+    (tmp_path / "main.cpp").write_bytes(b"int main() {}\n")
+
+    async def exercise() -> None:
+        missing = tmp_path / "missing-clang-format.exe"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "forgemcp.server"],
+            cwd=Path.cwd(),
+            env={
+                **os.environ,
+                "FORGEMCP_WORKSPACE": str(tmp_path),
+                "FORGEMCP_CLANG_FORMAT": str(missing),
+            },
+        )
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "clang_format__check", {"paths": ["main.cpp"]}
+                )
+                payload = _json_tool_content(result)
+                assert payload["error"]["code"] == "quality_tool_unavailable"
+                assert "Traceback" not in getattr(result.content[0], "text")
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.skipif(

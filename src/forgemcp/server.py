@@ -5,10 +5,11 @@ from __future__ import annotations
 import inspect
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 from pydantic_core import PydanticUndefined
 
 from forgemcp.core.application import ForgeApplication
@@ -81,12 +82,15 @@ def _tool_adapter(contribution: RegisteredToolContribution):
             default = inspect.Parameter.empty if field.is_required() else field.get_default(call_default_factory=True)
             if default is PydanticUndefined:
                 default = inspect.Parameter.empty
+            annotation = field.rebuild_annotation()
+            if field.description is not None:
+                annotation = Annotated[annotation, Field(description=field.description)]
             parameters.append(
                 inspect.Parameter(
                     name,
                     kind=inspect.Parameter.KEYWORD_ONLY,
                     default=default,
-                    annotation=field.annotation,
+                    annotation=annotation,
                 )
             )
 

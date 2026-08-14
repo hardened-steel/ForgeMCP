@@ -109,7 +109,7 @@ class QualityPlugin(ForgePlugin):
         contributions = (
             ("quality", "status", "Report fixed clang-format/clang-tidy availability and parser scope.", _EmptyArguments, QualityPlugin._status),
             ("clang_format", "check", "Check explicitly named workspace C/C++ files with project clang-format rules without modifying them.", _FormatCheckArguments, QualityPlugin._check),
-            ("clang_format", "apply", "Atomically apply verified clang-format replacements only when every required snapshot SHA-256 still matches.", _FormatApplyArguments, QualityPlugin._apply),
+            ("clang_format", "apply", "Apply one verified snapshot-CAS clang-format batch only when every required SHA-256 still matches.", _FormatApplyArguments, QualityPlugin._apply),
             ("clang_tidy", "list_checks", "List a bounded sorted clang-tidy check set without exposing arbitrary arguments.", _TidyChecksArguments, QualityPlugin._list_checks),
             ("clang_tidy", "run", "Run fixed read-only clang-tidy analysis using an explicit generated compile_commands directory; fixes are unavailable.", _TidyRunArguments, QualityPlugin._run_tidy),
             ("sanitizer", "parse_report", "Parse bounded supplied ASan/UBSan output read-only; this tool never launches a binary.", _SanitizerArguments, QualityPlugin._parse_report),
@@ -143,6 +143,7 @@ class QualityPlugin(ForgePlugin):
                 "Quality tools are qualified lazily; missing executables do not prevent startup.",
                 "compile_commands availability is evaluated only for each clang-tidy request directory.",
                 "clang-format uses bounded replacement XML and never invokes -i.",
+                "Project format/tidy configuration and compilation databases are trusted inputs; ForgeMCP is not a sandbox.",
                 "Phase 1 parses sanitizer output only and never runs instrumented binaries.",
             ),
         )

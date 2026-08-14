@@ -98,7 +98,9 @@ class TidyRunResult(ForgeModel):
 
     diagnostics: tuple[Diagnostic, ...] = Field(max_length=2048, description="Workspace-only normalized compiler-style clang-tidy diagnostics.")
     omitted_external_count: int = Field(ge=0, description="Diagnostics for non-workspace files intentionally omitted.")
+    omitted_invalid_count: int = Field(ge=0, description="Diagnostic-looking records omitted because their location or syntax was not safely normalizable.")
     truncated: bool = Field(description="Whether process capture or the diagnostics collection was bounded.")
+    complete: bool = Field(description="Whether all captured diagnostic-looking records were normalized without truncation.")
     execution_state: TidyExecutionState = Field(description="Completed analysis, failed tool invocation, or timeout.")
     process: QualityProcessSummary = Field(description="Safe process completion facts without raw diagnostics output.")
 
@@ -127,6 +129,7 @@ class SanitizerFinding(ForgeModel):
     summary: str = Field(min_length=1, max_length=4096, description="Bounded human-facing summary stripped of addresses and raw source content.")
     frames: tuple[SanitizerFrame, ...] = Field(max_length=64, description="Bounded workspace-safe stack frames.")
     omitted_external_count: int = Field(ge=0, description="External stack frames intentionally hidden from the response.")
+    truncated: bool = Field(description="Whether frame or string bounds omitted part of this finding.")
     complete: bool = Field(description="Whether this finding had a recognizable complete header and termination.")
 
 

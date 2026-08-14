@@ -28,6 +28,9 @@ from forgemcp.workspace import WorkspaceError, WorkspaceService, WorkspaceTextEd
 MAX_FORMAT_FILES = 64
 """Maximum explicitly named formatter targets per request."""
 
+MAX_FORMAT_XML_CHARACTERS = 65_536
+"""Independent parser bound for untrusted clang-format XML."""
+
 _SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cp", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl"})
 _VERSION = re.compile(r"\bclang-format version\s+([^\r\n]+)", re.IGNORECASE)
 
@@ -35,13 +38,19 @@ _VERSION = re.compile(r"\bclang-format version\s+([^\r\n]+)", re.IGNORECASE)
 class ProcessRunner(Protocol):
     """The intentionally small ProcessRuntime surface used by formatter services."""
 
-    async def run(self, argv: Sequence[str], *, cwd: str = ".", timeout_seconds: float | None = None) -> ProcessResult:
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float | None = None,
+        input_data: bytes | None = None,
+    ) -> ProcessResult:
         """Run a bounded argv process."""
 
 
 @dataclass(frozen=True, slots=True)
 class _ToolSelection:
-    requested: str
     canonical: str
     version: str
 
@@ -63,14 +72,18 @@ class _FormattedFile:
 
 def known_quality_candidates(tool_name: str) -> tuple[Path, ...]:
     """Return only conventional operator-installed LLVM locations, never a scan."""
-    if os.name != "nt":
-        return ()
-    roots = tuple(
-        Path(value)
-        for value in (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"))
-        if value
-    )
-    return tuple(root / "LLVM" / "bin" / f"{tool_name}.exe" for root in roots)
+    if os.name == "nt":
+        roots = tuple(
+            Path(value)
+            for value in (
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramW6432"),
+                os.environ.get("ProgramFiles(x86)"),
+            )
+            if value
+        )
+        return tuple(root / "LLVM" / "bin" / f"{tool_name}.exe" for root in roots)
+    return tuple(directory / tool_name for directory in (Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/llvm/bin")))
 
 
 def process_summary(result: ProcessResult) -> QualityProcessSummary:
@@ -118,6 +131,17 @@ class ClangFormatService:
         if any(item.snapshot.sha256 != expected for item, (_, expected) in zip(formatted, requested, strict=True)):
             return FormatApplyResult(applied=False, files=results, conflict=True)
 
+        # Guard no-op files too: the public apply result covers every requested
+        # snapshot even though Workspace needs edits only for changing files.
+        try:
+            if any(
+                self._workspace.get_snapshot(item.result.path).sha256 != item.snapshot.sha256
+                for item in formatted
+            ):
+                return FormatApplyResult(applied=False, files=results, conflict=True)
+        except WorkspaceError:
+            return FormatApplyResult(applied=False, files=results, conflict=True)
+
         edits_by_path: dict[str, tuple[WorkspaceTextEdit, ...]] = {}
         expected_snapshots: dict[str, FileSnapshot] = {}
         for item in formatted:
@@ -152,14 +176,32 @@ class ClangFormatService:
             if canonical is None:
                 continue
             try:
-                result = await self._process_runtime.run([candidate, "--version"], cwd=".", timeout_seconds=5.0)
+                result = await self._process_runtime.run([canonical, "--version"], cwd=".", timeout_seconds=5.0)
             except ProcessError:
                 continue
             if result.timed_out or result.exit_code != 0 or result.stdout.truncated or result.stderr.truncated:
                 continue
             match = _VERSION.search(result.stdout.text) or _VERSION.search(result.stderr.text)
-            if match is not None:
-                return _ToolSelection(candidate, canonical, match.group(1).strip()[:256])
+            version = match.group(1).strip() if match is not None else ""
+            if not version or len(version) > 256:
+                continue
+            try:
+                help_result = await self._process_runtime.run(
+                    [canonical, "--help"], cwd=".", timeout_seconds=5.0
+                )
+            except ProcessError:
+                continue
+            help_text = help_result.stdout.text + help_result.stderr.text
+            if (
+                help_result.timed_out
+                or help_result.exit_code != 0
+                or help_result.stdout.truncated
+                or help_result.stderr.truncated
+                or "--output-replacements-xml" not in help_text
+                or "--assume-filename" not in help_text
+            ):
+                continue
+            return _ToolSelection(canonical, version)
         raise QualityToolUnavailableError("clang-format is not available through the configured Process Runtime.")
 
     def _canonical(self, candidate: str) -> str | None:
@@ -180,11 +222,20 @@ class ClangFormatService:
             raise QualityRequestError("Formatter paths must be an explicit bounded collection.") from error
         if not values or len(values) > MAX_FORMAT_FILES or any(not isinstance(path, str) for path in values):
             raise QualityRequestError("Formatter requests must name from one through 64 explicit source files.")
-        if len(set(values)) != len(values):
+        identity_keys = tuple(os.path.normcase(os.path.normpath(path)) for path in values)
+        if len(set(identity_keys)) != len(identity_keys):
             raise QualityRequestError("Formatter requests must not name a source file more than once.")
         for path in values:
+            if not path or len(path) > 4096 or "\x00" in path:
+                raise QualityRequestError("Formatter paths must be bounded NUL-free workspace paths.")
             if Path(path).suffix.lower() not in _SOURCE_SUFFIXES:
                 raise QualityRequestError("Formatter supports only explicit C and C++ source-file extensions.")
+            try:
+                self._workspace.get_snapshot(path)
+            except WorkspaceError as error:
+                raise QualityRequestError(
+                    "Formatter paths must be valid workspace-relative non-link paths."
+                ) from error
         return values
 
     def _validate_apply_files(self, files: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
@@ -213,16 +264,28 @@ class ClangFormatService:
         try:
             source, snapshot = self._workspace.read_text(path)
             result = await self._process_runtime.run(
-                [selected.requested, "--output-replacements-xml", path], cwd=".", timeout_seconds=30.0
+                [
+                    selected.canonical,
+                    "--output-replacements-xml",
+                    f"--assume-filename={path}",
+                ],
+                cwd=".",
+                timeout_seconds=30.0,
+                input_data=source.encode("utf-8"),
             )
             summary = process_summary(result)
-            if result.timed_out or result.exit_code != 0 or result.stdout.truncated:
+            if result.timed_out or result.exit_code != 0 or result.stdout.truncated or result.stderr.truncated:
                 return _FailedFormattedFile(FormatFileResult(path=path, snapshot_sha256=snapshot.sha256, process=summary, error="clang-format could not produce a complete structured result."))
-            replacements = self._parse_replacements(result.stdout.text)
-            formatted = self._apply_replacements(source, replacements)
+            if not source and not result.stdout.text:
+                replacements: tuple[_Replacement, ...] = ()
+            else:
+                replacements = self._parse_replacements(
+                    result.stdout.text, source_size=len(source.encode("utf-8"))
+                )
             positions = _byte_positions(source)
             if any(item.offset not in positions or item.offset + item.length not in positions for item in replacements):
                 raise ValueError("clang-format replacement did not align to UTF-8 source boundaries.")
+            formatted = self._apply_replacements(source, replacements)
             return _FormattedFile(
                 result=FormatFileResult(
                     path=path,
@@ -239,25 +302,50 @@ class ClangFormatService:
             return _FailedFormattedFile(FormatFileResult(path=path, error="The requested file could not be formatted safely."))
 
     @staticmethod
-    def _parse_replacements(output: str) -> tuple[_Replacement, ...]:
+    def _parse_replacements(output: str, *, source_size: int) -> tuple[_Replacement, ...]:
+        if len(output) > MAX_FORMAT_XML_CHARACTERS:
+            raise ValueError("clang-format replacement XML exceeds the parser limit.")
+        if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", output, re.IGNORECASE):
+            raise ValueError("clang-format replacement XML must not contain DTDs or entities.")
         root = ET.fromstring(output)
-        if root.tag != "replacements" or root.attrib.get("incomplete_format") == "true":
+        xml_space = "{http://www.w3.org/XML/1998/namespace}space"
+        if root.tag != "replacements" or set(root.attrib) - {xml_space, "incomplete_format"}:
+            raise ValueError("clang-format replacement XML has an unexpected root.")
+        if root.attrib.get(xml_space, "preserve") != "preserve":
+            raise ValueError("clang-format replacement XML has invalid whitespace policy.")
+        incomplete = root.attrib.get("incomplete_format")
+        if incomplete not in {None, "false", "true"} or incomplete == "true":
             raise ValueError("clang-format did not return complete replacement XML.")
+        if root.text is not None and root.text.strip():
+            raise ValueError("clang-format replacement XML has unexpected root text.")
         replacements: list[_Replacement] = []
         previous_end = -1
         previous_start = -1
         for node in root:
             if node.tag != "replacement":
                 raise ValueError("clang-format replacement XML was malformed.")
-            offset = int(node.attrib["offset"])
-            length = int(node.attrib["length"])
+            if set(node.attrib) != {"offset", "length"} or len(node):
+                raise ValueError("clang-format replacement XML has invalid replacement attributes.")
+            raw_offset = node.attrib["offset"]
+            raw_length = node.attrib["length"]
+            if not raw_offset.isascii() or not raw_offset.isdecimal() or len(raw_offset) > 20:
+                raise ValueError("clang-format replacement offset is invalid.")
+            if not raw_length.isascii() or not raw_length.isdecimal() or len(raw_length) > 20:
+                raise ValueError("clang-format replacement length is invalid.")
+            offset = int(raw_offset)
+            length = int(raw_length)
+            end = offset + length
+            if end > source_size:
+                raise ValueError("clang-format replacement is outside the source file.")
             if offset < 0 or length < 0 or offset < previous_end or offset == previous_start:
                 raise ValueError("clang-format replacement ranges overlap.")
             text = node.text or ""
             if "\x00" in text:
                 raise ValueError("clang-format replacement XML contains NUL.")
+            if node.tail is not None and node.tail.strip():
+                raise ValueError("clang-format replacement XML has unexpected trailing text.")
             replacements.append(_Replacement(offset, length, text))
-            previous_end = offset + length
+            previous_end = end
             previous_start = offset
         return tuple(replacements)
 
