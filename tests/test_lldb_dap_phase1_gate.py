@@ -140,3 +140,93 @@ def test_real_lldb_dap_launches_local_pe_dwarf_debuggee_and_cleans_up(tmp_path: 
             assert executable.name.casefold() not in debuggee_check.stdout.casefold()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.skipif(
+    _local_llvm_path("FORGEMCP_LLDB_DAP_LIVE_TEST", _DEFAULT_LLDB_DAP) is None
+    or _local_llvm_path("FORGEMCP_LLVM_CLANG_LIVE_TEST", _DEFAULT_CLANG) is None,
+    reason="real DAP gate requires a local standalone lldb-dap and clang installation",
+)
+def test_real_lldb_dap_stop_contains_paused_and_running_sessions_then_allows_relaunch(tmp_path: Path):
+    """Exercise strict Job ownership for both stop states and a second session."""
+    adapter = _local_llvm_path("FORGEMCP_LLDB_DAP_LIVE_TEST", _DEFAULT_LLDB_DAP)
+    clang = _local_llvm_path("FORGEMCP_LLVM_CLANG_LIVE_TEST", _DEFAULT_CLANG)
+    assert adapter is not None and clang is not None
+    source = tmp_path / "loop.c"
+    build = tmp_path / "build"
+    build.mkdir()
+    executable = build / "dap_phase1_loop.exe"
+    source.write_text(
+        "int main(void) {\n"
+        "  volatile unsigned value = 0;\n"
+        "  for (;;) { value += 1; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    compile_result = subprocess.run(
+        [str(clang), "-g", "-gdwarf-4", "-O0", str(source), "-o", str(executable)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if compile_result.returncode != 0:
+        pytest.skip("local LLVM cannot link the required PE/COFF + DWARF debuggee")
+
+    async def exercise() -> list[int]:
+        config = ForgeConfig(workspace_root=tmp_path, lldb_dap_path=adapter)
+        logger = create_logger("CRITICAL")
+        runtime = ProcessRuntime(config, logger)
+        service = DebuggerService(WorkspaceService(config, logger), runtime, LldbDapBackend(config, logger, runtime))
+        pids: list[int] = []
+        try:
+            await service.launch(
+                DebugLaunchRequest(
+                    program="build/dap_phase1_loop.exe",
+                    cwd="build",
+                    stop_on_entry=False,
+                    initial_breakpoints={"loop.c": (DebugBreakpointSpec(line=2),)},
+                )
+            )
+            for _ in range(100):
+                if (await service.status()).state is DebuggerState.PAUSED:
+                    break
+                await asyncio.sleep(0.05)
+            assert (await service.status()).state is DebuggerState.PAUSED
+            assert service._handle is not None and service._handle.required_ownership and service._handle.ownership_established
+            pids.append(service._handle.pid)
+            assert (await service.stop()).state is DebuggerState.TERMINATED
+            assert runtime._handles == set()
+
+            # A clean TERMINATED state is the only relaunch state.  With no
+            # breakpoint the same infinite debuggee stays RUNNING until stop.
+            launched = await service.launch(DebugLaunchRequest(program="build/dap_phase1_loop.exe", cwd="build", stop_on_entry=False))
+            assert launched.state is DebuggerState.RUNNING
+            assert service._handle is not None and service._handle.required_ownership and service._handle.ownership_established
+            pids.append(service._handle.pid)
+            assert (await service.stop()).state is DebuggerState.TERMINATED
+            assert runtime._handles == set()
+        finally:
+            await service.aclose()
+            await runtime.aclose()
+        return pids
+
+    adapter_pids = asyncio.run(exercise())
+    if os.name == "nt":
+        for adapter_pid in adapter_pids:
+            adapter_check = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {adapter_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            assert str(adapter_pid) not in adapter_check.stdout
+        debuggee_check = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {executable.name}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert executable.name.casefold() not in debuggee_check.stdout.casefold()

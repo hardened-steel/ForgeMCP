@@ -114,7 +114,7 @@ Every command is a non-empty NUL-free argv sequence and is launched only with `a
 
 Process output and complete argv/environment values are never logged. Completion logs contain only exit/timeout state and each stream's character count plus truncation bit. The runtime retains all live `ProcessHandle` instances; callers should await `ProcessRuntime.aclose()` during asynchronous host shutdown. `ForgeApplication.aclose()` provides the corresponding application-level hook. The MCP stdio adapter already awaits it in FastMCP's lifespan. `ForgeApplication.stop()` can bridge to the asynchronous lifecycle only when no event loop is active; async hosts must await `ForgeApplication.aclose()`.
 
-On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates after the policy grace period to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP`; the runtime creates a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE` and no breakaway flags before launching, then verifies assignment. Closing that job removes non-detached descendants even when the direct child has already exited. Normal callers retain a `taskkill /PID <pid> /T /F` fallback after observed Job-assignment failure. A trusted adapter does not: if the Job cannot be created or assigned, its direct process is immediately reaped, no handle is returned, and `ProcessOwnershipError` reports that required ownership was unavailable. Its scrubbed environment inherits no ForgeMCP variables; Windows receives only present `SystemRoot`, `WINDIR`, `ComSpec`, `TEMP`, `TMP`, and `PATHEXT`, plus a `PATH` built from the approved executable/companion directories. Normal CMake and clangd callers still inherit their composition-time environment. argv, environment, and raw process output never enter logs.
+On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates after the policy grace period to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP`; the runtime creates a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE` and no breakaway flags before launching, then verifies assignment. Closing that job removes non-detached descendants even when the direct child has already exited. Normal callers retain a `taskkill /PID <pid> /T /F` fallback after observed Job-assignment failure. A trusted adapter does not: if the Job cannot be created or assigned, its direct process is immediately reaped, no handle is returned, and `ProcessOwnershipError` reports that required ownership was unavailable. Its scrubbed environment inherits no ForgeMCP variables; Windows receives only present `SystemRoot`, `WINDIR`, `ComSpec`, `TEMP`, `TMP`, and `PATHEXT`, plus a `PATH` built from the approved executable/companion directories. Normal CMake and clangd callers still inherit their composition-time environment. argv, environment, and raw process output never enter logs. This contains the owned normal process tree, including adapter descendants on adapter crash; it cannot absolutely cover OS/power crashes or a trusted compromised process deliberately escaping the platform containment primitive.
 
 `LldbDapQualifier` is a transport-neutral, internal Phase-0 helper, not a DAP client or MCP tool. It reads a declarative `FORGEMCP_LLDB_DAP` path first, then local PATH/LLVM/Visual Studio/VS Code/local-toolchain candidates, and accepts an adapter only after fixed `--version`/`--help` probes and a start/close cycle succeed through `run_trusted_adapter`/`start_trusted_adapter`. Its `AdapterQualification` separates runnable-process facts from unverified DAP, object-format, and debug-information capabilities, and retains only safe probe exit statuses and a parsed version. An opt-in test-local `initialize`/`disconnect` gate can check a real installed adapter without introducing a second production DAP transport. Debuggee environment is intentionally not part of this adapter environment; a future DAP launch policy owns it.
 
@@ -123,8 +123,13 @@ On POSIX each child starts a new session and process group. Graceful cleanup sig
 `forgemcp.dap` is a production, transport-neutral DAP client, separate from
 `forgemcp.lsp`. Its `framing`, `protocol`, and `client` modules own bounded
 `Content-Length` parsing (8 KiB headers/1 MiB bodies), sequential outbound
-frames, monotonic client sequences, concurrent out-of-order response routing,
-events, timeout/cancellation, and safe EOF/malformed-message failure. The
+frames, monotonic client sequences, command-correlated concurrent out-of-order
+response routing, events, timeout/cancellation, and safe EOF/malformed-message
+failure. Pre-normalization event and reverse-request queues are bounded to 16
+and 8 records respectively (with four fixed reverse workers); saturation,
+malformed input, a wrong response command, or an unexpected EOF fails pending
+requests with a bounded error, closes adapter stdin, and tears down workers.
+The
 client never owns a process or imports Core, Workspace, MCP, or LLDB code.
 It denies every reverse request: `runInTerminal` and `startDebugging` have
 explicit policy failures and all other reverse requests are unsupported.
@@ -152,12 +157,18 @@ verified standalone DAP adapter in this design.
 Phase 1 implements `UNAVAILABLE → STOPPED → STARTING → INITIALIZED →
 CONFIGURING → RUNNING/PAUSED → TERMINATING → TERMINATED`, with `FAILED` as a
 safe terminal failure path. `initialized` is awaited before initial source
-breakpoints and `configurationDone`; the launch response is awaited afterwards,
-which avoids LLDB-DAP's configuration-sequence deadlock. `stopped`,
+breakpoints and `configurationDone` when the adapter explicitly advertises
+`supportsConfigurationDoneRequest`; the launch response is awaited afterwards,
+which avoids LLDB-DAP's configuration-sequence deadlock. `debugger__stop`
+pre-empts a pending `STARTING`/`CONFIGURING` launch by cancellation, then uses
+the same bounded disconnect/tree-close path; a new launch is accepted only
+after the previous resource cleanup reaches `TERMINATED`. `stopped`,
 `continued`, `exited`, `terminated`, `output`, and breakpoint events enter a
 256-record/512-KiB normalized cursor ring. `debugger__events` returns only
 bounded normalized events, `next_cursor`, eviction count, and truncation.
-Final close clears the ring and all handles.
+`debugger__stop` retains one normalized terminal event for post-stop reading;
+the ring is cleared before the next session and on full application shutdown.
+All handles are cleared on close.
 
 Only workspace-relative existing program, CWD, and source breakpoint paths are
 accepted. `WorkspaceService.validate_execution_path` is a validation-only
@@ -176,9 +187,13 @@ application session and, for paused data, stop generation. Continue/step,
 pause/continued events, stop, crash, or session exit invalidate stopped-data
 handles and cancel pending paused reads. Read-only inspection runs only while
 paused and confirms its captured stop generation before returning. Evaluate
-uses `context="hover"` and a conservative variable/member/index grammar;
-backticks, semicolons, assignments, calls, REPL/watch contexts, and LLDB
-command escape are unavailable. Attach, PDB claims, terminal brokering,
+uses `context="hover"` and accepts only one ASCII identifier lookup; member
+access, indexing, dereference, casts, overloaded operators, calls, assignment,
+comments, whitespace/confusables, REPL/watch contexts, and LLDB command escape
+are unavailable. This deliberately small grammar reduces egress and mutation
+surface but does **not** make native evaluate side-effect-free: LLDB may still
+execute debuggee evaluation semantics. Variables/scopes are the primary
+read-only inspection path. Attach, PDB claims, terminal brokering,
 memory/disassembly/mutation, restart, conditional/function/data breakpoints,
 source/symbol download, and arbitrary adapter/LLDB commands remain unsupported.
 

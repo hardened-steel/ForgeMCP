@@ -184,24 +184,27 @@ class DapClient:
 
 `DapClient` assigns a monotonically increasing positive outbound `seq` to
 both client requests and replies to reverse requests.  A response is matched
-only by its `request_seq`, not arrival order.  Its sole reader task routes
-responses to a pending-future table, publishes events independently, and
-starts a bounded reverse-request handler task.  A single writer lock encloses
-write plus `drain`, so frames cannot interleave.  Read-only DAP requests may
-be concurrent; service policy, not the transport, decides which requests are
-allowed at a particular debugger state.
+by its `request_seq` **and expected command**, not arrival order.  Its sole
+reader task routes responses to a pending-future table, publishes events
+through a bounded queue, and passes reverse requests to fixed workers.  A
+single writer lock encloses write plus `drain`, so frames cannot interleave.
+Read-only DAP requests may be concurrent; service policy, not the transport,
+decides which requests are allowed at a particular debugger state.
 
 Timeout or caller cancellation removes the pending future and sends one
 best-effort DAP `cancel` only when the adapter advertised cancellation.  A
-late response is discarded and counted without emitting its content.  Malformed
+late response is discarded and counted without emitting its content; a response
+for a different pending command is a structural protocol failure.  Malformed
 wire data, structural protocol violations, writer failure, or unexpected EOF
 atomically fails the client and every pending/reverse task with a safe
 `DapProtocolError` or `DapConnectionClosedError`; a well-formed unsuccessful
 DAP response becomes a bounded `DapRequestError`, and a deadline becomes
-`DapRequestTimeoutError`.  At most four reverse handlers run at once and each
-has a ten-second response deadline, after which the client returns a bounded
-failure response.  An expected EOF after shutdown is terminal but not an
-adapter-crash diagnostic.  `aclose()` is idempotent and never waits on the
+`DapRequestTimeoutError`.  At most 16 unnormalised events and 8 reverse
+requests are retained while four reverse handlers run; saturation is a bounded
+protocol failure rather than unbounded task/payload retention. Each reverse
+response has a ten-second deadline. A failure closes adapter stdin and tears
+down workers; an expected EOF after shutdown is terminal but not an
+adapter-crash diagnostic. `aclose()` is idempotent and never waits on the
 reader from inside the reader task.
 
 The client accepts only two reverse request command names:
@@ -328,7 +331,8 @@ The DAP ordering is fixed: start the adapter through Process Runtime; create
 and start `DapClient`; issue `initialize` with native path format and
 ForgeMCP's 0-based lines/columns; validate capabilities; issue `launch` as a
 pending request; wait for `initialized`; replace source breakpoint sets for
-the supplied initial breakpoint groups; send `configurationDone`; then await
+the supplied initial breakpoint groups; send `configurationDone` only when the
+adapter explicitly advertises `supportsConfigurationDoneRequest`; then await
 the launch response.  The public `launch` input includes initial breakpoints
 because a stateless MCP caller otherwise has no tool between `initialized` and
 `configurationDone`.  Later `set_breakpoints` replaces the full set for one
@@ -340,9 +344,11 @@ state `PAUSED` after configuration completes.  `exited` records a bounded exit
 code/event; `terminated` releases the session.  The adapter process and the
 debuggee are distinct: `ProcessHandle.pid` is never presented as a debuggee
 handle, and an adapter-reported process ID is metadata only.  If the adapter
-crashes while the debuggee may be alive, status is `FAILED` and reports
-`debuggee_termination_confirmed=false`; ForgeMCP must not claim cleanup it
-cannot prove.
+crashes, `ProcessHandle.wait()` closes the required Windows Job Object or the
+owned POSIX group before the watcher reports `FAILED`, so normal descendants
+are terminated. This is a containment guarantee for the owned tree, not a
+claim that an OS crash or an intentionally escaping trusted process can be
+recovered or contained absolutely.
 
 Before any continue, step, restart, stop, or forced close is sent, the service
 closes the current stopped-data epoch and cancels pending stopped-data reads.
@@ -350,7 +356,10 @@ This is deliberately conservative: if the execution request later fails, the
 client refetches threads/stack/scopes rather than trusting a race-prone handle.
 `pause` is valid while `RUNNING`; read requests are rejected until a `stopped`
 event.  At most one active debug session exists per `ForgeApplication` in the
-MVP; a second launch receives `debugger_session_active`.
+MVP; a second launch receives `debugger_session_active`. `stop` pre-empts a
+pending `STARTING` or `CONFIGURING` launch by cancelling that operation before
+waiting for the session lock, so an unresponsive configuration request cannot
+retain the owned process tree past the bounded close path.
 
 Close is idempotent and begins by setting `TERMINATING`, blocking new work,
 cancelling non-close requests, and invalidating handles.  For a launched
@@ -374,7 +383,7 @@ trusts to execute.  It is not an OS sandbox.
 | Environment | The debuggee receives only a bounded explicit override mapping whose keys are allow-listed by policy; values are never logged. The adapter starts from a scrubbed, minimal environment that removes symbol/network configuration such as `DEBUGINFOD_URLS` and `_NT_SYMBOL_PATH` unless a future policy allows them. This requires a runtime/configuration change. |
 | Debugger commands | No arbitrary adapter args, LLDB `*Commands`, GDB setup commands, source maps, remote endpoints, shell, terminal, or file descriptor redirection. |
 | Symbols and sources | Disable auto-download/network symbol or source lookup. A workspace source is returned only after `WorkspaceService.validate_reported_path`; an external source may supply bounded display metadata, never a path ForgeMCP will read, open, or treat as workspace-contained. A backend may be configured to omit external-source metadata entirely. |
-| Evaluate and variables | Values, stack, variables, modules, memory, output, and expressions are sensitive egress and never enter logs. Phase 1 allows explicit `evaluate` only in DAP `watch` or `hover` contexts for a current frame; never `repl`, `clipboard`, or arbitrary debugger-command context. Even those contexts can have side effects in native debuggers, so the result is labelled `side_effects_possible`; callers must opt in by making the tool call. |
+| Evaluate and variables | Values, stack, variables, modules, memory, output, and expressions are sensitive egress and never enter logs. Phase 1 sends evaluate only as DAP `hover` in a current frame, never `repl`, `watch`, `clipboard`, or a debugger-command context. Its accepted grammar is one ASCII identifier; member/index/dereference syntax is rejected because overloaded C++ operations are not semantically read-only. Even an identifier lookup can have side effects in native debuggers, so the result is labelled `side_effects_possible`; variables/scopes remain the primary read-only inspection route. |
 | Mutation | `setVariable`, `writeMemory`, `setExpression`, `restart`, and attach are separate capabilities and Phase 2 only. They never ride on a broad `evaluate` permission. |
 | Adapter messages | Treat all incoming DAP fields as malformed until validated, capped, and normalized. Do not log raw DAP, adapter stderr, raw source paths, launch argv, environment values, variable values, or memory. |
 
@@ -524,8 +533,9 @@ a cursor older than the retained head reports `dropped=true`.  Debuggee output
 is normalized to `DebugOutputEvent`, retained under the same total bound, and
 is not written to logs.  Adapter stderr is continuously drained to avoid a
 pipe deadlock, counted up to 64 KiB, then discarded; raw stderr never becomes
-an event.  On final close, the terminal status retains counters and last
-sequence only; the event and all handle caches are cleared.
+an event. `debugger__stop` preserves one deduplicated normalized terminal event
+for post-stop reads; a new session and full application shutdown clear the
+event store. All handle caches clear on final close.
 
 ### Process Runtime Phase-0 completion and remaining admission criteria
 
@@ -611,8 +621,10 @@ Visual Studio-bundled copies remain unavailable and are not a fallback backend.
 The implemented state machine is `UNAVAILABLE`, `STOPPED`, `STARTING`,
 `INITIALIZED`, `CONFIGURING`, `RUNNING`, `PAUSED`, `TERMINATING`,
 `TERMINATED`, and `FAILED`. The service waits for `initialized`, installs
-initial source breakpoints, sends `configurationDone`, then awaits the launch
-response so LLDB-DAP's configuration sequencing cannot deadlock. It sends
+initial source breakpoints, sends `configurationDone` only when the adapter
+advertises it, then awaits the launch response so LLDB-DAP's configuration
+sequencing cannot deadlock. `stop` cancels a pending start/configuration before
+the bounded disconnect/tree cleanup. It sends
 `disconnect(terminateDebuggee=true)` before closing the DAP transport and uses
 the ProcessHandle fallback cleanup path.
 
@@ -623,9 +635,10 @@ External sources are metadata-only/omitted and are never read. Native DAP IDs
 are replaced by random typed TTL handles bound to application/session and,
 for stopped data, stop generation; continued/step/stop/crash invalidates them.
 Events use an in-session monotonic cursor and a bounded 256-event/512-KiB ring.
-Safe evaluate is hover-context conservative variable/member/index lookup only;
-LLDB command escape, calls, assignment, semicolons, and REPL contexts remain
-denied.
+Evaluate is a hover-context single-identifier lookup only; LLDB command escape,
+calls, assignment, semicolons, members, indexes, dereference, casts, comments,
+and REPL contexts remain denied. This is not a claim that native evaluate is
+side-effect-free; variables/scopes are the primary read-only inspection path.
 
 Open questions retained for the implementation review are the exact supported
 LLVM/LLDB version floor; the build-tree allow-list representation; which

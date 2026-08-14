@@ -49,9 +49,13 @@ _MAX_EVENT_COUNT = 256
 _MAX_EVENT_BYTES = 512 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 _MAX_READ_RESULTS = 200
-_SAFE_EVALUATE = re.compile(
-    r"^(?:\*?[_A-Za-z]\w*(?:::[_A-Za-z]\w*)*)(?:(?:\.|->)[_A-Za-z]\w*|\[\d+\])*$"
-)
+# C++ member access, indexing, dereference, casts, and operator syntax cannot
+# be proved side-effect-free: user-defined operators and debugger expression
+# evaluation may execute inferior code.  Phase 1 consequently permits only a
+# single ASCII identifier lookup in the selected frame.  Even that is labelled
+# as side-effect-possible because LLDB owns the evaluation semantics.
+_SAFE_EVALUATE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INITIALIZE_CAPABILITIES = ("supportsCancelRequest", "supportsConfigurationDoneRequest", "supportsTerminateRequest")
 _STOPPED_REASONS = {
     "breakpoint": DebugStoppedReason.BREAKPOINT,
     "step": DebugStoppedReason.STEP,
@@ -198,12 +202,16 @@ class DebuggerService:
         self._state_lock = asyncio.Lock()
         self._initialized_event = asyncio.Event()
         self._capabilities: tuple[str, ...] = ()
+        self._supports_configuration_done = False
         self._active_thread_id: str | None = None
         self._failure: str | None = None
         self._closing = False
         self._stderr_bytes = 0
         self._debuggee_termination_confirmed = False
         self._breakpoint_generation: dict[str, int] = {}
+        self._terminal_event_recorded = False
+        self._exited_event_recorded = False
+        self._launch_operation: asyncio.Task[object] | None = None
 
     async def status(self) -> DebugSessionStatus:
         """Return status without launching, probing, or exposing raw protocol data."""
@@ -223,6 +231,9 @@ class DebuggerService:
     async def launch(self, request: DebugLaunchRequest) -> DebugSessionStatus:
         """Initialize, configure, and launch one workspace-contained debuggee."""
         async with self._session_lock, self._mutating_lock:
+            launch_operation = asyncio.current_task()
+            if launch_operation is None:
+                raise RuntimeError("Debugger launch requires an asyncio task.")
             if self._state is DebuggerState.UNAVAILABLE:
                 raise DebuggerUnavailableError(self._adapter_info.unavailable_reason or "No debugger adapter is available.")
             if (
@@ -242,9 +253,10 @@ class DebuggerService:
                 raise DebuggerUnsupportedError("Debuggee environment overrides are not configured for Phase 1.")
             program = self._workspace.validate_execution_path(request.program, kind="file")
             cwd = self._workspace.validate_execution_path(request.cwd or ".", kind="directory")
-            await self._begin_launch()
             launch_task: asyncio.Task[Mapping[str, object]] | None = None
+            self._launch_operation = launch_operation
             try:
+                await self._begin_launch()
                 started = await self._backend.start_adapter()
                 if not isinstance(started, ProcessHandle):
                     raise DebuggerUnavailableError("The backend did not return a managed adapter process.")
@@ -254,7 +266,7 @@ class DebuggerService:
                 self._stderr_task = asyncio.create_task(self._drain_stderr(started), name="forgemcp-debugger-stderr")
                 self._watch_task = asyncio.create_task(self._watch_adapter(started), name="forgemcp-debugger-watch")
                 initialize = await self._client.request("initialize", self._backend.initialize_arguments(), timeout_seconds=10.0)
-                self._capabilities = tuple(sorted(name for name, value in initialize.items() if name.startswith("supports") and value is True))
+                self._set_initialize_capabilities(initialize)
                 await self._set_state(DebuggerState.INITIALIZED)
                 launch_task = asyncio.create_task(
                     self._client.request(
@@ -279,12 +291,19 @@ class DebuggerService:
                         self._state = DebuggerState.CONFIGURING
                 for path, breakpoints in request.initial_breakpoints.items():
                     await self._set_breakpoints_unlocked(path, breakpoints)
-                await self._client.request("configurationDone", {}, timeout_seconds=10.0)
+                if self._supports_configuration_done:
+                    await self._client.request("configurationDone", {}, timeout_seconds=10.0)
                 await launch_task
                 async with self._state_lock:
                     if self._state is DebuggerState.CONFIGURING:
                         self._state = DebuggerState.RUNNING
                     return self._status_locked()
+            except asyncio.CancelledError:
+                if launch_task is not None:
+                    launch_task.cancel()
+                    await asyncio.gather(launch_task, return_exceptions=True)
+                await self._close_unlocked()
+                raise
             except Exception as error:
                 if launch_task is not None:
                     launch_task.cancel()
@@ -292,9 +311,19 @@ class DebuggerService:
                 await self._mark_failed(error)
                 await self._close_unlocked()
                 raise self._safe_exception(error) from None
+            finally:
+                if self._launch_operation is launch_operation:
+                    self._launch_operation = None
 
     async def stop(self) -> DebugSessionStatus:
         """Idempotently terminate the launched debuggee and the strict adapter tree."""
+        launch_operation = self._launch_operation
+        if launch_operation is not None and launch_operation is not asyncio.current_task() and not launch_operation.done():
+            # ``launch`` intentionally holds the session lock across DAP
+            # configuration to keep the session slot atomic.  Cancellation is
+            # the bounded pre-emption path that lets stop tear down a hung
+            # STARTING/CONFIGURING adapter instead of waiting for its timeout.
+            launch_operation.cancel()
         async with self._session_lock, self._mutating_lock:
             await self._close_unlocked()
             return await self.status()
@@ -302,6 +331,10 @@ class DebuggerService:
     async def aclose(self) -> None:
         """Plugin lifecycle shutdown; completes before ProcessRuntime shutdown."""
         await self.stop()
+        async with self._state_lock:
+            # Terminal events remain queryable after debugger__stop, but not
+            # after whole-application shutdown and never into a new session.
+            self._events.clear()
 
     async def set_breakpoints(self, path: str, breakpoints: tuple[DebugBreakpointSpec, ...]) -> tuple[DebugBreakpoint, ...]:
         async with self._mutating_lock:
@@ -416,12 +449,15 @@ class DebuggerService:
         self._events.clear()
         self._initialized_event = asyncio.Event()
         self._capabilities = ()
+        self._supports_configuration_done = False
         self._active_thread_id = None
         self._failure = None
         self._closing = False
         self._stderr_bytes = 0
         self._debuggee_termination_confirmed = False
         self._breakpoint_generation.clear()
+        self._terminal_event_recorded = False
+        self._exited_event_recorded = False
         await self._set_state(DebuggerState.STARTING)
 
     async def _set_breakpoints_unlocked(self, path: str, breakpoints: tuple[DebugBreakpointSpec, ...]) -> tuple[DebugBreakpoint, ...]:
@@ -513,11 +549,13 @@ class DebuggerService:
                 if self._state not in {DebuggerState.TERMINATING, DebuggerState.TERMINATED, DebuggerState.FAILED}:
                     self._state = DebuggerState.RUNNING
             elif event == "exited":
-                exit_code = body.get("exitCode")
-                self._events.append(kind="exited", exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None)
+                if not self._exited_event_recorded:
+                    exit_code = body.get("exitCode")
+                    self._events.append(kind="exited", exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None)
+                    self._exited_event_recorded = True
             elif event == "terminated":
                 await self._invalidate_stopped_data_locked()
-                self._events.append(kind="terminated")
+                self._record_terminal_event_locked()
                 self._debuggee_termination_confirmed = True
                 if self._state not in {DebuggerState.TERMINATING, DebuggerState.FAILED}:
                     self._state = DebuggerState.TERMINATED
@@ -550,6 +588,11 @@ class DebuggerService:
                 self._state = DebuggerState.FAILED
                 self._failure = "The debug adapter exited unexpectedly."
                 self._handles.clear_all()
+                # ProcessHandle.wait closes the owned Windows Job / POSIX
+                # process group before returning, so a required-ownership
+                # adapter crash also forces its debuggee descendants down.
+                self._debuggee_termination_confirmed = handle.required_ownership and handle.ownership_established
+                self._record_terminal_event_locked("The debug adapter exited and its owned process tree was closed.")
 
     async def _drain_stderr(self, handle: ProcessHandle) -> None:
         try:
@@ -586,9 +629,10 @@ class DebuggerService:
         self._watch_task = None
         self._stderr_task = None
         self._handles.clear_all()
-        self._events.clear()
         self._debuggee_termination_confirmed = True
-        self._state = DebuggerState.TERMINATED
+        async with self._state_lock:
+            self._record_terminal_event_locked("The debug session was stopped.")
+            self._state = DebuggerState.TERMINATED
 
     async def _mark_failed(self, error: Exception) -> None:
         async with self._state_lock:
@@ -599,6 +643,24 @@ class DebuggerService:
     async def _set_state(self, state: DebuggerState) -> None:
         async with self._state_lock:
             self._state = state
+
+    def _set_initialize_capabilities(self, initialize: Mapping[str, object]) -> None:
+        """Validate only capability flags Phase 1 actually consumes/exposes."""
+        enabled: list[str] = []
+        for name in _INITIALIZE_CAPABILITIES:
+            value = initialize.get(name)
+            if value is not None and not isinstance(value, bool):
+                raise DebuggerRequestError("The debug adapter returned invalid capability data.")
+            if value is True:
+                enabled.append(name)
+        self._capabilities = tuple(enabled)
+        self._supports_configuration_done = initialize.get("supportsConfigurationDoneRequest") is True
+
+    def _record_terminal_event_locked(self, description: str | None = None) -> None:
+        if self._terminal_event_recorded:
+            return
+        self._events.append(kind="terminated", description=description)
+        self._terminal_event_recorded = True
 
     def _status_locked(self) -> DebugSessionStatus:
         return DebugSessionStatus(
@@ -689,7 +751,15 @@ def _dap_coordinate(value: object) -> int | None:
 def _text(value: object, fallback: str, maximum: int) -> tuple[str, bool]:
     if not isinstance(value, str):
         return fallback, False
-    return value[:maximum], len(value) > maximum
+    # JSON permits escaped lone surrogates, but writing one back through an MCP
+    # stdio transport can fail.  C0/C1 controls (except normal text layout
+    # whitespace) are likewise made inert before any output reaches a client.
+    normalized = value.encode("utf-8", "replace").decode("utf-8")
+    normalized = "".join(
+        character if character in "\t\n\r" or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F) else "\uFFFD"
+        for character in normalized
+    )
+    return normalized[:maximum], len(normalized) > maximum
 
 
 def _text_or_none(value: object, maximum: int) -> str | None:

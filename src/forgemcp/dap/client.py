@@ -19,6 +19,8 @@ from forgemcp.dap.framing import MAX_DAP_MESSAGE_BYTES, frame_message, read_mess
 from forgemcp.dap.protocol import DapEvent, DapResponse, DapReverseRequest, parse_message
 
 DapEventHandler = Callable[[str, Mapping[str, object]], object | Awaitable[object]]
+_MAX_QUEUED_EVENTS = 16
+_MAX_QUEUED_REVERSE_REQUESTS = 8
 
 
 class DapClientState(StrEnum):
@@ -57,10 +59,14 @@ class DapClient:
         self._default_timeout_seconds = float(default_timeout_seconds)
         self._state = DapClientState.CREATED
         self._reader_task: asyncio.Task[None] | None = None
-        self._event_tasks: set[asyncio.Task[None]] = set()
+        # Each validated inbound body can still approach the 1 MiB framing
+        # limit.  Keep the temporary pre-normalization queues deliberately
+        # small, then fail and close rather than retaining an adapter flood.
+        self._event_queue: asyncio.Queue[DapEvent] = asyncio.Queue(maxsize=_MAX_QUEUED_EVENTS)
+        self._reverse_queue: asyncio.Queue[DapReverseRequest] = asyncio.Queue(maxsize=_MAX_QUEUED_REVERSE_REQUESTS)
+        self._event_task: asyncio.Task[None] | None = None
         self._reverse_tasks: set[asyncio.Task[None]] = set()
-        self._reverse_semaphore = asyncio.Semaphore(4)
-        self._pending: dict[int, asyncio.Future[DapResponse]] = {}
+        self._pending: dict[int, tuple[str, asyncio.Future[DapResponse]]] = {}
         self._next_seq = 1
         self._write_lock = asyncio.Lock()
         self._failure: DapError | None = None
@@ -97,6 +103,12 @@ class DapClient:
             raise DapConnectionClosedError("The DAP client cannot be restarted after close or failure.")
         self._state = DapClientState.RUNNING
         self._reader_task = asyncio.create_task(self._read_loop(), name="forgemcp-dap-reader")
+        if self._event_handler is not None:
+            self._event_task = asyncio.create_task(self._event_loop(), name="forgemcp-dap-events")
+        self._reverse_tasks = {
+            asyncio.create_task(self._reverse_loop(), name=f"forgemcp-dap-reverse-{index}")
+            for index in range(4)
+        }
 
     async def request(
         self,
@@ -115,7 +127,7 @@ class DapClient:
         timeout = self._validate_timeout(timeout_seconds)
         sequence = self._allocate_sequence()
         future: asyncio.Future[DapResponse] = asyncio.get_running_loop().create_future()
-        self._pending[sequence] = future
+        self._pending[sequence] = (command, future)
         try:
             payload: dict[str, object] = {"seq": sequence, "type": "request", "command": command}
             if arguments is not None:
@@ -139,7 +151,14 @@ class DapClient:
                 self._supports_cancel_request = response.body.get("supportsCancelRequest") is True
             return response.body
         finally:
-            self._pending.pop(sequence, None)
+            pending = self._pending.pop(sequence, None)
+            # A failed write can fail this private future before the caller
+            # has awaited it.  Consume that exception so asyncio never emits
+            # a payload-adjacent "Future exception was never retrieved"
+            # diagnostic during teardown.
+            if pending is not None and pending[1].done() and not pending[1].cancelled():
+                with contextlib.suppress(DapError):
+                    pending[1].exception()
 
     async def cancel(self, request_seq: int) -> None:
         """Best-effort DAP cancellation, only when explicitly supported."""
@@ -164,10 +183,13 @@ class DapClient:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader_task
-        for task in (*self._event_tasks, *self._reverse_tasks):
+        tasks = tuple(task for task in (self._event_task, *self._reverse_tasks) if task is not None)
+        for task in tasks:
             task.cancel()
-        if self._event_tasks or self._reverse_tasks:
-            await asyncio.gather(*self._event_tasks, *self._reverse_tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._event_task = None
+        self._reverse_tasks.clear()
         if not self._writer.is_closing():
             self._writer.close()
             with contextlib.suppress(Exception):
@@ -186,24 +208,42 @@ class DapClient:
             self._fail(error)
         except Exception:
             self._fail(DapProtocolError("The debug-adapter protocol stream failed."))
+        finally:
+            # A malformed peer is not left with a live stdin and background
+            # handler workers.  ``aclose`` knows not to await this reader from
+            # itself, so this remains safe on the reader task.
+            if self._state is DapClientState.FAILED:
+                await self.aclose()
 
     async def _dispatch(self, message: DapResponse | DapEvent | DapReverseRequest) -> None:
         if isinstance(message, DapResponse):
-            future = self._pending.get(message.request_seq)
-            if future is None or future.done():
+            pending = self._pending.get(message.request_seq)
+            if pending is None or pending[1].done():
                 self._late_responses += 1
+            elif pending[0] != message.command:
+                self._fail(DapProtocolError("The debug adapter sent a response for the wrong command."))
             else:
-                future.set_result(message)
+                pending[1].set_result(message)
             return
         if isinstance(message, DapEvent):
             if self._event_handler is not None:
-                task = asyncio.create_task(self._publish_event(message), name="forgemcp-dap-event")
-                self._event_tasks.add(task)
-                task.add_done_callback(self._event_tasks.discard)
+                try:
+                    self._event_queue.put_nowait(message)
+                except asyncio.QueueFull:
+                    self._fail(DapProtocolError("The debug adapter exceeded the bounded event queue."))
             return
-        task = asyncio.create_task(self._deny_reverse_request(message), name="forgemcp-dap-reverse-request")
-        self._reverse_tasks.add(task)
-        task.add_done_callback(self._reverse_tasks.discard)
+        try:
+            self._reverse_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            self._fail(DapProtocolError("The debug adapter exceeded the bounded reverse-request queue."))
+
+    async def _event_loop(self) -> None:
+        while True:
+            await self._publish_event(await self._event_queue.get())
+
+    async def _reverse_loop(self) -> None:
+        while True:
+            await self._deny_reverse_request(await self._reverse_queue.get())
 
     async def _publish_event(self, event: DapEvent) -> None:
         try:
@@ -215,29 +255,28 @@ class DapClient:
             return
 
     async def _deny_reverse_request(self, request: DapReverseRequest) -> None:
-        async with self._reverse_semaphore:
-            # The service deliberately has no terminal broker or nested-session
-            # launcher.  Unknown commands are equally denied; their arguments
-            # are never interpreted or logged.
-            message = "Reverse DAP requests are not supported by ForgeMCP."
-            if request.command == "runInTerminal":
-                message = "runInTerminal is disabled by ForgeMCP policy."
-            elif request.command == "startDebugging":
-                message = "startDebugging is disabled by ForgeMCP policy."
-            try:
-                await asyncio.wait_for(
-                    self._send({
-                        "seq": self._allocate_sequence(),
-                        "type": "response",
-                        "request_seq": request.seq,
-                        "success": False,
-                        "command": request.command,
-                        "message": message,
-                    }),
-                    timeout=10.0,
-                )
-            except (TimeoutError, DapError):
-                return
+        # The service deliberately has no terminal broker or nested-session
+        # launcher.  Unknown commands are equally denied; their arguments are
+        # never interpreted or logged.
+        message = "Reverse DAP requests are not supported by ForgeMCP."
+        if request.command == "runInTerminal":
+            message = "runInTerminal is disabled by ForgeMCP policy."
+        elif request.command == "startDebugging":
+            message = "startDebugging is disabled by ForgeMCP policy."
+        try:
+            await asyncio.wait_for(
+                self._send({
+                    "seq": self._allocate_sequence(),
+                    "type": "response",
+                    "request_seq": request.seq,
+                    "success": False,
+                    "command": request.command,
+                    "message": message,
+                }),
+                timeout=10.0,
+            )
+        except (TimeoutError, DapError):
+            return
 
     async def _cancel_pending(self, sequence: int) -> None:
         self._pending.pop(sequence, None)
@@ -285,8 +324,10 @@ class DapClient:
         self._state = DapClientState.FAILED
         self._failure = error
         self._fail_pending(error)
+        if not self._writer.is_closing():
+            self._writer.close()
 
     def _fail_pending(self, error: DapError) -> None:
-        for future in tuple(self._pending.values()):
+        for _, future in tuple(self._pending.values()):
             if not future.done():
                 future.set_exception(error)

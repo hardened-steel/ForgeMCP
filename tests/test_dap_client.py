@@ -166,6 +166,98 @@ def test_malformed_data_and_eof_fail_every_pending_future_without_payload_leakag
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "frame",
+    (
+        b"Content-Length: 1\r\nContent-Length: 1\r\n\r\n{}",
+        b"Content-Length: -1\r\n\r\n{}",
+        b"Content-Length: 0\r\n\r\n",
+        b"Content-Length: 1048577\r\n\r\n{}",
+        b"X-Unknown: value\r\nContent-Length: 2\r\n\r\n{}",
+        b"Content-Length: 2\r\n\r\n\xff\xff",
+        b"Content-Length: 2\r\n\r\n[]",
+    ),
+)
+def test_invalid_framing_is_a_bounded_client_failure(frame: bytes):
+    async def exercise() -> None:
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+        client = DapClient(reader, writer)  # type: ignore[arg-type]
+        await client.start()
+        reader.feed_data(frame)
+        await asyncio.sleep(0.01)
+        assert client.state is DapClientState.FAILED
+        assert isinstance(client.failure, DapProtocolError)
+        assert writer.closed is True
+        assert client._event_task is None
+        assert client._reverse_tasks == set()
+
+    asyncio.run(exercise())
+
+
+def test_oversized_partial_header_and_response_command_mismatch_close_safely():
+    async def exercise() -> None:
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+        client = DapClient(reader, writer)  # type: ignore[arg-type]
+        await client.start()
+        reader.feed_data(b"A" * 8193)
+        await asyncio.sleep(0.01)
+        assert client.state is DapClientState.FAILED
+        assert isinstance(client.failure, DapProtocolError)
+
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+        client = DapClient(reader, writer)  # type: ignore[arg-type]
+        await client.start()
+        pending = asyncio.create_task(client.request("threads"))
+        await asyncio.sleep(0)
+        reader.feed_data(_frame({"seq": 1, "type": "response", "request_seq": 1, "command": "stackTrace", "success": True, "body": {}}))
+        with pytest.raises(DapProtocolError):
+            await pending
+        await asyncio.sleep(0.01)
+        assert client.state is DapClientState.FAILED
+        assert writer.closed is True
+
+    asyncio.run(exercise())
+
+
+def test_bounded_event_and_reverse_request_workers_reject_floods_without_task_growth():
+    async def exercise() -> None:
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+
+        async def slow_event(_: str, __: dict[str, object]) -> None:
+            await asyncio.Event().wait()
+
+        client = DapClient(reader, writer, event_handler=slow_event)  # type: ignore[arg-type]
+        await client.start()
+        reader.feed_data(b"".join(
+            _frame({"seq": index + 1, "type": "event", "event": "output", "body": {}})
+            for index in range(17)
+        ))
+        await asyncio.sleep(0.02)
+        assert client.state is DapClientState.FAILED
+        assert isinstance(client.failure, DapProtocolError)
+        assert client._event_task is None
+        assert client._reverse_tasks == set()
+
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+        client = DapClient(reader, writer)  # type: ignore[arg-type]
+        await client.start()
+        reader.feed_data(b"".join(
+            _frame({"seq": index + 1, "type": "request", "command": "unknown", "arguments": {}})
+            for index in range(9)
+        ))
+        await asyncio.sleep(0.02)
+        assert client.state is DapClientState.FAILED
+        assert isinstance(client.failure, DapProtocolError)
+        assert client._reverse_tasks == set()
+
+    asyncio.run(exercise())
+
+
 def test_transport_gate_uses_a_fake_dap_subprocess_only_through_process_runtime(tmp_path: Path):
     """Exercise real pipes while keeping the production client process-neutral."""
     fake_adapter = r'''

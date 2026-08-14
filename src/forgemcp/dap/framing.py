@@ -23,12 +23,22 @@ async def read_message(
     ``StreamReader`` retains excess bytes, so fragmented frames and several
     messages supplied in one read are handled without a private byte buffer.
     """
-    try:
-        headers = await reader.readuntil(b"\r\n\r\n")
-    except asyncio.LimitOverrunError as error:
-        raise DapProtocolError("The debug adapter sent oversized message headers.") from error
-    if len(headers) > max_header_bytes:
-        raise DapProtocolError("The debug adapter sent oversized message headers.")
+    # ``StreamReader.readuntil`` applies its own (usually 64 KiB) buffer
+    # limit.  That is too loose for this protocol boundary and would defer an
+    # 8 KiB-header rejection until much more hostile input had accumulated.
+    # Reading one header byte at a time keeps the public bound exact while the
+    # StreamReader retains any already-buffered following frames.
+    headers = bytearray()
+    while not headers.endswith(b"\r\n\r\n"):
+        try:
+            chunk = await reader.read(1)
+        except asyncio.LimitOverrunError as error:
+            raise DapProtocolError("The debug adapter sent oversized message headers.") from error
+        if not chunk:
+            raise asyncio.IncompleteReadError(bytes(headers), None)
+        headers.extend(chunk)
+        if len(headers) > max_header_bytes:
+            raise DapProtocolError("The debug adapter sent oversized message headers.")
     content_length: int | None = None
     for line in headers[:-4].split(b"\r\n"):
         if not line or b"\x00" in line:
@@ -47,7 +57,7 @@ async def read_message(
             content_length = int(value)
         elif header_name != "content-type":
             raise DapProtocolError("The debug adapter sent an unsupported message header.")
-    if content_length is None or content_length > max_message_bytes:
+    if content_length is None or content_length < 1 or content_length > max_message_bytes:
         raise DapProtocolError("The debug adapter sent a message outside the configured size limit.")
     try:
         payload = await reader.readexactly(content_length)

@@ -42,8 +42,8 @@ Feature integrations use the public `forgemcp.plugins` contract. CMake and clang
 
 Debugger Phase 1 is launch-only source debugging through a separately installed
 exact `FORGEMCP_LLDB_DAP` path. It supports workspace-contained PE/COFF + DWARF launch, source
-breakpoints, execution control, paused inspection, conservative hover evaluate,
-and bounded events. Attach, MSVC/PDB compatibility claims, terminals, arbitrary
+breakpoints, execution control, paused inspection, one-identifier hover lookup
+(which may still execute debugger/inferior evaluation semantics), and bounded events. Attach, MSVC/PDB compatibility claims, terminals, arbitrary
 LLDB commands, and source/symbol downloads are intentionally unsupported; see
 [ADR 0009](docs/adr/0009-dap-architecture-backend-and-debugger-trust-model.md).
 

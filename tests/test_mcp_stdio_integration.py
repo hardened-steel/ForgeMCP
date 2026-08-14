@@ -31,6 +31,13 @@ _EXPECTED_TOOLS = {
     "debugger__list_adapters",
 }
 
+_DEBUGGER_TOOLS = {
+    "debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop",
+    "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over",
+    "debugger__step_in", "debugger__step_out", "debugger__threads", "debugger__stack_trace",
+    "debugger__scopes", "debugger__variables", "debugger__evaluate", "debugger__events",
+}
+
 _DEFAULT_LLDB_DAP = Path(r"C:\Program Files\LLVM\bin\lldb-dap.exe")
 _DEFAULT_CLANG = Path(r"C:\Program Files\LLVM\bin\clang.exe")
 
@@ -75,7 +82,13 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert initialized.serverInfo.name == "ForgeMCP"
 
                     tools = await session.list_tools()
-                    assert _EXPECTED_TOOLS.issubset({tool.name for tool in tools.tools})
+                    tool_by_name = {tool.name: tool for tool in tools.tools}
+                    assert _EXPECTED_TOOLS.issubset(tool_by_name)
+                    assert _DEBUGGER_TOOLS.issubset(tool_by_name)
+                    launch_schema = tool_by_name["debugger__launch"].inputSchema
+                    assert {"program", "args", "environment", "initial_breakpoints", "stop_on_entry"} <= launch_schema["properties"].keys()
+                    assert launch_schema["additionalProperties"] is False
+                    assert tool_by_name["debugger__events"].inputSchema["properties"]["limit"]["default"] == 100
 
                     status = await session.call_tool("cmake__status")
                     assert status.isError is False
@@ -90,6 +103,11 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert {"state", "session_generation", "stop_generation", "last_event_sequence"} <= debugger_status.keys()
                     adapters = _json_tool_content(await session.call_tool("debugger__list_adapters"))
                     assert len(adapters["adapters"]) == 1
+                    invalid_debugger_arguments = await session.call_tool(
+                        "debugger__launch", {"program": "missing.exe", "unexpected": True}
+                    )
+                    assert invalid_debugger_arguments.isError is True
+                    assert "Traceback" not in getattr(invalid_debugger_arguments.content[0], "text")
 
                     for tool_name, arguments in (
                         ("clangd__completion", {"path": "missing.cpp", "position": {"line": 0, "column": 0}}),

@@ -35,12 +35,17 @@ irreversible choices belong in [adr/](adr/).
   opaque stopped-data handles; source breakpoints, execution control,
   inspection/evaluate, cursor events, fake-adapter lifecycle tests, and real
   standalone LLVM 22.1.8 PE/COFF + DWARF service/MCP stdio gates.
+- DAP Phase 1 security/integration audit: strict response-command correlation,
+  bounded pre-normalization event/reverse queues and teardown, strict MCP
+  unknown-field rejection, stop pre-emption during configuration, capability-
+  gated `configurationDone`, terminal-event retention, and minimal
+  side-effect-possible identifier evaluate policy. Fake, real LLDB-DAP, MCP
+  stdio, CMake, clangd, and full-suite regression pass on the audited host.
 
 ### In progress
 
-- Phase 1 audit review: preserve the passing standalone LLVM 22.1.8
-  PE/COFF + DWARF gate and maintain the intentionally narrow launch-only
-  policy. MSVC/PDB compatibility remains unclaimed.
+- No DAP Phase 1 work is in progress. MSVC/PDB compatibility remains
+  unclaimed and requires a separate adapter/toolchain gate.
 
 ## Delivery sequence and dependencies
 
@@ -115,15 +120,17 @@ lifecycle.
 Delivered scope:
 
 - a bounded `forgemcp.dap` transport/client, separate from LSP, with partial
-  framing, concurrent out-of-order responses, events, reverse-request denial,
-  capability-gated cancel, EOF/malformed failure, and sequential writes;
+  framing, command-correlated concurrent out-of-order responses, bounded
+  event/reverse queues, reverse-request denial, capability-gated cancel,
+  EOF/malformed failure, and sequential writes;
 - an application-scoped builtin debugger plugin and exactly one active launch
   session per application;
 - policy-approved direct stdio `lldb-dap`, starting only a workspace-contained
   build-tree executable with validated argv/CWD. The debuggee environment map
   is disabled until an explicit allow-list is configured;
 - source breakpoints, continue/pause/step, threads, stack/scopes/variables,
-  and watch/hover evaluation while paused; and
+  and a paused hover-context single-identifier evaluate (which may still have
+  native debugger side effects); and
 - `debugger__status`, `debugger__list_adapters`, `debugger__launch`,
   `debugger__stop`, `debugger__set_breakpoints`, `debugger__continue`,
   `debugger__pause`, `debugger__step_over`, `debugger__step_in`,
@@ -146,9 +153,10 @@ The Phase-0 gate to start implementation has passed:
 The Phase-1 delivery gates have passed on this host:
 
 - deterministic fake transport and fake-adapter tests cover fragmented frames,
-  out-of-order responses, events, reverse-request denial, timeout/cancellation,
-  malformed input/EOF, deferred launch configuration, event cursors, handles,
-  stale invalidation, and shutdown;
+  out-of-order/command-mismatch responses, bounded event/reverse floods,
+  reverse-request denial, timeout/cancellation, malformed input/EOF, deferred
+  launch configuration, stop during configuration, event cursors/terminal
+  retention, handles, stale invalidation, and shutdown;
 - the standalone LLVM `C:\Program Files\LLVM\bin\lldb-dap.exe` 22.1.8 gate
   builds a local `-O0 -g -gdwarf-4` PE/COFF executable, confirms `.debug_info`
   via `llvm-readobj`, then passes initialize/launch/breakpoint/stopped/threads/

@@ -69,7 +69,7 @@ class _VariablesArguments(ForgeModel):
 
 
 class _EvaluateArguments(_FrameArguments):
-    expression: str = Field(min_length=1, max_length=1024, description="Conservative hover-only variable/member/index inspection expression.")
+    expression: str = Field(min_length=1, max_length=1024, description="Single ASCII identifier lookup in the selected frame; native evaluation can still have side effects.")
 
 
 ToolOperation = Callable[[DebuggerService, ForgeModel], Awaitable[object]]
@@ -119,7 +119,7 @@ class DebuggerPlugin(ForgePlugin):
             ("stack_trace", "List opaque current-stop frames for a thread.", _StackArguments, self._stack_trace),
             ("scopes", "List scopes and opaque variable handles for a frame.", _FrameArguments, self._scopes),
             ("variables", "Expand one opaque current-stop variables handle.", _VariablesArguments, self._variables),
-            ("evaluate", "Evaluate a conservative hover-only inspection expression in a frame.", _EvaluateArguments, self._evaluate),
+            ("evaluate", "Evaluate one identifier lookup in a frame; native evaluation may still have side effects.", _EvaluateArguments, self._evaluate),
             ("events", "Read a bounded cursor page of normalized debugger events.", _EventsArguments, self._events),
         )
         for name, description, model, operation in contributions:

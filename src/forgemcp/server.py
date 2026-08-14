@@ -7,10 +7,20 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from pydantic import ConfigDict
 from pydantic_core import PydanticUndefined
 
 from forgemcp.core.application import ForgeApplication
 from forgemcp.plugins import RegisteredToolContribution, ToolRegistry
+
+
+# FastMCP derives a transient Pydantic arguments model from each Python
+# signature.  Its SDK default silently ignores unknown keys, which would bypass
+# the strict ``ForgeModel`` contracts before a contribution receives its
+# mapping.  Configure that common base before any tool is registered so every
+# published flat schema and every actual stdio invocation reject extra fields.
+ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
 
 def server_status(application: ForgeApplication) -> dict[str, object]:
