@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from forgemcp import __version__
-from forgemcp.cmake import CMakePlugin
+from forgemcp.cmake import CMakePlugin, CompilationDatabaseRegistry
 from forgemcp.clangd import ClangdPlugin
 from forgemcp.debugger import DebuggerPlugin
 from forgemcp.quality import QualityPlugin
@@ -28,7 +28,7 @@ from forgemcp.project import (
     ProjectStatusService,
     WorkspaceStatusProvider,
 )
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import WorkspaceMutationBus, WorkspacePlugin, WorkspaceService
 from forgemcp.toolchain import ToolchainDiscoveryService
 
 
@@ -80,7 +80,9 @@ class ForgeApplication:
         services.register("config", config)
         logger = create_logger(config.log_level)
         services.register("logger", logger)
-        workspace = WorkspaceService(config, logger)
+        mutations = WorkspaceMutationBus(logger)
+        compilation_database = CompilationDatabaseRegistry(logger)
+        workspace = WorkspaceService(config, logger, mutations=mutations)
         toolchain = ToolchainDiscoveryService(config)
         process_runtime = ProcessRuntime(
             config, logger, approved_executable_paths=toolchain.approved_executable_paths
@@ -88,6 +90,8 @@ class ForgeApplication:
         if toolchain.toolchain_environment is not None:
             process_runtime.set_toolchain_environment(toolchain.toolchain_environment)
         services.register("workspace", workspace)
+        services.register("workspace_mutations", mutations)
+        services.register("compilation_database", compilation_database)
         services.register("toolchain_discovery", toolchain)
         services.register("process_runtime", process_runtime)
         project_status_registry = ProjectStatusRegistry()
@@ -99,13 +103,13 @@ class ForgeApplication:
         plugins = PluginManager(config=config, services=services, logger=logger)
         services.register("plugins", plugins)
         for plugin in (
-            CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), ProjectPlugin(), QualityPlugin(),
+            WorkspacePlugin(), CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), ProjectPlugin(), QualityPlugin(),
             *tuple(builtin_plugins),
         ):
             plugins.register_builtin(plugin)
         application = cls(config, services)
         project_status_registry.register(CoreStatusProvider(lambda: application.state.value))
-        project_status_registry.register(WorkspaceStatusProvider(workspace))
+        project_status_registry.register(WorkspaceStatusProvider(workspace, mutations))
         project_status_registry.register(ProcessRuntimeStatusProvider(process_runtime))
         project_status_registry.register(
             PluginManagerStatusProvider(
@@ -138,6 +142,10 @@ class ForgeApplication:
         plugins = self.services.get("plugins")
         if not isinstance(plugins, PluginManager):
             raise TypeError("The 'plugins' service must be a PluginManager.")
+        if "workspace_mutations" in self.services:
+            mutations = self.services.get("workspace_mutations")
+            if isinstance(mutations, WorkspaceMutationBus):
+                await mutations.start()
         await plugins.start()
         self._state = LifecycleState.RUNNING
         self._logger.info("application_started", workspace_configured=True)
@@ -171,6 +179,10 @@ class ForgeApplication:
             await plugins.aclose()
         finally:
             try:
+                if "workspace_mutations" in self.services:
+                    mutations = self.services.get("workspace_mutations")
+                    if isinstance(mutations, WorkspaceMutationBus):
+                        await mutations.aclose()
                 process_runtime = self.services.get("process_runtime")
                 if isinstance(process_runtime, ProcessRuntime):
                     await process_runtime.aclose()
@@ -187,5 +199,8 @@ class ForgeApplication:
             # host filesystem location through MCP.
             workspace_root="configured",
             state=self.state,
-            services=self.services.names(),
+            services=tuple(
+                name for name in self.services.names()
+                if name not in {"workspace_mutations", "compilation_database"}
+            ),
         )

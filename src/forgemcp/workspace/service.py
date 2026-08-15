@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from forgemcp.workspace.errors import (
     WorkspaceTextEditError,
 )
 from forgemcp.workspace.policy import WorkspacePolicy
+from forgemcp.workspace.events import WorkspaceMutationBus
 
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -178,11 +180,15 @@ class WorkspaceService:
         logger: StructuredLogger,
         *,
         policy: WorkspacePolicy | None = None,
+        mutations: WorkspaceMutationBus | None = None,
     ) -> None:
         """Bind the service to validated configuration and an explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
         self._policy = WorkspacePolicy() if policy is None else policy
+        self._mutations = mutations
+        self._mutation_operation = 0
+        self._filesystem_lock = threading.RLock()
 
     @property
     def workspace_root(self) -> Path:
@@ -385,16 +391,14 @@ class WorkspaceService:
 
         staged = self._stage_changes(plans)
         try:
-            for item in staged:
-                current = self._snapshot_path(item.plan.target)
-                if not self._same_snapshot(current, item.plan.before):
-                    self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
-                    return PatchResult(applied=False)
-            self._commit_staged_changes(staged)
+            if not self._commit_staged_changes(staged):
+                self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
+                return PatchResult(applied=False)
         finally:
             self._cleanup_staging(staged)
 
         changes = tuple(self._to_file_change(plan) for plan in plans)
+        self._publish_mutations(plans, changes)
         self._logger.info("workspace_patch_applied", changed_files=len(changes))
         return PatchResult(applied=True, changes=changes)
 
@@ -463,15 +467,13 @@ class WorkspaceService:
             return PatchResult(applied=True)
         staged = self._stage_changes(plans)
         try:
-            for item in staged:
-                current = self._snapshot_path(item.plan.target)
-                if not self._same_snapshot(current, item.plan.before):
-                    self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
-                    return PatchResult(applied=False)
-            self._commit_staged_changes(staged)
+            if not self._commit_staged_changes(staged):
+                self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
+                return PatchResult(applied=False)
         finally:
             self._cleanup_staging(staged)
         changes = tuple(self._to_file_change(plan) for plan in plans)
+        self._publish_mutations(plans, changes)
         self._logger.info("workspace_text_edits_applied", changed_files=len(changes))
         return PatchResult(applied=True, changes=changes)
 
@@ -866,26 +868,36 @@ class WorkspaceService:
             self._cleanup_staging(staged)
             raise PatchCommitError("Patch staging failed before any source file changed.") from error
 
-    def _commit_staged_changes(self, staged: list[_StagedChange]) -> None:
+    def _commit_staged_changes(self, staged: list[_StagedChange]) -> bool:
         """Replace every target, restoring earlier targets if a later replace fails."""
-        committed: list[_StagedChange] = []
-        try:
+        with self._filesystem_lock:
+            # The final compare-and-swap happens under the application-local
+            # filesystem lock.  A cross-process writer remains a documented
+            # OS race, but concurrent ForgeMCP requests cannot interleave the
+            # check and replacement boundary.
             for item in staged:
-                plan = item.plan
-                committed.append(item)
-                if plan.before.exists:
-                    descriptor, backup_name = tempfile.mkstemp(
-                        prefix=".forgemcp-", suffix=".backup", dir=plan.target.parent
-                    )
-                    os.close(descriptor)
-                    item.backup_path = Path(backup_name)
-                    os.replace(plan.target, item.backup_path)
-                if item.temporary_path is not None:
-                    os.replace(item.temporary_path, plan.target)
-                    item.temporary_path = None
-        except OSError as error:
-            self._restore_committed_changes(committed)
-            raise PatchCommitError("Patch commit failed; ForgeMCP restored the previous file state.") from error
+                current = self._snapshot_path(item.plan.target)
+                if not self._same_snapshot(current, item.plan.before):
+                    return False
+            committed: list[_StagedChange] = []
+            try:
+                for item in staged:
+                    plan = item.plan
+                    committed.append(item)
+                    if plan.before.exists:
+                        descriptor, backup_name = tempfile.mkstemp(
+                            prefix=".forgemcp-", suffix=".backup", dir=plan.target.parent
+                        )
+                        os.close(descriptor)
+                        item.backup_path = Path(backup_name)
+                        os.replace(plan.target, item.backup_path)
+                    if item.temporary_path is not None:
+                        os.replace(item.temporary_path, plan.target)
+                        item.temporary_path = None
+            except OSError as error:
+                self._restore_committed_changes(committed)
+                raise PatchCommitError("Patch commit failed; ForgeMCP restored the previous file state.") from error
+        return True
 
     def _restore_committed_changes(self, committed: list[_StagedChange]) -> None:
         """Best-effort rollback for targets already replaced during this operation."""
@@ -923,6 +935,23 @@ class WorkspaceService:
         after = None if plan.kind is FileChangeKind.DELETED else self._snapshot_path(plan.target)
         before = None if plan.kind is FileChangeKind.CREATED else plan.before
         return FileChange(uri=plan.target.as_uri(), kind=plan.kind, before=before, after=after)
+
+    def _publish_mutations(
+        self, plans: Sequence[_PlannedChange], changes: Sequence[FileChange]
+    ) -> None:
+        """Queue one ordered post-commit batch after staging cleanup is complete."""
+        if self._mutations is None or not changes:
+            return
+        self._mutation_operation += 1
+        operation_id = f"workspace-{self._mutation_operation}"
+        event_changes: list[tuple[str, FileChangeKind, FileSnapshot | None, FileSnapshot | None]] = []
+        for plan, change in zip(plans, changes, strict=True):
+            event_changes.append(
+                (self._relative_key(plan.target), change.kind, change.before, change.after)
+            )
+        # Publication never invokes a subscriber while Workspace has staging
+        # state. Failure or saturation is contained by the application bus.
+        self._mutations.publish(tuple(event_changes), operation_id=operation_id)
 
     def _parse_unified_patch(self, patch: str) -> tuple[_FilePatch, ...]:
         """Parse the deliberately small, text-only unified-diff subset we support."""

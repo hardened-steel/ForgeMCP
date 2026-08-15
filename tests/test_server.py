@@ -165,6 +165,11 @@ def test_server_adapts_plugin_tool_contributions_only_after_plugin_start(tmp_pat
                     "quality__status",
                 "sanitizer__parse_report",
                 "server_status",
+                "workspace__apply_text_edits",
+                "workspace__apply_unified_patch",
+                "workspace__get_snapshot",
+                "workspace__list_files",
+                "workspace__read_text",
             ]
 
     asyncio.run(exercise())

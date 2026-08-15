@@ -21,6 +21,7 @@ def test_config_is_created_from_explicit_environment(tmp_path):
             "FORGEMCP_LLDB_DAP": str(tmp_path / "tools" / "lldb-dap.exe"),
             "FORGEMCP_CLANG_FORMAT": str(tmp_path / "tools" / "clang-format.exe"),
             "FORGEMCP_CLANG_TIDY": str(tmp_path / "tools" / "clang-tidy.exe"),
+            "FORGEMCP_COMPILE_COMMANDS": "required",
         },
         cwd=Path("unused"),
     )
@@ -36,6 +37,13 @@ def test_config_is_created_from_explicit_environment(tmp_path):
     assert config.lldb_dap_path == (tmp_path / "tools" / "lldb-dap.exe").absolute()
     assert config.clang_format_path == (tmp_path / "tools" / "clang-format.exe").absolute()
     assert config.clang_tidy_path == (tmp_path / "tools" / "clang-tidy.exe").absolute()
+    assert config.compile_commands == "required"
+
+
+@pytest.mark.parametrize("value", ["invalid", "ON"])
+def test_config_rejects_invalid_compile_commands_mode(tmp_path, value):
+    with pytest.raises(ConfigurationError):
+        ForgeConfig.from_environment({"FORGEMCP_WORKSPACE": str(tmp_path), "FORGEMCP_COMPILE_COMMANDS": value})
 
 
 def test_config_rejects_missing_workspace(tmp_path):

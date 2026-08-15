@@ -25,6 +25,16 @@ ContextAwareToolHandler = Callable[[Mapping[str, object], ToolExecutionContext],
 ToolHandler = LegacyToolHandler | ContextAwareToolHandler
 
 
+@dataclass(frozen=True, slots=True)
+class ToolHints:
+    """SDK-neutral projection of standard MCP tool safety annotations."""
+
+    read_only: bool | None = None
+    destructive: bool | None = None
+    idempotent: bool | None = None
+    open_world: bool | None = None
+
+
 def handler_accepts_execution_context(handler: ToolHandler) -> bool:
     """Return whether a handler explicitly opts into the v1 context keyword.
 
@@ -67,6 +77,7 @@ class ToolContribution:
     handler: ToolHandler = field(repr=False, compare=False)
     input_model: type[BaseModel] | None = field(default=None, repr=False, compare=False)
     namespace: str | None = field(default=None, repr=False, compare=False)
+    hints: ToolHints | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not _TOOL_IDENTIFIER.fullmatch(self.name):
@@ -83,6 +94,8 @@ class ToolContribution:
             not isinstance(self.namespace, str) or not _PLUGIN_IDENTIFIER.fullmatch(self.namespace)
         ):
             raise ToolNamespaceError("Tool contribution namespaces must be lower-case plugin-style identifiers.")
+        if self.hints is not None and not isinstance(self.hints, ToolHints):
+            raise TypeError("Tool contribution hints must be ToolHints when supplied.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +129,11 @@ class RegisteredToolContribution:
     def input_model(self) -> type[BaseModel] | None:
         """Return the optional transport-neutral Pydantic input contract."""
         return self.contribution.input_model
+
+    @property
+    def hints(self) -> ToolHints | None:
+        """Return SDK-neutral MCP safety annotations for this operation."""
+        return self.contribution.hints
 
 
 class ToolRegistry:

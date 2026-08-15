@@ -25,6 +25,7 @@ warnings.filterwarnings(
 )
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict, Field
 from pydantic_core import PydanticUndefined
@@ -161,7 +162,14 @@ def _register_contributed_tools(
 ) -> None:
     """Adapt transport-neutral contributions after plugin startup, never exposing FastMCP to them."""
     for contribution in registry.contributions():
-        mcp.tool(name=contribution.name, description=contribution.description)(
+        hints = contribution.hints
+        annotations = None if hints is None else ToolAnnotations(
+            readOnlyHint=hints.read_only,
+            destructiveHint=hints.destructive,
+            idempotentHint=hints.idempotent,
+            openWorldHint=hints.open_world,
+        )
+        mcp.tool(name=contribution.name, description=contribution.description, annotations=annotations)(
             _tool_adapter(contribution)
         )
 
@@ -232,6 +240,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmake-generator", metavar="NAME", help="Generator used only when no configure preset is active.")
     parser.add_argument("--configure-preset", metavar="NAME", help="Default configure preset.")
     parser.add_argument("--configuration", dest="default_configuration", metavar="NAME", help="Default multi-config configuration.")
+    parser.add_argument("--compile-commands", choices=("auto", "required", "off"), help="Compilation database policy for CMake and clangd.")
     parser.add_argument("--configure-timeout-sec", dest="configure_timeout_seconds", type=float, metavar="SECONDS", help="Configure timeout (1..3600).")
     parser.add_argument("--build-timeout-sec", dest="build_timeout_seconds", type=float, metavar="SECONDS", help="Build timeout (1..3600).")
     parser.add_argument("--test-timeout-sec", dest="test_timeout_seconds", type=float, metavar="SECONDS", help="CTest timeout (1..3600).")

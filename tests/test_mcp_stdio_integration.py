@@ -17,6 +17,8 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 _EXPECTED_TOOLS = {
     "server_status",
+    "workspace__list_files", "workspace__read_text", "workspace__get_snapshot",
+    "workspace__apply_unified_patch", "workspace__apply_text_edits",
     "project__status",
     "cmake__status",
     "cmake__list_presets",
@@ -241,6 +243,7 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
                     assert {
                         "project__status", "cmake__status", "cmake__configure",
                         "cmake__build", "cmake__ctest_list_tests", "cmake__ctest_run",
+                        "workspace__read_text", "workspace__apply_unified_patch",
                     } <= tools
                     status = _json_tool_content(await session.call_tool("project__status", {}))
                     assert status["workspace_root"] == "configured"
@@ -250,6 +253,23 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
                         "cmake__configure", {"binary_dir": "build"}, progress_callback=observe
                     ))
                     assert configured["process"]["exit_code"] == 0
+                    assert configured["compilation_database"]["availability"] == "available"
+                    source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "main.cpp"}))
+                    patched = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/main.cpp\n+++ b/main.cpp\n@@ -1 +1 @@\n-int main() { return 0; }\n+int main() { return 0; } // workspace-sync\n",
+                            "expected_snapshots": {"main.cpp": source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert patched["applied"] is True
+                    assert "workspace-sync" in _json_tool_content(
+                        await session.call_tool("workspace__read_text", {"path": "main.cpp"})
+                    )["text"]
+                    await asyncio.sleep(0.1)
+                    stale_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    cmake_component = next(item for item in stale_status["components"] if item["id"] == "cmake")
+                    assert "configuration_stale" not in cmake_component["warnings"]
                     built = _json_tool_content(await session.call_tool(
                         "cmake__build", {"binary_dir": "build", "targets": ["app"]}, progress_callback=observe
                     ))
@@ -262,6 +282,21 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
                         "cmake__ctest_run", {"binary_dir": "build"}, progress_callback=observe
                     ))
                     assert executed["process"]["exit_code"] == 0
+                    cmake_source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "CMakeLists.txt"}))
+                    cmake_changed = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -5 +5,2 @@\n add_test(NAME app_runs COMMAND app)\n+# workspace-triggered reconfigure\n",
+                            "expected_snapshots": {"CMakeLists.txt": cmake_source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert cmake_changed["applied"] is True
+                    await asyncio.sleep(0.1)
+                    stale_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    cmake_component = next(item for item in stale_status["components"] if item["id"] == "cmake")
+                    assert "configuration_stale" in cmake_component["warnings"]
+                    reconfigured = _json_tool_content(await session.call_tool("cmake__configure", {"binary_dir": "build"}))
+                    assert reconfigured["process"]["exit_code"] == 0
                     assert len(progress) >= 3
                     assert any(message == "Configure completed" for _, _, message in progress)
                     assert any(message == "Build completed" for _, _, message in progress)

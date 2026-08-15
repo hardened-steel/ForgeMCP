@@ -9,6 +9,7 @@ from pydantic import Field, ValidationError
 
 from forgemcp.clangd.errors import ClangdRequestError
 from forgemcp.clangd.service import ClangdService
+from forgemcp.cmake.events import CompilationDatabaseRegistry, CompilationDatabaseSubscription
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import Diagnostic, Position, Range
 from forgemcp.models._base import ForgeModel
@@ -24,7 +25,12 @@ from forgemcp.plugins import (
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import (
+    WorkspaceMutationBatch,
+    WorkspaceMutationBus,
+    WorkspaceMutationSubscription,
+    WorkspaceService,
+)
 from forgemcp.toolchain import ToolchainDiscoveryService
 
 
@@ -65,7 +71,7 @@ class _StatusArguments(ForgeModel):
 
 
 class _StartArguments(ForgeModel):
-    compile_commands_dir: str = Field(description="Workspace-relative directory containing compile_commands.json.")
+    compile_commands_dir: str | None = Field(default=None, description="Optional workspace-relative database directory. When omitted clangd uses the latest validated CMake profile, or fallback commands under the off policy.")
 
 
 class _StopArguments(ForgeModel):
@@ -195,18 +201,20 @@ class _ClangdStatusProvider:
 class ClangdPlugin(ForgePlugin):
     """Application-scoped clangd plugin; it creates no server until ``start`` tool use."""
 
-    __slots__ = ("_service", "_status_registry")
+    __slots__ = ("_service", "_status_registry", "_mutation_subscription", "_database_subscription")
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="clangd",
-                requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"),
+                requires_services=("workspace", "workspace_mutations", "compilation_database", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"clangd"}),
             )
         )
         self._service: ClangdService | None = None
         self._status_registry: ProjectStatusRegistry | None = None
+        self._mutation_subscription: WorkspaceMutationSubscription | None = None
+        self._database_subscription: CompilationDatabaseSubscription | None = None
 
     @property
     def service(self) -> ClangdService:
@@ -219,6 +227,8 @@ class ClangdPlugin(ForgePlugin):
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
         toolchain = context.services.get("toolchain_discovery")
+        mutations = context.services.get("workspace_mutations")
+        compilation_database = context.services.get("compilation_database")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(process_runtime, ProcessRuntime):
             raise TypeError("The clangd plugin requires WorkspaceService and ProcessRuntime.")
@@ -226,19 +236,39 @@ class ClangdPlugin(ForgePlugin):
             raise TypeError("The clangd plugin requires ProjectStatusRegistry.")
         if not isinstance(toolchain, ToolchainDiscoveryService):
             raise TypeError("The clangd plugin requires ToolchainDiscoveryService.")
-        self._service = ClangdService(context.config, workspace, process_runtime, toolchain)
+        if not isinstance(mutations, WorkspaceMutationBus):
+            raise TypeError("The clangd plugin requires WorkspaceMutationBus.")
+        if not isinstance(compilation_database, CompilationDatabaseRegistry):
+            raise TypeError("The clangd plugin requires CompilationDatabaseRegistry.")
+        self._service = ClangdService(context.config, workspace, process_runtime, toolchain, mutations, compilation_database)
+        self._mutation_subscription = mutations.subscribe("clangd", self._on_workspace_mutation)
+        self._database_subscription = compilation_database.subscribe("clangd", self._on_compilation_database)
         self._status_registry = status_registry
         status_registry.register(_ClangdStatusProvider(self._service))
         self._register_tools(context)
 
     async def stop(self) -> None:
         """Stop the managed server before Process Runtime closes its child handles."""
+        if self._mutation_subscription is not None:
+            await self._mutation_subscription.aclose()
+            self._mutation_subscription = None
+        if self._database_subscription is not None:
+            self._database_subscription.close()
+            self._database_subscription = None
         if self._status_registry is not None:
             self._status_registry.unregister("clangd")
             self._status_registry = None
         if self._service is not None:
             await self._service.aclose()
             self._service = None
+
+    async def _on_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
+        if self._service is not None:
+            await self._service.handle_workspace_mutation(batch)
+
+    async def _on_compilation_database(self, status) -> None:
+        if self._service is not None:
+            await self._service.handle_compilation_database_update(status)
 
     def _register_tools(self, context: PluginContext) -> None:
         contributions = (

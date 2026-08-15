@@ -15,7 +15,7 @@ from forgemcp.project.errors import ProjectStatusError, ProjectStatusRequestErro
 from forgemcp.project.models import MAX_CAPABILITIES, ComponentState, ComponentStatus, StatusFact, utc_now
 from forgemcp.project.registry import ProjectStatusProvider, ProjectStatusRegistry
 from forgemcp.project.service import ProjectStatusService
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import WorkspaceMutationBus, WorkspaceService
 
 
 class _ProjectStatusArguments(ForgeModel):
@@ -53,15 +53,16 @@ class WorkspaceStatusProvider:
 
     id = "workspace"
 
-    def __init__(self, workspace: WorkspaceService) -> None:
+    def __init__(self, workspace: WorkspaceService, mutations: WorkspaceMutationBus | None = None) -> None:
         self._workspace = workspace
+        self._mutations = mutations
 
     async def snapshot_status(self) -> ComponentStatus:
         policy = self._workspace.policy
         return ComponentStatus(
             id=self.id,
             display_name="Workspace",
-            state=ComponentState.AVAILABLE,
+            state=ComponentState.DEGRADED if self._mutations is not None and self._mutations.degraded else ComponentState.AVAILABLE,
             capabilities=("workspace.read", "workspace.patch", "workspace.generated_directory"),
             summary="Configured workspace root and immutable access policy are available.",
             facts=(
@@ -69,7 +70,9 @@ class WorkspaceStatusProvider:
                 StatusFact(name="write_policy", value=True),
                 StatusFact(name="max_read", value=policy.max_read_bytes, unit="bytes"),
                 StatusFact(name="max_patch", value=policy.max_patch_bytes, unit="bytes"),
+                StatusFact(name="mutation_generation", value=self._mutations.generation if self._mutations is not None else 0),
             ),
+            warnings=("mutation_subscriber_degraded",) if self._mutations is not None and self._mutations.degraded else (),
             observed_at=utc_now(),
         )
 

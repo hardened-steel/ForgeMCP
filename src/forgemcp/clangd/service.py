@@ -62,6 +62,8 @@ from forgemcp.clangd.models import (
     WorkspaceSymbol,
     WorkspaceSymbolsResult,
 )
+from forgemcp.cmake.events import CompilationDatabaseRegistry
+from forgemcp.cmake.models import CompilationDatabaseStatus
 from forgemcp.core.config import ForgeConfig
 from forgemcp.lsp import (
     LspClient,
@@ -77,6 +79,8 @@ from forgemcp.lsp import (
 from forgemcp.models import Diagnostic, FileSnapshot, Position, Range, Severity
 from forgemcp.processes import ProcessError, ProcessHandle, ProcessRuntime
 from forgemcp.workspace import (
+    WorkspaceMutationBatch,
+    WorkspaceMutationBus,
     WorkspaceError,
     WorkspaceService,
     WorkspaceTextEdit,
@@ -173,17 +177,23 @@ class ClangdService:
     def __init__(
         self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRuntime,
         toolchain: ToolchainDiscoveryService | None = None,
+        mutations: WorkspaceMutationBus | None = None,
+        compilation_database: CompilationDatabaseRegistry | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
         self._toolchain = toolchain
+        self._mutations_enabled = mutations is not None
+        self._compilation_database_registry = compilation_database
         self._state = ClangdSessionState.STOPPED
         self._compile_commands_dir: str | None = None
+        self._compile_commands_fingerprint: str | None = None
         self._position_encoding = PositionEncoding.UTF16
         self._handle: ProcessHandle | None = None
         self._client: LspClient | None = None
         self._documents: dict[str, _DocumentState] = {}
+        self._dirty_generations: dict[str, int] = {}
         self._actions: dict[str, _CachedAction] = {}
         self._hierarchy_items: dict[str, _CachedHierarchyItem] = {}
         self._failure: str | None = None
@@ -274,10 +284,10 @@ class ClangdService:
                 counts_truncated=len(self._documents) > MAX_PROJECT_STATUS_DOCUMENTS,
             )
 
-    async def start(self, compile_commands_dir: str) -> ClangdStartResult:
-        """Start clangd with a validated explicit compilation database directory."""
+    async def start(self, compile_commands_dir: str | None = None) -> ClangdStartResult:
+        """Start clangd with the selected validated database or fallback commands."""
         async with self._lifecycle_lock:
-            directory = self._validate_compile_commands_dir(compile_commands_dir)
+            directory = self._select_compile_commands_dir(compile_commands_dir)
             if self._state is ClangdSessionState.RUNNING:
                 if directory != self._compile_commands_dir:
                     raise ClangdRequestError(
@@ -290,13 +300,15 @@ class ClangdService:
             self._failure = None
             self._closing = False
             self._documents.clear()
+            self._dirty_generations.clear()
             self._clear_caches()
             self._stderr_characters = 0
             self._stderr_truncated = False
             try:
-                handle = await self._process_runtime.start(
-                    [self._executable, f"--compile-commands-dir={directory}"], cwd="."
-                )
+                argv = [self._executable]
+                if directory is not None:
+                    argv.append(f"--compile-commands-dir={directory}")
+                handle = await self._process_runtime.start(argv, cwd=".")
                 client = LspClient(handle.stdout, handle.stdin, notification_handler=self._on_notification)
                 # Retain both immediately so every failed initialize path reaps
                 # the protocol child through the same managed lifecycle.
@@ -310,6 +322,10 @@ class ClangdService:
                 self._handle = handle
                 self._client = client
                 self._compile_commands_dir = directory
+                selected = self._compilation_database_registry.latest if self._compilation_database_registry is not None else None
+                self._compile_commands_fingerprint = (
+                    selected.fingerprint if selected is not None and selected.binary_dir == directory else None
+                )
                 self._state = ClangdSessionState.RUNNING
                 self._availability_observed = True
                 self._available = True
@@ -348,6 +364,7 @@ class ClangdService:
                             with contextlib.suppress(LspError):
                                 await client.notify("textDocument/didClose", {"textDocument": {"uri": document.uri}})
                     self._documents.clear()
+                    self._dirty_generations.clear()
                     self._clear_caches()
                 if client is not None and client.state is LspClientState.RUNNING:
                     with contextlib.suppress(LspError):
@@ -374,6 +391,7 @@ class ClangdService:
                 self._watch_task = None
                 self._stderr_task = None
                 self._compile_commands_dir = None
+                self._compile_commands_fingerprint = None
                 if self._state is not ClangdSessionState.FAILED:
                     self._state = ClangdSessionState.STOPPED
 
@@ -963,7 +981,7 @@ class ClangdService:
             raise ClangdEditConflictError("WorkspaceEdit could not be applied because the workspace changed.") from error
         if not result.applied:
             raise ClangdEditConflictError("WorkspaceEdit did not match the current workspace snapshots.")
-        if result.changes:
+        if result.changes and not self._mutations_enabled:
             await self._synchronize_changed_documents(result.changes)
         return WorkspaceEditSummary(
             applied=True,
@@ -1070,6 +1088,97 @@ class ClangdService:
                     },
                 )
         self._clear_caches()
+
+    async def handle_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
+        """Synchronize tracked files after a Workspace post-commit event.
+
+        Untracked changes receive only a bounded dirty marker.  The handler is
+        invoked by a single application-local event worker after the filesystem
+        commit/cleanup boundary, so no Workspace lock is retained while LSP is
+        notified.
+        """
+        if self._state is not ClangdSessionState.RUNNING or self._client is None:
+            for change in batch.changes:
+                self._dirty_generations[change.path] = batch.generation
+            return
+        client = self._client
+        diagnostics_to_wait: list[asyncio.Event] = []
+        async with self._mutation_lock:
+            async with self._document_lock:
+                self._clear_caches()
+                for change in batch.changes:
+                    document = self._document_for_path(change.path)
+                    if document is None:
+                        self._dirty_generations[change.path] = batch.generation
+                        continue
+                    after = change.after
+                    if after is None or not after.exists or after.sha256 is None:
+                        document.diagnostics = ()
+                        document.diagnostics_snapshot_sha256 = None
+                        document.stale_diagnostics = True
+                        document.diagnostic_event = asyncio.Event()
+                        self._dirty_generations[change.path] = batch.generation
+                        continue
+                    try:
+                        text, snapshot = self._workspace.read_text(document.path)
+                    except WorkspaceError:
+                        document.stale_diagnostics = True
+                        self._dirty_generations[change.path] = batch.generation
+                        continue
+                    if snapshot.sha256 != after.sha256:
+                        document.stale_diagnostics = True
+                        self._dirty_generations[change.path] = batch.generation
+                        continue
+                    document.snapshot = snapshot
+                    document.version += 1
+                    document.diagnostics = ()
+                    document.diagnostics_snapshot_sha256 = None
+                    document.stale_diagnostics = True
+                    document.diagnostic_event = asyncio.Event()
+                    await self._notify(
+                        client,
+                        "textDocument/didChange",
+                        {
+                            "textDocument": {"uri": document.uri, "version": document.version},
+                            "contentChanges": [{"text": text}],
+                        },
+                    )
+                    self._dirty_generations.pop(change.path, None)
+                    diagnostics_to_wait.append(document.diagnostic_event)
+        # The diagnostics model already validates document versions/snapshots.
+        # Bound the integration wait so a silent server cannot stall future
+        # workspace batches.
+        for event in diagnostics_to_wait:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(event.wait(), timeout=2.0)
+
+    async def handle_compilation_database_update(self, status: CompilationDatabaseStatus) -> None:
+        """Perform one bounded controlled reinitialize when the DB revision changes.
+
+        This is intentionally a database-metadata handoff, never an LSP
+        extension carrying compile command contents.  Failure is recorded in
+        clangd's cached state and is intentionally swallowed so CMake's
+        already-successful configure response is unchanged.
+        """
+        if status.availability != "available" or status.binary_dir is None or status.fingerprint is None:
+            return
+        if self._state is not ClangdSessionState.RUNNING:
+            return
+        if status.binary_dir == self._compile_commands_dir and status.fingerprint == self._compile_commands_fingerprint:
+            return
+        if self._state is not ClangdSessionState.RUNNING:
+            return
+        async with self._document_lock:
+            paths = tuple(document.path for document in list(self._documents.values())[:64])
+        try:
+            await self.aclose()
+            await self.start(status.binary_dir)
+            for path in paths:
+                await self._synchronize_document(path)
+            self._compile_commands_fingerprint = status.fingerprint
+        except Exception:
+            self._set_failed("clangd_reinitialize_failed")
+
 
     def _document_for_path(self, path: str) -> _DocumentState | None:
         """Find the one open document by Workspace-normalized path, not wire URI spelling."""
@@ -1432,6 +1541,22 @@ class ClangdService:
             raise ClangdRequestError("compile_commands_dir must contain compile_commands.json.")
         return generated.relative_path
 
+    def _select_compile_commands_dir(self, requested: str | None) -> str | None:
+        """Use an explicit safe directory first, then the latest validated profile."""
+        if requested is not None:
+            if not isinstance(requested, str) or not requested:
+                raise ClangdRequestError("compile_commands_dir must be a workspace-relative directory when supplied.")
+            return self._validate_compile_commands_dir(requested)
+        if self._compilation_database_registry is not None:
+            selected = self._compilation_database_registry.latest
+            if selected is not None and selected.availability == "available" and selected.binary_dir is not None:
+                return self._validate_compile_commands_dir(selected.binary_dir)
+        # The `off` policy deliberately starts clangd without a database flag;
+        # clangd then uses its documented fallback compile-command inference.
+        if self._config.compile_commands == "off":
+            return None
+        return None
+
     def _initialize_parameters(self) -> dict[str, object]:
         root_uri = self._workspace.workspace_root.as_uri()
         return {
@@ -1549,6 +1674,7 @@ class ClangdService:
                         "contentChanges": [{"text": text}],
                     },
                 )
+            self._dirty_generations.pop(document.path, None)
             return document, text
 
     async def _on_notification(self, method: str, params: Mapping[str, object]) -> None:

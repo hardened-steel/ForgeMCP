@@ -18,6 +18,7 @@ from forgemcp.cmake import (
     CMakePresetError,
     CMakeRequestError,
     CMakeService,
+    CompilationDatabaseRequirementError,
     CTestJsonError,
 )
 from forgemcp.core.application import ForgeApplication
@@ -327,6 +328,50 @@ def test_configure_writes_file_api_query_uses_argv_and_validated_cache_variables
 
     with pytest.raises(CMakeRequestError):
         asyncio.run(service.configure(source_dir="src", binary_dir="build", cache_variables={"bad-key": "x"}))
+
+
+def test_compile_commands_policy_adds_export_rejects_known_visual_studio_required_and_marks_stale(tmp_path):
+    prepare_project(tmp_path)
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    runtime = FakeProcessRuntime([process_result(stdout="configured")])
+    service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime, config)
+
+    result = asyncio.run(service.configure(source_dir="src", binary_dir="build"))
+
+    assert result.compilation_database is not None
+    assert "-DCMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON" in runtime.calls[0][0]
+    service.mark_workspace_mutation(("CMakeLists.txt",))
+    assert service.cached_project_status().configuration_stale is True
+
+    required = CMakeService(
+        WorkspaceService(
+            ForgeConfig(workspace_root=tmp_path, compile_commands="required", cmake_generator="Visual Studio 17 2022"),
+            create_logger("CRITICAL"),
+        ),
+        FakeProcessRuntime([]),
+        ForgeConfig(workspace_root=tmp_path, compile_commands="required", cmake_generator="Visual Studio 17 2022"),
+    )
+    with pytest.raises(CompilationDatabaseRequirementError):
+        asyncio.run(required.configure(source_dir="src", binary_dir="another-build"))
+
+
+def test_compilation_database_validation_returns_metadata_without_commands(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    generated = workspace.open_generated_directory("build", create=True)
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "secret-compiler --token=never-return"}]),
+    )
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+
+    database = service._validate_compilation_database(generated)
+
+    assert database.availability == "available"
+    assert database.generator_support == "supported"
+    assert database.entry_count == 1
+    assert "secret-compiler" not in database.model_dump_json()
 
 
 def test_configure_rejects_workspace_escape_and_symlink_build_directory(tmp_path):

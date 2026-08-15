@@ -74,6 +74,11 @@ irreversible choices belong in [adr/](adr/).
   contract, FastMCP token adapter, bounded ProcessRuntime observer, CMake/
   CTest phase-heartbeat UX with strict Ninja/CTest exact parsing, and lifecycle
   phase progress for clang-tidy, clangd, and debugger. See ADR 0013.
+- UX Stabilization Phase B.1: builtin Workspace MCP tools, bounded
+  application-local post-commit mutation batches, CMake stale marking, source-
+  aware compilation-database policy/validation, and clangd document/database
+  coherence. See ADR 0014. No external watcher, Git, resources, prompts, or
+  completion surface is included.
 
 ### In progress
 
@@ -220,7 +225,10 @@ resolve; each needs a bounded contract and safety review.
 - clangd intentionally omits semantic tokens, inlay hints, code lenses,
   arbitrary LSP methods, arbitrary execute-command, resource operations
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
-- There are no generic Workspace MCP editing tools or Git integration.
+- Workspace MCP tools deliberately support bounded read/snapshot, guarded
+  unified-patch creation, and existing-file text edits only; delete/rename,
+  binary files, arbitrary paths, external watcher, resources/prompts, and Git
+  integration remain unavailable.
   `project__status` reports cached safe component metadata only and deliberately
   has no aggregated diagnostic messages or refresh. DAP Phase 1 is launch-only LLDB-DAP
   source debugging for the passed standalone LLVM/DWARF gate; it is not an

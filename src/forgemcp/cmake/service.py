@@ -17,6 +17,7 @@ from forgemcp.cmake.errors import (
     CMakePresetError,
     CMakeRequestError,
     CMakeToolUnavailableError,
+    CompilationDatabaseRequirementError,
     CTestJsonError,
 )
 from forgemcp.cmake.models import (
@@ -33,6 +34,7 @@ from forgemcp.cmake.models import (
     CMakeTestPreset,
     CMakeToolStatus,
     CMakeVersion,
+    CompilationDatabaseStatus,
     CTestRunResult,
     CTestTest,
     CTestTestList,
@@ -43,6 +45,7 @@ from forgemcp.processes import ProcessError
 from forgemcp.processes import ProcessOutputObserver
 from forgemcp.plugins import NoOpProgressReporter, ProgressUpdate, ToolExecutionContext
 from forgemcp.cmake.progress import CMakeOutputProgressObserver, run_heartbeat, safe_progress_label
+from forgemcp.cmake.events import CompilationDatabaseRegistry
 from forgemcp.workspace import (
     GeneratedWorkspaceDirectory,
     WorkspaceError,
@@ -61,6 +64,11 @@ MAX_PARALLEL_JOBS = 256
 _VERSION_BANNER = re.compile(r"\b(?:cmake|ctest)\s+version\s+(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
 _CACHE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FAILED_TEST_LINE = re.compile(r"^\s*\d+\s*-\s*(?P<name>.+?)\s+\([^)]*\)\s*$")
+_CMAKE_GENERATOR_CACHE = re.compile(r"^CMAKE_GENERATOR(?::[^=]+)?=(?P<value>[^\r\n]{1,256})$", re.MULTILINE)
+
+MAX_COMPILATION_DATABASE_BYTES = 4 * 1024 * 1024
+MAX_COMPILATION_DATABASE_ENTRIES = 100_000
+MAX_COMPILATION_DATABASE_DEPTH = 16
 
 CacheValue: TypeAlias = str | int | bool
 
@@ -88,6 +96,8 @@ class CMakeProjectStatusCache:
     last_configure: CMakeOperationStatusCache | None
     last_build: CMakeOperationStatusCache | None
     last_test: CMakeOperationStatusCache | None
+    configuration_stale: bool
+    compilation_database: CompilationDatabaseStatus | None
 
 
 class ProcessRunner(Protocol):
@@ -120,11 +130,13 @@ class CMakeService:
         process_runtime: ProcessRunner,
         config: ForgeConfig | None = None,
         toolchain: ToolchainDiscoveryService | None = None,
+        compilation_database: CompilationDatabaseRegistry | None = None,
     ) -> None:
         self._workspace = workspace
         self._process_runtime = process_runtime
         self._config = config
         self._toolchain = toolchain
+        self._compilation_database_registry = compilation_database
         self._cached_tool_status: CMakeStatus | None = None
         self._configured_binary_dir: str | None = None
         self._active_operations = 0
@@ -132,6 +144,9 @@ class CMakeService:
         self._last_build: CMakeOperationStatusCache | None = None
         self._last_test: CMakeOperationStatusCache | None = None
         self._resolved_profile: CMakeResolvedProfile | None = None
+        self._configuration_stale = False
+        self._compilation_database: CompilationDatabaseStatus | None = None
+        self._configured_toolchain_file: str | None = None
 
     def cached_project_status(self) -> CMakeProjectStatusCache:
         """Return content-free metadata without filesystem access or tool probes."""
@@ -143,6 +158,8 @@ class CMakeService:
             last_configure=self._last_configure,
             last_build=self._last_build,
             last_test=self._last_test,
+            configuration_stale=self._configuration_stale,
+            compilation_database=self._compilation_database,
         )
 
     async def status(self) -> CMakeStatus:
@@ -157,6 +174,8 @@ class CMakeService:
             cmake=cmake,
             ctest=ctest,
             profile=profile,
+            compilation_database=self._compilation_database,
+            warnings=self._status_warnings(),
         )
         self._cached_tool_status = status
         return status
@@ -214,19 +233,24 @@ class CMakeService:
             if generated.relative_path == source:
                 raise CMakeRequestError("CMake source_dir and binary_dir must be different directories.")
             preset_name = self._selected_preset(preset)
+            existing_generator = self._cached_generator(generated)
+            requested_generator = self._requested_generator(preset_name, existing_generator)
+            known_generator = requested_generator or self._preset_generator(source, preset_name)
+            self._preflight_generator(existing_generator, known_generator)
             generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
 
             argv = [self._tool_executable("cmake"), "-S", source, "-B", generated.relative_path]
             if preset_name is not None:
                 argv.extend(["--preset", preset_name])
-            elif self._config is not None and self._config.cmake_generator is not None:
-                argv.extend(["-G", self._config.cmake_generator])
+            elif requested_generator is not None and existing_generator is None:
+                argv.extend(["-G", requested_generator])
                 if (
-                    self._config.target_arch != "auto"
-                    and self._config.cmake_generator.casefold().startswith("visual studio")
+                    self._config is not None
+                    and self._config.target_arch != "auto"
+                    and requested_generator.casefold().startswith("visual studio")
                 ):
                     argv.extend(["-A", self._config.target_arch])
-            argv.extend(self._cache_arguments(cache_variables))
+            argv.extend(self._configure_cache_arguments(cache_variables, requested_generator))
             await context.report_progress(ProgressUpdate(2, None, "Configure started"))
             result = await self._run_with_progress(
                 "cmake", argv, timeout_seconds=self._default_timeout("configure"),
@@ -252,6 +276,19 @@ class CMakeService:
                 "configure", outcome, generated.relative_path, started, exit_code=result.exit_code
             )
             if outcome == "success":
+                database = self._validate_compilation_database(generated)
+                self._compilation_database = database
+                self._configuration_stale = False
+                self._configured_toolchain_file = self._toolchain_file_from_request(cache_variables, source)
+                warnings = self._compilation_warnings(database)
+                if self._compile_commands_mode == "required" and database.availability != "available":
+                    self._last_configure = self._operation_cache(
+                        "configure", "requirement_failed", generated.relative_path, started,
+                        exit_code=result.exit_code,
+                    )
+                    raise CompilationDatabaseRequirementError(
+                        "CMake configured the build tree, but the required compile_commands.json database is unavailable or invalid."
+                    )
                 self._configured_binary_dir = generated.relative_path
                 self._resolved_profile = CMakeResolvedProfile(
                     source_dir=source,
@@ -260,6 +297,16 @@ class CMakeService:
                     binary_dir_source=profile.binary_dir_source,
                     configure_preset_source=profile.configure_preset_source,
                 )
+                response = CMakeConfigureResult(
+                    source_dir=source,
+                    binary_dir=generated.relative_path,
+                    preset=preset_name,
+                    process=result,
+                    compilation_database=database,
+                    warnings=warnings,
+                )
+                if self._compilation_database_registry is not None:
+                    await self._compilation_database_registry.publish(database)
                 await context.report_progress(ProgressUpdate(4, None, "Configure completed", terminal=True))
             else:
                 message = "Configure timed out" if result.timed_out else "Configure failed"
@@ -679,6 +726,28 @@ class CMakeService:
                 return expanded
         return None
 
+    def _preset_generator(self, source_dir: str, preset: str | None) -> str | None:
+        """Read only a directly declared preset generator for safe preflight."""
+        if preset is None:
+            return None
+        source = self._workspace.require_directory(source_dir)
+        for filename in ("CMakePresets.json", "CMakeUserPresets.json"):
+            path = filename if source == "." else f"{source}/{filename}"
+            try:
+                document = self._parse_preset_document(self._workspace.read_text(path)[0], path)
+            except WorkspaceFileNotFoundError:
+                continue
+            for item in self._preset_entries(document, "configurePresets"):
+                if item.get("name") != preset:
+                    continue
+                value = item.get("generator")
+                if value is None:
+                    return None
+                if not isinstance(value, str) or not value or len(value) > 256 or "\x00" in value:
+                    raise CMakePresetError("The selected configure preset has an unsafe generator.")
+                return value
+        return None
+
     @staticmethod
     def _parse_preset_document(text: str, path: str) -> Mapping[str, object]:
         try:
@@ -793,6 +862,218 @@ class CMakeService:
                 raise CMakeRequestError("Cache variable values must be NUL-free strings, integers, or booleans.")
             arguments.append(f"-D{name}:STRING={rendered}")
         return tuple(arguments)
+
+    @property
+    def _compile_commands_mode(self) -> str:
+        """Return the composed policy; config-less unit composition keeps legacy neutrality."""
+        return "off" if self._config is None else self._config.compile_commands
+
+    def _configure_cache_arguments(
+        self, cache_variables: Mapping[str, CacheValue] | None, requested_generator: str | None
+    ) -> tuple[str, ...]:
+        """Apply operation cache precedence and the database export policy."""
+        values: dict[str, CacheValue] = {} if cache_variables is None else dict(cache_variables)
+        export = values.get("CMAKE_EXPORT_COMPILE_COMMANDS")
+        if self._compile_commands_mode == "required" and self._cache_value_is_off(export):
+            raise CMakeRequestError(
+                "compile_commands=required conflicts with explicit CMAKE_EXPORT_COMPILE_COMMANDS=OFF."
+            )
+        if self._compile_commands_mode != "off" and "CMAKE_EXPORT_COMPILE_COMMANDS" not in values:
+            values["CMAKE_EXPORT_COMPILE_COMMANDS"] = True
+        if (
+            requested_generator == "Ninja"
+            and self._config is not None
+            and self._config.default_configuration is not None
+            and "CMAKE_BUILD_TYPE" not in values
+        ):
+            values["CMAKE_BUILD_TYPE"] = self._config.default_configuration
+        return self._cache_arguments(values)
+
+    @staticmethod
+    def _cache_value_is_off(value: CacheValue | None) -> bool:
+        return value is False or (isinstance(value, str) and value.strip().upper() in {"0", "OFF", "FALSE", "NO"})
+
+    def _cached_generator(self, generated: GeneratedWorkspaceDirectory) -> str | None:
+        """Read an actual existing build-tree generator without trusting request options."""
+        try:
+            cache = generated.read_text("CMakeCache.txt")
+        except WorkspaceFileNotFoundError:
+            return None
+        except WorkspaceError:
+            return None
+        match = _CMAKE_GENERATOR_CACHE.search(cache)
+        return match.group("value") if match is not None else None
+
+    def _requested_generator(self, preset: str | None, existing_generator: str | None) -> str | None:
+        """Choose Ninja only for an unpinned, empty tree with qualified discovery."""
+        if preset is not None:
+            return None
+        if self._config is not None and self._config.cmake_generator is not None:
+            return self._config.cmake_generator
+        if existing_generator is not None:
+            return None
+        if self._toolchain is not None and self._toolchain.executable("ninja") is not None:
+            return "Ninja"
+        return None
+
+    def _preflight_generator(self, existing: str | None, requested: str | None) -> None:
+        if existing is not None and requested is not None and existing != requested:
+            raise CMakeRequestError(
+                "The existing CMake build tree uses a different generator; choose another empty workspace-relative build directory."
+            )
+        known = existing or requested
+        if self._compile_commands_mode == "required" and known is not None and not self._generator_supports_compile_commands(known):
+            raise CompilationDatabaseRequirementError(
+                "compile_commands=required is unsupported by the selected CMake generator; choose an empty Ninja or Makefiles build directory."
+            )
+
+    @staticmethod
+    def _generator_supports_compile_commands(generator: str) -> bool:
+        """Recognize only CMake generator families with documented support."""
+        return generator in {"Ninja", "Ninja Multi-Config"} or generator.endswith("Makefiles")
+
+    def _actual_generator(self, generated: GeneratedWorkspaceDirectory) -> str | None:
+        return self._cached_generator(generated)
+
+    def _validate_compilation_database(self, generated: GeneratedWorkspaceDirectory) -> CompilationDatabaseStatus:
+        """Validate only bounded metadata of CMake's generated database."""
+        generator = self._actual_generator(generated)
+        support = (
+            "supported" if generator is not None and self._generator_supports_compile_commands(generator)
+            else "unsupported" if generator is not None
+            else "unknown"
+        )
+        if self._compile_commands_mode == "off":
+            return CompilationDatabaseStatus(
+                availability="off", generator_support=support, generator=generator,
+                binary_dir=generated.relative_path,
+            )
+        if support == "unsupported":
+            return CompilationDatabaseStatus(
+                availability="unsupported", generator_support=support, generator=generator,
+                binary_dir=generated.relative_path,
+            )
+        try:
+            snapshot = generated.get_snapshot("compile_commands.json")
+        except WorkspaceError:
+            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
+        if not snapshot.exists:
+            return CompilationDatabaseStatus(availability="missing", generator_support=support, generator=generator, binary_dir=generated.relative_path)
+        if snapshot.size_bytes is None or snapshot.size_bytes > MAX_COMPILATION_DATABASE_BYTES:
+            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
+        try:
+            text = generated.read_text("compile_commands.json")
+            document = json.loads(text)
+        except (WorkspaceError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
+        if not isinstance(document, list) or len(document) > MAX_COMPILATION_DATABASE_ENTRIES or self._json_depth(document) > MAX_COMPILATION_DATABASE_DEPTH:
+            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
+        invalid = 0
+        external = 0
+        for entry in document:
+            if not self._valid_database_entry(entry):
+                invalid += 1
+                continue
+            assert isinstance(entry, Mapping)
+            file_name = entry.get("file")
+            assert isinstance(file_name, str)
+            try:
+                directory = entry.get("directory")
+                if isinstance(directory, str):
+                    base = self._workspace.validate_reported_path(directory)
+                else:
+                    base = generated.relative_path
+                self._workspace.validate_reported_path(file_name, relative_to=base)
+            except WorkspaceError:
+                external += 1
+        return CompilationDatabaseStatus(
+            availability="available" if invalid == 0 else "invalid",
+            generator_support=support,
+            generator=generator,
+            binary_dir=generated.relative_path,
+            entry_count=len(document),
+            omitted_external_entries=external,
+            invalid_entries=invalid,
+            fingerprint=snapshot.sha256 if invalid == 0 else None,
+        )
+
+    @staticmethod
+    def _json_depth(value: object, depth: int = 0) -> int:
+        if depth > MAX_COMPILATION_DATABASE_DEPTH:
+            return depth
+        if isinstance(value, Mapping):
+            return max((CMakeService._json_depth(item, depth + 1) for item in value.values()), default=depth)
+        if isinstance(value, list):
+            return max((CMakeService._json_depth(item, depth + 1) for item in value), default=depth)
+        return depth
+
+    @staticmethod
+    def _valid_database_entry(value: object) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        file_name = value.get("file")
+        directory = value.get("directory")
+        command = value.get("command")
+        arguments = value.get("arguments")
+        if not isinstance(file_name, str) or not file_name or len(file_name) > 4096:
+            return False
+        if directory is not None and (not isinstance(directory, str) or not directory or len(directory) > 4096):
+            return False
+        if isinstance(command, str) and command and len(command) <= 65_536:
+            return True
+        return isinstance(arguments, list) and bool(arguments) and len(arguments) <= 1024 and all(
+            isinstance(item, str) and len(item) <= 16_384 for item in arguments
+        )
+
+    def _compilation_warnings(self, database: CompilationDatabaseStatus) -> tuple[str, ...]:
+        warnings: list[str] = []
+        if database.availability in {"missing", "invalid", "unsupported"}:
+            warnings.append("compile_commands_unavailable")
+        if database.generator_support == "unsupported":
+            warnings.append("compile_commands_generator_unsupported")
+        return tuple(warnings)
+
+    def _status_warnings(self) -> tuple[str, ...]:
+        warnings: list[str] = []
+        if self._configuration_stale:
+            warnings.append("configuration_stale")
+        if self._compilation_database is not None:
+            warnings.extend(self._compilation_warnings(self._compilation_database))
+        return tuple(dict.fromkeys(warnings))
+
+    def mark_workspace_mutation(self, paths: Sequence[str]) -> None:
+        """Mark a cached configuration stale for relevant committed source changes."""
+        if self._configured_binary_dir is None:
+            return
+        for path in paths:
+            lower = path.casefold()
+            if (
+                lower == "cmakelists.txt"
+                or lower.endswith("/cmakelists.txt")
+                or lower.endswith(".cmake")
+                or lower in {"cmakepresets.json", "cmakeuserpresets.json"}
+                or lower.endswith("/cmakepresets.json")
+                or lower.endswith("/cmakeuserpresets.json")
+                or (
+                    self._configured_toolchain_file is not None
+                    and lower == self._configured_toolchain_file.casefold()
+                )
+            ):
+                self._configuration_stale = True
+                return
+
+    def _toolchain_file_from_request(
+        self, values: Mapping[str, CacheValue] | None, source_dir: str
+    ) -> str | None:
+        if values is None:
+            return None
+        value = values.get("CMAKE_TOOLCHAIN_FILE")
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return self._workspace.validate_reported_path(value, relative_to=source_dir)
+        except WorkspaceError:
+            return None
 
     @staticmethod
     def _validate_optional_name(value: str | None, *, label: str) -> str | None:

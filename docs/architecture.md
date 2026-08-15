@@ -45,7 +45,7 @@ Every model is immutable, rejects unknown fields, and has Pydantic field descrip
 
 `forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it registers ForgeMCP's `CMakePlugin` explicitly during composition and accepts `builtin_plugins=` for additional owned feature plugins. CMake's state belongs to that plugin instance and therefore to one application instance.
 
-Workspace and Process Runtime are not feature plugins. They remain foundational, always-composed Core services and are available to a feature plugin only when it declares their names in `PluginMetadata.requires_services`. The explicitly composed builtin plugins are CMake, clangd, debugger, and Quality. clangd and Quality start only lightweight services at application startup, never a tool process, so a missing executable does not prevent ForgeApplication from running.
+Workspace and Process Runtime are foundational Core services. Workspace's MCP adapter is the builtin `WorkspacePlugin`; filesystem policy and mutation logic remain in `forgemcp.workspace`. The explicitly composed builtin plugins are Workspace, CMake, clangd, debugger, Project, and Quality. clangd and Quality start only lightweight services at application startup, never a tool process, so a missing executable does not prevent ForgeApplication from running.
 
 A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
@@ -141,7 +141,7 @@ not scan an unbounded cache or acquire the WorkspaceEdit mutation lock.
 
 ## Workspace module
 
-`forgemcp.workspace` is a transport-neutral filesystem service for exactly `ForgeConfig.workspace_root`; it has no MCP tool adapter and does not import `mcp.server`. `ForgeApplication.create()` composes it as `application.services.get("workspace")`.
+`forgemcp.workspace` is a transport-neutral filesystem service for exactly `ForgeConfig.workspace_root`; it has no MCP dependency. `WorkspacePlugin` contributes `workspace__list_files`, `workspace__read_text`, `workspace__get_snapshot`, `workspace__apply_unified_patch`, and `workspace__apply_text_edits` through the normal ToolContribution contract. It returns relative paths and content-free snapshot metadata; mutation texts never enter logs/errors. Delete and rename are deliberately absent from this public tool surface.
 
 Its public `WorkspaceService` API is:
 
@@ -154,6 +154,13 @@ Its public `WorkspaceService` API is:
 - `validate_reported_path(path, relative_to=".") -> str`
 
 All supplied paths are workspace-relative strings. Absolute, drive-qualified, and parent-traversal paths are rejected. A requested path containing a symlink is rejected; directory listing does not follow and omits symlinks. The default immutable `WorkspacePolicy` excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories, and provides bounded UTF-8 reads and patch input. Callers can compose `WorkspaceService` with another policy when their generated-directory conventions differ.
+
+After a successful staged commit and staging cleanup, Workspace emits exactly one
+ordered application-local mutation batch. It contains only generation,
+operation ID, relative path, change kind, and prior/current snapshot metadata.
+Each subscriber has one bounded worker/queue; failure or saturation is a safe
+degraded integration warning and cannot undo the filesystem commit. The bus is
+owned by one ForgeApplication and is not an external filesystem watcher.
 
 Every patch target must carry a compare-and-swap expectation: preferably the `FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file; `None` represents an expected absent file for creation. A snapshot conflict or hunk mismatch returns `PatchResult(applied=False)` before source files are changed. Patches are text-only unified diffs, staged beside their targets and committed with rollback backups; patch input and file content never enter Workspace log context. File change events are intentionally not implemented yet.
 
@@ -171,9 +178,9 @@ nor writes.
 
 `forgemcp.clangd` is an application-scoped builtin feature plugin with capability `clangd`. Its `ClangdService` receives only the declared `workspace`, `process_runtime`, and cached `toolchain_discovery` services through `PluginContext`; it does not receive FastMCP, ForgeApplication, or a raw registry. Every clangd child is launched through Process Runtime. `FORGEMCP_CLANGD` may set an absolute executable path; otherwise the central discovery service chooses one exact policy-approved candidate. No MCP argument can supply executable flags, `--query-driver`, or a path outside the workspace.
 
-`clangd__start` requires an explicit workspace-contained, non-symlink directory with `compile_commands.json`, then launches only `clangd --compile-commands-dir=<validated-relative-directory>`. It performs `initialize` followed by `initialized`. clangd is an untrusted, fallible protocol peer: all incoming messages are size-bounded, parsed into normalized models at the adapter boundary, and neither raw payloads, compiler arguments, source/replacement text, nor stderr are logged. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed discard limit.
+`clangd__start` may receive an explicit workspace-contained, non-symlink compilation-database directory, otherwise it uses the latest CMake-validated profile. `off` permits fallback command inference. It launches only fixed clangd arguments and performs `initialize` followed by `initialized`. A validated database fingerprint change triggers one bounded controlled restart/reinitialize and reopens only previously tracked documents; a restart failure degrades clangd but does not revise the CMake configure result. clangd is an untrusted, fallible protocol peer: all incoming messages are size-bounded, parsed into normalized models at the adapter boundary, and neither raw payloads, compiler arguments, source/replacement text, nor stderr are logged. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed discard limit.
 
-Document text is read only through WorkspaceService. On first use ForgeMCP sends `didOpen`; when a new `FileSnapshot` SHA-256 is observed, it sends a full `didChange` with a monotonically increasing version. Only snapshot, URI, version, and normalized diagnostics are retained, never a permanent source-text cache. `publishDiagnostics` is associated with the active snapshot/version. `clangd__diagnostics` reports completeness, timeout, and staleness; an empty current publication is a successful empty result.
+Document text is read only through WorkspaceService. On first use ForgeMCP sends `didOpen`; when a new `FileSnapshot` SHA-256 is observed, it sends a full `didChange` with a monotonically increasing version. Workspace mutation batches invalidate cached actions/hierarchy/diagnostics, resynchronize only already tracked documents, and keep untracked paths dirty/lazy. Only snapshot, URI, version, and normalized diagnostics are retained, never a permanent source-text cache. `publishDiagnostics` is associated with the active snapshot/version. `clangd__diagnostics` reports completeness, timeout, and staleness; an empty current publication is a successful empty result.
 
 The public coordinate policy is Unicode code-point columns. LSP's negotiated `utf-8`, `utf-16`, or `utf-32` character offset is converted only at the LSP adapter boundary, rejecting positions that split an encoded character. Input document paths are workspace-relative and checked by WorkspaceService. Incoming file URIs are percent-decoded and revalidated through WorkspaceService; results outside the workspace are omitted and reported only through an omitted-result count. See [ADR 0007](adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md).
 
@@ -299,6 +306,17 @@ the LLDB/backend boundary.
 `forgemcp.cmake` is a transport-neutral builtin feature plugin. `CMakeService` discovers `cmake` and `ctest`, parses versions, and supports CMake 3.23 or later. It lists safe summaries from `CMakePresets.json` and `CMakeUserPresets.json`, intentionally omitting `environment` and `cacheVariables`; CMake itself remains responsible for preset inheritance, conditions, and macro expansion.
 
 Every configure request supplies a workspace-contained `source_dir` and an explicitly selected workspace-contained generated `binary_dir`. Configure writes the File API `codemodel-v2` query via `GeneratedWorkspaceDirectory` and invokes `cmake -S ... -B ...` through Process Runtime. When a preset is selected, CMake receives `--preset`, but ForgeMCP still passes the validated `-B` value so the preset cannot direct execution to an external build tree. No raw shell command or generic extra-argument field is exposed. Optional cache values are restricted to CMake-style identifier keys and NUL-free scalar values.
+
+The immutable compile-commands policy is `auto` by default, `required`, or
+`off`. `auto` adds `CMAKE_EXPORT_COMPILE_COMMANDS=ON`; a qualified Ninja is
+selected only for a new unpinned tree, while an explicit Visual Studio generator
+or preset is preserved. Existing CMake cache generator changes are rejected
+with an empty-build-directory suggestion. After configure ForgeMCP reads the
+actual cache generator, validates a bounded regular UTF-8 JSON database inside
+the generated build tree, and exposes availability/support/count/fingerprint
+metadata only. Database commands and external paths are trusted project input
+for native tools and never returned or logged. Workspace CMake-file mutations
+only mark cached configuration stale; they do not configure automatically.
 
 Targets come only from CMake File API codemodel v2 replies, never `--target help`. Missing, stale, malformed, unsupported-version, symlinked, or out-of-workspace replies return a CMake domain error. Reported source, artifact, and build paths are revalidated through Workspace before they are exposed as workspace-relative strings. Build preserves a non-zero CMake exit as a `ProcessResult`, with optional multi-config name and bounded `parallel_jobs`. CTest test discovery uses `ctest --show-only=json-v1`; execution supports all tests or a generated escaped exact-name selection and exposes no client-supplied regex or arbitrary CTest arguments. Timeout and output bounds are those of Process Runtime.
 

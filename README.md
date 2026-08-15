@@ -7,6 +7,8 @@ ForgeMCP is an MCP server that will provide AI assistants with deep, structured 
 The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 
 - `server_status`
+- `workspace__list_files`, `workspace__read_text`, `workspace__get_snapshot`
+- `workspace__apply_unified_patch`, `workspace__apply_text_edits`
 - `project__status`
 - `cmake__status`
 - `cmake__list_presets`
@@ -43,7 +45,7 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 
 `--workspace` / `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
-Feature integrations use the public `forgemcp.plugins` contract. CMake and clangd are built-in plugins; clangd does not start a process until `clangd__start` receives an explicit workspace-contained directory with `compile_commands.json`. `--clangd` / `FORGEMCP_CLANGD` may name an exact executable; otherwise the application-scoped Toolchain Discovery Service uses its common safe selection rules. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md), [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md), and [ADR 0007](docs/adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md) before allowing third-party code or extending clangd.
+Feature integrations use the public `forgemcp.plugins` contract. Workspace, CMake, and clangd are built-in plugins; clangd does not start a process until `clangd__start` is called. It uses an explicit workspace-contained `compile_commands.json` directory when supplied, otherwise the latest CMake-validated profile (or fallback commands with policy `off`). `--clangd` / `FORGEMCP_CLANGD` may name an exact executable; otherwise the application-scoped Toolchain Discovery Service uses its common safe selection rules. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md), [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md), [ADR 0007](docs/adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md), and [ADR 0014](docs/adr/0014-workspace-mutations-and-compilation-database-coherence.md) before allowing third-party code or extending clangd.
 
 `project__status {}` is the sole Project Intelligence Phase 1 operation. It
 concurrently aggregates bounded cached snapshots for Core, Workspace, Process
@@ -150,6 +152,7 @@ forgemcp --workspace C:\src\demo --build-dir build
 | `--cmake-generator NAME` | `FORGEMCP_CMAKE_GENERATOR` | none | bounded name | Generator outside a preset | Mutually exclusive with a configured preset. |
 | `--configure-preset NAME` | `FORGEMCP_CONFIGURE_PRESET` | none | bounded name | Default configure preset | Its direct `binaryDir` is rechecked in workspace policy. |
 | `--configuration NAME` | `FORGEMCP_DEFAULT_CONFIGURATION` | none | bounded name | Default multi-config configuration | Passed as one argv value only. |
+| `--compile-commands MODE` | `FORGEMCP_COMPILE_COMMANDS` | `auto` | `auto`, `required`, `off` | CMake compilation database policy | `required` rejects unsupported/missing databases; `off` uses clangd fallback commands. |
 | `--configure-timeout-sec N` | `FORGEMCP_CONFIGURE_TIMEOUT_SEC` | `300` | `0 < N <= 3600` | Configure timeout | Process Runtime remains the execution boundary. |
 | `--build-timeout-sec N` | `FORGEMCP_BUILD_TIMEOUT_SEC` | `900` | `0 < N <= 3600` | Build timeout | Process Runtime remains the execution boundary. |
 | `--test-timeout-sec N` | `FORGEMCP_TEST_TIMEOUT_SEC` | `900` | `0 < N <= 3600` | CTest timeout | Per-call safe timeout may override it. |
@@ -170,6 +173,33 @@ and configuration source categories only; it never contains the inherited PATH,
 raw environment values, secrets, executable paths, VS instance IDs, or other
 host paths. Plain `doctor` is local operator output and may show the same safe
 categories, but is not an MCP response.
+
+### Workspace MCP tools and compilation database coherence
+
+Workspace tools accept only workspace-relative UTF-8 paths, never absolute
+paths, binary files, arbitrary filesystem access, or Git operations. Start
+with `workspace__read_text` or `workspace__get_snapshot`; pass the returned
+SHA-256 to every mutation. A snapshot conflict changes nothing: read again
+before retrying. `workspace__apply_unified_patch` supports safe creation only
+when the new target is explicitly expected absent (`null`); delete and rename
+are intentionally not public tools. `workspace__apply_text_edits` edits only
+existing files. Neither tool logs source, edit, or patch text.
+
+Successful Workspace commits publish one content-free, application-local batch
+after filesystem cleanup. Active clangd documents receive a bounded full-text
+`didChange`; untracked documents remain lazy. CMakeLists, `.cmake`, preset, and
+configured in-workspace toolchain mutations mark CMake configuration stale but
+never auto-configure. There is no external filesystem watcher.
+
+`--compile-commands auto` adds `CMAKE_EXPORT_COMPILE_COMMANDS=ON`. For an
+empty unpinned tree with a qualified Ninja, ForgeMCP uses Ninja (on Windows
+with the discovered MSVC Developer environment); an explicit generator or
+preset wins, and an explicit Visual Studio generator is never replaced. Ninja,
+Ninja Multi-Config, and available Makefile generators are the only claimed
+database-capable families. Visual Studio generators configure normally but
+report the database limitation. CMake validates the generated database inside
+the selected build tree and shares metadata/fingerprint only; active clangd is
+reinitialized when that fingerprint changes. See [ADR 0014](docs/adr/0014-workspace-mutations-and-compilation-database-coherence.md).
 
 ### CMake build-directory resolution
 

@@ -8,6 +8,7 @@ from pydantic import Field, ValidationError
 
 from forgemcp.cmake.errors import CMakeRequestError
 from forgemcp.cmake.service import CMakeService
+from forgemcp.cmake.events import CompilationDatabaseRegistry
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
@@ -25,7 +26,12 @@ from forgemcp.project import (
     StatusFact,
 )
 from forgemcp.project.models import utc_now
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import (
+    WorkspaceMutationBatch,
+    WorkspaceMutationBus,
+    WorkspaceMutationSubscription,
+    WorkspaceService,
+)
 from forgemcp.toolchain import ToolchainDiscoveryService
 
 
@@ -96,6 +102,7 @@ class _CMakeStatusProvider:
             StatusFact(name="availability_observed", value=tool is not None),
             StatusFact(name="available", value=available if available is not None else False),
             StatusFact(name="configured", value=cached.configured_binary_dir is not None),
+            StatusFact(name="configuration_stale", value=cached.configuration_stale),
             StatusFact(name="active_operations", value=cached.active_operations),
         ]
         warnings: list[str] = []
@@ -128,6 +135,11 @@ class _CMakeStatusProvider:
                 warnings.append(f"{prefix}_{operation.outcome}")
         if tool is None:
             warnings.append("tool_availability_not_observed")
+        if cached.configuration_stale:
+            warnings.append("configuration_stale")
+        if cached.compilation_database is not None:
+            if cached.compilation_database.availability in {"missing", "invalid", "unsupported"}:
+                warnings.append("compile_commands_unavailable")
         return ComponentStatus(
             id=self.id,
             display_name="CMake and CTest",
@@ -143,18 +155,19 @@ class _CMakeStatusProvider:
 class CMakePlugin(ForgePlugin):
     """Application-scoped builtin plugin exposing CMake and CTest tool contributions."""
 
-    __slots__ = ("_service", "_status_registry")
+    __slots__ = ("_service", "_status_registry", "_mutation_subscription")
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="cmake",
-                requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"),
+                requires_services=("workspace", "workspace_mutations", "compilation_database", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"cmake.configure", "cmake.file-api-v2", "ctest.run"}),
             )
         )
         self._service: CMakeService | None = None
         self._status_registry: ProjectStatusRegistry | None = None
+        self._mutation_subscription: WorkspaceMutationSubscription | None = None
 
     @property
     def service(self) -> CMakeService:
@@ -167,6 +180,8 @@ class CMakePlugin(ForgePlugin):
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
         toolchain = context.services.get("toolchain_discovery")
+        mutations = context.services.get("workspace_mutations")
+        compilation_database = context.services.get("compilation_database")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService):
             raise TypeError("The CMake plugin requires WorkspaceService under the 'workspace' service name.")
@@ -174,7 +189,12 @@ class CMakePlugin(ForgePlugin):
             raise TypeError("The CMake plugin requires ProjectStatusRegistry.")
         if not isinstance(toolchain, ToolchainDiscoveryService):
             raise TypeError("The CMake plugin requires ToolchainDiscoveryService.")
-        self._service = CMakeService(workspace, process_runtime, context.config, toolchain)  # type: ignore[arg-type]
+        if not isinstance(compilation_database, CompilationDatabaseRegistry):
+            raise TypeError("The CMake plugin requires CompilationDatabaseRegistry.")
+        self._service = CMakeService(workspace, process_runtime, context.config, toolchain, compilation_database)  # type: ignore[arg-type]
+        if not isinstance(mutations, WorkspaceMutationBus):
+            raise TypeError("The CMake plugin requires WorkspaceMutationBus.")
+        self._mutation_subscription = mutations.subscribe("cmake", self._on_workspace_mutation)
         self._status_registry = status_registry
         status_registry.register(_CMakeStatusProvider(self._service))
         context.tools.register(
@@ -242,10 +262,18 @@ class CMakePlugin(ForgePlugin):
 
     async def stop(self) -> None:
         """Release application-owned service state; the registry removes contributions."""
+        if self._mutation_subscription is not None:
+            await self._mutation_subscription.aclose()
+            self._mutation_subscription = None
         if self._status_registry is not None:
             self._status_registry.unregister("cmake")
             self._status_registry = None
         self._service = None
+
+    def _on_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
+        """Mark cached CMake state stale after a committed source transaction."""
+        if self._service is not None:
+            self._service.mark_workspace_mutation(tuple(change.path for change in batch.changes))
 
     async def _dispatch(
         self,

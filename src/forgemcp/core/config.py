@@ -58,6 +58,7 @@ _SOURCE_DEFAULTS = {
     "cmake_generator": ConfigurationSource.DEFAULT,
     "configure_preset": ConfigurationSource.DEFAULT,
     "default_configuration": ConfigurationSource.DEFAULT,
+    "compile_commands": ConfigurationSource.DEFAULT,
     "configure_timeout_seconds": ConfigurationSource.DEFAULT,
     "build_timeout_seconds": ConfigurationSource.DEFAULT,
     "test_timeout_seconds": ConfigurationSource.DEFAULT,
@@ -87,6 +88,7 @@ class ForgeConfig:
     cmake_generator: str | None = None
     configure_preset: str | None = None
     default_configuration: str | None = None
+    compile_commands: str = "auto"
     configure_timeout_seconds: float = 300.0
     build_timeout_seconds: float = 900.0
     test_timeout_seconds: float = 900.0
@@ -133,6 +135,8 @@ class ForgeConfig:
         _validate_short_text(self.cmake_generator, "cmake_generator")
         _validate_short_text(self.configure_preset, "configure_preset")
         _validate_short_text(self.default_configuration, "default_configuration")
+        if self.compile_commands not in {"auto", "required", "off"}:
+            raise ConfigurationError("compile_commands must be auto, required, or off.")
         if self.cmake_generator is not None and self.configure_preset is not None:
             raise ConfigurationError(
                 "cmake_generator and configure_preset cannot both be configured."
@@ -194,6 +198,7 @@ class ForgeConfig:
                 "preset_source": self.source_of("configure_preset").value,
                 "configuration_configured": self.default_configuration is not None,
                 "configuration_source": self.source_of("default_configuration").value,
+                "compile_commands": {"configured": self.source_of("compile_commands") is not ConfigurationSource.DEFAULT, "source": self.source_of("compile_commands").value, "mode": self.compile_commands},
             },
             "timeouts": {
                 "configure_configured": self.source_of("configure_timeout_seconds") is not ConfigurationSource.DEFAULT,
@@ -258,6 +263,7 @@ class ForgeConfig:
             "cmake_generator": choose("cmake_generator", "FORGEMCP_CMAKE_GENERATOR", None),
             "configure_preset": choose("configure_preset", "FORGEMCP_CONFIGURE_PRESET", None),
             "default_configuration": choose("default_configuration", "FORGEMCP_DEFAULT_CONFIGURATION", None),
+            "compile_commands": choose("compile_commands", "FORGEMCP_COMPILE_COMMANDS", "auto"),
             "configure_timeout_seconds": _read_timeout(
                 choose("configure_timeout_seconds", "FORGEMCP_CONFIGURE_TIMEOUT_SEC", 300.0),
                 "FORGEMCP_CONFIGURE_TIMEOUT_SEC",

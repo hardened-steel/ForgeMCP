@@ -3,6 +3,7 @@
 from forgemcp.cmake.errors import (
     CMakeError,
     CMakeFileApiError,
+    CompilationDatabaseRequirementError,
     CMakePresetError,
     CMakeRequestError,
     CMakeToolUnavailableError,
@@ -23,11 +24,13 @@ from forgemcp.cmake.models import (
     CMakeTestPreset,
     CMakeToolStatus,
     CMakeVersion,
+    CompilationDatabaseStatus,
     CTestRunResult,
     CTestTest,
     CTestTestList,
 )
 from forgemcp.cmake.plugin import CMakePlugin
+from forgemcp.cmake.events import CompilationDatabaseRegistry, CompilationDatabaseSubscription
 from forgemcp.cmake.service import CMakeService, MAX_PARALLEL_JOBS, MINIMUM_CMAKE_VERSION
 
 __all__ = [
@@ -39,6 +42,8 @@ __all__ = [
     "CMakeError",
     "CMakeFileApiError",
     "CMakePlugin",
+    "CompilationDatabaseRegistry",
+    "CompilationDatabaseSubscription",
     "CMakePresetError",
     "CMakePresetList",
     "CMakeResolvedProfile",
@@ -51,6 +56,8 @@ __all__ = [
     "CMakeToolStatus",
     "CMakeToolUnavailableError",
     "CMakeVersion",
+    "CompilationDatabaseStatus",
+    "CompilationDatabaseRequirementError",
     "CMakeVersionError",
     "CTestJsonError",
     "CTestRunResult",

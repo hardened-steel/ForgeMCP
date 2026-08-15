@@ -805,7 +805,7 @@ def test_builtin_clangd_plugin_registers_every_phase_one_tool_with_flat_schemas(
                 assert set(tools[name].inputSchema["properties"]) == properties
             expected_required = {
                 "clangd__status": set(),
-                "clangd__start": {"compile_commands_dir"},
+                "clangd__start": set(),
                 "clangd__stop": set(),
                 "clangd__diagnostics": {"path"},
                 "clangd__hover": {"path", "position"},

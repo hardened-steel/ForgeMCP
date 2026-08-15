@@ -41,6 +41,19 @@ class CMakeResolvedProfile(ForgeModel):
     configure_preset_source: str = Field(min_length=1, description="Safe source category for selected preset.")
 
 
+class CompilationDatabaseStatus(ForgeModel):
+    """Validated metadata for a generated compile_commands.json file only."""
+
+    availability: str = Field(min_length=1, description="available, missing, invalid, unsupported, or off.")
+    generator_support: str = Field(min_length=1, description="supported, unsupported, or unknown based on the actual CMake generator.")
+    generator: str | None = Field(default=None, description="Actual bounded CMake generator name when safely observed.")
+    binary_dir: str | None = Field(default=None, description="Workspace-relative generated build directory when available.")
+    entry_count: int = Field(default=0, ge=0, description="Validated total database entries.")
+    omitted_external_entries: int = Field(default=0, ge=0, description="External source entries omitted from ForgeMCP accounting.")
+    invalid_entries: int = Field(default=0, ge=0, description="Entries rejected by bounded database validation.")
+    fingerprint: str | None = Field(default=None, description="Content fingerprint; compiler commands and database contents are never returned.")
+
+
 class CMakeStatus(ForgeModel):
     """Combined environment status for the CMake feature."""
 
@@ -49,6 +62,8 @@ class CMakeStatus(ForgeModel):
     cmake: CMakeToolStatus = Field(description="CMake executable status.")
     ctest: CMakeToolStatus = Field(description="CTest executable status.")
     profile: CMakeResolvedProfile | None = Field(default=None, description="Resolved safe workspace CMake profile.")
+    compilation_database: CompilationDatabaseStatus | None = Field(default=None, description="Cached validated compilation-database metadata.")
+    warnings: tuple[str, ...] = Field(default=(), description="Bounded safe warnings such as configuration_stale.")
 
 
 class CMakeConfigurePreset(ForgeModel):
@@ -104,6 +119,8 @@ class CMakeConfigureResult(ForgeModel):
     binary_dir: str = Field(min_length=1, description="Validated workspace-relative generated build directory.")
     preset: str | None = Field(default=None, description="Selected configure preset, if any.")
     process: ProcessResult = Field(description="Structured configure command result.")
+    compilation_database: CompilationDatabaseStatus | None = Field(default=None, description="Validated generated compilation-database metadata after configure.")
+    warnings: tuple[str, ...] = Field(default=(), description="Bounded safe configure warnings.")
 
 
 class CMakeTargetMetadata(ForgeModel):
