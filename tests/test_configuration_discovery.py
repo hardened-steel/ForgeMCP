@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from forgemcp.cmake import CMakeService
+from forgemcp.cmake import CMakePresetError, CMakeService, CMakeToolUnavailableError
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ConfigurationSource, ForgeConfig
 from forgemcp.core.logging import create_logger
@@ -66,13 +66,28 @@ def test_cli_precedes_environment_and_safe_config_does_not_leak_values(tmp_path:
     assert str(tmp_path) not in rendered
 
 
+def test_environment_sourced_configuration_never_serializes_raw_values(tmp_path: Path) -> None:
+    config = _config(tmp_path, {
+        "FORGEMCP_WORKSPACE": str(tmp_path),
+        "FORGEMCP_SOURCE_DIR": "source-SUPERSECRET",
+        "FORGEMCP_BUILD_DIR": "build-SUPERSECRET",
+        "FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST": "private-plugin-name",
+        "FORGEMCP_CONFIGURE_TIMEOUT_SEC": "12.5",
+    })
+
+    rendered = json.dumps(config.sanitized_effective_config())
+    for raw in ("source-SUPERSECRET", "build-SUPERSECRET", "private-plugin-name", "12.5", str(tmp_path)):
+        assert raw not in rendered
+
+
 def test_fake_build_tools_vs_is_selected_and_developer_environment_is_filtered(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     program_files = tmp_path.parent / f"ProgramFilesX86-{tmp_path.name}"
     instance, _ = _vs_layout(program_files)
     document = [{
-        "installationPath": str(instance), "productId": "Microsoft.VisualStudio.Product.BuildTools",
+        "installationPath": str(instance), "instanceId": "fake-build-tools",
+        "productId": "Microsoft.VisualStudio.Product.BuildTools",
         "installationVersion": "18.1", "displayName": "Visual Studio Build Tools",
         "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}],
     }]
@@ -80,14 +95,17 @@ def test_fake_build_tools_vs_is_selected_and_developer_environment_is_filtered(t
     service = ToolchainDiscoveryService(
         config,
         run_vswhere=lambda _: json.dumps(document).encode(),
-        capture_environment=lambda *_: {"PATH": "trusted-bin", "INCLUDE": "include", "TOKEN": "not-exported"},
+        capture_environment=lambda *_: {
+            "PATH": str(instance / "VC"),
+            "INCLUDE": str(instance / "VC"),
+        },
     )
     assert service.executable("cmake") is not None
     assert service.executable("cl") is not None
     assert service.snapshot().visual_studio_vc_tools is True
     assert service.toolchain_environment is not None and "TOKEN" not in service.toolchain_environment
     safe = json.dumps(service.snapshot().as_dict())
-    assert str(instance) not in safe and "trusted-bin" not in safe and "not-exported" not in safe
+    assert str(instance) not in safe
 
 
 @pytest.mark.parametrize("payload", [b"not json", b"[" + b" " * (512 * 1024) + b"]"], ids=("malformed", "oversized"))
@@ -117,8 +135,8 @@ def test_multiple_vs_instances_are_deterministic_and_missing_workload_is_visible
     (newer / "Common7" / "Tools").mkdir(parents=True)
     (newer / "Common7" / "Tools" / "VsDevCmd.bat").write_text("@exit /b 0", encoding="utf-8")
     document = [
-        {"installationPath": str(older), "productId": "BuildTools", "installationVersion": "18.9", "displayName": "Build Tools", "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}]},
-        {"installationPath": str(newer), "productId": "Community", "installationVersion": "18.10", "displayName": "Community", "packages": []},
+        {"installationPath": str(older), "instanceId": "fake-build-tools", "productId": "BuildTools", "installationVersion": "18.9", "displayName": "Build Tools", "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}]},
+        {"installationPath": str(newer), "instanceId": "fake-community", "productId": "Community", "installationVersion": "18.10", "displayName": "Community", "packages": []},
     ]
     config = _config(workspace, {"FORGEMCP_WORKSPACE": str(workspace), "ProgramFiles(x86)": str(program_files)}, toolchain="msvc")
     discovery = ToolchainDiscoveryService(config, run_vswhere=lambda _: json.dumps(document).encode())
@@ -139,13 +157,60 @@ def test_developer_environment_failure_and_malicious_line_are_safely_rejected(tm
     workspace.mkdir()
     program_files = tmp_path.parent / f"ProgramFilesX86-{tmp_path.name}"
     instance, _ = _vs_layout(program_files)
-    document = [{"installationPath": str(instance), "productId": "BuildTools", "installationVersion": "18.1", "displayName": "Build Tools", "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}]}]
+    document = [{"installationPath": str(instance), "instanceId": "fake-build-tools", "productId": "BuildTools", "installationVersion": "18.1", "displayName": "Build Tools", "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}]}]
     config = _config(workspace, {"FORGEMCP_WORKSPACE": str(workspace), "ProgramFiles(x86)": str(program_files)})
     failed = ToolchainDiscoveryService(config, run_vswhere=lambda _: json.dumps(document).encode(), capture_environment=lambda *_: (_ for _ in ()).throw(ValueError("bad")))
     malicious = ToolchainDiscoveryService(config, run_vswhere=lambda _: json.dumps(document).encode(), capture_environment=lambda *_: {"PATH": "ok", "BAD\x00KEY": "value"})
     assert failed.toolchain_environment is None and malicious.toolchain_environment is None
     assert "visual_studio: developer environment capture failed" in failed.snapshot().rejections
     assert "visual_studio: developer environment capture failed" in malicious.snapshot().rejections
+
+
+def test_developer_environment_rejects_case_duplicate_secrets_and_untrusted_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    program_files = tmp_path.parent / f"ProgramFilesX86-{tmp_path.name}"
+    instance, _ = _vs_layout(program_files)
+    document = [{
+        "installationPath": str(instance), "instanceId": "fake-build-tools",
+        "productId": "BuildTools", "installationVersion": "18.1", "displayName": "Build Tools",
+        "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}],
+    }]
+    config = _config(workspace, {"FORGEMCP_WORKSPACE": str(workspace), "ProgramFiles(x86)": str(program_files)})
+    safe = str(instance / "VC")
+    cases = (
+        {"PATH": safe, "Path": safe},
+        {"PATH": safe, "MiXeD_ToKeN": "value"},
+        {"PATH": "relative-bin"},
+        {"PATH": str(workspace)},
+    )
+    for captured in cases:
+        discovery = ToolchainDiscoveryService(
+            config,
+            run_vswhere=lambda _: json.dumps(document).encode(),
+            capture_environment=lambda *_args, captured=captured: captured,
+        )
+        assert discovery.toolchain_environment is None
+        assert "visual_studio: developer environment capture failed" in discovery.snapshot().rejections
+
+
+def test_vswhere_depth_and_duplicate_instances_are_bounded(tmp_path: Path) -> None:
+    program_files = tmp_path.parent / f"ProgramFilesX86-{tmp_path.name}"
+    instance, _ = _vs_layout(program_files)
+    config = _config(tmp_path, {"FORGEMCP_WORKSPACE": str(tmp_path), "ProgramFiles(x86)": str(program_files)})
+    nested = b"[" * 17 + b"]" * 17
+    deep = ToolchainDiscoveryService(config, run_vswhere=lambda _: nested)
+    assert "vswhere: malformed output" in deep.snapshot().rejections
+
+    document = [{
+        "installationPath": str(instance), "instanceId": "duplicate",
+        "productId": "BuildTools", "installationVersion": "18.1", "displayName": "Build Tools",
+        "packages": [{"id": "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"}],
+    }]
+    duplicate = ToolchainDiscoveryService(
+        config, run_vswhere=lambda _: json.dumps([*document, *document]).encode()
+    )
+    assert "visual_studio: duplicate instance" in duplicate.snapshot().rejections
 
 
 def test_architecture_and_workspace_spoofs_are_rejected(tmp_path: Path) -> None:
@@ -171,6 +236,24 @@ def test_symlink_and_replacement_candidates_cannot_keep_approval(tmp_path: Path)
     assert policy.approves_exact_executable(target)
     target.write_bytes(b"replacement-with-different-metadata")
     assert not policy.approves_exact_executable(target)
+
+
+def test_invalid_explicit_cmake_path_cannot_fallback_to_a_bare_path_tool(tmp_path: Path) -> None:
+    missing = tmp_path.parent / "missing-explicit-cmake.exe"
+    config = _config(
+        tmp_path,
+        {"FORGEMCP_WORKSPACE": str(tmp_path)},
+        cmake_path=str(missing),
+    )
+    discovery = ToolchainDiscoveryService(config)
+    runtime = _Runtime()
+    service = CMakeService(
+        WorkspaceService(config, create_logger("CRITICAL")), runtime, config, discovery
+    )
+
+    with pytest.raises(CMakeToolUnavailableError, match="configured toolchain discovery"):
+        asyncio.run(service.configure(binary_dir="build"))
+    assert runtime.calls == []
 
 
 def test_filtered_developer_environment_failure_is_nonfatal_and_multi_app_state_isolated(tmp_path: Path) -> None:
@@ -209,6 +292,22 @@ def test_optional_binary_dir_resolves_preset_then_workspace_default(tmp_path: Pa
     assert asyncio.run(service.status()).profile.binary_dir_source == "discovery"
 
 
+@pytest.mark.parametrize("preset", [
+    {"name": "dev", "inherits": "base"},
+    {"name": "dev", "binaryDir": "build", "condition": {"type": "equals", "lhs": "x", "rhs": "x"}},
+    {"name": "dev"},
+])
+def test_ambiguous_preset_binary_dir_is_not_partially_interpreted(tmp_path: Path, preset: dict[str, object]) -> None:
+    (tmp_path / "CMakePresets.json").write_text(
+        json.dumps({"version": 4, "configurePresets": [preset]}), encoding="utf-8"
+    )
+    config = _config(tmp_path, {"FORGEMCP_WORKSPACE": str(tmp_path), "FORGEMCP_CONFIGURE_PRESET": "dev"})
+    service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), _Runtime(), config)
+
+    with pytest.raises(CMakePresetError):
+        asyncio.run(service.configure())
+
+
 def test_doctor_json_and_print_config_are_sanitized(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     main(["--workspace", str(tmp_path), "--build-dir", "build", "print-config"])
     printed = capsys.readouterr().out
@@ -217,6 +316,30 @@ def test_doctor_json_and_print_config_are_sanitized(tmp_path: Path, capsys: pyte
     doctor = capsys.readouterr().out
     assert str(tmp_path) not in doctor
     assert '"tools"' in doctor
+    payload = json.loads(doctor)
+    assert set(payload) == {"configuration", "discovery"}
+    assert set(payload["discovery"]) == {
+        "toolchain", "host_arch", "target_arch", "visual_studio", "tools", "rejections",
+    }
+    assert len(payload["discovery"]["tools"]) == 13
+    assert all(set(item) == {"tool", "available", "source", "rejection"} for item in payload["discovery"]["tools"])
+    assert len(payload["discovery"]["rejections"]) <= 64
+
+
+def test_cli_configuration_errors_are_stderr_only_before_transport(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as invalid_timeout:
+        main(["--workspace", str(tmp_path), "--configure-timeout-sec", "0", "print-config"])
+    assert invalid_timeout.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error:" in captured.err and "Traceback" not in captured.err
+
+    with pytest.raises(SystemExit) as unknown_flag:
+        main(["--workspace", str(tmp_path), "--unexpected-phase-a-flag"])
+    assert unknown_flag.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unrecognized arguments" in captured.err
 
 
 def test_every_runtime_environment_variable_is_documented() -> None:

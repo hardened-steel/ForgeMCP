@@ -11,9 +11,10 @@ server was started from an ordinary shell.
 ## Decision
 
 `ForgeConfig` is immutable and is composed once from CLI over `FORGEMCP_*`
-environment over defaults. It retains source metadata for every effective
+environment over defaults. Operation arguments apply above this configuration
+at their individual validated boundary. It retains source metadata for every effective
 setting and a private read-only host-environment snapshot. Its public sanitized
-representation contains source categories and safe scalar values only; it never
+representation contains only source categories and configured markers; it never
 contains environment values, secrets, or absolute host paths. The no-subcommand
 `forgemcp` server command remains compatible, while `doctor` and
 `print-config` are local, sanitized commands implemented with stdlib argparse.
@@ -32,13 +33,18 @@ workspace, canonicalized and later protected by ProcessPolicy metadata
 replacement checks. Project status reads the service's cache only.
 
 On Windows the service invokes a standard-location `vswhere.exe` with fixed
-arguments, bounds/parses JSON, deterministically selects eligible Community,
+arguments, bounds/parses JSON (including depth, count, duplicate, and malformed
+instance checks), deterministically selects eligible Community,
 Professional, Enterprise, or Build Tools instances (including prerelease),
-checks VC components, and selects host/target-specific compiler paths. It may
-capture `VsDevCmd.bat` using only a fixed `cmd.exe /d /s /c call ... && set`
-form whose script was discovered under the selected instance and whose
-architecture values are enums. The resulting environment is bounded and
-filtered to known compiler/build keys before Process Runtime inherits it.
+checks VC components, exact instance-ID selectors, and host/target-specific
+compiler paths. It may capture `VsDevCmd.bat` using only a fixed system
+`cmd.exe /d /s /c call ... && set` fixed command form whose script was discovered under
+the selected instance and whose architecture values are enums. Paths containing
+cmd metacharacters that cannot be proved safe are rejected. The resulting
+environment is bounded, case-normalized, and filters PATH/LIB/INCLUDE entries
+to existing non-reparse trusted VS/system/SDK directories; it never preserves
+the inherited user PATH or secret-looking variables. Only exact selected
+CMake/CTest commands receive it.
 
 `cppvsdbg` and `OpenDebugAD7` remain availability-only discoveries. They are
 not automatic backends and do not alter the LLVM/DWARF DAP baseline in ADR 0009.
@@ -46,7 +52,8 @@ not automatic backends and do not alter the LLVM/DWARF DAP baseline in ADR 0009.
 ## Consequences
 
 Applications are isolated from each other's CLI/environment snapshots, CMake
-can inherit a filtered MSVC Developer environment from a normal shell, and
+and CTest can inherit a filtered MSVC Developer environment from a normal shell,
+and
 doctor gives actionable but path-safe rejection categories. Discovery itself is
 performed at application startup/composition or local doctor, not by
 `project__status`. CMake, build, test, and all tool probes still execute trusted

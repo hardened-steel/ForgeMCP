@@ -221,10 +221,12 @@ resolve; each needs a bounded contract and safety review.
   has no aggregated diagnostic messages or refresh. DAP Phase 1 is launch-only LLDB-DAP
   source debugging for the passed standalone LLVM/DWARF gate; it is not an
   MSVC/PDB compatibility claim.
-- CMake and CTest are discovered through the Process Runtime environment; an
-  installation outside `PATH` must be deliberately made available by the host
-  policy/environment. Quality tools additionally accept their two explicit
-  absolute environment paths and conventional installed LLVM candidates.
+- CMake and CTest use the application-scoped exact toolchain selection: an
+  explicit CLI/environment executable wins, otherwise discovery may select a
+  trusted Visual Studio or safe PATH/standalone candidate. When VS discovery
+  succeeds, only CMake/CTest receive its filtered Developer environment.
+  Quality tools retain their stricter exact-executable policy and never receive
+  that environment.
 
 ## Open architecture decisions
 

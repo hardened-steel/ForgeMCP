@@ -137,17 +137,17 @@ forgemcp --workspace C:\src\demo --build-dir build
 | `--workspace DIR` | `FORGEMCP_WORKSPACE` | current directory | existing directory | Workspace root | Validated once; never emitted as a host path. |
 | `--source-dir DIR` | `FORGEMCP_SOURCE_DIR` | `.` | workspace-relative directory | Default CMake source tree | Workspace policy and symlink checks apply. |
 | `--build-dir DIR` | `FORGEMCP_BUILD_DIR` | preset `binaryDir`, then `build` | workspace-relative directory | Default CMake build tree | Every variant is workspace-contained and symlink-safe. |
-| `--cmake PATH` | `FORGEMCP_CMAKE` | discovery | absolute executable | CMake executable | Exact regular non-link/reparse file, never in workspace. |
-| `--ctest PATH` | `FORGEMCP_CTEST` | discovery | absolute executable | CTest executable | Same exact-file policy. |
-| `--clangd PATH` | `FORGEMCP_CLANGD` | discovery | absolute executable | clangd executable | Same exact-file policy; no flags are configurable. |
-| `--clang-format PATH` | `FORGEMCP_CLANG_FORMAT` | discovery | absolute executable | clang-format executable | Same exact-file policy; `-i` remains unavailable. |
-| `--clang-tidy PATH` | `FORGEMCP_CLANG_TIDY` | discovery | absolute executable | clang-tidy executable | Same exact-file policy; no arbitrary arguments/fixes. |
-| `--lldb-dap PATH` | `FORGEMCP_LLDB_DAP` | discovery | absolute executable | LLVM DAP adapter | Exact-file qualification and strict adapter policy still apply. |
+| `--cmake PATH` | `FORGEMCP_CMAKE` | discovery | local absolute executable | CMake executable | Exact regular non-link/reparse file, never in workspace; UNC/device paths are rejected. |
+| `--ctest PATH` | `FORGEMCP_CTEST` | discovery | local absolute executable | CTest executable | Same exact-file policy. |
+| `--clangd PATH` | `FORGEMCP_CLANGD` | discovery | local absolute executable | clangd executable | Same exact-file policy; no flags are configurable. |
+| `--clang-format PATH` | `FORGEMCP_CLANG_FORMAT` | discovery | local absolute executable | clang-format executable | Same exact-file policy; `-i` remains unavailable. |
+| `--clang-tidy PATH` | `FORGEMCP_CLANG_TIDY` | discovery | local absolute executable | clang-tidy executable | Same exact-file policy; no arbitrary arguments/fixes. |
+| `--lldb-dap PATH` | `FORGEMCP_LLDB_DAP` | discovery | local absolute executable | LLVM DAP adapter | Exact-file qualification and strict adapter policy still apply. |
 | `--toolchain MODE` | `FORGEMCP_TOOLCHAIN` | `auto` | `auto`, `msvc`, `llvm` | Discovery preference | Does not enable a new debugger backend. |
 | `--host-arch ARCH` | `FORGEMCP_HOST_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | Tool process architecture | Incompatible PE candidates are rejected. |
 | `--target-arch ARCH` | `FORGEMCP_TARGET_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | MSVC compiler target | Used only in fixed VS developer-environment setup. |
-| `--visual-studio-instance SELECTOR` | `FORGEMCP_VISUAL_STUDIO_INSTANCE` | deterministic eligible instance | bounded product/display/version selector | Select a VS instance | No selector enters a shell command. |
-| `--cmake-generator NAME` | `FORGEMCP_CMAKE_GENERATOR` | none | bounded name | Generator outside a preset | Omitted whenever a configure preset is active. |
+| `--visual-studio-instance SELECTOR` | `FORGEMCP_VISUAL_STUDIO_INSTANCE` | deterministic eligible instance | exact bounded instance ID, product, display-name, or version | Select a VS instance | Paths and command fragments are rejected; no selector enters a shell command. |
+| `--cmake-generator NAME` | `FORGEMCP_CMAKE_GENERATOR` | none | bounded name | Generator outside a preset | Mutually exclusive with a configured preset. |
 | `--configure-preset NAME` | `FORGEMCP_CONFIGURE_PRESET` | none | bounded name | Default configure preset | Its direct `binaryDir` is rechecked in workspace policy. |
 | `--configuration NAME` | `FORGEMCP_DEFAULT_CONFIGURATION` | none | bounded name | Default multi-config configuration | Passed as one argv value only. |
 | `--configure-timeout-sec N` | `FORGEMCP_CONFIGURE_TIMEOUT_SEC` | `300` | `0 < N <= 3600` | Configure timeout | Process Runtime remains the execution boundary. |
@@ -164,6 +164,13 @@ The local commands are `forgemcp doctor`, `forgemcp doctor --json`, and
 availability/rejection reasons. `cppvsdbg` and `OpenDebugAD7` are discovery-only
 candidates and are never selected automatically.
 
+`doctor --json` emits one bounded JSON object with exactly `configuration` and
+`discovery` sections. It contains fixed tool IDs, source/rejection categories,
+and configuration source categories only; it never contains the inherited PATH,
+raw environment values, secrets, executable paths, VS instance IDs, or other
+host paths. Plain `doctor` is local operator output and may show the same safe
+categories, but is not an MCP response.
+
 ### CMake build-directory resolution
 
 For all CMake operations, omitted `binary_dir` resolves as follows:
@@ -176,6 +183,23 @@ tool-call binary_dir → CLI --build-dir → FORGEMCP_BUILD_DIR
 `cmake__status` includes the resulting workspace-relative source/build profile
 and its safe source category. Preset, CLI, and environment choices use the same
 Workspace policy; none can select a build tree outside the workspace.
+
+ForgeMCP only derives a preset build directory from a direct, unconditional
+`binaryDir` using the supported `${sourceDir}` macro. Inheritance, conditions,
+other macros, and missing `binaryDir` are left to CMake; if ForgeMCP needs a
+pre-configure build location in those cases, the caller must supply `binary_dir`
+explicitly. ForgeMCP does not claim that a Visual Studio generator produces
+`compile_commands.json`.
+
+### Timeout scopes
+
+`FORGEMCP_CONFIGURE_TIMEOUT_SEC`, `FORGEMCP_BUILD_TIMEOUT_SEC`, and
+`FORGEMCP_TEST_TIMEOUT_SEC` are ForgeMCP operation limits. The safe CTest
+operation timeout may override its configured default, but it remains bounded
+by Process Runtime policy. Codex `tool_timeout_sec` is an independent client
+deadline and must be high enough for the operation; an MCP server cannot extend
+it. MCP progress is not part of Phase A and, when added in a later phase, will
+not itself extend a client timeout.
 
 ### Windows and Codex examples
 

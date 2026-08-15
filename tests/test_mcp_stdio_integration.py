@@ -105,6 +105,8 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     project_status_result = await session.call_tool("project__status", {})
                     assert project_status_result.isError is False
                     project_status = _json_tool_content(project_status_result)
+                    assert project_status["workspace_root"] == "configured"
+                    assert str(tmp_path) not in json.dumps(project_status)
                     assert project_status["partial"] is False
                     assert project_status["health"] in {"healthy", "degraded", "failed"}
                     assert project_status["activity"] in {"idle", "busy", "paused"}
@@ -119,6 +121,10 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert status.isError is False
                     status_payload = _json_tool_content(status)
                     assert {"available", "cmake", "ctest", "minimum_cmake_version"} <= status_payload.keys()
+
+                    core_status = _json_tool_content(await session.call_tool("server_status", {}))
+                    assert core_status["workspace_root"] == "configured"
+                    assert str(tmp_path) not in json.dumps(core_status)
 
                     clangd_status = await session.call_tool("clangd__status")
                     assert clangd_status.isError is False
@@ -179,6 +185,83 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
     server_errors = asyncio.run(exercise())
 
     assert '"event": "application_stopped"' in server_errors
+    assert str(tmp_path) not in server_errors
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows MCP toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_environment(
+    tmp_path: Path,
+):
+    """Run the CMake vertical slice through SDK stdio with CLI-only configuration."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.23)\n"
+        "project(forgemcp_cli_mcp_gate LANGUAGES CXX)\n"
+        "add_executable(app main.cpp)\n"
+        "enable_testing()\n"
+        "add_test(NAME app_runs COMMAND app)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+
+    async def exercise() -> str:
+        errors_path = tmp_path / "server-stderr.log"
+        # The child gets no ForgeMCP setting and no inherited Developer/PATH
+        # state.  VS discovery and VsDevCmd must establish the CMake toolchain.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("FORGEMCP_")
+            and key.upper() not in {"VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR"}
+        }
+        environment["PATH"] = ""
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m", "forgemcp.server", "--workspace", str(tmp_path),
+                "--toolchain", "msvc", "--configure-timeout-sec", "300",
+                "--build-timeout-sec", "300", "--test-timeout-sec", "300",
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+        )
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    initialized = await session.initialize()
+                    assert initialized.serverInfo.name == "ForgeMCP"
+                    tools = {tool.name for tool in (await session.list_tools()).tools}
+                    assert {
+                        "project__status", "cmake__status", "cmake__configure",
+                        "cmake__build", "cmake__ctest_list_tests", "cmake__ctest_run",
+                    } <= tools
+                    status = _json_tool_content(await session.call_tool("project__status", {}))
+                    assert status["workspace_root"] == "configured"
+                    cmake_status = _json_tool_content(await session.call_tool("cmake__status", {}))
+                    assert cmake_status["available"] is True
+                    configured = _json_tool_content(await session.call_tool(
+                        "cmake__configure", {"binary_dir": "build"}
+                    ))
+                    assert configured["process"]["exit_code"] == 0
+                    built = _json_tool_content(await session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}
+                    ))
+                    assert built["process"]["exit_code"] == 0
+                    tests = _json_tool_content(await session.call_tool(
+                        "cmake__ctest_list_tests", {"binary_dir": "build"}
+                    ))
+                    assert [item["name"] for item in tests["tests"]] == ["app_runs"]
+                    executed = _json_tool_content(await session.call_tool(
+                        "cmake__ctest_run", {"binary_dir": "build"}
+                    ))
+                    assert executed["process"]["exit_code"] == 0
+        return errors_path.read_text(encoding="utf-8")
+
+    errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in errors
+    assert str(tmp_path) not in errors
 
 
 @pytest.mark.parametrize(

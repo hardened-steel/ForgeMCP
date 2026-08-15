@@ -4,18 +4,30 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from collections.abc import Mapping
 from typing import Any
 
-_SENSITIVE_KEY_PARTS = ("content", "password", "secret", "token", "authorization", "cookie")
+_SENSITIVE_KEY_PARTS = (
+    "content", "password", "secret", "token", "authorization", "cookie",
+    "path", "argv", "environment", "exception", "error",
+)
+_ABSOLUTE_PATH = re.compile(r"(?:^[A-Za-z]:[\\/]|^\\\\|^/)")
+
+
+def _requires_redaction(value: Any) -> bool:
+    """Keep exception text and host paths out of operational records."""
+    if isinstance(value, BaseException):
+        return True
+    return isinstance(value, str) and _ABSOLUTE_PATH.search(value) is not None
 
 
 def sanitize_log_context(context: Mapping[str, Any]) -> dict[str, Any]:
     """Redact fields that could carry source code, file contents, or credentials."""
     sanitized: dict[str, Any] = {}
     for key, value in context.items():
-        if any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
+        if any(part in key.lower() for part in _SENSITIVE_KEY_PARTS) or _requires_redaction(value):
             sanitized[key] = "<redacted>"
         elif isinstance(value, Mapping):
             sanitized[key] = sanitize_log_context(value)

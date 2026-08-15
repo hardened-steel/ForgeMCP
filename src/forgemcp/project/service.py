@@ -32,7 +32,10 @@ class ProjectStatusService:
         total_timeout_seconds: float = 1.0,
     ) -> None:
         self._registry = registry
-        self._workspace_root = str(workspace_root)
+        # The root remains an application-internal composition dependency. A
+        # project-status response must be portable and must not reveal a host
+        # path, even when a provider fails.
+        self._workspace_root = "configured"
         self._provider_timeout_seconds = provider_timeout_seconds
         self._total_timeout_seconds = total_timeout_seconds
 

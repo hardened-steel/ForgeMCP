@@ -376,17 +376,17 @@ def test_trusted_adapter_environment_is_scrubbed_and_path_is_explicit(tmp_path, 
     asyncio.run(exercise())
 
 
-def test_normal_process_callers_keep_inheritance_and_best_effort_mode(tmp_path, monkeypatch):
+def test_normal_process_callers_do_not_inherit_forgemcp_settings(tmp_path, monkeypatch):
     async def exercise() -> None:
         monkeypatch.setenv("FORGEMCP_TEST_NORMAL", "still-inherited")
         service = runtime(tmp_path)
         handle = await service.start(
-            [sys.executable, "-u", "-c", "import os; print(os.environ['FORGEMCP_TEST_NORMAL'], flush=True)"]
+            [sys.executable, "-u", "-c", "import os; print(os.getenv('FORGEMCP_TEST_NORMAL'), flush=True)"]
         )
 
         assert handle.required_ownership is False
         assert handle.environment_mode.value == "inherit"
-        assert (await handle.stdout.readline()).decode().strip() == "still-inherited"
+        assert (await handle.stdout.readline()).decode().strip() == "None"
         assert await handle.wait(timeout_seconds=1.0) == 0
         await service.aclose()
 

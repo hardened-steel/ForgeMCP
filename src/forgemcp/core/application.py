@@ -85,6 +85,8 @@ class ForgeApplication:
         process_runtime = ProcessRuntime(
             config, logger, approved_executable_paths=toolchain.approved_executable_paths
         )
+        if toolchain.toolchain_environment is not None:
+            process_runtime.set_toolchain_environment(toolchain.toolchain_environment)
         services.register("workspace", workspace)
         services.register("toolchain_discovery", toolchain)
         services.register("process_runtime", process_runtime)
@@ -130,20 +132,15 @@ class ForgeApplication:
         """Start feature plugins and enter the running state exactly once."""
         if self._state is not LifecycleState.CREATED:
             raise LifecycleError(f"Cannot start an application in state '{self._state}'.")
-        toolchain = self.services.get("toolchain_discovery") if "toolchain_discovery" in self.services else None
-        if isinstance(toolchain, ToolchainDiscoveryService):
-            # Discovery is cached before plugins start.  ProjectStatus consumes
-            # this cache only and never refreshes or invokes a subprocess.
-            toolchain.refresh()
-            process_runtime = self.services.get("process_runtime")
-            if isinstance(process_runtime, ProcessRuntime) and toolchain.toolchain_environment is not None:
-                process_runtime.set_toolchain_environment(toolchain.toolchain_environment)
+        # Discovery and executable metadata approvals are composed together
+        # before ProcessRuntime exists.  Never refresh one without replacing
+        # the other's immutable approvals; project status reads this cache.
         plugins = self.services.get("plugins")
         if not isinstance(plugins, PluginManager):
             raise TypeError("The 'plugins' service must be a PluginManager.")
         await plugins.start()
         self._state = LifecycleState.RUNNING
-        self._logger.info("application_started", workspace_root=str(self.config.workspace_root))
+        self._logger.info("application_started", workspace_configured=True)
 
     def stop(self) -> None:
         """Synchronously stop when no event loop is active; async hosts use ``aclose``."""
@@ -185,7 +182,10 @@ class ForgeApplication:
         """Return safe diagnostic state without inspecting project contents."""
         return ServerStatus(
             version=__version__,
-            workspace_root=str(self.config.workspace_root),
+            # A server response is not an operator-facing diagnostic.  Keep
+            # the established field for compatibility but never disclose the
+            # host filesystem location through MCP.
+            workspace_root="configured",
             state=self.state,
             services=self.services.names(),
         )

@@ -16,9 +16,12 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import Final
 
 from forgemcp.core.config import ConfigurationSource, ForgeConfig
@@ -35,11 +38,21 @@ _MAX_VSWHERE_BYTES = 512 * 1024
 _MAX_ENVIRONMENT_BYTES = 256 * 1024
 _MAX_ENVIRONMENT_LINES = 256
 _MAX_ENVIRONMENT_VALUE = 16 * 1024
-_INSTANCE_VALUE = re.compile(r"^[A-Za-z0-9._:/\\ -]{1,256}$")
+_MAX_ENVIRONMENT_NAME = 128
+_MAX_VS_COMPONENTS = 256
+_MAX_JSON_DEPTH = 16
+_INSTANCE_VALUE = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+# Windows has a small set of standard parenthesized variables such as
+# PROGRAMFILES(X86).  '=' remains forbidden, so drive pseudo-variables (=C:)
+# and malformed set output cannot enter the filtered environment.
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_()]{0,127}$")
 _ARCH_MACHINE = {"x86": 0x14C, "x64": 0x8664, "arm64": 0xAA64}
 _SAFE_ENVIRONMENT_KEYS = frozenset({
     "PATH", "INCLUDE", "LIB", "LIBPATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
 })
+_SECRET_ENVIRONMENT_PARTS = ("SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "COOKIE", "AUTH")
+_CMD_UNSAFE_PATH_CHARACTERS = frozenset("&()%!^\"\r\n")
+_ELIGIBLE_VS_PRODUCTS = ("community", "professional", "enterprise", "buildtools")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +79,7 @@ class VisualStudioInstance:
     """Sanitized selected VS metadata; installation paths and IDs stay private."""
 
     installation_path: Path
+    instance_id: str
     product_id: str
     display_name: str
     installation_version: str
@@ -240,10 +254,14 @@ class ToolchainDiscoveryService:
             return ()
         try:
             document = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (RecursionError, UnicodeDecodeError, json.JSONDecodeError):
             self._record_rejection("vswhere: malformed output")
             return ()
-        if not isinstance(document, list) or len(document) > 64:
+        if (
+            not isinstance(document, list)
+            or len(document) > 64
+            or not _json_depth_within(document, _MAX_JSON_DEPTH)
+        ):
             self._record_rejection("vswhere: malformed output")
             return ()
         instances: list[VisualStudioInstance] = []
@@ -251,40 +269,85 @@ class ToolchainDiscoveryService:
             parsed = self._parse_vs_instance(item)
             if parsed is not None:
                 instances.append(parsed)
-        return tuple(sorted(instances, key=lambda item: (_version_key(item.installation_version), item.product_id, str(item.installation_path)), reverse=True))
+        unique: dict[tuple[str, str], VisualStudioInstance] = {}
+        for instance in instances:
+            key = (instance.instance_id.casefold(), _path_key(instance.installation_path))
+            if key in unique:
+                self._record_rejection("visual_studio: duplicate instance")
+                continue
+            unique[key] = instance
+        return tuple(
+            sorted(
+                unique.values(),
+                key=lambda item: (
+                    _version_key(item.installation_version),
+                    item.product_id.casefold(),
+                    item.instance_id.casefold(),
+                    _path_key(item.installation_path),
+                ),
+                reverse=True,
+            )
+        )
 
     def _parse_vs_instance(self, value: object) -> VisualStudioInstance | None:
         if not isinstance(value, Mapping):
             self._record_rejection("visual_studio: malformed instance")
             return None
         raw_path = value.get("installationPath")
+        instance_id = value.get("instanceId")
         product = value.get("productId", "VisualStudio")
         version = value.get("installationVersion", "0")
         display = value.get("displayName", product)
-        if not all(isinstance(item, str) and _INSTANCE_VALUE.fullmatch(item) for item in (raw_path, product, version, display)):
+        if not all(
+            isinstance(item, str) and _INSTANCE_VALUE.fullmatch(item)
+            for item in (raw_path, instance_id, product, version, display)
+        ):
             self._record_rejection("visual_studio: malformed instance")
             return None
+        if not any(product.casefold().endswith(kind) for kind in _ELIGIBLE_VS_PRODUCTS):
+            self._record_rejection("visual_studio: unsupported product")
+            return None
         path = Path(raw_path)
-        if not path.is_absolute() or _contains_link_or_reparse_point(path) or not path.is_dir():
+        if (
+            not path.is_absolute()
+            or _is_windows_special_path(path)
+            or _contains_link_or_reparse_point(path)
+            or not path.is_dir()
+        ):
             self._record_rejection("visual_studio: installation is unsafe or missing")
             return None
         packages = value.get("packages", [])
+        if not isinstance(packages, list) or len(packages) > _MAX_VS_COMPONENTS:
+            self._record_rejection("visual_studio: malformed instance")
+            return None
         components = frozenset(
             item.get("id") for item in packages
             if isinstance(item, Mapping) and isinstance(item.get("id"), str) and len(item["id"]) <= 256
         )
         dev_script = self._first_safe_file((path / "Common7" / "Tools" / "VsDevCmd.bat", path / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"))
-        return VisualStudioInstance(path.resolve(), product, display, version, components, dev_script)
+        return VisualStudioInstance(path.resolve(), instance_id, product, display, version, components, dev_script)
 
     def _select_visual_studio(self, instances: Sequence[VisualStudioInstance]) -> VisualStudioInstance | None:
         selector = self._config.visual_studio_instance
         if selector is not None:
             key = selector.casefold()
-            selected = next((item for item in instances if key in {item.product_id.casefold(), item.display_name.casefold(), item.installation_version.casefold()}), None)
+            selected = next(
+                (
+                    item for item in instances
+                    if key in {
+                        item.instance_id.casefold(),
+                        item.product_id.casefold(),
+                        item.display_name.casefold(),
+                        item.installation_version.casefold(),
+                    }
+                ),
+                None,
+            )
             if selected is None:
                 self._record_rejection("visual_studio: requested instance was not found")
             elif not selected.has_vc_tools:
                 self._record_rejection("visual_studio: selected instance is missing the VC tool workload")
+                return None
             return selected
         if self._config.toolchain == "llvm":
             return next((item for item in instances if item.has_vc_tools), instances[0] if instances else None)
@@ -299,10 +362,13 @@ class ToolchainDiscoveryService:
         if self._selected_vs.dev_script is None:
             self._record_rejection("visual_studio: developer command script is unavailable")
             return None
+        if not _is_under(self._selected_vs.dev_script, self._selected_vs.installation_path):
+            self._record_rejection("visual_studio: developer command script is unsafe")
+            return None
         try:
             captured = self._capture_environment(self._selected_vs.dev_script, self._host_arch, self._target_arch)
             return self._filter_developer_environment(captured)
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
             self._record_rejection("visual_studio: developer environment capture failed")
             return None
 
@@ -310,16 +376,91 @@ class ToolchainDiscoveryService:
         if not isinstance(environment, Mapping) or len(environment) > _MAX_ENVIRONMENT_LINES:
             raise ValueError("invalid environment")
         filtered: dict[str, str] = {}
+        total_bytes = 0
         for key, value in environment.items():
-            if not isinstance(key, str) or not isinstance(value, str) or "\x00" in key or "\x00" in value or len(value) > _MAX_ENVIRONMENT_VALUE:
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or _ENVIRONMENT_NAME.fullmatch(key) is None
+                or "\x00" in value
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+                or len(value) > _MAX_ENVIRONMENT_VALUE
+            ):
                 raise ValueError("invalid environment")
             upper = key.upper()
-            allowed = upper in _SAFE_ENVIRONMENT_KEYS or upper.startswith(("VC", "VS", "WINDOWSSDK", "UCRTVERSION", "UNIVERSALCRTSDKDIR", "WINDOWSLIBPATH"))
+            if upper in filtered or any(part in upper for part in _SECRET_ENVIRONMENT_PARTS):
+                raise ValueError("invalid environment")
+            allowed = (
+                upper in _SAFE_ENVIRONMENT_KEYS
+                or upper in {
+                    "VCINSTALLDIR", "VCIDEINSTALLDIR", "VCTOOLSINSTALLDIR",
+                    "VCTOOLSREDISTDIR", "VCTOOLSVERSION", "VSINSTALLDIR",
+                    "VISUALSTUDIOVERSION",
+                }
+                or upper.startswith((
+                    "VSCMD_", "VCTOOLS", "WINDOWSSDK", "WINDOWSLIBPATH",
+                    "UCRTVERSION", "UNIVERSALCRTSDKDIR",
+                ))
+                or re.fullmatch(r"VS\d+COMNTOOLS", upper) is not None
+            )
             if allowed:
-                filtered[key] = value
-        if not filtered.get("PATH"):
+                total_bytes += len(key.encode("utf-8")) + len(value.encode("utf-8")) + 1
+                if total_bytes > _MAX_ENVIRONMENT_BYTES:
+                    raise ValueError("invalid environment")
+                filtered[upper] = value
+        path = filtered.get("PATH")
+        if not path:
             raise ValueError("Developer environment did not supply PATH")
-        return filtered
+        for name in ("PATH", "INCLUDE", "LIB", "LIBPATH"):
+            if name in filtered:
+                filtered[name] = self._filter_developer_path_list(filtered[name])
+        return MappingProxyType(filtered)
+
+    def _filter_developer_path_list(self, value: str) -> str:
+        """Retain only existing, non-reparse VS/system toolchain directories."""
+        parts = value.split(";")
+        if not parts:
+            raise ValueError("invalid developer path")
+        accepted: list[Path] = []
+        seen: set[str] = set()
+        for raw in parts:
+            if not raw or "\x00" in raw:
+                raise ValueError("invalid developer path")
+            directory = Path(raw)
+            if (
+                not directory.is_absolute()
+                or _is_windows_special_path(directory)
+                or _contains_link_or_reparse_point(directory)
+                or not directory.is_dir()
+                or self._is_within_workspace(directory.resolve())
+                or not self._is_trusted_developer_directory(directory.resolve())
+            ):
+                raise ValueError("invalid developer path")
+            key = _path_key(directory.resolve())
+            if key not in seen:
+                seen.add(key)
+                accepted.append(directory.resolve())
+        if not accepted:
+            raise ValueError("invalid developer path")
+        return ";".join(str(item) for item in accepted)
+
+    def _is_trusted_developer_directory(self, directory: Path) -> bool:
+        instance = self._selected_vs
+        if instance is not None and _is_under(directory, instance.installation_path):
+            return True
+        system_root = self._environment_value("SystemRoot") or self._environment_value("WINDIR")
+        if system_root:
+            root = Path(system_root)
+            if root.is_absolute() and not _is_windows_special_path(root) and _is_under(directory, root):
+                return True
+        # VsDevCmd legitimately adds SDK directories below the standard Program
+        # Files roots.  Do not admit arbitrary host PATH entries merely because
+        # they share a drive with a VS installation.
+        return any(
+            _is_under(directory, root / "Windows Kits")
+            or _is_under(directory, root / "Microsoft SDKs")
+            for root in self._program_files_roots()
+        )
 
     def _visual_studio_tool_paths(self, instance: VisualStudioInstance, tool: str) -> tuple[Path, ...]:
         root = instance.installation_path
@@ -362,6 +503,8 @@ class ToolchainDiscoveryService:
     def _safe_candidate(self, candidate: Path, tool: str) -> tuple[Path | None, str | None]:
         if not candidate.is_absolute():
             return None, "candidate is not absolute"
+        if _is_windows_special_path(candidate):
+            return None, "candidate uses an unsafe Windows path form"
         if _contains_link_or_reparse_point(candidate):
             return None, "candidate traverses a symlink or reparse point"
         try:
@@ -389,7 +532,11 @@ class ToolchainDiscoveryService:
         return self._first_safe_file(candidates)
 
     def _program_files_roots(self) -> tuple[Path, ...]:
-        values = (self._environment.get("ProgramFiles(x86)"), self._environment.get("ProgramFiles"), self._environment.get("ProgramW6432"))
+        values = (
+            self._environment_value("ProgramFiles(x86)"),
+            self._environment_value("ProgramFiles"),
+            self._environment_value("ProgramW6432"),
+        )
         roots = [Path(value) for value in values if value and Path(value).is_absolute()]
         return tuple(dict.fromkeys(roots))
 
@@ -407,7 +554,12 @@ class ToolchainDiscoveryService:
     def _first_safe_file(paths: Sequence[Path]) -> Path | None:
         for path in paths:
             try:
-                if path.is_absolute() and not _contains_link_or_reparse_point(path) and path.is_file():
+                if (
+                    path.is_absolute()
+                    and not _is_windows_special_path(path)
+                    and not _contains_link_or_reparse_point(path)
+                    and path.is_file()
+                ):
                     return path
             except OSError:
                 continue
@@ -425,7 +577,18 @@ class ToolchainDiscoveryService:
         return "x86"
 
     def _is_active_developer_environment(self) -> bool:
-        return any(name in self._environment for name in ("VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR"))
+        return any(
+            self._environment_value(name) is not None
+            for name in ("VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR")
+        )
+
+    def _environment_value(self, name: str) -> str | None:
+        """Read one Windows environment name case-insensitively from the snapshot."""
+        wanted = name.casefold()
+        return next(
+            (value for key, value in self._environment.items() if key.casefold() == wanted),
+            None,
+        )
 
     def _is_within_workspace(self, path: Path) -> bool:
         try:
@@ -438,20 +601,23 @@ class ToolchainDiscoveryService:
         if message not in self._rejections and len(self._rejections) < 64:
             self._rejections.append(message)
 
-    @staticmethod
-    def _default_run_vswhere(path: Path) -> bytes:
-        completed = subprocess.run(
+    def _default_run_vswhere(self, path: Path) -> bytes:
+        return self._run_bounded_capture(
             [str(path), "-all", "-products", "*", "-prerelease", "-format", "json", "-utf8"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=5, check=False, shell=False,
+            timeout_seconds=5.0,
+            maximum_bytes=_MAX_VSWHERE_BYTES,
         )
-        if completed.returncode != 0:
-            raise subprocess.SubprocessError("vswhere failed")
-        return completed.stdout
 
     def _default_capture_environment(self, script: Path, host_arch: str, target_arch: str) -> Mapping[str, str]:
         # ``script`` was discovered under a validated VS instance; architectures
-        # are enum values. The command has no caller-controlled shell fragment.
+        # are enum values.  ``cmd.exe`` has no escaping form that safely proves
+        # every metacharacter in a batch-file path inert, so reject those rare
+        # installation paths before constructing its fixed command text.
+        if (
+            not script.is_absolute()
+            or any(character in _CMD_UNSAFE_PATH_CHARACTERS for character in str(script))
+        ):
+            raise subprocess.SubprocessError("VsDevCmd path cannot be represented safely")
         if script.name.casefold() == "vcvarsall.bat":
             command = f'call "{script}" {target_arch} >nul && set'
         else:
@@ -461,7 +627,6 @@ class ToolchainDiscoveryService:
             for key, value in self._environment.items()
             if key.upper() in {
                 "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "PATHEXT",
-                "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
                 "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES",
             }
         }
@@ -471,21 +636,25 @@ class ToolchainDiscoveryService:
         cmd_path, reason = self._safe_candidate(Path(system_root) / "System32" / "cmd.exe", "cmd")
         if cmd_path is None:
             raise subprocess.SubprocessError(f"trusted cmd.exe is unavailable ({reason})")
+        if any(character in _CMD_UNSAFE_PATH_CHARACTERS for character in str(cmd_path)):
+            raise subprocess.SubprocessError("trusted cmd.exe path cannot be represented safely")
         # VsDevCmd may invoke fixed Windows helpers such as where.exe; retain
-        # only System32 rather than inheriting host PATH.  ``cmd.exe`` needs a
-        # raw Windows command line for the ``call`` batch syntax; every token
-        # in it is either a checked script/path or an architecture enum.
+        # only System32 rather than inheriting host PATH.  The command passed
+        # to cmd is fixed except for the already-qualified path and enum values.
         seed["PATH"] = str(Path(system_root) / "System32")
+        # Python's Windows argv quoting adds an outer pair around the command
+        # argument, which changes cmd.exe's `/s /c` quote-removal rules.  Use
+        # the documented raw command line only after rejecting every cmd
+        # metacharacter from the sole path embedded in it.
         command_line = f'"{cmd_path}" /d /s /c {command}'
-        completed = subprocess.run(
+        output = self._run_bounded_capture(
             command_line,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=seed,
-            timeout=15, check=False, shell=False,
+            timeout_seconds=15.0,
+            maximum_bytes=_MAX_ENVIRONMENT_BYTES,
+            environment=seed,
         )
-        if completed.returncode != 0 or len(completed.stdout) > _MAX_ENVIRONMENT_BYTES:
-            raise subprocess.SubprocessError(f"Developer environment setup failed ({completed.returncode})")
         result: dict[str, str] = {}
-        for line in completed.stdout.decode("utf-8", errors="strict").splitlines():
+        for line in output.decode("utf-8", errors="strict").splitlines():
             if "=" not in line:
                 raise ValueError("malicious environment line")
             key, value = line.split("=", 1)
@@ -493,6 +662,112 @@ class ToolchainDiscoveryService:
                 raise ValueError("malicious environment line")
             result[key] = value
         return result
+
+    def _run_bounded_capture(
+        self,
+        argv: Sequence[str] | str,
+        *,
+        timeout_seconds: float,
+        maximum_bytes: int,
+        environment: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """Run a discovery helper with a streaming byte cap and tree cleanup.
+
+        ``subprocess.run(..., stdout=PIPE)`` first accumulates all output, so a
+        post-hoc size check is not a bound.  Discovery is synchronous during
+        composition, therefore this small local helper owns the short-lived
+        process directly and kills its Windows process tree on overflow or
+        timeout before returning a fixed failure category.
+        """
+        kwargs: dict[str, object] = {"shell": False}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        process = subprocess.Popen(
+            argv if isinstance(argv, str) else list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=None if environment is None else dict(environment),
+            **kwargs,
+        )
+        assert process.stdout is not None
+        output = bytearray()
+        output_lock = threading.Lock()
+        overflow = threading.Event()
+        read_failed = threading.Event()
+
+        def read_stdout() -> None:
+            try:
+                while True:
+                    chunk = process.stdout.read(65_536)
+                    if not chunk:
+                        return
+                    with output_lock:
+                        remaining = maximum_bytes - len(output)
+                        if len(chunk) > remaining:
+                            if remaining > 0:
+                                output.extend(chunk[:remaining])
+                            overflow.set()
+                            return
+                        output.extend(chunk)
+            except OSError:
+                read_failed.set()
+
+        reader = threading.Thread(target=read_stdout, name="forgemcp-discovery-capture", daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        while process.poll() is None:
+            if overflow.is_set() or read_failed.is_set() or time.monotonic() >= deadline:
+                timed_out = time.monotonic() >= deadline
+                self._terminate_discovery_process_tree(process)
+                break
+            time.sleep(0.01)
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self._terminate_discovery_process_tree(process)
+        reader.join(timeout=2.0)
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+        if (
+            timed_out
+            or overflow.is_set()
+            or read_failed.is_set()
+            or reader.is_alive()
+            or process.returncode != 0
+        ):
+            raise subprocess.SubprocessError("bounded discovery helper failed")
+        return bytes(output)
+
+    def _terminate_discovery_process_tree(self, process: subprocess.Popen[bytes]) -> None:
+        """Best-effort Windows tree termination for timed-out discovery helpers."""
+        if os.name == "nt":
+            system_root = self._environment_value("SystemRoot") or self._environment_value("WINDIR")
+            if system_root:
+                taskkill, _ = self._safe_candidate(
+                    Path(system_root) / "System32" / "taskkill.exe", "taskkill"
+                )
+                if taskkill is not None:
+                    try:
+                        subprocess.run(
+                            [str(taskkill), "/pid", str(process.pid), "/t", "/f"],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5.0,
+                            check=False,
+                            shell=False,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
 
 
 def _read_pe_machine(path: Path) -> int | None:
@@ -517,3 +792,43 @@ def _read_pe_machine(path: Path) -> int | None:
 def _version_key(value: str) -> tuple[int, ...]:
     """Deterministic numeric ordering for normal VS installation versions."""
     return tuple(int(item) if item.isdigit() else -1 for item in value.split("."))
+
+
+def _path_key(path: Path) -> str:
+    """Return the platform-correct identity key for trusted filesystem paths."""
+    value = str(path)
+    return value.casefold() if os.name == "nt" else value
+
+
+def _is_under(candidate: Path, root: Path) -> bool:
+    """Containment with Windows' case-insensitive comparison semantics."""
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        if os.name != "nt":
+            return False
+    candidate_key = _path_key(candidate)
+    root_key = _path_key(root).rstrip("\\/")
+    return candidate_key == root_key or candidate_key.startswith(root_key + "\\") or candidate_key.startswith(root_key + "/")
+
+
+def _is_windows_special_path(path: Path) -> bool:
+    """Reject UNC and device namespaces, which do not have local-file guarantees."""
+    raw = str(path)
+    windows = PureWindowsPath(raw)
+    return raw.startswith(("\\\\?\\", "\\\\.\\")) or windows.drive.startswith("\\\\")
+
+
+def _json_depth_within(value: object, maximum: int) -> bool:
+    """Bound nested vswhere data iteratively, avoiding parser-adjacent recursion."""
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > maximum:
+            return False
+        if isinstance(current, Mapping):
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+    return True

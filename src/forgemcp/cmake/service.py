@@ -211,6 +211,11 @@ class CMakeService:
                 argv.extend(["--preset", preset_name])
             elif self._config is not None and self._config.cmake_generator is not None:
                 argv.extend(["-G", self._config.cmake_generator])
+                if (
+                    self._config.target_arch != "auto"
+                    and self._config.cmake_generator.casefold().startswith("visual studio")
+                ):
+                    argv.extend(["-A", self._config.target_arch])
             argv.extend(self._cache_arguments(cache_variables))
             result = await self._run_required("cmake", argv, timeout_seconds=self._default_timeout("configure"))
             response = CMakeConfigureResult(
@@ -333,7 +338,15 @@ class CMakeService:
                 argv.extend(["--build-config", selected_configuration])
             if names:
                 argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
-            result = await self._run_required("ctest", argv, timeout_seconds=timeout_seconds or self._default_timeout("test"))
+            result = await self._run_required(
+                "ctest",
+                argv,
+                timeout_seconds=(
+                    self._default_timeout("test")
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
+            )
             failed_tests = self._failed_tests(result)
             response = CTestRunResult(
                 binary_dir=generated.relative_path,
@@ -378,10 +391,10 @@ class CMakeService:
     async def _tool_status(self, executable: str, *, requires_minimum: bool) -> CMakeToolStatus:
         """Convert absence, command failure, and banner parsing into safe status data."""
         try:
-            result = await self._process_runtime.run(
-                [self._tool_executable(executable), "--version"], cwd="."
+            result = await self._run_required(
+                executable, [self._tool_executable(executable), "--version"]
             )
-        except ProcessError:
+        except (CMakeToolUnavailableError, ProcessError):
             return CMakeToolStatus(
                 executable=executable,
                 available=False,
@@ -427,7 +440,12 @@ class CMakeService:
     ) -> ProcessResult:
         """Run a fixed executable and make runtime absence a safe CMake domain error."""
         try:
-            return await self._process_runtime.run(argv, cwd=".", timeout_seconds=timeout_seconds)
+            runner = (
+                getattr(self._process_runtime, "run_toolchain")
+                if self._toolchain is not None and hasattr(self._process_runtime, "run_toolchain")
+                else self._process_runtime.run
+            )
+            return await runner(argv, cwd=".", timeout_seconds=timeout_seconds)
         except ProcessError as error:
             raise CMakeToolUnavailableError(
                 f"{executable} is not available through the configured Process Runtime."
@@ -439,6 +457,9 @@ class CMakeService:
             selected = self._toolchain.executable(tool)
             if selected is not None:
                 return str(selected)
+            raise CMakeToolUnavailableError(
+                f"{tool} is unavailable from the configured toolchain discovery service."
+            )
         return tool
 
     def _default_timeout(self, operation: str) -> float | None:
@@ -517,9 +538,20 @@ class CMakeService:
             for item in self._preset_entries(document, "configurePresets"):
                 if item.get("name") != preset:
                     continue
+                inherits = item.get("inherits")
+                if inherits not in (None, (), []):
+                    raise CMakePresetError(
+                        "The selected configure preset uses inheritance that ForgeMCP does not interpret; provide binary_dir explicitly."
+                    )
+                if item.get("condition") is not None:
+                    raise CMakePresetError(
+                        "The selected configure preset uses a condition that ForgeMCP does not interpret; provide binary_dir explicitly."
+                    )
                 value = item.get("binaryDir")
                 if value is None:
-                    return None
+                    raise CMakePresetError(
+                        "The selected configure preset has no direct binaryDir; provide binary_dir explicitly."
+                    )
                 if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
                     raise CMakePresetError("The selected configure preset has an unsafe binaryDir.")
                 # CMake owns general preset macro expansion.  The one static

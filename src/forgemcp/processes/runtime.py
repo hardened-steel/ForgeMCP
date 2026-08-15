@@ -442,8 +442,16 @@ class ProcessRuntime:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        self._base_environment = dict(config.host_environment)
+        # ForgeMCP settings are input to composition, never an implicit child
+        # process API.  In particular an unknown FORGEMCP_* variable must not
+        # alter a project's configure/build/test subprocesses.
+        self._base_environment = {
+            key: value
+            for key, value in config.host_environment.items()
+            if not key.upper().startswith("FORGEMCP_")
+        }
         self._executable_search_path = self._base_environment.get("PATH")
+        self._toolchain_environment: Mapping[str, str] | None = None
         self._fixed_quality_executables: dict[str, Path] = {}
         for tool_name in _FIXED_QUALITY_EXECUTABLES:
             configured = (
@@ -485,7 +493,7 @@ class ProcessRuntime:
         self._close_task: asyncio.Task[None] | None = None
 
     def set_toolchain_environment(self, environment: Mapping[str, str]) -> None:
-        """Replace inherited child environment with a filtered VS developer environment.
+        """Install the filtered VS environment for CMake/CTest commands only.
 
         The discovery service owns the filtering.  This method deliberately
         copies only validated strings and never records values in logs/status.
@@ -497,8 +505,38 @@ class ProcessRuntime:
             if not isinstance(key, str) or not isinstance(value, str) or "\x00" in key or "\x00" in value:
                 raise ProcessEnvironmentError("Toolchain environment must be a NUL-free string mapping.")
             checked[key] = value
-        self._base_environment = checked
-        self._executable_search_path = checked.get("PATH")
+        self._toolchain_environment = dict(checked)
+
+    async def run_toolchain(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float | None = None,
+        input_data: bytes | None = None,
+    ) -> ProcessResult:
+        """Run only an exact selected CMake/CTest command with the VS environment.
+
+        This intentionally has no environment argument.  Feature plugins
+        cannot use it as a generic arbitrary-environment process launcher.
+        """
+        if isinstance(argv, str) or not isinstance(argv, Sequence) or not argv:
+            raise ProcessArgumentError("Commands must be a non-empty argv sequence, never a shell string.")
+        executable = Path(argv[0]) if isinstance(argv[0], str) else Path()
+        name = executable.stem.casefold() if os.name == "nt" else executable.name
+        if (
+            name not in {"cmake", "ctest"}
+            or not executable.is_absolute()
+            or not self._policy.approves_exact_executable(executable)
+        ):
+            raise ProcessExecutableError("Only exact discovered CMake and CTest executables may use the toolchain environment.")
+        return await self.run(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            input_data=input_data,
+            _environment_base=self._toolchain_environment,
+        )
 
     @property
     def workspace_root(self) -> Path:
@@ -545,6 +583,7 @@ class ProcessRuntime:
         environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
         approved_path_directories: Sequence[Path] = (),
         require_exact_executable: bool = False,
+        _environment_base: Mapping[str, str] | None = None,
     ) -> ProcessResult:
         """Run one bounded short command and return its completed result.
 
@@ -563,6 +602,7 @@ class ProcessRuntime:
             environment_mode=environment_mode,
             approved_path_directories=approved_path_directories,
             require_exact_executable=require_exact_executable,
+            _environment_base=_environment_base,
         )
         self._short_handles.add(handle)
         started_at = datetime.now(UTC)
@@ -630,6 +670,7 @@ class ProcessRuntime:
         environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
         approved_path_directories: Sequence[Path] = (),
         require_exact_executable: bool = False,
+        _environment_base: Mapping[str, str] | None = None,
     ) -> ProcessHandle:
         """Start an allow-listed protocol process with streaming stdin/stdout/stderr.
 
@@ -652,6 +693,7 @@ class ProcessRuntime:
             mode=requested_environment_mode,
             executable=Path(executable_argv[0]),
             approved_path_directories=approved_path_directories,
+            base_environment=_environment_base,
         )
         job = _WindowsProcessJob.create()
         if os.name == "nt" and requested_ownership is ProcessTreeOwnership.REQUIRED and job is None:
@@ -910,6 +952,7 @@ class ProcessRuntime:
         mode: ProcessEnvironmentMode,
         executable: Path,
         approved_path_directories: Sequence[Path],
+        base_environment: Mapping[str, str] | None,
     ) -> dict[str, str]:
         if mode is ProcessEnvironmentMode.SCRUBBED:
             if inherit_environment is not None:
@@ -944,7 +987,7 @@ class ProcessRuntime:
             allowed = self._policy.allowed_environment_overrides
             if allowed is not None and key not in allowed:
                 raise ProcessEnvironmentError("An environment override is not allowed by process policy.")
-        values = dict(self._base_environment) if inherit else {}
+        values = dict(self._base_environment if base_environment is None else base_environment) if inherit else {}
         values.update(overrides)
         return values
 

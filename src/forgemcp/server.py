@@ -6,9 +6,21 @@ import argparse
 import inspect
 import json
 import sys
+import warnings
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
+
+# Current MCP releases can emit this third-party Pydantic forward-reference
+# warning while constructing FastMCP.  In stdio mode warnings are stderr
+# protocol-adjacent diagnostics; suppress this known non-actionable warning so
+# it cannot disclose the host site-packages path or resemble a server failure.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Field 'lifespan' has an incomplete definition:.*",
+    category=Warning,
+    module=r"pydantic_settings\.sources\.utils",
+)
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -17,6 +29,7 @@ from pydantic_core import PydanticUndefined
 
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ForgeConfig
+from forgemcp.core.errors import ConfigurationError
 from forgemcp.plugins import RegisteredToolContribution, ToolRegistry
 from forgemcp.toolchain import ToolchainDiscoveryService
 
@@ -157,8 +170,15 @@ def _cli_config(arguments: argparse.Namespace) -> ForgeConfig:
 
 def main(argv: list[str] | None = None) -> None:
     """Run stdio by default; ``doctor`` and ``print-config`` are local commands."""
-    arguments = _parser().parse_args(argv)
-    config = _cli_config(arguments)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    try:
+        config = _cli_config(arguments)
+    except ConfigurationError as error:
+        # ``argparse`` gives the local operator a concise stderr-only failure
+        # before the stdio transport can be created.  Do not leak a traceback
+        # or let a malformed option corrupt MCP stdout.
+        parser.error(error.message)
     if arguments.command == "print-config":
         print(json.dumps(config.sanitized_effective_config(), ensure_ascii=False, sort_keys=True))
         return

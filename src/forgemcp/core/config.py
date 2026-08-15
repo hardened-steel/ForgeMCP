@@ -8,6 +8,8 @@ snapshot for safe tool discovery, but exposes only source metadata to diagnostic
 from __future__ import annotations
 
 import os
+import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -34,6 +36,8 @@ _PATH_FIELDS = frozenset(
     }
 )
 _RELATIVE_DIRECTORY_FIELDS = frozenset({"cmake_source_dir", "build_dir"})
+_PLUGIN_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_VISUAL_STUDIO_SELECTOR = re.compile(r"^[\w .-]{1,256}$", re.UNICODE)
 _SOURCE_DEFAULTS = {
     "workspace_root": ConfigurationSource.DEFAULT,
     "log_level": ConfigurationSource.DEFAULT,
@@ -87,6 +91,8 @@ class ForgeConfig:
     build_timeout_seconds: float = 900.0
     test_timeout_seconds: float = 900.0
     _sources: Mapping[str, ConfigurationSource] = field(default_factory=dict, repr=False, compare=False)
+    # Direct construction is also a Core composition boundary.  The snapshot is
+    # made once here and never reread by feature code or Process Runtime.
     _host_environment: Mapping[str, str] = field(default_factory=lambda: dict(os.environ), repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -104,8 +110,11 @@ class ForgeConfig:
             allowlist = frozenset(self.external_plugin_allowlist)
         except TypeError as error:
             raise ConfigurationError("External plugin allow-list must be a collection of entry-point names.") from error
-        if any(not isinstance(name, str) or not name for name in allowlist):
-            raise ConfigurationError("External plugin allow-list entries must be non-empty strings.")
+        if len(allowlist) > 64 or any(
+            not isinstance(name, str) or _PLUGIN_IDENTIFIER.fullmatch(name) is None
+            for name in allowlist
+        ):
+            raise ConfigurationError("External plugin allow-list entries must be bounded entry-point identifiers.")
         for field_name in _RELATIVE_DIRECTORY_FIELDS:
             value = getattr(self, field_name)
             if value is None and field_name == "build_dir":
@@ -120,13 +129,22 @@ class ForgeConfig:
         for field_name in ("host_arch", "target_arch"):
             if getattr(self, field_name) not in {"auto", "x64", "x86", "arm64"}:
                 raise ConfigurationError(f"{field_name} must be auto, x64, x86, or arm64.")
-        _validate_short_text(self.visual_studio_instance, "visual_studio_instance")
+        _validate_visual_studio_selector(self.visual_studio_instance)
         _validate_short_text(self.cmake_generator, "cmake_generator")
         _validate_short_text(self.configure_preset, "configure_preset")
         _validate_short_text(self.default_configuration, "default_configuration")
+        if self.cmake_generator is not None and self.configure_preset is not None:
+            raise ConfigurationError(
+                "cmake_generator and configure_preset cannot both be configured."
+            )
         for field_name in ("configure_timeout_seconds", "build_timeout_seconds", "test_timeout_seconds"):
             value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 3600:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 < value <= 3600
+            ):
                 raise ConfigurationError(f"{field_name} must be between 0 and 3600 seconds.")
             object.__setattr__(self, field_name, float(value))
         sources = dict(_SOURCE_DEFAULTS)
@@ -163,19 +181,35 @@ class ForgeConfig:
         }
         return {
             "workspace": {"configured": True, "source": self.source_of("workspace_root").value},
-            "source_dir": {"value": self.cmake_source_dir, "source": self.source_of("cmake_source_dir").value},
-            "build_dir": {"value": self.build_dir or "build", "source": self.source_of("build_dir").value},
-            "toolchain": {"value": self.toolchain, "source": self.source_of("toolchain").value},
-            "host_arch": {"value": self.host_arch, "source": self.source_of("host_arch").value},
-            "target_arch": {"value": self.target_arch, "source": self.source_of("target_arch").value},
+            "source_dir": {"configured": True, "source": self.source_of("cmake_source_dir").value},
+            "build_dir": {"configured": self.build_dir is not None, "source": self.source_of("build_dir").value},
+            "toolchain": {"configured": self.source_of("toolchain") is not ConfigurationSource.DEFAULT, "source": self.source_of("toolchain").value},
+            "host_arch": {"configured": self.source_of("host_arch") is not ConfigurationSource.DEFAULT, "source": self.source_of("host_arch").value},
+            "target_arch": {"configured": self.source_of("target_arch") is not ConfigurationSource.DEFAULT, "source": self.source_of("target_arch").value},
             "visual_studio_instance": {"configured": self.visual_studio_instance is not None, "source": self.source_of("visual_studio_instance").value},
             "cmake": {
                 "generator_configured": self.cmake_generator is not None,
+                "generator_source": self.source_of("cmake_generator").value,
                 "preset_configured": self.configure_preset is not None,
+                "preset_source": self.source_of("configure_preset").value,
                 "configuration_configured": self.default_configuration is not None,
+                "configuration_source": self.source_of("default_configuration").value,
             },
-            "timeouts": {"configure_seconds": self.configure_timeout_seconds, "build_seconds": self.build_timeout_seconds, "test_seconds": self.test_timeout_seconds},
-            "log_level": {"value": self.log_level, "source": self.source_of("log_level").value},
+            "timeouts": {
+                "configure_configured": self.source_of("configure_timeout_seconds") is not ConfigurationSource.DEFAULT,
+                "configure_source": self.source_of("configure_timeout_seconds").value,
+                "build_configured": self.source_of("build_timeout_seconds") is not ConfigurationSource.DEFAULT,
+                "build_source": self.source_of("build_timeout_seconds").value,
+                "test_configured": self.source_of("test_timeout_seconds") is not ConfigurationSource.DEFAULT,
+                "test_source": self.source_of("test_timeout_seconds").value,
+            },
+            "log_level": {"configured": self.source_of("log_level") is not ConfigurationSource.DEFAULT, "source": self.source_of("log_level").value},
+            "external_plugins": {
+                "enabled_configured": self.source_of("external_plugins_enabled") is not ConfigurationSource.DEFAULT,
+                "enabled_source": self.source_of("external_plugins_enabled").value,
+                "allowlist_configured": bool(self.external_plugin_allowlist),
+                "allowlist_source": self.source_of("external_plugin_allowlist").value,
+            },
             "tools": tools,
         }
 
@@ -224,9 +258,18 @@ class ForgeConfig:
             "cmake_generator": choose("cmake_generator", "FORGEMCP_CMAKE_GENERATOR", None),
             "configure_preset": choose("configure_preset", "FORGEMCP_CONFIGURE_PRESET", None),
             "default_configuration": choose("default_configuration", "FORGEMCP_DEFAULT_CONFIGURATION", None),
-            "configure_timeout_seconds": choose("configure_timeout_seconds", "FORGEMCP_CONFIGURE_TIMEOUT_SEC", 300.0),
-            "build_timeout_seconds": choose("build_timeout_seconds", "FORGEMCP_BUILD_TIMEOUT_SEC", 900.0),
-            "test_timeout_seconds": choose("test_timeout_seconds", "FORGEMCP_TEST_TIMEOUT_SEC", 900.0),
+            "configure_timeout_seconds": _read_timeout(
+                choose("configure_timeout_seconds", "FORGEMCP_CONFIGURE_TIMEOUT_SEC", 300.0),
+                "FORGEMCP_CONFIGURE_TIMEOUT_SEC",
+            ),
+            "build_timeout_seconds": _read_timeout(
+                choose("build_timeout_seconds", "FORGEMCP_BUILD_TIMEOUT_SEC", 900.0),
+                "FORGEMCP_BUILD_TIMEOUT_SEC",
+            ),
+            "test_timeout_seconds": _read_timeout(
+                choose("test_timeout_seconds", "FORGEMCP_TEST_TIMEOUT_SEC", 900.0),
+                "FORGEMCP_TEST_TIMEOUT_SEC",
+            ),
         }
         for name, variable in {
             "cmake_path": "FORGEMCP_CMAKE", "ctest_path": "FORGEMCP_CTEST", "clangd_path": "FORGEMCP_CLANGD",
@@ -240,7 +283,13 @@ class ForgeConfig:
 
 
 def _normalise_tool_path(value: object, field_name: str) -> Path:
-    if not isinstance(value, Path) or not value.is_absolute():
+    raw = str(value) if isinstance(value, Path) else ""
+    windows = PureWindowsPath(raw)
+    is_unc_or_device = (
+        raw.startswith(("\\\\?\\", "\\\\.\\"))
+        or windows.drive.startswith("\\\\")
+    )
+    if not isinstance(value, Path) or not value.is_absolute() or is_unc_or_device:
         variable = {
             "clangd_path": "FORGEMCP_CLANGD", "lldb_dap_path": "FORGEMCP_LLDB_DAP",
             "clang_format_path": "FORGEMCP_CLANG_FORMAT", "clang_tidy_path": "FORGEMCP_CLANG_TIDY",
@@ -251,7 +300,12 @@ def _normalise_tool_path(value: object, field_name: str) -> Path:
 
 
 def _normalise_relative_directory(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise ConfigurationError(f"{field_name} must be a non-empty workspace-relative directory.")
     native, windows, posix = Path(value), PureWindowsPath(value), PurePosixPath(value)
     if native.is_absolute() or native.anchor or windows.drive or windows.root or windows.is_absolute() or posix.is_absolute():
@@ -263,8 +317,27 @@ def _normalise_relative_directory(value: object, field_name: str) -> str:
 
 
 def _validate_short_text(value: object, field_name: str) -> None:
-    if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 256 or "\x00" in value):
+    if value is not None and (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 256
+        or "\x00" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise ConfigurationError(f"{field_name} must be bounded non-empty text when supplied.")
+
+
+def _validate_visual_studio_selector(value: object) -> None:
+    """Accept only an exact non-path VS instance identifier/display/version selector."""
+    if value is not None and (
+        not isinstance(value, str)
+        or _VISUAL_STUDIO_SELECTOR.fullmatch(value) is None
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ConfigurationError(
+            "visual_studio_instance must be a bounded VS instance selector, not a path or command fragment."
+        )
 
 
 def _validated_environment(environment: Mapping[str, str]) -> dict[str, str]:
@@ -280,3 +353,18 @@ def _read_boolean(value: str, *, variable_name: str) -> bool:
     if normalised in {"0", "false", "no", ""}:
         return False
     raise ConfigurationError(f"{variable_name} must be one of true/false, yes/no, or 1/0.")
+
+
+def _read_timeout(value: object, variable_name: str) -> float:
+    """Parse CLI/environment timeout values before immutable config construction."""
+    if isinstance(value, bool):
+        raise ConfigurationError(f"{variable_name} must be a number between 0 and 3600 seconds.")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError(
+            f"{variable_name} must be a number between 0 and 3600 seconds."
+        ) from error
+    if not math.isfinite(parsed) or not 0 < parsed <= 3600:
+        raise ConfigurationError(f"{variable_name} must be a number between 0 and 3600 seconds.")
+    return parsed

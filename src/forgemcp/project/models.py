@@ -128,8 +128,8 @@ class ProjectStatus(ForgeModel):
     """Bounded, partial, non-transactional application workspace snapshot."""
 
     generated_at: datetime = Field(description="UTC aggregation completion time.")
-    workspace_root: Annotated[str, StringConstraints(min_length=1, max_length=4096)] = Field(
-        description="The one configured absolute workspace root."
+    workspace_root: Annotated[str, StringConstraints(min_length=1, max_length=32)] = Field(
+        description="Fixed configured marker; host workspace paths are never disclosed."
     )
     health: ProjectHealth = Field(description="Deterministic service-health classification.")
     activity: ProjectActivity = Field(description="Activity independent from service health.")

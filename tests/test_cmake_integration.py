@@ -26,6 +26,7 @@ from forgemcp.core.logging import create_logger
 from forgemcp.models import ProcessOutput, ProcessResult
 from forgemcp.processes import ProcessExecutableError, ProcessRuntime
 from forgemcp.server import create_server
+from forgemcp.toolchain import ToolchainDiscoveryService
 from forgemcp.workspace import SymlinkWorkspacePathError, WorkspacePathError, WorkspaceService
 
 
@@ -76,30 +77,44 @@ def _real_cmake_tools() -> tuple[Path, Path] | None:
     return None
 
 
-def _runtime_with_real_cmake_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProcessRuntime:
-    tools = _real_cmake_tools()
-    if tools is None:
-        pytest.skip("requires CMake and CTest in PATH or a standard Windows installation")
-    cmake, ctest = tools
-    assert cmake.parent == ctest.parent
-    search_directories = [cmake.parent]
-    ninja = shutil.which("ninja")
-    if ninja is not None:
-        search_directories.append(Path(ninja).parent)
-    elif os.name == "nt":
-        bundled_ninja = cmake.parent.parent.parent / "Ninja" / "ninja.exe"
-        if bundled_ninja.is_file():
-            search_directories.append(bundled_ninja.parent)
-    existing_path = os.environ.get("PATH", "")
-    monkeypatch.setenv(
-        "PATH", os.pathsep.join(str(directory) for directory in search_directories) + os.pathsep + existing_path
+def _runtime_with_real_cmake_tools(
+    tmp_path: Path,
+) -> tuple[ProcessRuntime, CMakeService]:
+    """Compose the production VS discovery and filtered toolchain runtime.
+
+    The live gates intentionally start with no inherited developer shell and
+    no usable PATH.  Testing an ad-hoc PATH would bypass the exact executable
+    and VsDevCmd trust boundary that the real application uses.
+    """
+    if os.name != "nt":
+        pytest.skip("requires the Windows Visual Studio discovery gate")
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.casefold().startswith("forgemcp_")
+        and not name.casefold().startswith("vscmd_")
+        and name.casefold() not in {"vcinstalldir", "vsinstalldir", "windowslibpath"}
+    }
+    environment["PATH"] = ""
+    config = ForgeConfig.from_sources(
+        environment=environment,
+        cli={"workspace_root": str(tmp_path), "toolchain": "msvc"},
+        cwd=tmp_path,
     )
-    if len(search_directories) > 1:
-        # Avoid relying on a Visual Studio developer-shell environment for the
-        # no-language File API check. A normal developer shell can still make
-        # a C++ compiler available for the full test below.
-        monkeypatch.setenv("CMAKE_GENERATOR", "Ninja")
-    return ProcessRuntime(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL"))
+    toolchain = ToolchainDiscoveryService(config)
+    if (
+        toolchain.executable("cmake") is None
+        or toolchain.executable("ctest") is None
+        or toolchain.toolchain_environment is None
+    ):
+        pytest.skip("requires a discoverable Visual Studio CMake/CTest and VsDevCmd environment")
+    runtime = ProcessRuntime(
+        config,
+        create_logger("CRITICAL"),
+        approved_executable_paths=toolchain.approved_executable_paths,
+    )
+    runtime.set_toolchain_environment(toolchain.toolchain_environment)
+    return runtime, CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime, config, toolchain)
 
 
 def process_result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ProcessResult:
@@ -501,16 +516,13 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
     not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
     reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
 )
-def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
+def test_real_cmake_file_api_without_compiler(tmp_path):
     """Exercise configure and File API whenever CMake/CTest are available."""
     (tmp_path / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_file_api LANGUAGES NONE)\n",
         encoding="utf-8",
     )
-    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
-    service = CMakeService(
-        WorkspaceService(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL")), runtime
-    )
+    runtime, service = _runtime_with_real_cmake_tools(tmp_path)
 
     async def exercise() -> None:
         try:
@@ -530,16 +542,14 @@ def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
     not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
     reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
 )
-def test_optional_real_cmake_vertical_slice(tmp_path, monkeypatch):
+def test_optional_real_cmake_vertical_slice(tmp_path):
     """Exercise configure, File API, build, and CTest when a C++ compiler is usable."""
     (tmp_path / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_smoke LANGUAGES CXX)\nadd_executable(app main.cpp)\nenable_testing()\nadd_test(NAME app_runs COMMAND app)\n",
         encoding="utf-8",
     )
     (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
-    config = ForgeConfig(workspace_root=tmp_path)
-    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
-    service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime)
+    runtime, service = _runtime_with_real_cmake_tools(tmp_path)
 
     async def exercise() -> None:
         try:

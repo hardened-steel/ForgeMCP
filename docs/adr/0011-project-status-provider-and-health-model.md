@@ -80,7 +80,8 @@ source/file/patch content, diagnostic messages, compiler/debugger/tool output,
 argv, environment, PIDs, variables, stack frames, expressions/evaluate results,
 sanitizer symbols, raw exceptions, external plugin module paths, and executable
 paths. Workspace/build/compilation-database directories are workspace-relative;
-only `ProjectStatus.workspace_root` is absolute.
+`ProjectStatus.workspace_root` is the fixed marker `configured`, never an
+absolute host path.
 
 Registry capacity is 64 providers. A component has at most 128 capabilities, 32
 facts, and 32 warnings; aggregate capabilities have a 128-item limit and
