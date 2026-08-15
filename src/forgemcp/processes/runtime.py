@@ -46,7 +46,7 @@ class ProcessRuntimeCachedStatus:
     required_ownership: bool
 
 
-def _known_llvm_quality_tools() -> tuple[Path, ...]:
+def _known_llvm_quality_tools(environment: Mapping[str, str]) -> tuple[Path, ...]:
     """Return fixed conventional LLVM quality-tool locations for policy approval.
 
     This intentionally does not scan arbitrary directories.  A candidate is
@@ -58,9 +58,9 @@ def _known_llvm_quality_tools() -> tuple[Path, ...]:
         roots.extend(
             Path(value)
             for value in (
-                os.environ.get("ProgramFiles"),
-                os.environ.get("ProgramW6432"),
-                os.environ.get("ProgramFiles(x86)"),
+                environment.get("ProgramFiles"),
+                environment.get("ProgramW6432"),
+                environment.get("ProgramFiles(x86)"),
             )
             if value
         )
@@ -437,11 +437,12 @@ class ProcessRuntime:
         logger: StructuredLogger,
         *,
         policy: ProcessPolicy | None = None,
+        approved_executable_paths: frozenset[Path] = frozenset(),
     ) -> None:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        self._base_environment = dict(os.environ)
+        self._base_environment = dict(config.host_environment)
         self._executable_search_path = self._base_environment.get("PATH")
         self._fixed_quality_executables: dict[str, Path] = {}
         for tool_name in _FIXED_QUALITY_EXECUTABLES:
@@ -454,17 +455,18 @@ class ProcessRuntime:
                 )
                 if discovered is not None:
                     self._fixed_quality_executables[tool_name] = discovered
-        configured_exact_paths: set[Path] = {
+        configured_exact_paths: set[Path] = set(approved_executable_paths)
+        configured_exact_paths.update({
             path
             for path in (config.clangd_path, config.lldb_dap_path)
             if path is not None and path.is_file() and not path.is_symlink()
-        }
+        })
         configured_exact_paths.update(
             candidate
             for path in (
                 config.clang_format_path,
                 config.clang_tidy_path,
-                *_known_llvm_quality_tools(),
+                *_known_llvm_quality_tools(config.host_environment),
                 *self._fixed_quality_executables.values(),
             )
             if path is not None
@@ -481,6 +483,22 @@ class ProcessRuntime:
         self._short_handles: set[ProcessHandle] = set()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    def set_toolchain_environment(self, environment: Mapping[str, str]) -> None:
+        """Replace inherited child environment with a filtered VS developer environment.
+
+        The discovery service owns the filtering.  This method deliberately
+        copies only validated strings and never records values in logs/status.
+        """
+        if self._handles:
+            raise ProcessPolicyError("Toolchain environment must be installed before launching processes.")
+        checked: dict[str, str] = {}
+        for key, value in environment.items():
+            if not isinstance(key, str) or not isinstance(value, str) or "\x00" in key or "\x00" in value:
+                raise ProcessEnvironmentError("Toolchain environment must be a NUL-free string mapping.")
+            checked[key] = value
+        self._base_environment = checked
+        self._executable_search_path = checked.get("PATH")
 
     @property
     def workspace_root(self) -> Path:

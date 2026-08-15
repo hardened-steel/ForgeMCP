@@ -31,6 +31,16 @@ class CMakeToolStatus(ForgeModel):
     error: str | None = Field(default=None, description="Intentional safe error when unavailable.")
 
 
+class CMakeResolvedProfile(ForgeModel):
+    """Workspace-relative effective CMake profile with safe provenance only."""
+
+    source_dir: str = Field(min_length=1, description="Resolved workspace-relative CMake source directory.")
+    binary_dir: str = Field(min_length=1, description="Resolved workspace-relative build directory.")
+    source_dir_source: str = Field(min_length=1, description="Safe source category for source_dir.")
+    binary_dir_source: str = Field(min_length=1, description="Safe source category for binary_dir.")
+    configure_preset_source: str = Field(min_length=1, description="Safe source category for selected preset.")
+
+
 class CMakeStatus(ForgeModel):
     """Combined environment status for the CMake feature."""
 
@@ -38,6 +48,7 @@ class CMakeStatus(ForgeModel):
     minimum_cmake_version: CMakeVersion = Field(description="Lowest CMake version supported by this feature.")
     cmake: CMakeToolStatus = Field(description="CMake executable status.")
     ctest: CMakeToolStatus = Field(description="CTest executable status.")
+    profile: CMakeResolvedProfile | None = Field(default=None, description="Resolved safe workspace CMake profile.")
 
 
 class CMakeConfigurePreset(ForgeModel):

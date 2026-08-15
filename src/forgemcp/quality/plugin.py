@@ -22,6 +22,7 @@ from forgemcp.quality.errors import QualityRequestError
 from forgemcp.quality.models import QualityStatus
 from forgemcp.quality.sanitizer import MAX_SANITIZER_INPUT_CHARACTERS, SanitizerReportParser
 from forgemcp.workspace import WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 class _EmptyArguments(ForgeModel):
@@ -152,7 +153,7 @@ class QualityPlugin(ForgePlugin):
         super().__init__(
             PluginMetadata(
                 plugin_id="quality",
-                requires_services=("workspace", "process_runtime", "project_status_registry"),
+                requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"clang-format", "clang-tidy", "sanitizer-report"}),
                 tool_namespaces=("clang_format", "clang_tidy", "sanitizer"),
             )
@@ -190,13 +191,16 @@ class QualityPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         runtime = context.services.get("process_runtime")
+        toolchain = context.services.get("toolchain_discovery")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(runtime, ProcessRuntime):
             raise TypeError("The Quality plugin requires WorkspaceService and ProcessRuntime.")
         if not isinstance(status_registry, ProjectStatusRegistry):
             raise TypeError("The Quality plugin requires ProjectStatusRegistry.")
-        self._format = ClangFormatService(context.config, workspace, runtime)
-        self._tidy = ClangTidyService(context.config, workspace, runtime)
+        if not isinstance(toolchain, ToolchainDiscoveryService):
+            raise TypeError("The Quality plugin requires ToolchainDiscoveryService.")
+        self._format = ClangFormatService(context.config, workspace, runtime, toolchain)
+        self._tidy = ClangTidyService(context.config, workspace, runtime, toolchain)
         self._sanitizer = SanitizerReportParser(workspace)
         self._format_required = context.config.clang_format_path is not None
         self._tidy_required = context.config.clang_tidy_path is not None

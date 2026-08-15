@@ -10,6 +10,7 @@ from forgemcp.core.logging import StructuredLogger
 from forgemcp.debugger.errors import DebuggerUnavailableError
 from forgemcp.debugger.models import DebugAdapterInfo
 from forgemcp.processes import LldbDapCandidate, LldbDapQualifier, ProcessRuntime
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 class LldbDapBackend:
@@ -17,10 +18,14 @@ class LldbDapBackend:
 
     backend_id = "lldb-dap"
 
-    def __init__(self, config: ForgeConfig, logger: StructuredLogger, runtime: ProcessRuntime) -> None:
+    def __init__(
+        self, config: ForgeConfig, logger: StructuredLogger, runtime: ProcessRuntime,
+        toolchain: ToolchainDiscoveryService | None = None,
+    ) -> None:
         self._config = config
         self._logger = logger
         self._runtime = runtime
+        self._toolchain = toolchain
         self._candidate: LldbDapCandidate | None = None
         self._info = self._discover_without_starting()
 
@@ -74,6 +79,24 @@ class LldbDapBackend:
 
     def _discover_without_starting(self) -> DebugAdapterInfo:
         """Select one exact non-link candidate by read-only local discovery only."""
+        if self._toolchain is not None:
+            path = self._toolchain.executable("lldb-dap")
+            if path is not None and self._runtime.policy.approves_exact_executable(path):
+                self._candidate = LldbDapCandidate(path=path, source=self._toolchain.source("lldb-dap"))
+                return DebugAdapterInfo(
+                    backend_id=self.backend_id,
+                    display_name="LLVM LLDB-DAP",
+                    available=True,
+                    source=self._toolchain.source("lldb-dap"),
+                    supported_modes=("launch",),
+                )
+            return DebugAdapterInfo(
+                backend_id=self.backend_id,
+                display_name="LLVM LLDB-DAP",
+                available=False,
+                supported_modes=("launch",),
+                unavailable_reason="No approved standalone lldb-dap executable was discovered.",
+            )
         qualifier = LldbDapQualifier(self._config, self._logger)
         for candidate in qualifier.discover():
             path = candidate.path

@@ -16,6 +16,7 @@ from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegis
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.workspace import WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 class _StatusArguments(ForgeModel):
@@ -159,7 +160,7 @@ class ClangdPlugin(ForgePlugin):
         super().__init__(
             PluginMetadata(
                 plugin_id="clangd",
-                requires_services=("workspace", "process_runtime", "project_status_registry"),
+                requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"clangd"}),
             )
         )
@@ -176,12 +177,15 @@ class ClangdPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
+        toolchain = context.services.get("toolchain_discovery")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(process_runtime, ProcessRuntime):
             raise TypeError("The clangd plugin requires WorkspaceService and ProcessRuntime.")
         if not isinstance(status_registry, ProjectStatusRegistry):
             raise TypeError("The clangd plugin requires ProjectStatusRegistry.")
-        self._service = ClangdService(context.config, workspace, process_runtime)
+        if not isinstance(toolchain, ToolchainDiscoveryService):
+            raise TypeError("The clangd plugin requires ToolchainDiscoveryService.")
+        self._service = ClangdService(context.config, workspace, process_runtime, toolchain)
         self._status_registry = status_registry
         status_registry.register(_ClangdStatusProvider(self._service))
         self._register_tools(context)

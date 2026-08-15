@@ -19,6 +19,7 @@ from forgemcp.project import (
 )
 from forgemcp.project.models import utc_now
 from forgemcp.workspace import WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 class _StatusArguments(ForgeModel):
@@ -26,12 +27,12 @@ class _StatusArguments(ForgeModel):
 
 
 class _ListPresetsArguments(ForgeModel):
-    source_dir: str = Field(default=".", description="Workspace-relative source directory.")
+    source_dir: str | None = Field(default=None, description="Optional workspace-relative source directory; configured default is used when omitted.")
 
 
 class _ConfigureArguments(ForgeModel):
-    source_dir: str = Field(default=".", description="Workspace-relative source directory.")
-    binary_dir: str = Field(description="Workspace-relative generated build directory.")
+    source_dir: str | None = Field(default=None, description="Optional workspace-relative source directory; configured default is used when omitted.")
+    binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory; resolved default is used when omitted.")
     preset: str | None = Field(default=None, description="Optional CMake configure preset name.")
     cache_variables: dict[str, str | int | bool] | None = Field(
         default=None,
@@ -40,22 +41,22 @@ class _ConfigureArguments(ForgeModel):
 
 
 class _ListTargetsArguments(ForgeModel):
-    binary_dir: str = Field(description="Workspace-relative generated build directory.")
+    binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory.")
 
 
 class _BuildArguments(ForgeModel):
-    binary_dir: str = Field(description="Workspace-relative generated build directory.")
+    binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory.")
     targets: list[str] = Field(default_factory=list, description="Optional exact CMake target names.")
     configuration: str | None = Field(default=None, description="Optional multi-config configuration.")
     parallel_jobs: int | None = Field(default=None, description="Optional bounded positive parallel-job count.")
 
 
 class _ListTestsArguments(ForgeModel):
-    binary_dir: str = Field(description="Workspace-relative generated build directory.")
+    binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory.")
 
 
 class _RunTestsArguments(ForgeModel):
-    binary_dir: str = Field(description="Workspace-relative generated build directory.")
+    binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory.")
     test_names: list[str] = Field(default_factory=list, description="Optional exact CTest test names.")
     configuration: str | None = Field(default=None, description="Optional multi-config configuration.")
     timeout_seconds: float | None = Field(
@@ -141,7 +142,7 @@ class CMakePlugin(ForgePlugin):
         super().__init__(
             PluginMetadata(
                 plugin_id="cmake",
-                requires_services=("workspace", "process_runtime", "project_status_registry"),
+                requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"cmake.configure", "cmake.file-api-v2", "ctest.run"}),
             )
         )
@@ -158,12 +159,15 @@ class CMakePlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
+        toolchain = context.services.get("toolchain_discovery")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService):
             raise TypeError("The CMake plugin requires WorkspaceService under the 'workspace' service name.")
         if not isinstance(status_registry, ProjectStatusRegistry):
             raise TypeError("The CMake plugin requires ProjectStatusRegistry.")
-        self._service = CMakeService(workspace, process_runtime)  # type: ignore[arg-type]
+        if not isinstance(toolchain, ToolchainDiscoveryService):
+            raise TypeError("The CMake plugin requires ToolchainDiscoveryService.")
+        self._service = CMakeService(workspace, process_runtime, context.config, toolchain)  # type: ignore[arg-type]
         self._status_registry = status_registry
         status_registry.register(_CMakeStatusProvider(self._service))
         context.tools.register(

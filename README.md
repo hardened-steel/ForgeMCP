@@ -41,9 +41,9 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `clang_tidy__list_checks`, `clang_tidy__run`
 - `sanitizer__parse_report`
 
-`FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
+`--workspace` / `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
-Feature integrations use the public `forgemcp.plugins` contract. CMake and clangd are built-in plugins; clangd does not start a process until `clangd__start` receives an explicit workspace-contained directory with `compile_commands.json`. `FORGEMCP_CLANGD` optionally names an absolute clangd executable; otherwise the Process Runtime uses its policy-approved PATH discovery. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md), [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md), and [ADR 0007](docs/adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md) before allowing third-party code or extending clangd.
+Feature integrations use the public `forgemcp.plugins` contract. CMake and clangd are built-in plugins; clangd does not start a process until `clangd__start` receives an explicit workspace-contained directory with `compile_commands.json`. `--clangd` / `FORGEMCP_CLANGD` may name an exact executable; otherwise the application-scoped Toolchain Discovery Service uses its common safe selection rules. External entry-point plugins are disabled by default; enabling them requires both `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true` and an explicit comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`. See [architecture.md](docs/architecture.md), [ADR 0005](docs/adr/0005-feature-plugin-contract-and-external-trust.md), and [ADR 0007](docs/adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md) before allowing third-party code or extending clangd.
 
 `project__status {}` is the sole Project Intelligence Phase 1 operation. It
 concurrently aggregates bounded cached snapshots for Core, Workspace, Process
@@ -59,18 +59,18 @@ messages, raw output, persistent history, and multi-workspace aggregation are
 not part of Phase 1; see [ADR 0011](docs/adr/0011-project-status-provider-and-health-model.md).
 
 Debugger Phase 1 is launch-only source debugging through a separately installed
-exact `FORGEMCP_LLDB_DAP` path. It supports workspace-contained PE/COFF + DWARF launch, source
+exact `--lldb-dap` / `FORGEMCP_LLDB_DAP` path or one exact discovered LLVM candidate. It supports workspace-contained PE/COFF + DWARF launch, source
 breakpoints, execution control, paused inspection, one-identifier hover lookup
 (which may still execute debugger/inferior evaluation semantics), and bounded events. Attach, MSVC/PDB compatibility claims, terminals, arbitrary
 LLDB commands, and source/symbol downloads are intentionally unsupported; see
 [ADR 0009](docs/adr/0009-dap-architecture-backend-and-debugger-trust-model.md).
 
-Quality Phase 1 is a builtin, non-persistent feature plugin. It discovers
-`clang-format` and `clang-tidy` from explicit absolute
-`FORGEMCP_CLANG_FORMAT` / `FORGEMCP_CLANG_TIDY` configuration first, then the
-policy-controlled PATH and conventional installed LLVM location. Relative,
-empty, current-directory, and workspace PATH candidates are not quality-tool
-approvals. Discovery records one canonical regular non-link executable with
+Quality Phase 1 is a builtin, non-persistent feature plugin. It receives
+`clang-format` and `clang-tidy` from the common discovery service, whose
+priority is explicit CLI/environment, active Developer environment, selected
+Visual Studio, safe PATH, then conventional LLVM location. Relative, empty,
+current-directory, and workspace PATH candidates are not quality-tool approvals.
+Discovery records one canonical regular non-link executable with
 metadata and every probe/run rechecks and launches that exact path. Missing tools
 do not prevent server startup. Formatting sends the captured UTF-8 snapshot on
 stdin with a validated `--assume-filename`, parses bounded replacement XML byte
@@ -106,6 +106,122 @@ forgemcp
 CMake 3.23 or later is supported. Configure, build, and test intentionally run
 the selected project's CMake logic and test executables; run ForgeMCP only for
 workspaces whose project code you trust. See [ADR 0006](docs/adr/0006-cmake-file-api-build-directory-and-trust-boundary.md).
+
+## Configuration and CLI (Phase A)
+
+`forgemcp` without a subcommand remains the stdio MCP server. Configuration is
+assembled once at application composition; feature plugins never read the host
+environment directly. The exact precedence is:
+
+1. a parameter on the individual safe MCP operation;
+2. the corresponding CLI option;
+3. the corresponding `FORGEMCP_*` environment variable;
+4. automatic toolchain/preset discovery;
+5. the documented default.
+
+CLI therefore always overrides environment. `forgemcp print-config` and
+`forgemcp doctor --json` report source categories only (`cli`, `environment`,
+`discovery`, `default`): they never print environment values, secrets, or
+absolute host executable paths.
+
+```powershell
+forgemcp --help
+forgemcp --workspace C:\src\demo --build-dir build doctor
+forgemcp --workspace C:\src\demo print-config
+# Backward-compatible stdio server:
+forgemcp --workspace C:\src\demo --build-dir build
+```
+
+| CLI option | Environment variable | Default | Allowed values | Purpose | Security remarks |
+| --- | --- | --- | --- | --- | --- |
+| `--workspace DIR` | `FORGEMCP_WORKSPACE` | current directory | existing directory | Workspace root | Validated once; never emitted as a host path. |
+| `--source-dir DIR` | `FORGEMCP_SOURCE_DIR` | `.` | workspace-relative directory | Default CMake source tree | Workspace policy and symlink checks apply. |
+| `--build-dir DIR` | `FORGEMCP_BUILD_DIR` | preset `binaryDir`, then `build` | workspace-relative directory | Default CMake build tree | Every variant is workspace-contained and symlink-safe. |
+| `--cmake PATH` | `FORGEMCP_CMAKE` | discovery | absolute executable | CMake executable | Exact regular non-link/reparse file, never in workspace. |
+| `--ctest PATH` | `FORGEMCP_CTEST` | discovery | absolute executable | CTest executable | Same exact-file policy. |
+| `--clangd PATH` | `FORGEMCP_CLANGD` | discovery | absolute executable | clangd executable | Same exact-file policy; no flags are configurable. |
+| `--clang-format PATH` | `FORGEMCP_CLANG_FORMAT` | discovery | absolute executable | clang-format executable | Same exact-file policy; `-i` remains unavailable. |
+| `--clang-tidy PATH` | `FORGEMCP_CLANG_TIDY` | discovery | absolute executable | clang-tidy executable | Same exact-file policy; no arbitrary arguments/fixes. |
+| `--lldb-dap PATH` | `FORGEMCP_LLDB_DAP` | discovery | absolute executable | LLVM DAP adapter | Exact-file qualification and strict adapter policy still apply. |
+| `--toolchain MODE` | `FORGEMCP_TOOLCHAIN` | `auto` | `auto`, `msvc`, `llvm` | Discovery preference | Does not enable a new debugger backend. |
+| `--host-arch ARCH` | `FORGEMCP_HOST_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | Tool process architecture | Incompatible PE candidates are rejected. |
+| `--target-arch ARCH` | `FORGEMCP_TARGET_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | MSVC compiler target | Used only in fixed VS developer-environment setup. |
+| `--visual-studio-instance SELECTOR` | `FORGEMCP_VISUAL_STUDIO_INSTANCE` | deterministic eligible instance | bounded product/display/version selector | Select a VS instance | No selector enters a shell command. |
+| `--cmake-generator NAME` | `FORGEMCP_CMAKE_GENERATOR` | none | bounded name | Generator outside a preset | Omitted whenever a configure preset is active. |
+| `--configure-preset NAME` | `FORGEMCP_CONFIGURE_PRESET` | none | bounded name | Default configure preset | Its direct `binaryDir` is rechecked in workspace policy. |
+| `--configuration NAME` | `FORGEMCP_DEFAULT_CONFIGURATION` | none | bounded name | Default multi-config configuration | Passed as one argv value only. |
+| `--configure-timeout-sec N` | `FORGEMCP_CONFIGURE_TIMEOUT_SEC` | `300` | `0 < N <= 3600` | Configure timeout | Process Runtime remains the execution boundary. |
+| `--build-timeout-sec N` | `FORGEMCP_BUILD_TIMEOUT_SEC` | `900` | `0 < N <= 3600` | Build timeout | Process Runtime remains the execution boundary. |
+| `--test-timeout-sec N` | `FORGEMCP_TEST_TIMEOUT_SEC` | `900` | `0 < N <= 3600` | CTest timeout | Per-call safe timeout may override it. |
+| `--log-level LEVEL` | `FORGEMCP_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | stderr logging level | Values never enter MCP stdio. |
+| `--external-plugins-enabled` / `--no-external-plugins` | `FORGEMCP_EXTERNAL_PLUGINS_ENABLED` | `false` | boolean | Existing opt-in plugin switch | Both switch and allow-list are still required. |
+| `--external-plugin-allowlist NAMES` | `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST` | empty | comma-separated entry-point IDs | Existing external plugin allow-list | Names only; no plugin paths or environment values are exposed. |
+
+The local commands are `forgemcp doctor`, `forgemcp doctor --json`, and
+`forgemcp print-config`. `doctor` checks, without enabling extra DAP backends,
+`cmake`, `ctest`, `ninja`, `MSBuild`, `cl`, `clang`, `clang++`, `clangd`,
+`clang-format`, `clang-tidy`, and `lldb-dap`; it reports only sanitized
+availability/rejection reasons. `cppvsdbg` and `OpenDebugAD7` are discovery-only
+candidates and are never selected automatically.
+
+### CMake build-directory resolution
+
+For all CMake operations, omitted `binary_dir` resolves as follows:
+
+```text
+tool-call binary_dir → CLI --build-dir → FORGEMCP_BUILD_DIR
+→ selected configure preset binaryDir → workspace-relative build
+```
+
+`cmake__status` includes the resulting workspace-relative source/build profile
+and its safe source category. Preset, CLI, and environment choices use the same
+Workspace policy; none can select a build tree outside the workspace.
+
+### Windows and Codex examples
+
+Run the local check before registering the server:
+
+```powershell
+forgemcp --workspace C:\src\demo --build-dir build doctor
+codex mcp add demo-cpp -- forgemcp --workspace C:\src\demo --build-dir build
+```
+
+A project-scoped `.codex/config.toml` can pass options through `args` (Windows
+TOML backslashes must be escaped):
+
+```toml
+[mcp_servers.forgemcp]
+command = "forgemcp"
+args = ["--workspace", "C:\\src\\demo", "--build-dir", "build", "--toolchain", "msvc"]
+tool_timeout_sec = 1800
+startup_timeout_sec = 30
+```
+
+### Test-only environment switches
+
+These are never read by the server configuration and must not be used for MCP
+deployment. They exist solely for explicitly opted-in integration fixtures and
+gates in this repository.
+
+| Variable | Purpose |
+| --- | --- |
+| `FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE` | Enables the real Windows VS discovery/MSVC/CMake/CTest gate with a cleared PATH. |
+| `FORGEMCP_LLDB_DAP_LIVE_TEST` | Supplies lldb-dap to existing opt-in DAP tests. |
+| `FORGEMCP_LLVM_CLANG_LIVE_TEST` | Supplies clang to existing opt-in DAP compile tests. |
+| `FORGEMCP_CLANG_FORMAT_LIVE_TEST` | Supplies clang-format to existing live Quality tests. |
+| `FORGEMCP_CLANG_TIDY_LIVE_TEST` | Supplies clang-tidy to existing live Quality tests. |
+| `FORGEMCP_PROJECT_STATUS_FIXTURE` | Selects only the test stdio fixture behavior. |
+| `FORGEMCP_TEST_VALUE`, `FORGEMCP_TEST_SECRET`, `FORGEMCP_TEST_NORMAL` | Process Runtime test fixtures; never runtime settings. |
+
+The alternative is an `env` block; CLI still wins if both are present:
+
+```toml
+[mcp_servers.forgemcp]
+command = "forgemcp"
+env = { FORGEMCP_WORKSPACE = "C:\\src\\demo", FORGEMCP_BUILD_DIR = "build", FORGEMCP_TOOLCHAIN = "msvc" }
+tool_timeout_sec = 1800
+startup_timeout_sec = 30
+```
 
 ## Core structure
 

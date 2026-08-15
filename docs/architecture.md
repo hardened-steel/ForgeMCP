@@ -4,6 +4,24 @@
 
 `forgemcp.core` is the composition root for the MCP server. It owns explicit configuration, workspace-root validation, the small service registry, application lifecycle, expected domain errors, and structured stderr logging.
 
+### Configuration and toolchain discovery (Phase A)
+
+`ForgeConfig` is immutable and is composed only in Core from CLI, then
+`FORGEMCP_*` environment, then defaults. It stores safe provenance categories
+but no public raw environment values. `forgemcp` remains a stdio server with no
+subcommand; stdlib-argparse `doctor` and `print-config` are local sanitized
+commands. `ToolchainDiscoveryService` is another application-scoped Core
+service. It supplies exact approved executables to CMake, clangd, Quality and
+Debugger; feature modules do not independently inspect environment/PATH.
+
+It caches discovery at startup, so `project__status` observes cached state only.
+On Windows it uses trusted standard-location `vswhere.exe`, deterministic VS
+instance/component/architecture selection, and a fixed-script filtered
+Developer environment capture. Process Runtime receives that bounded build
+environment before plugins launch. Its public diagnostics contain availability,
+source category and rejection category, never host paths or raw environment.
+See [ADR 0012](adr/0012-configuration-cli-and-windows-toolchain-discovery.md).
+
 The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
 
 `server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool contributions to the MCP SDK, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop.
@@ -52,6 +70,7 @@ Feature integrations use `PluginContext` rather than `application.services`. The
 - `logger` — `StructuredLogger`
 - `workspace` — `WorkspaceService`, the safe filesystem capability for the configured workspace
 - `process_runtime` — `ProcessRuntime`, the safe asynchronous external-tool capability for the configured workspace
+- `toolchain_discovery` — cached `ToolchainDiscoveryService` exact tool choices and its private filtered build environment; plugins may use executable selections but must not serialize host paths/environment
 - `plugins` — `PluginManager`, when a future plugin has a valid reason to depend on manager-owned status or registry data
 - `project_status_registry` — `ProjectStatusRegistry`, optionally declared by a
   feature plugin that can expose a bounded cached `ComponentStatus`
@@ -149,7 +168,7 @@ nor writes.
 
 `forgemcp.lsp` is a transport-neutral JSON-RPC 2.0/LSP stream adapter. It has no MCP SDK, Core, Workspace, or Process Runtime imports. `LspClient` owns Content-Length framing, one reader task, a monotonically increasing request-ID table, out-of-order response delivery, bounded inbound messages, request timeout/cancellation with `$/cancelRequest`, and safe failure propagation on malformed messages or EOF. It answers only minimal server-to-client requests (`workspace/configuration`, progress creation, capability registration, and a denied `workspace/applyEdit`); it is not a general LSP proxy.
 
-`forgemcp.clangd` is an application-scoped builtin feature plugin with capability `clangd`. Its `ClangdService` receives only the declared `workspace` and `process_runtime` services through `PluginContext`; it does not receive FastMCP, ForgeApplication, or a raw registry. Every clangd child is launched through Process Runtime. `FORGEMCP_CLANGD` may set an absolute executable path; the default runtime adds that one path to its normal policy allow-list. Otherwise the permitted bare `clangd` name is discovered through the composition-time PATH captured by Process Runtime. No MCP argument can supply executable flags, `--query-driver`, or a path outside the workspace.
+`forgemcp.clangd` is an application-scoped builtin feature plugin with capability `clangd`. Its `ClangdService` receives only the declared `workspace`, `process_runtime`, and cached `toolchain_discovery` services through `PluginContext`; it does not receive FastMCP, ForgeApplication, or a raw registry. Every clangd child is launched through Process Runtime. `FORGEMCP_CLANGD` may set an absolute executable path; otherwise the central discovery service chooses one exact policy-approved candidate. No MCP argument can supply executable flags, `--query-driver`, or a path outside the workspace.
 
 `clangd__start` requires an explicit workspace-contained, non-symlink directory with `compile_commands.json`, then launches only `clangd --compile-commands-dir=<validated-relative-directory>`. It performs `initialize` followed by `initialized`. clangd is an untrusted, fallible protocol peer: all incoming messages are size-bounded, parsed into normalized models at the adapter boundary, and neither raw payloads, compiler arguments, source/replacement text, nor stderr are logged. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed discard limit.
 
@@ -181,7 +200,7 @@ Process output and complete argv/environment values are never logged. Completion
 
 On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates after the policy grace period to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP`; the runtime creates a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE` and no breakaway flags before launching, then verifies assignment. Closing that job removes non-detached descendants even when the direct child has already exited. Normal callers retain a `taskkill /PID <pid> /T /F` fallback after observed Job-assignment failure. A trusted adapter does not: if the Job cannot be created or assigned, its direct process is immediately reaped, no handle is returned, and `ProcessOwnershipError` reports that required ownership was unavailable. Its scrubbed environment inherits no ForgeMCP variables; Windows receives only present `SystemRoot`, `WINDIR`, `ComSpec`, `TEMP`, `TMP`, and `PATHEXT`, plus a `PATH` built from the approved executable/companion directories. Normal CMake and clangd callers still inherit their composition-time environment. argv, environment, and raw process output never enter logs. This contains the owned normal process tree, including adapter descendants on adapter crash; it cannot absolutely cover OS/power crashes or a trusted compromised process deliberately escaping the platform containment primitive.
 
-`LldbDapQualifier` is a transport-neutral, internal Phase-0 helper, not a DAP client or MCP tool. It reads a declarative `FORGEMCP_LLDB_DAP` path first, then local PATH/LLVM/Visual Studio/VS Code/local-toolchain candidates, and accepts an adapter only after fixed `--version`/`--help` probes and a start/close cycle succeed through `run_trusted_adapter`/`start_trusted_adapter`. Its `AdapterQualification` separates runnable-process facts from unverified DAP, object-format, and debug-information capabilities, and retains only safe probe exit statuses and a parsed version. An opt-in test-local `initialize`/`disconnect` gate can check a real installed adapter without introducing a second production DAP transport. Debuggee environment is intentionally not part of this adapter environment; a future DAP launch policy owns it.
+`LldbDapQualifier` is a transport-neutral, internal Phase-0 helper, not a DAP client or MCP tool. Production backend executable selection comes from the central discovery service; qualifier tests retain fixed `--version`/`--help` probes and a start/close cycle through `run_trusted_adapter`/`start_trusted_adapter`. Its `AdapterQualification` separates runnable-process facts from unverified DAP, object-format, and debug-information capabilities, and retains only safe probe exit statuses and a parsed version. An opt-in test-local `initialize`/`disconnect` gate can check a real installed adapter without introducing a second production DAP transport. Debuggee environment is intentionally not part of this adapter environment; a future DAP launch policy owns it.
 
 ## DAP debugger feature
 
@@ -291,17 +310,18 @@ Logs are JSON records written to stderr, so they do not corrupt the MCP stdio pr
 
 `forgemcp.quality` is a transport-neutral builtin feature module containing
 `ClangFormatService`, `ClangTidyService`, `SanitizerReportParser`, immutable
-Quality models, and `QualityPlugin`. It receives only Workspace and Process
-Runtime through `PluginContext`; it neither imports FastMCP nor receives
+Quality models, and `QualityPlugin`. It receives only Workspace, Process
+Runtime, and cached Toolchain Discovery through `PluginContext`; it neither imports FastMCP nor receives
 ForgeApplication. Its tools are `quality__status`, `clang_format__check`,
 `clang_format__apply`, `clang_tidy__list_checks`, `clang_tidy__run`, and
 `sanitizer__parse_report`.
 
-Quality executable selection is fixed by server configuration: an explicit
-absolute `FORGEMCP_CLANG_FORMAT` or `FORGEMCP_CLANG_TIDY` is considered first,
-followed by a PATH search over absolute directories and a small conventional
-installed LLVM location. Empty/relative PATH entries, Windows current-directory
-search, and candidates inside the workspace are excluded. Discovery records a
+Quality executable selection is fixed by the central discovery service, with an
+absolute explicit CLI/environment choice
+considered first, followed by Developer environment, selected VS, safe PATH,
+and a small conventional installed LLVM location. Empty/relative PATH entries,
+Windows current-directory search, and candidates inside the workspace are
+excluded. Discovery records a
 canonical regular non-link path and file metadata; qualification uses bounded
 fixed `--version` and tool-specific `--help` probes, and every later launch uses
 that exact approved path with replacement detection. Availability is reported

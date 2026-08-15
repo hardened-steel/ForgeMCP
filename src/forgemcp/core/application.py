@@ -29,6 +29,7 @@ from forgemcp.project import (
     WorkspaceStatusProvider,
 )
 from forgemcp.workspace import WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 class LifecycleState(StrEnum):
@@ -80,8 +81,12 @@ class ForgeApplication:
         logger = create_logger(config.log_level)
         services.register("logger", logger)
         workspace = WorkspaceService(config, logger)
-        process_runtime = ProcessRuntime(config, logger)
+        toolchain = ToolchainDiscoveryService(config)
+        process_runtime = ProcessRuntime(
+            config, logger, approved_executable_paths=toolchain.approved_executable_paths
+        )
         services.register("workspace", workspace)
+        services.register("toolchain_discovery", toolchain)
         services.register("process_runtime", process_runtime)
         project_status_registry = ProjectStatusRegistry()
         services.register("project_status_registry", project_status_registry)
@@ -125,6 +130,14 @@ class ForgeApplication:
         """Start feature plugins and enter the running state exactly once."""
         if self._state is not LifecycleState.CREATED:
             raise LifecycleError(f"Cannot start an application in state '{self._state}'.")
+        toolchain = self.services.get("toolchain_discovery") if "toolchain_discovery" in self.services else None
+        if isinstance(toolchain, ToolchainDiscoveryService):
+            # Discovery is cached before plugins start.  ProjectStatus consumes
+            # this cache only and never refreshes or invokes a subprocess.
+            toolchain.refresh()
+            process_runtime = self.services.get("process_runtime")
+            if isinstance(process_runtime, ProcessRuntime) and toolchain.toolchain_environment is not None:
+                process_runtime.set_toolchain_environment(toolchain.toolchain_environment)
         plugins = self.services.get("plugins")
         if not isinstance(plugins, PluginManager):
             raise TypeError("The 'plugins' service must be a PluginManager.")

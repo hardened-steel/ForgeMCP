@@ -66,6 +66,10 @@ irreversible choices belong in [adr/](adr/).
   100,000-byte response truncation metadata, critical-provider health rules,
   failed-start provider rollback, and real MCP SDK stdio failure/timeout/race
   coverage.
+- UX Stabilization Phase A: immutable source-aware configuration, backwards-
+  compatible argparse CLI (`doctor`/`print-config`), optional safe CMake build
+  directory defaults, centralized cached toolchain discovery, Windows VS/Build
+  Tools discovery and filtered Developer-environment capture. See ADR 0012.
 
 ### In progress
 

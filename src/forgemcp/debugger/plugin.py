@@ -16,6 +16,7 @@ from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolCon
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
+from forgemcp.toolchain import ToolchainDiscoveryService
 from forgemcp.workspace import WorkspaceService
 
 
@@ -138,7 +139,7 @@ class DebuggerPlugin(ForgePlugin):
     __slots__ = ("_service", "_status_registry")
 
     def __init__(self) -> None:
-        super().__init__(PluginMetadata(plugin_id="debugger", requires_services=("workspace", "process_runtime", "project_status_registry"), provides=frozenset({"debugger"})))
+        super().__init__(PluginMetadata(plugin_id="debugger", requires_services=("workspace", "process_runtime", "toolchain_discovery", "project_status_registry"), provides=frozenset({"debugger"})))
         self._service: DebuggerService | None = None
         self._status_registry: ProjectStatusRegistry | None = None
 
@@ -151,12 +152,15 @@ class DebuggerPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         runtime = context.services.get("process_runtime")
+        toolchain = context.services.get("toolchain_discovery")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(runtime, ProcessRuntime):
             raise TypeError("The debugger plugin requires WorkspaceService and ProcessRuntime.")
         if not isinstance(status_registry, ProjectStatusRegistry):
             raise TypeError("The debugger plugin requires ProjectStatusRegistry.")
-        self._service = DebuggerService(workspace, runtime, LldbDapBackend(context.config, context.logger, runtime))
+        if not isinstance(toolchain, ToolchainDiscoveryService):
+            raise TypeError("The debugger plugin requires ToolchainDiscoveryService.")
+        self._service = DebuggerService(workspace, runtime, LldbDapBackend(context.config, context.logger, runtime, toolchain))
         self._status_registry = status_registry
         status_registry.register(
             _DebuggerStatusProvider(

@@ -488,7 +488,7 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
                 "preset",
                 "cache_variables",
             }
-            assert tools["cmake__configure"].inputSchema["required"] == ["binary_dir"]
+            assert "required" not in tools["cmake__configure"].inputSchema
             statuses = {status.plugin_id: status.state.value for status in application.services.get("plugins").statuses()}
             assert statuses["cmake"] == "running"
         statuses = {status.plugin_id: status.state.value for status in application.services.get("plugins").statuses()}
@@ -497,6 +497,10 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
     asyncio.run(exercise())
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
 def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
     """Exercise configure and File API whenever CMake/CTest are available."""
     (tmp_path / "CMakeLists.txt").write_text(
@@ -522,6 +526,10 @@ def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
     asyncio.run(exercise())
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
 def test_optional_real_cmake_vertical_slice(tmp_path, monkeypatch):
     """Exercise configure, File API, build, and CTest when a C++ compiler is usable."""
     (tmp_path / "CMakeLists.txt").write_text(

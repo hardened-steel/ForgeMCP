@@ -26,7 +26,7 @@ def test_server_status_smoke_test(tmp_path):
     assert status["state"] == LifecycleState.RUNNING.value
     assert status["services"] == [
         "config", "logger", "plugins", "process_runtime", "project_status_registry",
-        "project_status_service", "workspace",
+        "project_status_service", "toolchain_discovery", "workspace",
     ]
     server = create_server(lambda: application)
     assert server.name == "ForgeMCP"

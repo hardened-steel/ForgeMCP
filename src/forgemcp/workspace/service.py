@@ -270,6 +270,17 @@ class WorkspaceService:
             raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
         return GeneratedWorkspaceDirectory(self, self._relative_key(directory) or ".")
 
+    def validate_generated_directory_path(self, path: str) -> str:
+        """Validate a possibly-not-yet-created build path without writing it.
+
+        This is intentionally narrower than ``open_generated_directory`` and
+        lets status/profile resolution apply the same lexical, containment and
+        symlink policy without creating a build tree as an observation effect.
+        """
+        directory = self._resolve_path(path, apply_ignore_policy=False)
+        self._assert_no_symlink_components(directory)
+        return self._relative_key(directory) or "."
+
     def validate_reported_path(self, path: str, *, relative_to: str = ".") -> str:
         """Validate an untrusted absolute or relative path reported by a tool.
 

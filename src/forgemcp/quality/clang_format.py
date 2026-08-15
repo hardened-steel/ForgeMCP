@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -23,6 +23,7 @@ from forgemcp.quality.models import (
     QualityToolInfo,
 )
 from forgemcp.workspace import WorkspaceError, WorkspaceService, WorkspaceTextEdit
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 MAX_FORMAT_FILES = 64
@@ -70,15 +71,15 @@ class _FormattedFile:
     replacements: tuple[_Replacement, ...]
 
 
-def known_quality_candidates(tool_name: str) -> tuple[Path, ...]:
+def known_quality_candidates(tool_name: str, environment: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Return only conventional operator-installed LLVM locations, never a scan."""
     if os.name == "nt":
         roots = tuple(
             Path(value)
             for value in (
-                os.environ.get("ProgramFiles"),
-                os.environ.get("ProgramW6432"),
-                os.environ.get("ProgramFiles(x86)"),
+                (environment or {}).get("ProgramFiles"),
+                (environment or {}).get("ProgramW6432"),
+                (environment or {}).get("ProgramFiles(x86)"),
             )
             if value
         )
@@ -99,10 +100,14 @@ def process_summary(result: ProcessResult) -> QualityProcessSummary:
 class ClangFormatService:
     """Check and apply project-owned clang-format rules without ``-i`` or shell access."""
 
-    def __init__(self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRunner) -> None:
+    def __init__(
+        self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRunner,
+        toolchain: ToolchainDiscoveryService | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._toolchain = toolchain
         self._cached_status: QualityToolInfo | None = None
 
     @property
@@ -175,11 +180,15 @@ class ClangFormatService:
     async def _qualify(self) -> _ToolSelection:
         """Try configured path, policy-controlled PATH, then fixed LLVM candidates."""
         candidates: list[str] = []
-        if self._config.clang_format_path is not None:
+        if self._toolchain is not None:
+            selected = self._toolchain.executable("clang-format")
+            if selected is not None:
+                candidates.append(str(selected))
+        elif self._config.clang_format_path is not None:
             candidates.append(str(self._config.clang_format_path))
         else:
             candidates.append("clang-format")
-            candidates.extend(str(path) for path in known_quality_candidates("clang-format"))
+            candidates.extend(str(path) for path in known_quality_candidates("clang-format", self._config.host_environment))
         for candidate in candidates:
             canonical = self._canonical(candidate)
             if canonical is None:

@@ -82,6 +82,7 @@ from forgemcp.workspace import (
     WorkspaceTextEdit,
     WorkspaceTextEditError,
 )
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 MAX_NAVIGATION_RESULTS = 500
@@ -170,11 +171,13 @@ class ClangdService:
     """
 
     def __init__(
-        self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRuntime
+        self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRuntime,
+        toolchain: ToolchainDiscoveryService | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._toolchain = toolchain
         self._state = ClangdSessionState.STOPPED
         self._compile_commands_dir: str | None = None
         self._position_encoding = PositionEncoding.UTF16
@@ -1399,6 +1402,10 @@ class ClangdService:
 
     @property
     def _executable(self) -> str:
+        if self._toolchain is not None:
+            selected = self._toolchain.executable("clangd")
+            if selected is not None:
+                return str(selected)
         return str(self._config.clangd_path) if self._config.clangd_path is not None else "clangd"
 
     def _make_status(
