@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import json
 import sys
 import warnings
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from time import monotonic
 from typing import Annotated
 
 # Current MCP releases can emit this third-party Pydantic forward-reference
@@ -30,7 +32,14 @@ from pydantic_core import PydanticUndefined
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import ConfigurationError
-from forgemcp.plugins import RegisteredToolContribution, ToolRegistry
+from forgemcp.plugins import (
+    NoOpProgressReporter,
+    ProgressUpdate,
+    RegisteredToolContribution,
+    ToolExecutionContext,
+    ToolRegistry,
+    invoke_tool_handler,
+)
 from forgemcp.toolchain import ToolchainDiscoveryService
 
 
@@ -40,6 +49,78 @@ from forgemcp.toolchain import ToolchainDiscoveryService
 # mapping.  Configure that common base before any tool is registered so every
 # published flat schema and every actual stdio invocation reject extra fields.
 ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+
+class _McpProgressReporter:
+    """One bounded, synchronous progress bridge for a single SDK request.
+
+    It deliberately keeps no application/service references and creates no
+    notification tasks.  A slow or failing transport merely disables further
+    progress; it never changes the outcome or lifetime of a tool operation.
+    """
+
+    _MINIMUM_INTERVAL_SECONDS = 0.5
+    _DELIVERY_TIMEOUT_SECONDS = 0.75
+
+    def __init__(self, context: Context) -> None:
+        try:
+            request_context = context.request_context
+        except ValueError:
+            # FastMCP's in-process ``call_tool`` test/helper path supplies a
+            # Context shell outside a protocol request.  It has no token and
+            # must behave exactly like an in-process no-op reporter.
+            request_context = None
+        metadata = getattr(request_context, "meta", None)
+        self._context = context
+        self._enabled = getattr(metadata, "progressToken", None) is not None
+        self._last_sent_at = float("-inf")
+        self._last_progress: float | None = None
+        self._last_total: float | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def supports_progress(self) -> bool:
+        return self._enabled
+
+    async def report(self, update: ProgressUpdate) -> None:
+        if not self._enabled:
+            return
+        async with self._lock:
+            if not self._enabled:
+                return
+            # Progress is monotonic for one measurement mode.  A known exact
+            # total can intentionally replace an earlier phase-only update.
+            if self._last_total == update.total and self._last_progress is not None:
+                if update.progress < self._last_progress:
+                    return
+            now = monotonic()
+            if not update.terminal and now - self._last_sent_at < self._MINIMUM_INTERVAL_SECONDS:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._context.report_progress(update.progress, update.total, update.message),
+                    timeout=self._DELIVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                # Cancellation must reach the operation, whose ProcessRuntime
+                # cleanup path owns any subprocess tree.
+                raise
+            except Exception:
+                # Token/transport loss is best effort.  Do not log a message:
+                # a label can contain a validated target/test name.
+                self._enabled = False
+                return
+            self._last_sent_at = now
+            self._last_progress = update.progress
+            self._last_total = update.total
+
+
+def _execution_context(context: Context | None) -> ToolExecutionContext:
+    """Create an ephemeral SDK-free context for exactly one handler call."""
+    if context is None:
+        return ToolExecutionContext(NoOpProgressReporter())
+    reporter = _McpProgressReporter(context)
+    return ToolExecutionContext(reporter if reporter.supports_progress else NoOpProgressReporter())
 
 
 def server_status(application: ForgeApplication) -> dict[str, object]:
@@ -88,8 +169,8 @@ def _register_contributed_tools(
 def _tool_adapter(contribution: RegisteredToolContribution):
     """Create the SDK-facing wrapper for one generic mapping-based contribution."""
 
-    async def contributed_tool(arguments: dict[str, object]) -> object:
-        result = contribution.handler(arguments)
+    async def contributed_tool(arguments: dict[str, object], context: Context) -> object:
+        result = invoke_tool_handler(contribution.handler, arguments, _execution_context(context))
         if inspect.isawaitable(result):
             return await result
         return result
@@ -112,13 +193,18 @@ def _tool_adapter(contribution: RegisteredToolContribution):
                 )
             )
 
-        async def contributed_tool_with_schema(**arguments: object) -> object:
-            result = contribution.handler(arguments)
+        async def contributed_tool_with_schema(context: Context, **arguments: object) -> object:
+            result = invoke_tool_handler(contribution.handler, arguments, _execution_context(context))
             if inspect.isawaitable(result):
                 return await result
             return result
 
-        contributed_tool_with_schema.__signature__ = inspect.Signature(parameters)  # type: ignore[attr-defined]
+        contributed_tool_with_schema.__signature__ = inspect.Signature([
+            inspect.Parameter(
+                "context", kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context
+            ),
+            *parameters,
+        ])  # type: ignore[attr-defined]
         return contributed_tool_with_schema
 
     return contributed_tool

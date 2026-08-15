@@ -460,6 +460,8 @@ def test_build_returns_nonzero_process_result_and_enforces_parallel_bound(tmp_pa
     )
     with pytest.raises(CMakeRequestError):
         asyncio.run(service.build(binary_dir="build", parallel_jobs=0))
+    with pytest.raises(CMakeRequestError, match="bounded"):
+        asyncio.run(service.build(binary_dir="build", targets=("x" * 257,)))
 
 
 def test_ctest_json_listing_and_failed_exact_name_run(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
 from pydantic import Field, ValidationError
@@ -11,12 +12,52 @@ from forgemcp.clangd.service import ClangdService
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import Diagnostic, Position, Range
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    NoOpProgressReporter,
+    PluginContext,
+    PluginMetadata,
+    ProgressUpdate,
+    ToolContribution,
+    ToolExecutionContext,
+)
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.workspace import WorkspaceService
 from forgemcp.toolchain import ToolchainDiscoveryService
+
+
+async def _run_lifecycle_progress(
+    context: ToolExecutionContext, label: str, operation: Awaitable[object]
+) -> object:
+    """Report only phase/elapsed state for managed clangd lifecycle work."""
+    await context.report_progress(ProgressUpdate(0, None, label))
+    heartbeat: asyncio.Task[None] | None = None
+    if context.supports_progress:
+        async def pulse() -> None:
+            started = asyncio.get_running_loop().time()
+            while True:
+                await asyncio.sleep(2.0)
+                await context.report_progress(
+                    ProgressUpdate(0, None, f"{label} ({max(1, int(asyncio.get_running_loop().time() - started))}s)")
+                )
+        heartbeat = asyncio.create_task(pulse())
+    try:
+        result = await operation
+    except asyncio.CancelledError:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} cancelled", terminal=True))
+        raise
+    except Exception:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} failed", terminal=True))
+        raise
+    else:
+        await context.report_progress(ProgressUpdate(1, None, f"{label} completed", terminal=True))
+        return result
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 class _StatusArguments(ForgeModel):
@@ -86,7 +127,7 @@ class _HierarchyItemArguments(ForgeModel):
     limit: int | None = Field(default=None, description="Optional bounded result count from 1 through 500.")
 
 
-ToolOperation = Callable[[ClangdService, ForgeModel], Awaitable[ForgeModel | None]]
+ToolOperation = Callable[..., Awaitable[ForgeModel | None]]
 
 
 class _ClangdStatusProvider:
@@ -235,7 +276,7 @@ class ClangdPlugin(ForgePlugin):
                     name=name,
                     description=description,
                     input_model=model,
-                    handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op),
+                    handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context),
                 )
             )
 
@@ -244,6 +285,7 @@ class ClangdPlugin(ForgePlugin):
         model_type: type[ForgeModel],
         arguments: Mapping[str, object],
         operation: ToolOperation,
+        execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         try:
             request = model_type.model_validate(arguments)
@@ -252,7 +294,11 @@ class ClangdPlugin(ForgePlugin):
                 ClangdRequestError("Tool arguments do not match the published clangd schema.")
             ).as_dict()
         try:
-            result = await operation(self.service, request)
+            context = execution_context or ToolExecutionContext(NoOpProgressReporter())
+            if operation.__name__ in {"_start", "_stop"}:
+                result = await operation(self.service, request, context)
+            else:
+                result = await operation(self.service, request)
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
         return {"stopped": True} if result is None else result.model_dump(mode="json")
@@ -262,13 +308,15 @@ class ClangdPlugin(ForgePlugin):
         return await service.status()
 
     @staticmethod
-    async def _start(service: ClangdService, request: ForgeModel) -> ForgeModel:
+    async def _start(
+        service: ClangdService, request: ForgeModel, context: ToolExecutionContext
+    ) -> ForgeModel:
         assert isinstance(request, _StartArguments)
-        return await service.start(request.compile_commands_dir)
+        return await _run_lifecycle_progress(context, "Starting clangd", service.start(request.compile_commands_dir))
 
     @staticmethod
-    async def _stop(service: ClangdService, _: ForgeModel) -> None:
-        await service.aclose()
+    async def _stop(service: ClangdService, _: ForgeModel, context: ToolExecutionContext) -> None:
+        await _run_lifecycle_progress(context, "Stopping clangd", service.aclose())
         return None
 
     @staticmethod

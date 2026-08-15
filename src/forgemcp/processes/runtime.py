@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import ctypes
+import inspect
 from ctypes import wintypes
 import os
 import shutil
@@ -30,6 +31,11 @@ from forgemcp.processes.errors import (
     ProcessWorkingDirectoryError,
 )
 from forgemcp.processes.policy import ProcessPolicy, _contains_link_or_reparse_point
+from forgemcp.processes.observer import (
+    MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS,
+    ProcessOutputEvent,
+    ProcessOutputObserver,
+)
 
 if TYPE_CHECKING:
     from asyncio.streams import StreamReader, StreamWriter
@@ -292,6 +298,77 @@ class _BoundedTextCapture:
             self._truncated = True
 
 
+class _BoundedObserverDispatcher:
+    """Drain observer work through one bounded task without delaying pipe reads."""
+
+    _QUEUE_SIZE = 32
+    _DRAIN_TIMEOUT_SECONDS = 0.1
+
+    def __init__(self, observer: ProcessOutputObserver) -> None:
+        self._observer = observer
+        self._queue: asyncio.Queue[ProcessOutputEvent] = asyncio.Queue(maxsize=self._QUEUE_SIZE)
+        self._overflowed = False
+        self._failed = False
+        self._closed = False
+        self._consumer = asyncio.create_task(self._consume())
+
+    @property
+    def overflowed(self) -> bool:
+        return self._overflowed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def offer(self, stream: str, data: bytes) -> None:
+        """Enqueue at most one decoded bounded chunk; never await from a reader."""
+        if self._closed:
+            return
+        text = data.decode("utf-8", errors="replace")
+        truncated = len(text) > MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS
+        event = ProcessOutputEvent(
+            stream="stdout" if stream == "stdout" else "stderr",
+            text=text[:MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS],
+            observed_at=datetime.now(UTC),
+            truncated=truncated,
+        )
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Coalescing raw text would create another disclosure store.  A
+            # dropped event is explicit in the result and safe for progress to
+            # fall back to its heartbeat.
+            self._overflowed = True
+
+    async def aclose(self) -> None:
+        self._closed = True
+        try:
+            # Give a fast parser one bounded opportunity to consume final
+            # chunks (important when a short child exits immediately), but
+            # never make a slow observer part of process completion.
+            await asyncio.wait_for(self._queue.join(), timeout=self._DRAIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._overflowed = True
+        self._consumer.cancel()
+        await asyncio.gather(self._consumer, return_exceptions=True)
+
+    async def _consume(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                value = self._observer(event)
+                if inspect.isawaitable(value):
+                    await value
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Observers are best effort and their exceptions are neither
+                # logged with raw chunks nor allowed to affect the process.
+                self._failed = True
+            finally:
+                self._queue.task_done()
+
+
 class ProcessHandle:
     """Streaming handle for a long-lived clangd or DAP-adapter process.
 
@@ -514,6 +591,7 @@ class ProcessRuntime:
         cwd: str = ".",
         timeout_seconds: float | None = None,
         input_data: bytes | None = None,
+        observer: ProcessOutputObserver | None = None,
     ) -> ProcessResult:
         """Run only an exact selected CMake/CTest command with the VS environment.
 
@@ -535,6 +613,7 @@ class ProcessRuntime:
             cwd=cwd,
             timeout_seconds=timeout_seconds,
             input_data=input_data,
+            observer=observer,
             _environment_base=self._toolchain_environment,
         )
 
@@ -584,6 +663,7 @@ class ProcessRuntime:
         approved_path_directories: Sequence[Path] = (),
         require_exact_executable: bool = False,
         _environment_base: Mapping[str, str] | None = None,
+        observer: ProcessOutputObserver | None = None,
     ) -> ProcessResult:
         """Run one bounded short command and return its completed result.
 
@@ -608,8 +688,9 @@ class ProcessRuntime:
         started_at = datetime.now(UTC)
         stdout_capture = _BoundedTextCapture(self._policy.max_output_characters)
         stderr_capture = _BoundedTextCapture(self._policy.max_output_characters)
-        stdout_task = asyncio.create_task(self._capture_stream(handle.stdout, stdout_capture))
-        stderr_task = asyncio.create_task(self._capture_stream(handle.stderr, stderr_capture))
+        dispatcher = _BoundedObserverDispatcher(observer) if observer is not None else None
+        stdout_task = asyncio.create_task(self._capture_stream(handle.stdout, stdout_capture, "stdout", dispatcher))
+        stderr_task = asyncio.create_task(self._capture_stream(handle.stderr, stderr_capture, "stderr", dispatcher))
         capture_tasks = (stdout_task, stderr_task)
         timed_out = False
         exit_code: int | None = None
@@ -638,6 +719,8 @@ class ProcessRuntime:
         finally:
             self._short_handles.discard(handle)
             self._forget(handle)
+            if dispatcher is not None:
+                await asyncio.shield(dispatcher.aclose())
 
         finished_at = datetime.now(UTC)
         result = ProcessResult(
@@ -647,6 +730,8 @@ class ProcessRuntime:
             finished_at=finished_at,
             stdout=stdout_capture.to_model(),
             stderr=stderr_capture.to_model(),
+            observer_overflow=False if dispatcher is None else dispatcher.overflowed,
+            observer_failed=False if dispatcher is None else dispatcher.failed,
         )
         self._logger.info(
             "process_finished",
@@ -1103,10 +1188,18 @@ class ProcessRuntime:
             raise ProcessPolicyError("Process timeout exceeds the configured maximum.")
         return float(timeout_seconds)
 
-    async def _capture_stream(self, stream: "StreamReader", capture: _BoundedTextCapture) -> None:
+    async def _capture_stream(
+        self,
+        stream: "StreamReader",
+        capture: _BoundedTextCapture,
+        stream_name: str,
+        observer: _BoundedObserverDispatcher | None = None,
+    ) -> None:
         try:
             while data := await stream.read(65_536):
                 capture.feed(data)
+                if observer is not None:
+                    observer.offer(stream_name, data)
         finally:
             capture.finish()
 

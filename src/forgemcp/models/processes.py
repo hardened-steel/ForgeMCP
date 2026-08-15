@@ -49,6 +49,19 @@ class ProcessResult(ForgeModel):
     finished_at: datetime = Field(description="UTC instant at which process execution ended.")
     stdout: ProcessOutput = Field(description="Captured standard-output stream.")
     stderr: ProcessOutput = Field(description="Captured standard-error stream.")
+    duration_milliseconds: int = Field(
+        default=0,
+        ge=0,
+        description="Safe elapsed wall-clock duration, derived from the UTC completion timestamps.",
+    )
+    observer_overflow: bool = Field(
+        default=False,
+        description="Whether bounded local output observation dropped/coalesced events.",
+    )
+    observer_failed: bool = Field(
+        default=False,
+        description="Whether a local output observer failed without affecting process execution.",
+    )
 
     @field_validator("started_at", "finished_at")
     @classmethod
@@ -65,4 +78,9 @@ class ProcessResult(ForgeModel):
             raise ValueError("Timed-out processes must not expose an exit code.")
         if not self.timed_out and self.exit_code is None:
             raise ValueError("Completed processes must expose an exit code.")
+        object.__setattr__(
+            self,
+            "duration_milliseconds",
+            max(0, int((self.finished_at - self.started_at).total_seconds() * 1000)),
+        )
         return self

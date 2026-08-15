@@ -12,7 +12,15 @@ from pydantic import Field, ValidationError
 
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    NoOpProgressReporter,
+    PluginContext,
+    PluginMetadata,
+    ProgressUpdate,
+    ToolContribution,
+    ToolExecutionContext,
+)
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
@@ -57,7 +65,7 @@ class _SanitizerArguments(ForgeModel):
     output: str = Field(max_length=MAX_SANITIZER_INPUT_CHARACTERS, description="Bounded supplied sanitizer output parsed read-only; it is never executed or logged.")
 
 
-ToolOperation = Callable[["QualityPlugin", ForgeModel], Awaitable[ForgeModel]]
+ToolOperation = Callable[..., Awaitable[ForgeModel]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,21 +240,27 @@ class QualityPlugin(ForgePlugin):
                 description=description,
                 input_model=model,
                 namespace=namespace,
-                handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op),
+                handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context),
             ))
 
-    async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: ToolOperation) -> dict[str, object]:
+    async def _dispatch(
+        self,
+        model: type[ForgeModel],
+        arguments: Mapping[str, object],
+        operation: ToolOperation,
+        execution_context: ToolExecutionContext | None = None,
+    ) -> dict[str, object]:
         try:
             request = model.model_validate(arguments)
         except ValidationError:
             return to_mcp_error_response(QualityRequestError("Tool arguments do not match the published Quality schema.")).as_dict()
         try:
-            result = await operation(self, request)
+            result = await operation(self, request, execution_context or ToolExecutionContext(NoOpProgressReporter()))
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
         return result.model_dump(mode="json")
 
-    async def _status(self, _: ForgeModel) -> QualityStatus:
+    async def _status(self, _: ForgeModel, __: ToolExecutionContext) -> QualityStatus:
         self._active_operations += 1
         try:
             format_info = await self.clang_format.status()
@@ -268,7 +282,7 @@ class QualityPlugin(ForgePlugin):
             ),
         )
 
-    async def _check(self, request: ForgeModel) -> ForgeModel:
+    async def _check(self, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _FormatCheckArguments)
         started = monotonic()
         self._active_operations += 1
@@ -288,7 +302,7 @@ class QualityPlugin(ForgePlugin):
         )
         return result
 
-    async def _apply(self, request: ForgeModel) -> ForgeModel:
+    async def _apply(self, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _FormatApplyArguments)
         started = monotonic()
         self._active_operations += 1
@@ -307,7 +321,7 @@ class QualityPlugin(ForgePlugin):
         )
         return result
 
-    async def _list_checks(self, request: ForgeModel) -> ForgeModel:
+    async def _list_checks(self, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _TidyChecksArguments)
         started = monotonic()
         self._active_operations += 1
@@ -325,11 +339,16 @@ class QualityPlugin(ForgePlugin):
         self._last_tidy = self._operation_cache("tidy", outcome, len(result.checks), started)
         return result
 
-    async def _run_tidy(self, request: ForgeModel) -> ForgeModel:
+    async def _run_tidy(self, request: ForgeModel, execution_context: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _TidyRunArguments)
         started = monotonic()
         self._active_operations += 1
+        heartbeat: asyncio.Task[None] | None = None
         try:
+            await execution_context.report_progress(ProgressUpdate(0, None, "Preparing clang-tidy analysis"))
+            if execution_context.supports_progress:
+                heartbeat = asyncio.create_task(self._progress_heartbeat(execution_context, started))
+            await execution_context.report_progress(ProgressUpdate(1, None, "clang-tidy analysis started"))
             result = await self.clang_tidy.run(
                 paths=request.paths,
                 compile_commands_dir=request.compile_commands_dir,
@@ -338,14 +357,21 @@ class QualityPlugin(ForgePlugin):
             )
         except asyncio.CancelledError:
             self._last_tidy = self._operation_cache("tidy", "cancelled", len(request.paths), started)
+            await execution_context.report_progress(ProgressUpdate(1, None, "clang-tidy analysis cancelled", terminal=True))
             raise
         except Exception:
             self._last_tidy = self._operation_cache("tidy", "failure", len(request.paths), started)
+            await execution_context.report_progress(ProgressUpdate(1, None, "clang-tidy analysis failed", terminal=True))
             raise
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             self._active_operations -= 1
         outcome = "success" if result.execution_state.value == "completed" else "failure"
         self._last_tidy = self._operation_cache("tidy", outcome, len(result.diagnostics), started)
+        message = "clang-tidy analysis completed" if outcome == "success" else "clang-tidy analysis failed"
+        await execution_context.report_progress(ProgressUpdate(2, None, message, terminal=True))
         return result
 
     @staticmethod
@@ -363,6 +389,14 @@ class QualityPlugin(ForgePlugin):
             observed_at=datetime.now(UTC),
         )
 
-    async def _parse_report(self, request: ForgeModel) -> ForgeModel:
+    async def _parse_report(self, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _SanitizerArguments)
         return self.sanitizer.parse(request.output)
+
+    @staticmethod
+    async def _progress_heartbeat(context: ToolExecutionContext, started: float) -> None:
+        while True:
+            await asyncio.sleep(2.0)
+            await context.report_progress(
+                ProgressUpdate(1, None, f"clang-tidy analysis running ({max(1, int(monotonic() - started))}s)")
+            )

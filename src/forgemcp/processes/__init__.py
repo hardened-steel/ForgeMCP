@@ -11,6 +11,11 @@ from forgemcp.processes.errors import (
     ProcessWorkingDirectoryError,
 )
 from forgemcp.processes.policy import ProcessPolicy
+from forgemcp.processes.observer import (
+    MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS,
+    ProcessOutputEvent,
+    ProcessOutputObserver,
+)
 from forgemcp.processes.runtime import (
     ProcessEnvironmentMode,
     ProcessHandle,
@@ -31,6 +36,9 @@ __all__ = [
     "ProcessExecutableError",
     "ProcessHandle",
     "ProcessOwnershipError",
+    "MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS",
+    "ProcessOutputEvent",
+    "ProcessOutputObserver",
     "ProcessPolicy",
     "ProcessPolicyError",
     "ProcessRuntime",

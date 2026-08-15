@@ -230,6 +230,11 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
         with errors_path.open("w", encoding="utf-8") as server_errors:
             async with stdio_client(parameters, errlog=server_errors) as streams:
                 async with ClientSession(*streams) as session:
+                    progress: list[tuple[float, float | None, str | None]] = []
+
+                    async def observe(value: float, total: float | None, message: str | None) -> None:
+                        progress.append((value, total, message))
+
                     initialized = await session.initialize()
                     assert initialized.serverInfo.name == "ForgeMCP"
                     tools = {tool.name for tool in (await session.list_tools()).tools}
@@ -242,11 +247,11 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
                     cmake_status = _json_tool_content(await session.call_tool("cmake__status", {}))
                     assert cmake_status["available"] is True
                     configured = _json_tool_content(await session.call_tool(
-                        "cmake__configure", {"binary_dir": "build"}
+                        "cmake__configure", {"binary_dir": "build"}, progress_callback=observe
                     ))
                     assert configured["process"]["exit_code"] == 0
                     built = _json_tool_content(await session.call_tool(
-                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}
+                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}, progress_callback=observe
                     ))
                     assert built["process"]["exit_code"] == 0
                     tests = _json_tool_content(await session.call_tool(
@@ -254,9 +259,17 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
                     ))
                     assert [item["name"] for item in tests["tests"]] == ["app_runs"]
                     executed = _json_tool_content(await session.call_tool(
-                        "cmake__ctest_run", {"binary_dir": "build"}
+                        "cmake__ctest_run", {"binary_dir": "build"}, progress_callback=observe
                     ))
                     assert executed["process"]["exit_code"] == 0
+                    assert len(progress) >= 3
+                    assert any(message == "Configure completed" for _, _, message in progress)
+                    assert any(message == "Build completed" for _, _, message in progress)
+                    assert any(message == "Test run completed" for _, _, message in progress)
+                    final_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    runtime = next(item for item in final_status["components"] if item["id"] == "process_runtime")
+                    facts = {item["name"]: item["value"] for item in runtime["facts"]}
+                    assert facts["active_processes"] == 0
         return errors_path.read_text(encoding="utf-8")
 
     errors = asyncio.run(exercise())
@@ -343,6 +356,39 @@ def test_stdio_mcp_concurrent_project_status_calls_are_single_flight(tmp_path: P
                     )
                     facts = {item["name"]: item["value"] for item in component["facts"]}
                     assert facts["snapshot_calls"] == 1
+
+    asyncio.run(exercise())
+
+
+def test_stdio_mcp_progress_token_is_request_scoped_and_optional(tmp_path: Path):
+    """The real SDK callback receives monotonic terminal progress only with a token."""
+
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "progress_stdio_server.py"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env={**os.environ, "FORGEMCP_WORKSPACE": str(tmp_path)},
+        )
+        updates: list[tuple[float, float | None, str | None]] = []
+
+        async def observe(progress: float, total: float | None, message: str | None) -> None:
+            updates.append((progress, total, message))
+
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                with_token = await session.call_tool(
+                    "progress_fixture__slow", {}, progress_callback=observe
+                )
+                assert _json_tool_content(with_token) == {"completed": True}
+                assert len(updates) >= 2
+                assert [item[0] for item in updates] == sorted(item[0] for item in updates)
+                assert updates[-1] == (3.0, 3.0, "Fixture completed")
+
+                without_token = await session.call_tool("progress_fixture__slow", {})
+                assert _json_tool_content(without_token) == {"completed": True}
+                assert len(updates) >= 2
 
     asyncio.run(exercise())
 

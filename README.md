@@ -198,8 +198,31 @@ explicitly. ForgeMCP does not claim that a Visual Studio generator produces
 operation timeout may override its configured default, but it remains bounded
 by Process Runtime policy. Codex `tool_timeout_sec` is an independent client
 deadline and must be high enough for the operation; an MCP server cannot extend
-it. MCP progress is not part of Phase A and, when added in a later phase, will
-not itself extend a client timeout.
+it. Progress notifications never extend, replace, or reset either deadline.
+For configure/build/test work, use `tool_timeout_sec = 1800` in the Codex
+server entry unless a project has a deliberately smaller operating limit.
+
+### MCP progress (UX Stabilization Phase B)
+
+When the MCP client attaches a progress token, ForgeMCP reports request-scoped
+progress for `cmake__configure`, `cmake__build`, `cmake__ctest_run`,
+`clang_tidy__run`, `clangd__start`, `clangd__stop`, `debugger__launch`, and
+`debugger__stop`. Clients without a token, or clients whose progress transport
+is unavailable, receive the same result/error and the operation continues.
+
+Configure/build/test publish fixed safe phases and a bounded elapsed heartbeat
+while the tool is quiet. Ninja's strict `[completed/total]` form and strict
+CTest completion lines provide exact progress only when they are unambiguous;
+MSBuild and unknown generators deliberately remain heartbeat-only. Progress
+labels are short normalized status text. They never contain command argv,
+absolute paths, environment values, raw process output, source text, or
+secrets. Target/test labels are shown only after validation and length checks.
+
+Delivery is rate-limited and synchronous per request (there are no unbounded
+notification tasks). Each request has an independent reporter; slow/failing
+progress delivery is disabled for that call rather than blocking a child
+process. A successful long operation sends a terminal update; failure,
+timeout, and cancellation send a terminal category without claiming 100%.
 
 ### Windows and Codex examples
 

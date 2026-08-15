@@ -20,6 +20,8 @@ Every configure request requires an explicit safe `binary_dir`; source and binar
 
 Build and CTest non-zero exit codes are ordinary structured `ProcessResult` values. CTest list operations use `--show-only=json-v1`; selected test names are escaped internally into one exact-match regex, so the API does not expose regex semantics. Process Runtime remains the sole owner of executable allow-listing, timeout, output-size limits, environment policy, process-tree cleanup, and safe logging.
 
+Configure/build/test may consume a request-scoped transport-neutral execution context. They publish fixed safe preparation/start/finishing categories and a two-second elapsed heartbeat. Only strict Ninja `[completed/total]` and strict CTest completion forms become exact values; MSBuild and unknown/malformed output never become inferred percentages. Parsers retain no raw output and never copy CMake lines to progress. Validated, bounded target/test names may be used only as display labels. A normal result includes safe ProcessResult duration/status metadata; progress cannot change the configured operation timeout or any MCP client deadline.
+
 ## Consequences
 
 Clients receive generator-independent structured target information and safe, bounded process results. Built-in lifecycle and tool registration are testable without an MCP SDK or installed CMake, using fake Process Runtime responses and File API fixtures. Projects can use conventional `build`, `build-*`, and `cmake-build-*` directories without weakening source-file policy.

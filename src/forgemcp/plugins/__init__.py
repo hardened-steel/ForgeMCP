@@ -25,15 +25,27 @@ from forgemcp.plugins.errors import (
 )
 from forgemcp.plugins.manager import PluginManager, PluginState, PluginStatus
 from forgemcp.plugins.tools import (
+    ContextAwareToolHandler,
+    LegacyToolHandler,
     PluginToolRegistry,
     RegisteredToolContribution,
     ToolHandler,
     ToolContribution,
     ToolRegistry,
+    handler_accepts_execution_context,
+    invoke_tool_handler,
+)
+from forgemcp.plugins.execution import (
+    MAX_PROGRESS_MESSAGE_CHARACTERS,
+    NoOpProgressReporter,
+    ProgressReporter,
+    ProgressUpdate,
+    ToolExecutionContext,
 )
 
 __all__ = [
     "PLUGIN_API_VERSION",
+    "ContextAwareToolHandler",
     "DuplicateCapabilityError",
     "DuplicatePluginIdError",
     "DuplicateToolNameError",
@@ -55,9 +67,17 @@ __all__ = [
     "PluginState",
     "PluginStatus",
     "PluginToolRegistry",
+    "LegacyToolHandler",
+    "MAX_PROGRESS_MESSAGE_CHARACTERS",
+    "NoOpProgressReporter",
+    "ProgressReporter",
+    "ProgressUpdate",
     "RegisteredToolContribution",
     "ToolContribution",
+    "ToolExecutionContext",
     "ToolHandler",
     "ToolNamespaceError",
     "ToolRegistry",
+    "handler_accepts_execution_context",
+    "invoke_tool_handler",
 ]

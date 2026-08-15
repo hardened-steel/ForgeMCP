@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
 from pydantic import Field, ValidationError
@@ -12,7 +13,15 @@ from forgemcp.debugger.errors import DebuggerRequestError
 from forgemcp.debugger.models import DebugBreakpointSpec, DebugLaunchRequest
 from forgemcp.debugger.service import DebuggerService
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    NoOpProgressReporter,
+    PluginContext,
+    PluginMetadata,
+    ProgressUpdate,
+    ToolContribution,
+    ToolExecutionContext,
+)
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
@@ -75,7 +84,39 @@ class _EvaluateArguments(_FrameArguments):
     expression: str = Field(min_length=1, max_length=1024, description="Single ASCII identifier lookup in the selected frame; native evaluation can still have side effects.")
 
 
-ToolOperation = Callable[[DebuggerService, ForgeModel], Awaitable[object]]
+ToolOperation = Callable[..., Awaitable[object]]
+
+
+async def _run_lifecycle_progress(
+    context: ToolExecutionContext, label: str, operation: Awaitable[object]
+) -> object:
+    """Report bounded phase/elapsed state while a debugger lifecycle changes."""
+    await context.report_progress(ProgressUpdate(0, None, label))
+    heartbeat: asyncio.Task[None] | None = None
+    if context.supports_progress:
+        async def pulse() -> None:
+            started = asyncio.get_running_loop().time()
+            while True:
+                await asyncio.sleep(2.0)
+                await context.report_progress(
+                    ProgressUpdate(0, None, f"{label} ({max(1, int(asyncio.get_running_loop().time() - started))}s)")
+                )
+        heartbeat = asyncio.create_task(pulse())
+    try:
+        result = await operation
+    except asyncio.CancelledError:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} cancelled", terminal=True))
+        raise
+    except Exception:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} failed", terminal=True))
+        raise
+    else:
+        await context.report_progress(ProgressUpdate(1, None, f"{label} completed", terminal=True))
+        return result
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 class _DebuggerStatusProvider:
@@ -197,15 +238,25 @@ class DebuggerPlugin(ForgePlugin):
             ("events", "Read a bounded cursor page of normalized debugger events.", _EventsArguments, self._events),
         )
         for name, description, model, operation in contributions:
-            context.tools.register(ToolContribution(name=name, description=description, input_model=model, handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op)))
+            context.tools.register(ToolContribution(name=name, description=description, input_model=model, handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context)))
 
-    async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: ToolOperation) -> dict[str, object]:
+    async def _dispatch(
+        self,
+        model: type[ForgeModel],
+        arguments: Mapping[str, object],
+        operation: ToolOperation,
+        execution_context: ToolExecutionContext | None = None,
+    ) -> dict[str, object]:
         try:
             request = model.model_validate(arguments)
         except ValidationError:
             return to_mcp_error_response(DebuggerRequestError("Tool arguments do not match the published debugger schema.")).as_dict()
         try:
-            result = await operation(self.service, request)
+            context = execution_context or ToolExecutionContext(NoOpProgressReporter())
+            if operation.__name__ in {"_launch", "_stop"}:
+                result = await operation(self.service, request, context)
+            else:
+                result = await operation(self.service, request)
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
         if isinstance(result, ForgeModel):
@@ -225,20 +276,22 @@ class DebuggerPlugin(ForgePlugin):
         return {"adapters": [item.model_dump(mode="json") for item in await service.list_adapters()]}
 
     @staticmethod
-    async def _launch(service: DebuggerService, request: ForgeModel) -> object:
+    async def _launch(
+        service: DebuggerService, request: ForgeModel, context: ToolExecutionContext
+    ) -> object:
         assert isinstance(request, _LaunchArguments)
-        return await service.launch(DebugLaunchRequest(
+        return await _run_lifecycle_progress(context, "Launching debugger", service.launch(DebugLaunchRequest(
             program=request.program,
             cwd=request.cwd,
             args=tuple(request.args),
             environment=request.environment,
             stop_on_entry=request.stop_on_entry,
             initial_breakpoints={path: tuple(DebugBreakpointSpec(line=item.line, column=item.column) for item in items) for path, items in request.initial_breakpoints.items()},
-        ))
+        )))
 
     @staticmethod
-    async def _stop(service: DebuggerService, _: ForgeModel) -> object:
-        return await service.stop()
+    async def _stop(service: DebuggerService, _: ForgeModel, context: ToolExecutionContext) -> object:
+        return await _run_lifecycle_progress(context, "Stopping debugger", service.stop())
 
     @staticmethod
     async def _set_breakpoints(service: DebuggerService, request: ForgeModel) -> object:

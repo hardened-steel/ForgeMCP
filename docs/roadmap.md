@@ -70,6 +70,10 @@ irreversible choices belong in [adr/](adr/).
   compatible argparse CLI (`doctor`/`print-config`), optional safe CMake build
   directory defaults, centralized cached toolchain discovery, Windows VS/Build
   Tools discovery and filtered Developer-environment capture. See ADR 0012.
+- UX Stabilization Phase B: transport-neutral request execution/progress
+  contract, FastMCP token adapter, bounded ProcessRuntime observer, CMake/
+  CTest phase-heartbeat UX with strict Ninja/CTest exact parsing, and lifecycle
+  phase progress for clang-tidy, clangd, and debugger. See ADR 0013.
 
 ### In progress
 

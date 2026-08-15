@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -10,11 +11,51 @@ from typing import Any
 from pydantic import BaseModel
 
 from forgemcp.plugins.errors import DuplicateToolNameError, ToolNamespaceError
+from forgemcp.plugins.execution import ToolExecutionContext
 
 _TOOL_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 _PLUGIN_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_-]*$")
 
-ToolHandler = Callable[[Mapping[str, object]], object | Awaitable[object]]
+LegacyToolHandler = Callable[[Mapping[str, object]], object | Awaitable[object]]
+"""Mapping-only handler retained for external plugin compatibility."""
+
+ContextAwareToolHandler = Callable[[Mapping[str, object], ToolExecutionContext], object | Awaitable[object]]
+"""Handler shape for tools that opt into the request-scoped execution context."""
+
+ToolHandler = LegacyToolHandler | ContextAwareToolHandler
+
+
+def handler_accepts_execution_context(handler: ToolHandler) -> bool:
+    """Return whether a handler explicitly opts into the v1 context keyword.
+
+    Only the named keyword is considered an opt-in.  This avoids accidentally
+    binding context into a legacy handler's optional positional/default values.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get("execution_context") or parameters.get("context")
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def invoke_tool_handler(
+    handler: ToolHandler,
+    arguments: Mapping[str, object],
+    execution_context: ToolExecutionContext,
+) -> object | Awaitable[object]:
+    """Invoke old or context-aware contribution handlers without SDK leakage."""
+    if handler_accepts_execution_context(handler):
+        try:
+            parameters = inspect.signature(handler).parameters
+        except (TypeError, ValueError):  # pragma: no cover - guarded above
+            return handler(arguments)
+        name = "execution_context" if "execution_context" in parameters else "context"
+        return handler(arguments, **{name: execution_context})  # type: ignore[call-arg]
+    return handler(arguments)
 
 
 @dataclass(frozen=True, slots=True)

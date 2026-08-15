@@ -10,7 +10,14 @@ from forgemcp.cmake.errors import CMakeRequestError
 from forgemcp.cmake.service import CMakeService
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    NoOpProgressReporter,
+    PluginContext,
+    PluginMetadata,
+    ToolContribution,
+    ToolExecutionContext,
+)
 from forgemcp.project import (
     ComponentState,
     ComponentStatus,
@@ -65,7 +72,7 @@ class _RunTestsArguments(ForgeModel):
     )
 
 
-ToolOperation = Callable[[CMakeService, ForgeModel], Awaitable[ForgeModel]]
+ToolOperation = Callable[..., Awaitable[ForgeModel]]
 
 
 class _CMakeStatusProvider:
@@ -175,7 +182,7 @@ class CMakePlugin(ForgePlugin):
                 name="status",
                 description="Discover CMake and CTest and report supported parsed versions.",
                 input_model=_StatusArguments,
-                handler=lambda arguments: self._dispatch(_StatusArguments, arguments, self._status),
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_StatusArguments, arguments, self._status, execution_context),
             )
         )
         context.tools.register(
@@ -183,8 +190,8 @@ class CMakePlugin(ForgePlugin):
                 name="list_presets",
                 description="List safe configure, build, and test preset summaries without secrets.",
                 input_model=_ListPresetsArguments,
-                handler=lambda arguments: self._dispatch(
-                    _ListPresetsArguments, arguments, self._list_presets
+                handler=lambda arguments, *, execution_context=None: self._dispatch(
+                    _ListPresetsArguments, arguments, self._list_presets, execution_context
                 ),
             )
         )
@@ -193,7 +200,7 @@ class CMakePlugin(ForgePlugin):
                 name="configure",
                 description="Configure a workspace-contained generated CMake build directory.",
                 input_model=_ConfigureArguments,
-                handler=lambda arguments: self._dispatch(_ConfigureArguments, arguments, self._configure),
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_ConfigureArguments, arguments, self._configure, execution_context),
             )
         )
         context.tools.register(
@@ -201,8 +208,8 @@ class CMakePlugin(ForgePlugin):
                 name="list_targets",
                 description="Read CMake File API codemodel-v2 targets from a generated build directory.",
                 input_model=_ListTargetsArguments,
-                handler=lambda arguments: self._dispatch(
-                    _ListTargetsArguments, arguments, self._list_targets
+                handler=lambda arguments, *, execution_context=None: self._dispatch(
+                    _ListTargetsArguments, arguments, self._list_targets, execution_context
                 ),
             )
         )
@@ -211,7 +218,7 @@ class CMakePlugin(ForgePlugin):
                 name="build",
                 description="Build a CMake project or exact target names in a safe build directory.",
                 input_model=_BuildArguments,
-                handler=lambda arguments: self._dispatch(_BuildArguments, arguments, self._build),
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_BuildArguments, arguments, self._build, execution_context),
             )
         )
         context.tools.register(
@@ -219,8 +226,8 @@ class CMakePlugin(ForgePlugin):
                 name="ctest_list_tests",
                 description="List CTest tests through the documented json-v1 protocol.",
                 input_model=_ListTestsArguments,
-                handler=lambda arguments: self._dispatch(
-                    _ListTestsArguments, arguments, self._list_tests
+                handler=lambda arguments, *, execution_context=None: self._dispatch(
+                    _ListTestsArguments, arguments, self._list_tests, execution_context
                 ),
             )
         )
@@ -229,7 +236,7 @@ class CMakePlugin(ForgePlugin):
                 name="ctest_run",
                 description="Run all CTest tests or an exact-name subset with Process Runtime limits.",
                 input_model=_RunTestsArguments,
-                handler=lambda arguments: self._dispatch(_RunTestsArguments, arguments, self._run_tests),
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_RunTestsArguments, arguments, self._run_tests, execution_context),
             )
         )
 
@@ -245,6 +252,7 @@ class CMakePlugin(ForgePlugin):
         model_type: type[ForgeModel],
         arguments: Mapping[str, object],
         operation: ToolOperation,
+        execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         try:
             request = model_type.model_validate(arguments)
@@ -253,56 +261,59 @@ class CMakePlugin(ForgePlugin):
                 CMakeRequestError("Tool arguments do not match the published CMake schema.")
             ).as_dict()
         try:
-            result = await operation(self.service, request)
+            result = await operation(self.service, request, execution_context or ToolExecutionContext(NoOpProgressReporter()))
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
         return result.model_dump(mode="json")
 
     @staticmethod
-    async def _status(service: CMakeService, _: ForgeModel) -> ForgeModel:
+    async def _status(service: CMakeService, _: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         return await service.status()
 
     @staticmethod
-    async def _list_presets(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _list_presets(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _ListPresetsArguments)
         return await service.list_presets(source_dir=request.source_dir)
 
     @staticmethod
-    async def _configure(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _configure(service: CMakeService, request: ForgeModel, execution_context: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _ConfigureArguments)
         return await service.configure(
             source_dir=request.source_dir,
             binary_dir=request.binary_dir,
             preset=request.preset,
             cache_variables=request.cache_variables,
+            execution_context=execution_context,
         )
 
     @staticmethod
-    async def _list_targets(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _list_targets(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _ListTargetsArguments)
         return service.list_targets(binary_dir=request.binary_dir)
 
     @staticmethod
-    async def _build(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _build(service: CMakeService, request: ForgeModel, execution_context: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _BuildArguments)
         return await service.build(
             binary_dir=request.binary_dir,
             targets=request.targets,
             configuration=request.configuration,
             parallel_jobs=request.parallel_jobs,
+            execution_context=execution_context,
         )
 
     @staticmethod
-    async def _list_tests(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _list_tests(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _ListTestsArguments)
         return await service.list_tests(binary_dir=request.binary_dir)
 
     @staticmethod
-    async def _run_tests(service: CMakeService, request: ForgeModel) -> ForgeModel:
+    async def _run_tests(service: CMakeService, request: ForgeModel, execution_context: ToolExecutionContext) -> ForgeModel:
         assert isinstance(request, _RunTestsArguments)
         return await service.run_tests(
             binary_dir=request.binary_dir,
             test_names=request.test_names,
             configuration=request.configuration,
             timeout_seconds=request.timeout_seconds,
+            execution_context=execution_context,
         )

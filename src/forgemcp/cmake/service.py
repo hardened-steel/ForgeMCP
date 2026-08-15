@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -39,6 +40,9 @@ from forgemcp.cmake.models import (
 from forgemcp.core.config import ConfigurationSource, ForgeConfig
 from forgemcp.models import ProcessResult
 from forgemcp.processes import ProcessError
+from forgemcp.processes import ProcessOutputObserver
+from forgemcp.plugins import NoOpProgressReporter, ProgressUpdate, ToolExecutionContext
+from forgemcp.cmake.progress import CMakeOutputProgressObserver, run_heartbeat, safe_progress_label
 from forgemcp.workspace import (
     GeneratedWorkspaceDirectory,
     WorkspaceError,
@@ -97,6 +101,7 @@ class ProcessRunner(Protocol):
         environment: Mapping[str, str] | None = None,
         inherit_environment: bool | None = None,
         timeout_seconds: float | None = None,
+        observer: ProcessOutputObserver | None = None,
     ) -> ProcessResult:
         """Run a bounded argv command and return its structured process result."""
 
@@ -191,13 +196,18 @@ class CMakeService:
         binary_dir: str | None = None,
         preset: str | None = None,
         cache_variables: Mapping[str, CacheValue] | None = None,
+        execution_context: ToolExecutionContext | None = None,
     ) -> CMakeConfigureResult:
         """Configure a safe generated build directory using a preset or direct mode."""
         started = monotonic()
+        context = self._execution_context(execution_context)
         self._active_operations += 1
         normalised_binary = "."
         try:
+            context.throw_if_cancelled()
+            await context.report_progress(ProgressUpdate(0, None, "Preparing configure"))
             profile = self._resolve_profile(binary_dir=binary_dir, source_dir=source_dir, preset=preset)
+            await context.report_progress(ProgressUpdate(1, None, "Resolving toolchain and preset"))
             source = self._workspace.require_directory(profile.source_dir)
             generated = self._workspace.open_generated_directory(profile.binary_dir, create=True)
             normalised_binary = generated.relative_path
@@ -217,7 +227,11 @@ class CMakeService:
                 ):
                     argv.extend(["-A", self._config.target_arch])
             argv.extend(self._cache_arguments(cache_variables))
-            result = await self._run_required("cmake", argv, timeout_seconds=self._default_timeout("configure"))
+            await context.report_progress(ProgressUpdate(2, None, "Configure started"))
+            result = await self._run_with_progress(
+                "cmake", argv, timeout_seconds=self._default_timeout("configure"),
+                context=context, operation="configure", phase=2,
+            )
             response = CMakeConfigureResult(
                 source_dir=source,
                 binary_dir=generated.relative_path,
@@ -226,9 +240,11 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_configure = self._operation_cache("configure", "cancelled", normalised_binary, started)
+            await context.report_progress(ProgressUpdate(2, None, "Configure cancelled", terminal=True))
             raise
         except Exception:
             self._last_configure = self._operation_cache("configure", "failure", normalised_binary, started)
+            await context.report_progress(ProgressUpdate(2, None, "Configure failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
@@ -244,6 +260,10 @@ class CMakeService:
                     binary_dir_source=profile.binary_dir_source,
                     configure_preset_source=profile.configure_preset_source,
                 )
+                await context.report_progress(ProgressUpdate(4, None, "Configure completed", terminal=True))
+            else:
+                message = "Configure timed out" if result.timed_out else "Configure failed"
+                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -262,19 +282,31 @@ class CMakeService:
         targets: Iterable[str] = (),
         configuration: str | None = None,
         parallel_jobs: int | None = None,
+        execution_context: ToolExecutionContext | None = None,
     ) -> CMakeBuildResult:
         """Build the default project or explicit target names without invoking a shell."""
         started = monotonic()
+        context = self._execution_context(execution_context)
         self._active_operations += 1
         normalised_binary = "."
         target_names: tuple[str, ...] = ()
         try:
+            context.throw_if_cancelled()
+            await context.report_progress(ProgressUpdate(0, None, "Preparing build"))
             profile = self._resolve_profile(binary_dir=binary_dir, source_dir=None, preset=None)
             generated = self._workspace.open_generated_directory(profile.binary_dir)
             normalised_binary = generated.relative_path
             target_names = self._validate_names(targets, label="target")
             selected_configuration = self._selected_configuration(configuration)
             jobs = self._validate_parallel_jobs(parallel_jobs)
+            if target_names:
+                display = self._safe_progress_target(target_names[0])
+                message = f"Selected {len(target_names)} target" if len(target_names) == 1 else f"Selected {len(target_names)} targets"
+                if display is not None and len(target_names) == 1:
+                    message = f"Selected target: {display}"
+                await context.report_progress(ProgressUpdate(1, None, message))
+            else:
+                await context.report_progress(ProgressUpdate(1, None, "Selected default build targets"))
             argv = [self._tool_executable("cmake"), "--build", generated.relative_path]
             if target_names:
                 argv.extend(["--target", *target_names])
@@ -282,7 +314,11 @@ class CMakeService:
                 argv.extend(["--config", selected_configuration])
             if jobs is not None:
                 argv.extend(["--parallel", str(jobs)])
-            result = await self._run_required("cmake", argv, timeout_seconds=self._default_timeout("build"))
+            await context.report_progress(ProgressUpdate(2, None, "Build started"))
+            result = await self._run_with_progress(
+                "cmake", argv, timeout_seconds=self._default_timeout("build"),
+                context=context, operation="build", phase=2,
+            )
             response = CMakeBuildResult(
                 binary_dir=generated.relative_path,
                 targets=target_names,
@@ -291,13 +327,20 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_build = self._operation_cache("build", "cancelled", normalised_binary, started, item_count=len(target_names))
+            await context.report_progress(ProgressUpdate(2, None, "Build cancelled", terminal=True))
             raise
         except Exception:
             self._last_build = self._operation_cache("build", "failure", normalised_binary, started, item_count=len(target_names))
+            await context.report_progress(ProgressUpdate(2, None, "Build failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
             self._last_build = self._operation_cache("build", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(target_names))
+            if outcome == "success":
+                await context.report_progress(ProgressUpdate(4, None, "Build completed", terminal=True))
+            else:
+                message = "Build timed out" if result.timed_out else "Build failed"
+                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -321,24 +364,32 @@ class CMakeService:
         test_names: Iterable[str] = (),
         configuration: str | None = None,
         timeout_seconds: float | None = None,
+        execution_context: ToolExecutionContext | None = None,
     ) -> CTestRunResult:
         """Run all tests or an exact-name subset, with ProcessRuntime limits in force."""
         started = monotonic()
+        context = self._execution_context(execution_context)
         self._active_operations += 1
         normalised_binary = "."
         names: tuple[str, ...] = ()
         try:
+            context.throw_if_cancelled()
+            await context.report_progress(ProgressUpdate(0, None, "Preparing test run"))
             profile = self._resolve_profile(binary_dir=binary_dir, source_dir=None, preset=None)
             generated = self._workspace.open_generated_directory(profile.binary_dir)
             normalised_binary = generated.relative_path
             names = self._validate_names(test_names, label="test name")
             selected_configuration = self._selected_configuration(configuration)
+            await context.report_progress(
+                ProgressUpdate(1, None, "Preparing selected tests" if names else "Preparing discovered tests")
+            )
             argv = [self._tool_executable("ctest"), "--test-dir", generated.relative_path, "--output-on-failure"]
             if selected_configuration is not None:
                 argv.extend(["--build-config", selected_configuration])
             if names:
                 argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
-            result = await self._run_required(
+            await context.report_progress(ProgressUpdate(2, None, "Test run started"))
+            result = await self._run_with_progress(
                 "ctest",
                 argv,
                 timeout_seconds=(
@@ -346,6 +397,9 @@ class CMakeService:
                     if timeout_seconds is None
                     else timeout_seconds
                 ),
+                context=context,
+                operation="test",
+                phase=2,
             )
             failed_tests = self._failed_tests(result)
             response = CTestRunResult(
@@ -357,13 +411,21 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_test = self._operation_cache("test", "cancelled", normalised_binary, started, item_count=len(names))
+            await context.report_progress(ProgressUpdate(2, None, "Test run cancelled", terminal=True))
             raise
         except Exception:
             self._last_test = self._operation_cache("test", "failure", normalised_binary, started, item_count=len(names))
+            await context.report_progress(ProgressUpdate(2, None, "Test run failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
             self._last_test = self._operation_cache("test", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(names) if names else len(failed_tests))
+            await context.report_progress(ProgressUpdate(3, None, "Finishing test run"))
+            if outcome == "success":
+                await context.report_progress(ProgressUpdate(4, None, "Test run completed", terminal=True))
+            else:
+                message = "Test run timed out" if result.timed_out else "Test run failed"
+                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -436,7 +498,12 @@ class CMakeService:
         )
 
     async def _run_required(
-        self, executable: str, argv: Sequence[str], *, timeout_seconds: float | None = None
+        self,
+        executable: str,
+        argv: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+        observer: ProcessOutputObserver | None = None,
     ) -> ProcessResult:
         """Run a fixed executable and make runtime absence a safe CMake domain error."""
         try:
@@ -445,11 +512,59 @@ class CMakeService:
                 if self._toolchain is not None and hasattr(self._process_runtime, "run_toolchain")
                 else self._process_runtime.run
             )
-            return await runner(argv, cwd=".", timeout_seconds=timeout_seconds)
+            arguments: dict[str, object] = {"cwd": ".", "timeout_seconds": timeout_seconds}
+            if observer is not None and self._runner_accepts_observer(runner):
+                arguments["observer"] = observer
+            return await runner(argv, **arguments)
         except ProcessError as error:
             raise CMakeToolUnavailableError(
                 f"{executable} is not available through the configured Process Runtime."
             ) from error
+
+    async def _run_with_progress(
+        self,
+        executable: str,
+        argv: Sequence[str],
+        *,
+        timeout_seconds: float | None,
+        context: ToolExecutionContext,
+        operation: str,
+        phase: float,
+    ) -> ProcessResult:
+        """Run a command with one bounded observer worker and one heartbeat task."""
+        observer = CMakeOutputProgressObserver(context, operation)
+        heartbeat: asyncio.Task[None] | None = None
+        if context.supports_progress:
+            heartbeat = asyncio.create_task(run_heartbeat(context, operation=operation, phase=phase))
+        try:
+            return await self._run_required(
+                executable, argv, timeout_seconds=timeout_seconds,
+                observer=observer if context.supports_progress else None,
+            )
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+    @staticmethod
+    def _runner_accepts_observer(runner: object) -> bool:
+        """Keep Phase-A fake/external runners source-compatible with the new option."""
+        try:
+            signature = inspect.signature(runner)
+        except (TypeError, ValueError):
+            return False
+        return "observer" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    @staticmethod
+    def _execution_context(value: ToolExecutionContext | None) -> ToolExecutionContext:
+        return value if value is not None else ToolExecutionContext(NoOpProgressReporter())
+
+    @staticmethod
+    def _safe_progress_target(value: str) -> str | None:
+        return safe_progress_label(value)
 
     def _tool_executable(self, tool: str) -> str:
         """Return Discovery's exact approved path without exposing it in models."""
@@ -683,8 +798,17 @@ class CMakeService:
     def _validate_optional_name(value: str | None, *, label: str) -> str | None:
         if value is None:
             return None
-        if not isinstance(value, str) or not value or "\x00" in value or value.startswith("-"):
-            raise CMakeRequestError(f"The {label} must be a non-empty NUL-free name that does not start with '-'.")
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or "\x00" in value
+            or value.startswith("-")
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise CMakeRequestError(
+                f"The {label} must be a bounded non-empty NUL-free name that does not start with '-'."
+            )
         return value
 
     def _validate_names(self, values: Iterable[str], *, label: str) -> tuple[str, ...]:
