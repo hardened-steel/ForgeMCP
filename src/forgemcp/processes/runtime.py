@@ -303,6 +303,7 @@ class _BoundedObserverDispatcher:
 
     _QUEUE_SIZE = 32
     _DRAIN_TIMEOUT_SECONDS = 0.1
+    _CLOSE_TIMEOUT_SECONDS = 0.1
 
     def __init__(self, observer: ProcessOutputObserver) -> None:
         self._observer = observer
@@ -310,6 +311,10 @@ class _BoundedObserverDispatcher:
         self._overflowed = False
         self._failed = False
         self._closed = False
+        self._decoders = {
+            "stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        }
         self._consumer = asyncio.create_task(self._consume())
 
     @property
@@ -321,24 +326,35 @@ class _BoundedObserverDispatcher:
         return self._failed
 
     def offer(self, stream: str, data: bytes) -> None:
-        """Enqueue at most one decoded bounded chunk; never await from a reader."""
+        """Enqueue decoded bounded chunks; never await from a pipe reader."""
         if self._closed:
             return
-        text = data.decode("utf-8", errors="replace")
-        truncated = len(text) > MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS
-        event = ProcessOutputEvent(
-            stream="stdout" if stream == "stdout" else "stderr",
-            text=text[:MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS],
-            observed_at=datetime.now(UTC),
-            truncated=truncated,
-        )
-        try:
-            self._queue.put_nowait(event)
-        except asyncio.QueueFull:
-            # Coalescing raw text would create another disclosure store.  A
-            # dropped event is explicit in the result and safe for progress to
-            # fall back to its heartbeat.
-            self._overflowed = True
+        stream_name = "stdout" if stream == "stdout" else "stderr"
+        self._offer_text(stream_name, self._decoders[stream_name].decode(data, final=False))
+
+    def finish_stream(self, stream: str) -> None:
+        """Flush one stream's incremental decoder after its pipe reaches EOF."""
+        if self._closed:
+            return
+        stream_name = "stdout" if stream == "stdout" else "stderr"
+        self._offer_text(stream_name, self._decoders[stream_name].decode(b"", final=True))
+
+    def _offer_text(self, stream: str, text: str) -> None:
+        """Split decoded text deterministically before it reaches the queue."""
+        for start in range(0, len(text), MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS):
+            event = ProcessOutputEvent(
+                stream=stream,
+                text=text[start:start + MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS],
+                observed_at=datetime.now(UTC),
+            )
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Coalescing raw text would create another disclosure store.
+                # The deterministic 4 KiB chunks are simply dropped and the
+                # consumer falls back to its independent heartbeat.
+                self._overflowed = True
+                return
 
     async def aclose(self) -> None:
         self._closed = True
@@ -349,8 +365,47 @@ class _BoundedObserverDispatcher:
             await asyncio.wait_for(self._queue.join(), timeout=self._DRAIN_TIMEOUT_SECONDS)
         except TimeoutError:
             self._overflowed = True
-        self._consumer.cancel()
-        await asyncio.gather(self._consumer, return_exceptions=True)
+        if not self._consumer.done():
+            self._consumer.cancel()
+        done, _ = await asyncio.wait({self._consumer}, timeout=self._CLOSE_TIMEOUT_SECONDS)
+        if self._consumer not in done:
+            # A local observer may illegally suppress cancellation.  It gets
+            # at most this one worker and this one bounded queue; do not let
+            # it extend a process result or application shutdown.
+            self._failed = True
+            self._consumer.add_done_callback(self._consume_task_exception)
+            return
+        self._consume_task_exception(self._consumer)
+        await self._finalize_observer()
+
+    async def _finalize_observer(self) -> None:
+        """Give a parser a bounded chance to flush an unterminated final line."""
+        close = getattr(self._observer, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            value = close()
+            if not inspect.isawaitable(value):
+                return
+            task = asyncio.create_task(value)
+            done, _ = await asyncio.wait({task}, timeout=self._CLOSE_TIMEOUT_SECONDS)
+            if task not in done:
+                self._failed = True
+                task.cancel()
+                task.add_done_callback(self._consume_task_exception)
+                return
+            self._consume_task_exception(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._failed = True
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task[object]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
 
     async def _consume(self) -> None:
         while True:
@@ -1202,6 +1257,8 @@ class ProcessRuntime:
                     observer.offer(stream_name, data)
         finally:
             capture.finish()
+            if observer is not None:
+                observer.finish_stream(stream_name)
 
     async def _finish_captures(
         self,

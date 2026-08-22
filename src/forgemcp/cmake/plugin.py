@@ -98,11 +98,14 @@ class _CMakeStatusProvider:
             if available is False
             else ComponentState.IDLE
         )
+        if cached.mutation_delivery_degraded and state is not ComponentState.ACTIVE:
+            state = ComponentState.DEGRADED
         facts: list[StatusFact] = [
             StatusFact(name="availability_observed", value=tool is not None),
             StatusFact(name="available", value=available if available is not None else False),
             StatusFact(name="configured", value=cached.configured_binary_dir is not None),
             StatusFact(name="configuration_stale", value=cached.configuration_stale),
+            StatusFact(name="mutation_delivery_degraded", value=cached.mutation_delivery_degraded),
             StatusFact(name="active_operations", value=cached.active_operations),
         ]
         warnings: list[str] = []
@@ -137,6 +140,8 @@ class _CMakeStatusProvider:
             warnings.append("tool_availability_not_observed")
         if cached.configuration_stale:
             warnings.append("configuration_stale")
+        if cached.mutation_delivery_degraded:
+            warnings.append("workspace_mutation_delivery_degraded")
         if cached.compilation_database is not None:
             if cached.compilation_database.availability in {"missing", "invalid", "unsupported"}:
                 warnings.append("compile_commands_unavailable")
@@ -148,6 +153,7 @@ class _CMakeStatusProvider:
             summary="Cached CMake lifecycle and operation metadata; no command was executed for this snapshot.",
             facts=tuple(facts),
             warnings=tuple(warnings),
+            stale=cached.configuration_stale,
             observed_at=utc_now(),
         )
 
@@ -191,9 +197,11 @@ class CMakePlugin(ForgePlugin):
             raise TypeError("The CMake plugin requires ToolchainDiscoveryService.")
         if not isinstance(compilation_database, CompilationDatabaseRegistry):
             raise TypeError("The CMake plugin requires CompilationDatabaseRegistry.")
-        self._service = CMakeService(workspace, process_runtime, context.config, toolchain, compilation_database)  # type: ignore[arg-type]
         if not isinstance(mutations, WorkspaceMutationBus):
             raise TypeError("The CMake plugin requires WorkspaceMutationBus.")
+        self._service = CMakeService(
+            workspace, process_runtime, context.config, toolchain, compilation_database, mutations
+        )  # type: ignore[arg-type]
         self._mutation_subscription = mutations.subscribe("cmake", self._on_workspace_mutation)
         self._status_registry = status_registry
         status_registry.register(_CMakeStatusProvider(self._service))
@@ -273,7 +281,9 @@ class CMakePlugin(ForgePlugin):
     def _on_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
         """Mark cached CMake state stale after a committed source transaction."""
         if self._service is not None:
-            self._service.mark_workspace_mutation(tuple(change.path for change in batch.changes))
+            self._service.mark_workspace_mutation(
+                tuple(change.path for change in batch.changes), generation=batch.generation
+            )
 
     async def _dispatch(
         self,

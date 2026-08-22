@@ -17,12 +17,11 @@ _MAX_PROGRESS_LABEL = 96
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SPACE = re.compile(r"\s+")
 _SENSITIVE = re.compile(r"\b(?:api[ _-]?key|authorization|password|secret|token)\b", re.IGNORECASE)
-_NINJA = re.compile(r"^\[(?P<completed>[1-9][0-9]*)/(?P<total>[1-9][0-9]*)\]\s+")
-_CTEST_START = re.compile(r"^Start\s+(?P<index>[1-9][0-9]*):\s*(?P<name>.+)$")
+_NINJA = re.compile(r"^\[(?P<completed>[1-9][0-9]*)/(?P<total>[1-9][0-9]*)\] ")
 _CTEST_COMPLETE = re.compile(
     r"^\s*(?P<completed>[1-9][0-9]*)/(?P<total>[1-9][0-9]*)\s+"
     r"Test\s+#(?P<index>[1-9][0-9]*):\s*(?P<name>.+?)\s+\.{3,}\s*"
-    r"(?:Passed|Failed|\*\*\*[^\r\n]*)$"
+    r"(?:(?:Passed|Failed)(?:\s+[0-9]+(?:\.[0-9]+)?\s+sec)?|\*\*\*[^\r\n]*)$"
 )
 
 
@@ -50,26 +49,61 @@ class CMakeOutputProgressObserver:
         self._context = context
         self._operation = operation
         self._buffers = {"stdout": "", "stderr": ""}
+        self._discarding_line = {"stdout": False, "stderr": False}
         self._last_ninja: tuple[int, int] | None = None
         self._last_ctest: tuple[int, int] | None = None
+        self._exact_disabled = False
 
     async def __call__(self, event: ProcessOutputEvent) -> None:
-        # Observation chunks deliberately retain no durable raw text.  A small
-        # incomplete-line tail is enough for known CMake/Ninja/CTest formats.
-        previous = self._buffers[event.stream]
-        combined = (previous + event.text)[-8_192:]
-        lines = combined.splitlines()
-        self._buffers[event.stream] = "" if combined.endswith(("\n", "\r")) else (lines.pop() if lines else combined)
-        for line in lines:
+        # Observation chunks deliberately retain no durable raw text.  Keep
+        # only one bounded incomplete line per independent stream, and never
+        # treat the suffix of an oversized line as a new strict parser line.
+        await self._consume_text(event.stream, event.text, truncated=event.truncated)
+
+    async def aclose(self) -> None:
+        """Flush an EOF-terminated final line after ProcessRuntime drains it."""
+        for stream in ("stdout", "stderr"):
+            line = self._buffers[stream]
+            self._buffers[stream] = ""
+            if line and not self._discarding_line[stream]:
+                await self._observe_line(line)
+            self._discarding_line[stream] = False
+
+    async def _consume_text(self, stream: str, text: str, *, truncated: bool) -> None:
+        if truncated:
+            self._buffers[stream] = ""
+            self._discarding_line[stream] = True
+        combined = self._buffers[stream] + text
+        self._buffers[stream] = ""
+        while combined:
+            match = re.search(r"[\r\n]", combined)
+            if match is None:
+                if self._discarding_line[stream]:
+                    return
+                if len(combined) > 8_192:
+                    self._discarding_line[stream] = True
+                    return
+                self._buffers[stream] = combined
+                return
+            line = combined[:match.start()]
+            next_index = match.end()
+            if combined[match.start()] == "\r" and next_index < len(combined) and combined[next_index] == "\n":
+                next_index += 1
+            combined = combined[next_index:]
+            if self._discarding_line[stream]:
+                self._discarding_line[stream] = False
+                continue
+            if len(line) > 8_192:
+                continue
             await self._observe_line(line)
 
     async def _observe_line(self, line: str) -> None:
         if self._operation == "configure":
             normalized = line.strip().casefold()
             if normalized.endswith("configuring done"):
-                await self._context.report_progress(ProgressUpdate(2, None, "Generating build files"))
+                await self._context.report_progress(ProgressUpdate(0, None, "Generating build files"))
             elif normalized.endswith("generating done"):
-                await self._context.report_progress(ProgressUpdate(2, None, "Finalizing build files"))
+                await self._context.report_progress(ProgressUpdate(0, None, "Finalizing build files"))
             return
         if self._operation == "build":
             match = _NINJA.match(line)
@@ -78,23 +112,14 @@ class CMakeOutputProgressObserver:
             completed, total = int(match["completed"]), int(match["total"])
             if total > _MAX_PROGRESS_ITEMS or completed > total:
                 return
-            pair = (completed, total)
-            if pair == self._last_ninja or (
-                self._last_ninja is not None
-                and total == self._last_ninja[1]
-                and completed < self._last_ninja[0]
-            ):
+            if not self._accept_exact("ninja", completed, total):
                 return
-            self._last_ninja = pair
-            await self._context.report_progress(ProgressUpdate(completed, total, "Building"))
+            # A build can print a final Ninja counter before CMake reports a
+            # later failure.  Defer 100% to the known-success terminal update.
+            if completed < total:
+                await self._context.report_progress(ProgressUpdate(completed, total, "Building"))
             return
         if self._operation != "test":
-            return
-        start = _CTEST_START.match(line)
-        if start is not None:
-            name = safe_progress_label(start["name"])
-            if name is not None:
-                await self._context.report_progress(ProgressUpdate(2, None, f"Running test: {name}"))
             return
         match = _CTEST_COMPLETE.match(line)
         if match is None:
@@ -102,24 +127,48 @@ class CMakeOutputProgressObserver:
         completed, total = int(match["completed"]), int(match["total"])
         if total > _MAX_PROGRESS_ITEMS or completed > total:
             return
-        pair = (completed, total)
-        if pair == self._last_ctest or (
-            self._last_ctest is not None
-            and total == self._last_ctest[1]
-            and completed < self._last_ctest[0]
-        ):
+        if not self._accept_exact("ctest", completed, total):
             return
-        self._last_ctest = pair
-        name = safe_progress_label(match["name"])
-        message = "Test completed" if name is None else f"Test completed: {name}"
-        await self._context.report_progress(ProgressUpdate(completed, total, message))
+        if completed == total:
+            return
+        # CTest's live output belongs to the project process, not to the
+        # already model-validated request.  Do not publish its test-name
+        # field, even when it superficially resembles a safe label.
+        await self._context.report_progress(ProgressUpdate(completed, total, "Test completed"))
+
+    def terminal_success_update(self, message: str) -> ProgressUpdate:
+        """Return one terminal success without fabricating completion on failure."""
+        exact = self._last_ninja if self._operation == "build" else self._last_ctest if self._operation == "test" else None
+        if exact is not None and not self._exact_disabled:
+            _, total = exact
+            return ProgressUpdate(total, total, message, terminal=True, completed=True)
+        return ProgressUpdate(0, None, message, terminal=True, completed=True)
+
+    def _accept_exact(self, kind: str, completed: int, total: int) -> bool:
+        if self._exact_disabled:
+            return False
+        previous = self._last_ninja if kind == "ninja" else self._last_ctest
+        if previous is not None:
+            previous_completed, previous_total = previous
+            # A counter reset or changed total is a distinct internal build
+            # phase, not a new MCP measurement.  Fall back to heartbeats.
+            if total != previous_total or completed < previous_completed:
+                self._exact_disabled = True
+                return False
+            if (completed, total) == previous:
+                return False
+        if kind == "ninja":
+            self._last_ninja = (completed, total)
+        else:
+            self._last_ctest = (completed, total)
+        return True
 
 
 async def run_heartbeat(
     context: ToolExecutionContext,
     *,
     operation: str,
-    phase: float,
+    phase: float = 0,
 ) -> None:
     """Emit bounded elapsed activity while a child produces no recognized output."""
     started = monotonic()

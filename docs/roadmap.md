@@ -73,12 +73,15 @@ irreversible choices belong in [adr/](adr/).
 - UX Stabilization Phase B: transport-neutral request execution/progress
   contract, FastMCP token adapter, bounded ProcessRuntime observer, CMake/
   CTest phase-heartbeat UX with strict Ninja/CTest exact parsing, and lifecycle
-  phase progress for clang-tidy, clangd, and debugger. See ADR 0013.
+  phase progress for clang-tidy, clangd, and debugger. The independent
+  security/concurrency/protocol audit and opt-in real Windows gate passed on
+  2026-08-22. See ADR 0013.
 - UX Stabilization Phase B.1: builtin Workspace MCP tools, bounded
   application-local post-commit mutation batches, CMake stale marking, source-
   aware compilation-database policy/validation, and clangd document/database
-  coherence. See ADR 0014. No external watcher, Git, resources, prompts, or
-  completion surface is included.
+  coherence. The workspace/CMake/clangd coherence audit and opt-in real
+  Windows gate passed on 2026-08-22. See ADR 0014. No external watcher, Git,
+  resources, prompts, or completion surface is included.
 
 ### In progress
 

@@ -14,6 +14,7 @@ import pytest
 
 from forgemcp.clangd import (
     ClangdEditConflictError,
+    ClangdRequestError,
     ClangdHandleExpiredError,
     ClangdNotStartedError,
     ClangdService,
@@ -31,7 +32,7 @@ from forgemcp.core.logging import create_logger
 from forgemcp.models import Position, Range
 from forgemcp.processes import ProcessRuntime
 from forgemcp.lsp import PositionEncoding
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import WorkspaceMutationBus, WorkspaceService
 
 
 def _frame(value: object) -> bytes:
@@ -74,12 +75,15 @@ class _FakeWriter:
         self.document_version = 0
         self.stale_diagnostics = False
         self.data = bytearray()
+        self.methods: list[str] = []
 
     def write(self, data: bytes) -> None:
         self.data.extend(data)
         _, payload = data.split(b"\r\n\r\n", 1)
         value = json.loads(payload)
         method = value.get("method")
+        if isinstance(method, str):
+            self.methods.append(method)
         if method == "initialize":
             self._send({"jsonrpc": "2.0", "id": value["id"], "result": {"capabilities": {"positionEncoding": "utf-16"}}})
         elif method == "textDocument/didOpen":
@@ -243,6 +247,75 @@ def test_clangd_service_manages_lifecycle_documents_diagnostics_and_external_res
         await service.aclose()
         await service.aclose()
         assert service.state is ClangdSessionState.STOPPED
+
+    asyncio.run(exercise())
+
+
+def test_clangd_workspace_edit_and_post_commit_batch_emit_exactly_one_did_change(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "main.cpp").write_text("name()\n", encoding="utf-8")
+        config = ForgeConfig(workspace_root=tmp_path)
+        logger = create_logger("CRITICAL")
+        bus = WorkspaceMutationBus(logger)
+        workspace = WorkspaceService(config, logger, mutations=bus)
+        runtime = _FakeProcessRuntime()
+        service = ClangdService(config, workspace, runtime, mutations=bus)  # type: ignore[arg-type]
+        bus.subscribe("clangd", service.handle_workspace_mutation)
+        await bus.start()
+        await service.start("build")
+        await service.hover("main.cpp", Position(line=0, column=0))
+        assert runtime.handle is not None
+        writer = runtime.handle.stdin
+        before = writer.methods.count("textDocument/didChange")
+
+        renamed = await service.rename("main.cpp", Position(line=0, column=0), "renamed")
+        assert renamed.edit.applied is True
+        await asyncio.sleep(0)
+        assert writer.methods.count("textDocument/didChange") == before + 1
+        document = next(iter(service._documents.values()))
+        assert document.snapshot.sha256 == workspace.get_snapshot("main.cpp").sha256
+        await service.aclose()
+        await bus.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_failed_did_change_stays_pending_and_the_next_request_resynchronizes(tmp_path: Path):
+    async def exercise() -> None:
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        source = tmp_path / "main.cpp"
+        source.write_text("name()\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("build")
+        await service.hover("main.cpp", Position(line=0, column=0))
+        document = next(iter(service._documents.values()))
+        original_digest = document.snapshot.sha256
+        source.write_text("changed()\n", encoding="utf-8")
+        client = service._client
+        assert client is not None
+        original_notify = client.notify
+
+        async def fail_change(method: str, params: object) -> None:
+            if method == "textDocument/didChange":
+                from forgemcp.lsp import LspError
+
+                raise LspError("test-only notification failure")
+            await original_notify(method, params)  # type: ignore[arg-type]
+
+        client.notify = fail_change  # type: ignore[method-assign]
+        with pytest.raises(ClangdRequestError, match="synchronization is pending"):
+            await service.hover("main.cpp", Position(line=0, column=0))
+        assert document.snapshot.sha256 == original_digest
+        assert (await service.cached_project_status()).synchronization_degraded is True
+
+        client.notify = original_notify  # type: ignore[method-assign]
+        await service.hover("main.cpp", Position(line=0, column=0))
+        assert document.snapshot.sha256 == service._workspace.get_snapshot("main.cpp").sha256
+        assert (await service.cached_project_status()).synchronization_degraded is False
+        await service.aclose()
 
     asyncio.run(exercise())
 

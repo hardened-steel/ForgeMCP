@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 
@@ -22,6 +23,7 @@ from forgemcp.workspace import (
     WorkspaceTextEdit,
     WorkspaceTextEditError,
 )
+from forgemcp.workspace.events import WorkspaceMutationBus
 
 
 def workspace(root: Path, *, policy: WorkspacePolicy | None = None) -> WorkspaceService:
@@ -47,6 +49,15 @@ def test_list_files_returns_snapshots_and_excludes_default_generated_directories
 
     assert [snapshot.uri.rsplit("/", 1)[-1] for snapshot in files] == ["main.cpp", "top.txt"]
     assert all(snapshot.exists and snapshot.sha256 is not None for snapshot in files)
+
+
+def test_list_files_rejects_a_collection_larger_than_the_public_bound(tmp_path, monkeypatch):
+    for index in range(3):
+        (tmp_path / f"{index}.txt").write_text("bounded\n", encoding="utf-8")
+    monkeypatch.setattr(workspace_service_module, "MAX_WORKSPACE_LIST_FILES", 2)
+
+    with pytest.raises(WorkspaceFileTooLargeError, match="collection limit"):
+        workspace(tmp_path).list_files(recursive=True)
 
 
 def test_configurable_ignore_policy_can_include_custom_build_directory(tmp_path):
@@ -107,6 +118,58 @@ def test_read_text_is_utf8_bounded_and_returns_matching_snapshot(tmp_path):
         workspace(tmp_path).read_text("binary.bin")
     with pytest.raises(WorkspaceFileTooLargeError):
         service.read_text("large.txt")
+
+
+def test_multi_file_text_edits_respect_one_aggregate_output_limit_before_writing(tmp_path):
+    (tmp_path / "one.txt").write_text("one\n", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two\n", encoding="utf-8")
+    service = workspace(tmp_path, policy=WorkspacePolicy(max_patch_bytes=9))
+    before = {name: service.get_snapshot(name) for name in ("one.txt", "two.txt")}
+
+    with pytest.raises(WorkspaceFileTooLargeError, match="aggregate output"):
+        service.apply_text_edits(
+            {
+                "one.txt": (WorkspaceTextEdit(Range(start=Position(line=0, column=0), end=Position(line=0, column=1)), "abcd"),),
+                "two.txt": (WorkspaceTextEdit(Range(start=Position(line=0, column=0), end=Position(line=0, column=1)), "wxyz"),),
+            },
+            before,
+        )
+
+    assert (tmp_path / "one.txt").read_text(encoding="utf-8") == "one\n"
+    assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "two\n"
+
+
+def test_concurrent_mutations_publish_in_their_serialized_commit_order(tmp_path):
+    (tmp_path / "one.txt").write_text("one\n", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two\n", encoding="utf-8")
+    logger = create_logger("CRITICAL")
+    bus = WorkspaceMutationBus(logger)
+    service = WorkspaceService(ForgeConfig(workspace_root=tmp_path), logger, mutations=bus)
+    snapshots = {name: service.get_snapshot(name) for name in ("one.txt", "two.txt")}
+    ready = Barrier(3)
+    failures: list[BaseException] = []
+
+    def mutate(path: str, old: str, new: str) -> None:
+        try:
+            ready.wait()
+            assert service.apply_unified_patch(unified_change(path, old, new), {path: snapshots[path]}).applied
+        except BaseException as error:  # pragma: no cover - assertion aid for worker failures
+            failures.append(error)
+
+    first = Thread(target=mutate, args=("one.txt", "one", "ONE"))
+    second = Thread(target=mutate, args=("two.txt", "two", "TWO"))
+    first.start()
+    second.start()
+    ready.wait()
+    first.join()
+    second.join()
+
+    assert failures == []
+    batches = bus.batches_since(0)
+    assert batches is not None
+    assert [batch.generation for batch in batches] == [1, 2]
+    assert [batch.operation_id for batch in batches] == ["workspace-1", "workspace-2"]
+    assert {(tmp_path / "one.txt").read_text(encoding="utf-8"), (tmp_path / "two.txt").read_text(encoding="utf-8")} == {"ONE\n", "TWO\n"}
 
 
 def test_generated_directory_capability_creates_and_guards_file_api_style_files(tmp_path):
@@ -431,3 +494,35 @@ def test_apply_text_edits_rejects_ambiguous_same_boundary_insertions(tmp_path):
         )
 
     assert target.read_text(encoding="utf-8") == "abc\n"
+
+
+@pytest.mark.parametrize("path", ("note.txt:secret", "NUL", "con.txt", "dir/aux.cpp", r"\\server\share\x.cpp", r"\\?\C:\x.cpp"))
+def test_workspace_paths_reject_windows_ads_device_and_unc_spellings_on_every_host(tmp_path, path):
+    service = workspace(tmp_path)
+
+    with pytest.raises(WorkspacePathError):
+        service.get_snapshot(path)
+
+
+def test_unified_patch_noop_never_replaces_file_or_reports_a_change(tmp_path, monkeypatch):
+    target = tmp_path / "note.txt"
+    target.write_text("same\n", encoding="utf-8")
+    service = workspace(tmp_path)
+    replace = workspace_service_module.os.replace
+    calls = 0
+
+    def count_replace(source, destination):
+        nonlocal calls
+        calls += 1
+        return replace(source, destination)
+
+    monkeypatch.setattr(workspace_service_module.os, "replace", count_replace)
+    result = service.apply_unified_patch(
+        "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n same\n",
+        {"note.txt": service.get_snapshot("note.txt")},
+    )
+
+    assert result.applied is True
+    assert result.changes == ()
+    assert calls == 0
+    assert target.read_text(encoding="utf-8") == "same\n"

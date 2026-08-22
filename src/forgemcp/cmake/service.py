@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from forgemcp.workspace import (
     GeneratedWorkspaceDirectory,
     WorkspaceError,
     WorkspaceFileNotFoundError,
+    WorkspaceMutationBus,
     WorkspaceService,
 )
 from forgemcp.toolchain import ToolchainDiscoveryService
@@ -64,7 +66,9 @@ MAX_PARALLEL_JOBS = 256
 _VERSION_BANNER = re.compile(r"\b(?:cmake|ctest)\s+version\s+(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
 _CACHE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FAILED_TEST_LINE = re.compile(r"^\s*\d+\s*-\s*(?P<name>.+?)\s+\([^)]*\)\s*$")
-_CMAKE_GENERATOR_CACHE = re.compile(r"^CMAKE_GENERATOR(?::[^=]+)?=(?P<value>[^\r\n]{1,256})$", re.MULTILINE)
+_CMAKE_GENERATOR_CACHE = re.compile(
+    r"^CMAKE_GENERATOR(?::[^=]+)?=(?P<value>[^\r\n]{1,256})\r?$", re.MULTILINE
+)
 
 MAX_COMPILATION_DATABASE_BYTES = 4 * 1024 * 1024
 MAX_COMPILATION_DATABASE_ENTRIES = 100_000
@@ -98,6 +102,7 @@ class CMakeProjectStatusCache:
     last_test: CMakeOperationStatusCache | None
     configuration_stale: bool
     compilation_database: CompilationDatabaseStatus | None
+    mutation_delivery_degraded: bool
 
 
 class ProcessRunner(Protocol):
@@ -131,12 +136,14 @@ class CMakeService:
         config: ForgeConfig | None = None,
         toolchain: ToolchainDiscoveryService | None = None,
         compilation_database: CompilationDatabaseRegistry | None = None,
+        mutations: WorkspaceMutationBus | None = None,
     ) -> None:
         self._workspace = workspace
         self._process_runtime = process_runtime
         self._config = config
         self._toolchain = toolchain
         self._compilation_database_registry = compilation_database
+        self._mutations = mutations
         self._cached_tool_status: CMakeStatus | None = None
         self._configured_binary_dir: str | None = None
         self._active_operations = 0
@@ -147,6 +154,8 @@ class CMakeService:
         self._configuration_stale = False
         self._compilation_database: CompilationDatabaseStatus | None = None
         self._configured_toolchain_file: str | None = None
+        self._configured_source_dir: str | None = None
+        self._last_relevant_mutation_generation = 0
 
     def cached_project_status(self) -> CMakeProjectStatusCache:
         """Return content-free metadata without filesystem access or tool probes."""
@@ -158,8 +167,9 @@ class CMakeService:
             last_configure=self._last_configure,
             last_build=self._last_build,
             last_test=self._last_test,
-            configuration_stale=self._configuration_stale,
+            configuration_stale=self._configuration_stale or bool(self._mutations and self._mutations.degraded),
             compilation_database=self._compilation_database,
+            mutation_delivery_degraded=bool(self._mutations and self._mutations.degraded),
         )
 
     async def status(self) -> CMakeStatus:
@@ -222,11 +232,13 @@ class CMakeService:
         context = self._execution_context(execution_context)
         self._active_operations += 1
         normalised_binary = "."
+        configure_generation = self._mutations.generation if self._mutations is not None else 0
+        progress_observer: CMakeOutputProgressObserver | None = None
         try:
             context.throw_if_cancelled()
             await context.report_progress(ProgressUpdate(0, None, "Preparing configure"))
             profile = self._resolve_profile(binary_dir=binary_dir, source_dir=source_dir, preset=preset)
-            await context.report_progress(ProgressUpdate(1, None, "Resolving toolchain and preset"))
+            await context.report_progress(ProgressUpdate(0, None, "Resolving toolchain and preset"))
             source = self._workspace.require_directory(profile.source_dir)
             generated = self._workspace.open_generated_directory(profile.binary_dir, create=True)
             normalised_binary = generated.relative_path
@@ -234,7 +246,7 @@ class CMakeService:
                 raise CMakeRequestError("CMake source_dir and binary_dir must be different directories.")
             preset_name = self._selected_preset(preset)
             existing_generator = self._cached_generator(generated)
-            requested_generator = self._requested_generator(preset_name, existing_generator)
+            requested_generator = self._requested_generator(preset_name, existing_generator, generated)
             known_generator = requested_generator or self._preset_generator(source, preset_name)
             self._preflight_generator(existing_generator, known_generator)
             generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
@@ -250,11 +262,11 @@ class CMakeService:
                     and requested_generator.casefold().startswith("visual studio")
                 ):
                     argv.extend(["-A", self._config.target_arch])
-            argv.extend(self._configure_cache_arguments(cache_variables, requested_generator))
-            await context.report_progress(ProgressUpdate(2, None, "Configure started"))
-            result = await self._run_with_progress(
+            argv.extend(self._configure_cache_arguments(cache_variables, known_generator or existing_generator))
+            await context.report_progress(ProgressUpdate(0, None, "Configure started"))
+            result, progress_observer = await self._run_with_progress(
                 "cmake", argv, timeout_seconds=self._default_timeout("configure"),
-                context=context, operation="configure", phase=2,
+                context=context, operation="configure",
             )
             response = CMakeConfigureResult(
                 source_dir=source,
@@ -264,11 +276,11 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_configure = self._operation_cache("configure", "cancelled", normalised_binary, started)
-            await context.report_progress(ProgressUpdate(2, None, "Configure cancelled", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Configure cancelled", terminal=True))
             raise
         except Exception:
             self._last_configure = self._operation_cache("configure", "failure", normalised_binary, started)
-            await context.report_progress(ProgressUpdate(2, None, "Configure failed", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Configure failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
@@ -276,11 +288,15 @@ class CMakeService:
                 "configure", outcome, generated.relative_path, started, exit_code=result.exit_code
             )
             if outcome == "success":
+                # A process exit alone does not establish that ForgeMCP can
+                # consume CMake's generated model.  Keep process success but
+                # expose a fixed warning if its bounded File API validation
+                # fails, just like an optional compilation database.
+                file_api_valid = self._file_api_is_valid(generated)
                 database = self._validate_compilation_database(generated)
                 self._compilation_database = database
-                self._configuration_stale = False
                 self._configured_toolchain_file = self._toolchain_file_from_request(cache_variables, source)
-                warnings = self._compilation_warnings(database)
+                self._configured_source_dir = source
                 if self._compile_commands_mode == "required" and database.availability != "available":
                     self._last_configure = self._operation_cache(
                         "configure", "requirement_failed", generated.relative_path, started,
@@ -297,6 +313,15 @@ class CMakeService:
                     binary_dir_source=profile.binary_dir_source,
                     configure_preset_source=profile.configure_preset_source,
                 )
+                self._refresh_configuration_staleness_since(configure_generation)
+                if self._compilation_database_registry is not None:
+                    await self._compilation_database_registry.publish(database)
+                # A mutation can commit while database consumers are running.
+                # The final generation sample is the configure completion
+                # boundary; a later batch therefore cannot be cleared by this
+                # successful configure result.
+                self._refresh_configuration_staleness_since(configure_generation)
+                warnings = self._configure_warnings(database, file_api_valid=file_api_valid)
                 response = CMakeConfigureResult(
                     source_dir=source,
                     binary_dir=generated.relative_path,
@@ -305,12 +330,13 @@ class CMakeService:
                     compilation_database=database,
                     warnings=warnings,
                 )
-                if self._compilation_database_registry is not None:
-                    await self._compilation_database_registry.publish(database)
-                await context.report_progress(ProgressUpdate(4, None, "Configure completed", terminal=True))
+                message = "Configure completed" if not warnings else "Configure completed with warnings"
+                await context.report_progress(
+                    (progress_observer or CMakeOutputProgressObserver(context, "configure")).terminal_success_update(message)
+                )
             else:
                 message = "Configure timed out" if result.timed_out else "Configure failed"
-                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
+                await context.report_progress(ProgressUpdate(0, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -337,6 +363,7 @@ class CMakeService:
         self._active_operations += 1
         normalised_binary = "."
         target_names: tuple[str, ...] = ()
+        progress_observer: CMakeOutputProgressObserver | None = None
         try:
             context.throw_if_cancelled()
             await context.report_progress(ProgressUpdate(0, None, "Preparing build"))
@@ -351,9 +378,9 @@ class CMakeService:
                 message = f"Selected {len(target_names)} target" if len(target_names) == 1 else f"Selected {len(target_names)} targets"
                 if display is not None and len(target_names) == 1:
                     message = f"Selected target: {display}"
-                await context.report_progress(ProgressUpdate(1, None, message))
+                await context.report_progress(ProgressUpdate(0, None, message))
             else:
-                await context.report_progress(ProgressUpdate(1, None, "Selected default build targets"))
+                await context.report_progress(ProgressUpdate(0, None, "Selected default build targets"))
             argv = [self._tool_executable("cmake"), "--build", generated.relative_path]
             if target_names:
                 argv.extend(["--target", *target_names])
@@ -361,10 +388,10 @@ class CMakeService:
                 argv.extend(["--config", selected_configuration])
             if jobs is not None:
                 argv.extend(["--parallel", str(jobs)])
-            await context.report_progress(ProgressUpdate(2, None, "Build started"))
-            result = await self._run_with_progress(
+            await context.report_progress(ProgressUpdate(0, None, "Build started"))
+            result, progress_observer = await self._run_with_progress(
                 "cmake", argv, timeout_seconds=self._default_timeout("build"),
-                context=context, operation="build", phase=2,
+                context=context, operation="build",
             )
             response = CMakeBuildResult(
                 binary_dir=generated.relative_path,
@@ -374,20 +401,22 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_build = self._operation_cache("build", "cancelled", normalised_binary, started, item_count=len(target_names))
-            await context.report_progress(ProgressUpdate(2, None, "Build cancelled", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Build cancelled", terminal=True))
             raise
         except Exception:
             self._last_build = self._operation_cache("build", "failure", normalised_binary, started, item_count=len(target_names))
-            await context.report_progress(ProgressUpdate(2, None, "Build failed", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Build failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
             self._last_build = self._operation_cache("build", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(target_names))
             if outcome == "success":
-                await context.report_progress(ProgressUpdate(4, None, "Build completed", terminal=True))
+                await context.report_progress(
+                    (progress_observer or CMakeOutputProgressObserver(context, "build")).terminal_success_update("Build completed")
+                )
             else:
                 message = "Build timed out" if result.timed_out else "Build failed"
-                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
+                await context.report_progress(ProgressUpdate(0, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -419,6 +448,7 @@ class CMakeService:
         self._active_operations += 1
         normalised_binary = "."
         names: tuple[str, ...] = ()
+        progress_observer: CMakeOutputProgressObserver | None = None
         try:
             context.throw_if_cancelled()
             await context.report_progress(ProgressUpdate(0, None, "Preparing test run"))
@@ -428,15 +458,15 @@ class CMakeService:
             names = self._validate_names(test_names, label="test name")
             selected_configuration = self._selected_configuration(configuration)
             await context.report_progress(
-                ProgressUpdate(1, None, "Preparing selected tests" if names else "Preparing discovered tests")
+                ProgressUpdate(0, None, "Preparing selected tests" if names else "Preparing discovered tests")
             )
             argv = [self._tool_executable("ctest"), "--test-dir", generated.relative_path, "--output-on-failure"]
             if selected_configuration is not None:
                 argv.extend(["--build-config", selected_configuration])
             if names:
                 argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
-            await context.report_progress(ProgressUpdate(2, None, "Test run started"))
-            result = await self._run_with_progress(
+            await context.report_progress(ProgressUpdate(0, None, "Test run started"))
+            result, progress_observer = await self._run_with_progress(
                 "ctest",
                 argv,
                 timeout_seconds=(
@@ -446,7 +476,6 @@ class CMakeService:
                 ),
                 context=context,
                 operation="test",
-                phase=2,
             )
             failed_tests = self._failed_tests(result)
             response = CTestRunResult(
@@ -458,21 +487,23 @@ class CMakeService:
             )
         except asyncio.CancelledError:
             self._last_test = self._operation_cache("test", "cancelled", normalised_binary, started, item_count=len(names))
-            await context.report_progress(ProgressUpdate(2, None, "Test run cancelled", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Test run cancelled", terminal=True))
             raise
         except Exception:
             self._last_test = self._operation_cache("test", "failure", normalised_binary, started, item_count=len(names))
-            await context.report_progress(ProgressUpdate(2, None, "Test run failed", terminal=True))
+            await context.report_progress(ProgressUpdate(0, None, "Test run failed", terminal=True))
             raise
         else:
             outcome = "success" if result.exit_code == 0 and not result.timed_out else "failure"
             self._last_test = self._operation_cache("test", outcome, generated.relative_path, started, exit_code=result.exit_code, item_count=len(names) if names else len(failed_tests))
-            await context.report_progress(ProgressUpdate(3, None, "Finishing test run"))
+            await context.report_progress(ProgressUpdate(0, None, "Finishing test run"))
             if outcome == "success":
-                await context.report_progress(ProgressUpdate(4, None, "Test run completed", terminal=True))
+                await context.report_progress(
+                    (progress_observer or CMakeOutputProgressObserver(context, "test")).terminal_success_update("Test run completed")
+                )
             else:
                 message = "Test run timed out" if result.timed_out else "Test run failed"
-                await context.report_progress(ProgressUpdate(3, None, message, terminal=True))
+                await context.report_progress(ProgressUpdate(0, None, message, terminal=True))
             return response
         finally:
             self._active_operations -= 1
@@ -576,18 +607,18 @@ class CMakeService:
         timeout_seconds: float | None,
         context: ToolExecutionContext,
         operation: str,
-        phase: float,
-    ) -> ProcessResult:
+    ) -> tuple[ProcessResult, CMakeOutputProgressObserver]:
         """Run a command with one bounded observer worker and one heartbeat task."""
         observer = CMakeOutputProgressObserver(context, operation)
         heartbeat: asyncio.Task[None] | None = None
         if context.supports_progress:
-            heartbeat = asyncio.create_task(run_heartbeat(context, operation=operation, phase=phase))
+            heartbeat = asyncio.create_task(run_heartbeat(context, operation=operation))
         try:
-            return await self._run_required(
+            result = await self._run_required(
                 executable, argv, timeout_seconds=timeout_seconds,
                 observer=observer if context.supports_progress else None,
             )
+            return result, observer
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -881,7 +912,8 @@ class CMakeService:
         if self._compile_commands_mode != "off" and "CMAKE_EXPORT_COMPILE_COMMANDS" not in values:
             values["CMAKE_EXPORT_COMPILE_COMMANDS"] = True
         if (
-            requested_generator == "Ninja"
+            requested_generator is not None
+            and self._generator_is_single_config(requested_generator)
             and self._config is not None
             and self._config.default_configuration is not None
             and "CMAKE_BUILD_TYPE" not in values
@@ -904,7 +936,9 @@ class CMakeService:
         match = _CMAKE_GENERATOR_CACHE.search(cache)
         return match.group("value") if match is not None else None
 
-    def _requested_generator(self, preset: str | None, existing_generator: str | None) -> str | None:
+    def _requested_generator(
+        self, preset: str | None, existing_generator: str | None, generated: GeneratedWorkspaceDirectory
+    ) -> str | None:
         """Choose Ninja only for an unpinned, empty tree with qualified discovery."""
         if preset is not None:
             return None
@@ -912,9 +946,21 @@ class CMakeService:
             return self._config.cmake_generator
         if existing_generator is not None:
             return None
-        if self._toolchain is not None and self._toolchain.executable("ninja") is not None:
+        if not generated.is_empty():
+            return None
+        if self._can_auto_select_ninja():
             return "Ninja"
         return None
+
+    def _can_auto_select_ninja(self) -> bool:
+        """Require a qualified Ninja and a compatible selected toolchain environment."""
+        if self._toolchain is None or self._toolchain.executable("ninja") is None:
+            return False
+        if self._config is None:
+            return True
+        if self._config.toolchain == "msvc" and self._toolchain.toolchain_environment is None:
+            return False
+        return True
 
     def _preflight_generator(self, existing: str | None, requested: str | None) -> None:
         if existing is not None and requested is not None and existing != requested:
@@ -930,7 +976,15 @@ class CMakeService:
     @staticmethod
     def _generator_supports_compile_commands(generator: str) -> bool:
         """Recognize only CMake generator families with documented support."""
-        return generator in {"Ninja", "Ninja Multi-Config"} or generator.endswith("Makefiles")
+        return generator in {
+            "Ninja", "Ninja Multi-Config", "Unix Makefiles", "MinGW Makefiles",
+            "MSYS Makefiles", "NMake Makefiles", "NMake Makefiles JOM",
+            "Borland Makefiles", "Watcom WMake",
+        }
+
+    @classmethod
+    def _generator_is_single_config(cls, generator: str) -> bool:
+        return cls._generator_supports_compile_commands(generator) and generator != "Ninja Multi-Config"
 
     def _actual_generator(self, generated: GeneratedWorkspaceDirectory) -> str | None:
         return self._cached_generator(generated)
@@ -954,22 +1008,24 @@ class CMakeService:
                 binary_dir=generated.relative_path,
             )
         try:
-            snapshot = generated.get_snapshot("compile_commands.json")
-        except WorkspaceError:
-            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
-        if not snapshot.exists:
-            return CompilationDatabaseStatus(availability="missing", generator_support=support, generator=generator, binary_dir=generated.relative_path)
-        if snapshot.size_bytes is None or snapshot.size_bytes > MAX_COMPILATION_DATABASE_BYTES:
-            return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
-        try:
-            text = generated.read_text("compile_commands.json")
+            text, snapshot = generated.read_text_with_snapshot(
+                "compile_commands.json", maximum_bytes=MAX_COMPILATION_DATABASE_BYTES
+            )
             document = json.loads(text)
+        except WorkspaceFileNotFoundError:
+            return CompilationDatabaseStatus(availability="missing", generator_support=support, generator=generator, binary_dir=generated.relative_path)
         except (WorkspaceError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
-        if not isinstance(document, list) or len(document) > MAX_COMPILATION_DATABASE_ENTRIES or self._json_depth(document) > MAX_COMPILATION_DATABASE_DEPTH:
+        if (
+            not isinstance(document, list)
+            or len(document) > MAX_COMPILATION_DATABASE_ENTRIES
+            or self._json_depth(document) > MAX_COMPILATION_DATABASE_DEPTH
+            or not self._json_strings_within_limits(document)
+        ):
             return CompilationDatabaseStatus(availability="invalid", generator_support=support, generator=generator, binary_dir=generated.relative_path)
         invalid = 0
         external = 0
+        seen_entries: set[tuple[str, str]] = set()
         for entry in document:
             if not self._valid_database_entry(entry):
                 invalid += 1
@@ -979,13 +1035,17 @@ class CMakeService:
             assert isinstance(file_name, str)
             try:
                 directory = entry.get("directory")
-                if isinstance(directory, str):
-                    base = self._workspace.validate_reported_path(directory)
-                else:
-                    base = generated.relative_path
-                self._workspace.validate_reported_path(file_name, relative_to=base)
+                assert isinstance(directory, str)
+                base = self._workspace.validate_reported_path(directory)
+                file_path = self._workspace.validate_reported_path(file_name, relative_to=base)
             except WorkspaceError:
                 external += 1
+                continue
+            identity = (os.path.normcase(base), os.path.normcase(file_path))
+            if identity in seen_entries:
+                invalid += 1
+                continue
+            seen_entries.add(identity)
         return CompilationDatabaseStatus(
             availability="available" if invalid == 0 else "invalid",
             generator_support=support,
@@ -1008,6 +1068,22 @@ class CMakeService:
         return depth
 
     @staticmethod
+    def _json_strings_within_limits(value: object) -> bool:
+        """Bound every decoded project-input string before inspecting entries."""
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, str):
+                if len(current) > 65_536:
+                    return False
+            elif isinstance(current, Mapping):
+                pending.extend(current.keys())
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+        return True
+
+    @staticmethod
     def _valid_database_entry(value: object) -> bool:
         if not isinstance(value, Mapping):
             return False
@@ -1015,14 +1091,32 @@ class CMakeService:
         directory = value.get("directory")
         command = value.get("command")
         arguments = value.get("arguments")
-        if not isinstance(file_name, str) or not file_name or len(file_name) > 4096:
+        if not CMakeService._safe_database_string(file_name, 4096):
             return False
-        if directory is not None and (not isinstance(directory, str) or not directory or len(directory) > 4096):
+        if not CMakeService._safe_database_string(directory, 4096):
             return False
-        if isinstance(command, str) and command and len(command) <= 65_536:
-            return True
-        return isinstance(arguments, list) and bool(arguments) and len(arguments) <= 1024 and all(
-            isinstance(item, str) and len(item) <= 16_384 for item in arguments
+        output = value.get("output")
+        if output is not None and not CMakeService._safe_database_string(output, 4096):
+            return False
+        if command is not None and not CMakeService._safe_database_string(command, 65_536):
+            return False
+        if arguments is not None and not (
+            isinstance(arguments, list)
+            and bool(arguments)
+            and len(arguments) <= 1024
+            and all(CMakeService._safe_database_string(item, 16_384) for item in arguments)
+        ):
+            return False
+        return command is not None or arguments is not None
+
+    @staticmethod
+    def _safe_database_string(value: object, maximum: int) -> bool:
+        return (
+            isinstance(value, str)
+            and bool(value)
+            and len(value) <= maximum
+            and "\x00" not in value
+            and not any(ord(character) < 32 or ord(character) == 127 for character in value)
         )
 
     def _compilation_warnings(self, database: CompilationDatabaseStatus) -> tuple[str, ...]:
@@ -1033,20 +1127,67 @@ class CMakeService:
             warnings.append("compile_commands_generator_unsupported")
         return tuple(warnings)
 
-    def _status_warnings(self) -> tuple[str, ...]:
-        warnings: list[str] = []
+    def _file_api_is_valid(self, generated: GeneratedWorkspaceDirectory) -> bool:
+        """Validate the complete File API model without exposing its contents."""
+        try:
+            self._parse_target_configurations(self._load_codemodel(generated), generated)
+        except Exception:
+            # This is a post-process advisory check.  A malformed project
+            # reply must become one fixed warning category, never a raw parser
+            # error or an accidental transport failure after CMake succeeded.
+            return False
+        return True
+
+    def _configure_warnings(
+        self, database: CompilationDatabaseStatus, *, file_api_valid: bool
+    ) -> tuple[str, ...]:
+        """Return only fixed success-with-warning categories for configure."""
+        warnings = list(self._compilation_warnings(database))
+        if not file_api_valid:
+            warnings.append("file_api_unavailable")
         if self._configuration_stale:
             warnings.append("configuration_stale")
+        if self._mutations is not None and self._mutations.degraded:
+            warnings.append("workspace_mutation_delivery_degraded")
+        return tuple(dict.fromkeys(warnings))
+
+    def _status_warnings(self) -> tuple[str, ...]:
+        warnings: list[str] = []
+        if self._configuration_stale or bool(self._mutations and self._mutations.degraded):
+            warnings.append("configuration_stale")
+        if self._mutations is not None and self._mutations.degraded:
+            warnings.append("workspace_mutation_delivery_degraded")
         if self._compilation_database is not None:
             warnings.extend(self._compilation_warnings(self._compilation_database))
         return tuple(dict.fromkeys(warnings))
 
-    def mark_workspace_mutation(self, paths: Sequence[str]) -> None:
+    def mark_workspace_mutation(self, paths: Sequence[str], *, generation: int = 0) -> None:
         """Mark a cached configuration stale for relevant committed source changes."""
-        if self._configured_binary_dir is None:
+        if self._configured_binary_dir is None or self._configured_source_dir is None:
             return
         for path in paths:
             lower = path.casefold()
+            if lower == self._configured_binary_dir.casefold() or lower.startswith(
+                f"{self._configured_binary_dir.casefold()}/"
+            ):
+                continue
+            if (
+                self._configured_toolchain_file is not None
+                and lower == self._configured_toolchain_file.casefold()
+            ):
+                self._configuration_stale = True
+                self._last_relevant_mutation_generation = max(
+                    self._last_relevant_mutation_generation, generation
+                )
+                return
+            source = self._configured_source_dir.casefold()
+            if source != ".":
+                if lower == source:
+                    continue
+                prefix = f"{source}/"
+                if not lower.startswith(prefix):
+                    continue
+                lower = lower[len(prefix):]
             if (
                 lower == "cmakelists.txt"
                 or lower.endswith("/cmakelists.txt")
@@ -1054,13 +1195,26 @@ class CMakeService:
                 or lower in {"cmakepresets.json", "cmakeuserpresets.json"}
                 or lower.endswith("/cmakepresets.json")
                 or lower.endswith("/cmakeuserpresets.json")
-                or (
-                    self._configured_toolchain_file is not None
-                    and lower == self._configured_toolchain_file.casefold()
-                )
             ):
                 self._configuration_stale = True
+                self._last_relevant_mutation_generation = max(
+                    self._last_relevant_mutation_generation, generation
+                )
                 return
+
+    def _refresh_configuration_staleness_since(self, generation: int) -> None:
+        """Apply retained mutations after a configure generation capture."""
+        self._configuration_stale = self._last_relevant_mutation_generation > generation
+        if self._mutations is None:
+            return
+        batches = self._mutations.batches_since(generation)
+        if batches is None:
+            self._configuration_stale = True
+            return
+        for batch in batches:
+            self.mark_workspace_mutation(
+                tuple(change.path for change in batch.changes), generation=batch.generation
+            )
 
     def _toolchain_file_from_request(
         self, values: Mapping[str, CacheValue] | None, source_dir: str

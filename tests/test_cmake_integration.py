@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import forgemcp.cmake.events as cmake_events
 from forgemcp.cmake import (
     CMakeFileApiError,
     CMakePlugin,
@@ -28,10 +29,45 @@ from forgemcp.models import ProcessOutput, ProcessResult
 from forgemcp.processes import ProcessExecutableError, ProcessRuntime
 from forgemcp.server import create_server
 from forgemcp.toolchain import ToolchainDiscoveryService
-from forgemcp.workspace import SymlinkWorkspacePathError, WorkspacePathError, WorkspaceService
+from forgemcp.workspace import (
+    SymlinkWorkspacePathError,
+    WorkspaceMutationBus,
+    WorkspacePathError,
+    WorkspaceService,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "cmake_file_api"
+
+
+def test_compilation_database_registry_bounds_cancellation_suppressing_consumer(monkeypatch):
+    async def exercise() -> None:
+        released = asyncio.Event()
+        registry = cmake_events.CompilationDatabaseRegistry(create_logger("CRITICAL"))
+
+        async def suppress_cancel(_: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await released.wait()
+
+        monkeypatch.setattr(cmake_events, "COMPILATION_DATABASE_HANDLER_TIMEOUT_SECONDS", 0.01)
+        registry.subscribe("stuck", suppress_cancel)
+        await asyncio.wait_for(
+            registry.publish(
+                cmake_events.CompilationDatabaseStatus(
+                    availability="available", generator_support="supported", generator="Ninja",
+                    binary_dir="build", fingerprint="a" * 64,
+                )
+            ),
+            timeout=0.2,
+        )
+        assert registry.degraded is True
+        assert not registry._handlers
+        released.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(exercise())
 
 
 def _real_cmake_tools() -> tuple[Path, Path] | None:
@@ -341,6 +377,8 @@ def test_compile_commands_policy_adds_export_rejects_known_visual_studio_require
     assert result.compilation_database is not None
     assert "-DCMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON" in runtime.calls[0][0]
     service.mark_workspace_mutation(("CMakeLists.txt",))
+    assert service.cached_project_status().configuration_stale is False
+    service.mark_workspace_mutation(("src/CMakeLists.txt",))
     assert service.cached_project_status().configuration_stale is True
 
     required = CMakeService(
@@ -359,7 +397,7 @@ def test_compilation_database_validation_returns_metadata_without_commands(tmp_p
     config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
     workspace = WorkspaceService(config, create_logger("CRITICAL"))
     generated = workspace.open_generated_directory("build", create=True)
-    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\r\n")
     generated.write_text(
         "compile_commands.json",
         json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "secret-compiler --token=never-return"}]),
@@ -372,6 +410,85 @@ def test_compilation_database_validation_returns_metadata_without_commands(tmp_p
     assert database.generator_support == "supported"
     assert database.entry_count == 1
     assert "secret-compiler" not in database.model_dump_json()
+
+
+def test_compilation_database_rejects_spoofed_generator_duplicate_and_control_entries(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    generated = workspace.open_generated_directory("build", create=True)
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Evil Makefiles\n")
+    generated.write_text("compile_commands.json", "[]")
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+    assert service._validate_compilation_database(generated).generator_support == "unsupported"
+
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps(
+            [
+                {"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"},
+                {"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"},
+            ]
+        ),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "clang++\n--secret"}]),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"file": "main.cpp", "command": "clang++ -c main.cpp"}]),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+
+
+def test_configure_preserves_stale_when_a_cmake_file_commits_during_configure(tmp_path):
+    async def exercise() -> None:
+        (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.23)\n", encoding="utf-8")
+        config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+        logger = create_logger("CRITICAL")
+        bus = WorkspaceMutationBus(logger)
+        workspace = WorkspaceService(config, logger, mutations=bus)
+        generated = workspace.open_generated_directory("build", create=True)
+        generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+        generated.write_text(
+            "compile_commands.json",
+            json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"}]),
+        )
+
+        class MutatingRuntime:
+            async def run(self, argv, **kwargs):
+                workspace.apply_unified_patch(
+                    "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -1 +1,2 @@\n cmake_minimum_required(VERSION 3.23)\n+# changed during configure\n",
+                    {"CMakeLists.txt": workspace.get_snapshot("CMakeLists.txt")},
+                )
+                return process_result(stdout="configured")
+
+        service = CMakeService(workspace, MutatingRuntime(), config, mutations=bus)
+        result = await service.configure(binary_dir="build")
+        assert result.process.exit_code == 0
+        assert service.cached_project_status().configuration_stale is True
+        await bus.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_compile_command_generator_and_build_type_policy_is_exact(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto", default_configuration="Debug")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+
+    assert service._generator_supports_compile_commands("Ninja") is True
+    assert service._generator_supports_compile_commands("Ninja Multi-Config") is True
+    assert service._generator_supports_compile_commands("Unix Makefiles") is True
+    assert service._generator_supports_compile_commands("Spoofed Makefiles") is False
+    assert "CMAKE_BUILD_TYPE" not in " ".join(service._configure_cache_arguments({}, "Ninja Multi-Config"))
+    assert "-DCMAKE_BUILD_TYPE:STRING=Debug" in service._configure_cache_arguments({}, "Unix Makefiles")
+    assert "-DCMAKE_BUILD_TYPE:STRING=Release" in service._configure_cache_arguments(
+        {"CMAKE_BUILD_TYPE": "Release"}, "Ninja"
+    )
 
 
 def test_configure_rejects_workspace_escape_and_symlink_build_directory(tmp_path):

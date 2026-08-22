@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import ConfigDict, Field, ValidationError, field_validator
+from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import FileSnapshot, Range
@@ -53,9 +53,83 @@ class _TextEdit(ForgeModel):
     new_text: str = Field(max_length=MAX_TOOL_PATCH_CHARACTERS, description="UTF-8 replacement text. It is never logged or returned in errors.")
 
 
+TextEditCollection = Annotated[list[_TextEdit], Field(min_length=1, max_length=MAX_TOOL_EDITS)]
+
+
 class _TextEditsArguments(ForgeModel):
-    edits_by_path: dict[WorkspacePath, list[_TextEdit]] = Field(min_length=1, max_length=MAX_TOOL_FILES, description="Bounded atomic batch of existing-file edits by workspace-relative path. Creation, deletion, and rename are unavailable here.")
+    edits_by_path: dict[WorkspacePath, TextEditCollection] = Field(min_length=1, max_length=MAX_TOOL_FILES, description="Bounded atomic batch of existing-file edits by workspace-relative path. Creation, deletion, and rename are unavailable here.")
     expected_snapshots: dict[WorkspacePath, Sha256] = Field(min_length=1, max_length=MAX_TOOL_FILES, description="Current lowercase SHA-256 values by exactly the edited workspace-relative paths.")
+
+    @model_validator(mode="after")
+    def bounded_batch(self) -> "_TextEditsArguments":
+        if sum(len(edits) for edits in self.edits_by_path.values()) > MAX_TOOL_EDITS:
+            raise ValueError("The text-edit batch exceeds the configured edit collection limit.")
+        total_content_bytes = 0
+        for edits in self.edits_by_path.values():
+            for edit in edits:
+                try:
+                    total_content_bytes += len(edit.new_text.encode("utf-8"))
+                except UnicodeEncodeError as error:
+                    raise ValueError("Text-edit replacement text must be valid UTF-8.") from error
+                if total_content_bytes > MAX_TOOL_PATCH_CHARACTERS:
+                    raise ValueError("The text-edit batch exceeds the configured content limit.")
+        return self
+
+
+class _SnapshotResult(ForgeModel):
+    exists: bool
+    size_bytes: int | None
+    sha256: Sha256 | None
+    modified_at: str | None
+    captured_at: str
+
+
+class _FileResult(ForgeModel):
+    path: WorkspacePath
+    snapshot: _SnapshotResult
+
+
+class _FileChangeResult(ForgeModel):
+    path: WorkspacePath
+    kind: Literal["created", "modified", "deleted"]
+    before: _SnapshotResult | None
+    after: _SnapshotResult | None
+
+
+class _ListFilesResult(ForgeModel):
+    files: Annotated[list[_FileResult], Field(max_length=MAX_TOOL_FILES)]
+
+
+class _ReadTextResult(ForgeModel):
+    path: WorkspacePath
+    text: str = Field(max_length=MAX_TOOL_PATCH_CHARACTERS)
+    snapshot: _SnapshotResult
+
+
+class _SnapshotToolResult(ForgeModel):
+    path: WorkspacePath
+    snapshot: _SnapshotResult
+
+
+class _MutationResult(ForgeModel):
+    applied: bool
+    changes: Annotated[list[_FileChangeResult], Field(max_length=MAX_TOOL_FILES)]
+
+
+class _WorkspaceErrorDetail(ForgeModel):
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=4096)
+
+
+class _WorkspaceToolError(ForgeModel):
+    ok: Literal[False]
+    error: _WorkspaceErrorDetail
+
+
+ListFilesOutput = _ListFilesResult | _WorkspaceToolError
+ReadTextOutput = _ReadTextResult | _WorkspaceToolError
+SnapshotOutput = _SnapshotToolResult | _WorkspaceToolError
+MutationOutput = _MutationResult | _WorkspaceToolError
 
 
 def _public_snapshot(snapshot: FileSnapshot) -> dict[str, object]:
@@ -118,14 +192,14 @@ class WorkspacePlugin(ForgePlugin):
             raise TypeError("The Workspace plugin requires WorkspaceService.")
         self._service = service
         tools = (
-            ("list_files", "List bounded regular non-symlink files below a workspace-relative directory. Read a file or get its snapshot before mutation; ignored/generated directories are not exposed.", _ListFilesArguments, self._list_files, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
-            ("read_text", "Read one bounded UTF-8 workspace file and its SHA-256 snapshot. Before any mutation, use this or get_snapshot; after a conflict, read again before retrying.", _PathArguments, self._read_text, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
-            ("get_snapshot", "Get content-free metadata and SHA-256 for one workspace-relative path. Use its SHA-256 as optimistic concurrency input before mutation.", _PathArguments, self._get_snapshot, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
-            ("apply_unified_patch", "Atomically apply a strict text-only unified patch guarded by expected SHA-256 values. New files are allowed only with an expected absent (null) target; delete and rename are intentionally unavailable. On conflict, read a fresh snapshot before retrying. Successful changes synchronize active clangd documents and make CMake files stale.", _UnifiedPatchArguments, self._apply_patch, ToolHints(read_only=False, destructive=True, idempotent=False, open_world=False)),
-            ("apply_text_edits", "Atomically apply guarded Unicode-code-point edits to existing UTF-8 workspace files. Supply each current SHA-256; creation, deletion, and rename are unavailable. On conflict, read a fresh snapshot before retrying. Successful changes synchronize active clangd documents and make CMake files stale.", _TextEditsArguments, self._apply_text_edits, ToolHints(read_only=False, destructive=True, idempotent=False, open_world=False)),
+            ("list_files", "List bounded regular non-symlink files below a workspace-relative directory. Read a file or get its snapshot before mutation; ignored/generated directories are not exposed.", _ListFilesArguments, ListFilesOutput, self._list_files, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
+            ("read_text", "Read one bounded UTF-8 workspace file and its SHA-256 snapshot. Before any mutation, use this or get_snapshot; after a conflict, read again before retrying.", _PathArguments, ReadTextOutput, self._read_text, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
+            ("get_snapshot", "Get content-free metadata and SHA-256 for one workspace-relative path. Use its SHA-256 as optimistic concurrency input before mutation.", _PathArguments, SnapshotOutput, self._get_snapshot, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
+            ("apply_unified_patch", "Atomically apply a strict text-only unified patch guarded by expected SHA-256 values. New files are allowed only with an expected absent (null) target; delete and rename are intentionally unavailable. On conflict, read a fresh snapshot before retrying. Successful changes synchronize active clangd documents and make CMake files stale.", _UnifiedPatchArguments, MutationOutput, self._apply_patch, ToolHints(read_only=False, destructive=True, idempotent=False, open_world=False)),
+            ("apply_text_edits", "Atomically apply guarded Unicode-code-point edits to existing UTF-8 workspace files. Supply each current SHA-256; creation, deletion, and rename are unavailable. On conflict, read a fresh snapshot before retrying. Successful changes synchronize active clangd documents and make CMake files stale.", _TextEditsArguments, MutationOutput, self._apply_text_edits, ToolHints(read_only=False, destructive=True, idempotent=False, open_world=False)),
         )
-        for name, description, model, operation, hints in tools:
-            context.tools.register(ToolContribution(name=name, description=description, input_model=model, handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op), hints=hints))
+        for name, description, model, output_type, operation, hints in tools:
+            context.tools.register(ToolContribution(name=name, description=description, input_model=model, output_type=output_type, handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op), hints=hints))
 
     async def stop(self) -> None:
         self._service = None
@@ -155,7 +229,10 @@ class WorkspacePlugin(ForgePlugin):
         expected = dict(request.expected_snapshots)
         # The underlying historical Workspace capability understands deletion;
         # this new public tool deliberately does not introduce that surface.
-        if "--- /dev/null" not in request.patch and "+++ /dev/null" in request.patch:
+        if any(
+            line.startswith("+++ ") and line[4:].split("\t", 1)[0] == "/dev/null"
+            for line in request.patch.splitlines()
+        ):
             return to_mcp_error_response(WorkspaceRequestError("Delete operations are not available through this Workspace tool.")).as_dict()
         result = self.service.apply_unified_patch(request.patch, expected)
         return {"applied": result.applied, "changes": [_public_change(change, self.service) for change in result.changes]}

@@ -41,6 +41,11 @@ _HUNK_HEADER = re.compile(
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?: .*)?$"
 )
 _PATCH_METADATA_PREFIXES = ("diff --git ", "index ", "new file mode ", "deleted file mode ")
+_WINDOWS_RESERVED_COMPONENT = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE
+)
+MAX_WORKSPACE_LIST_FILES = 1_000
+MAX_WORKSPACE_MUTATION_EDITS = 1_000
 
 ExpectedSnapshot: TypeAlias = FileSnapshot | str | None
 
@@ -111,6 +116,7 @@ class _PlannedChange:
     before: FileSnapshot
     kind: FileChangeKind
     after_text: str | None
+    no_op: bool = False
 
 
 @dataclass(slots=True)
@@ -120,6 +126,7 @@ class _StagedChange:
     plan: _PlannedChange
     temporary_path: Path | None
     backup_path: Path | None = None
+    after_snapshot: FileSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +148,16 @@ class GeneratedWorkspaceDirectory:
     def read_text(self, path: str) -> str:
         """Read one bounded UTF-8 generated file below this directory."""
         return self._service._read_generated_text(self.relative_path, path)
+
+    def read_text_with_snapshot(self, path: str, *, maximum_bytes: int) -> tuple[str, FileSnapshot]:
+        """Read bounded generated metadata and the snapshot of those exact bytes."""
+        return self._service._read_generated_text_with_snapshot(
+            self.relative_path, path, maximum_bytes=maximum_bytes
+        )
+
+    def is_empty(self) -> bool:
+        """Return whether the generated directory contains no entries."""
+        return self._service._generated_directory_is_empty(self.relative_path)
 
     def list_files(self, path: str = ".") -> tuple[str, ...]:
         """List direct regular, non-symlink file names below one generated directory."""
@@ -188,6 +205,7 @@ class WorkspaceService:
         self._policy = WorkspacePolicy() if policy is None else policy
         self._mutations = mutations
         self._mutation_operation = 0
+        self._mutation_lock = threading.RLock()
         self._filesystem_lock = threading.RLock()
 
     @property
@@ -270,7 +288,7 @@ class WorkspaceService:
             self._create_directory_without_symlinks(directory)
         if not directory.exists():
             raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
-        if directory.is_symlink():
+        if _is_link_or_reparse_point(directory):
             raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
         if not directory.is_dir():
             raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
@@ -309,6 +327,8 @@ class WorkspaceService:
             candidate = native
         else:
             candidate = base / native
+        candidate_parts = candidate.parts[1:] if candidate.anchor else candidate.parts
+        self._reject_windows_special_components(candidate_parts)
         self._assert_no_symlink_components(candidate)
         try:
             resolved = candidate.resolve(strict=False)
@@ -353,6 +373,15 @@ class WorkspaceService:
         patch: str,
         expected_snapshots: Mapping[str, ExpectedSnapshot],
     ) -> PatchResult:
+        """Serialize one guarded unified patch through commit and publication."""
+        with self._mutation_lock:
+            return self._apply_unified_patch_locked(patch, expected_snapshots)
+
+    def _apply_unified_patch_locked(
+        self,
+        patch: str,
+        expected_snapshots: Mapping[str, ExpectedSnapshot],
+    ) -> PatchResult:
         """Apply a guarded unified patch or report an unchanged failed result.
 
         Every touched path must have an expected snapshot.  A matching
@@ -366,20 +395,24 @@ class WorkspaceService:
         expected_by_target = self._normalize_expected_snapshots(expected_snapshots)
 
         targets: dict[str, Path] = {}
+        patches_by_target: dict[str, _FilePatch] = {}
         for file_patch in file_patches:
             target = self._resolve_path(file_patch.target_path)
-            key = self._relative_key(target)
+            key = self._path_identity(target)
             if key in targets:
                 raise InvalidUnifiedPatchError("A unified patch may touch each file at most once.")
             targets[key] = target
+            patches_by_target[key] = file_patch
         if set(targets) != set(expected_by_target):
             raise ExpectedSnapshotError("Expected snapshots must cover exactly the files in the patch.")
 
         plans: list[_PlannedChange] = []
-        for file_patch in file_patches:
-            target = targets[self._relative_key(self._resolve_path(file_patch.target_path))]
+        total_output_bytes = 0
+        for key in sorted(targets):
+            file_patch = patches_by_target[key]
+            target = targets[key]
             current = self._snapshot_path(target)
-            expected = expected_by_target[self._relative_key(target)]
+            expected = expected_by_target[key]
             if not self._matches_expected_snapshot(target, current, expected):
                 self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
                 return PatchResult(applied=False)
@@ -387,9 +420,15 @@ class WorkspaceService:
             if planned is None:
                 self._logger.warning("workspace_patch_not_applied", reason="hunk_mismatch")
                 return PatchResult(applied=False)
+            total_output_bytes = self._add_bounded_mutation_output(
+                total_output_bytes, planned.after_text
+            )
             plans.append(planned)
 
-        staged = self._stage_changes(plans)
+        actionable = [plan for plan in plans if not plan.no_op]
+        if not actionable:
+            return PatchResult(applied=True)
+        staged = self._stage_changes(actionable)
         try:
             if not self._commit_staged_changes(staged):
                 self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
@@ -397,12 +436,21 @@ class WorkspaceService:
         finally:
             self._cleanup_staging(staged)
 
-        changes = tuple(self._to_file_change(plan) for plan in plans)
-        self._publish_mutations(plans, changes)
+        changes = tuple(self._to_file_change(item) for item in staged)
+        self._publish_mutations(actionable, changes)
         self._logger.info("workspace_patch_applied", changed_files=len(changes))
         return PatchResult(applied=True, changes=changes)
 
     def apply_text_edits(
+        self,
+        edits_by_path: Mapping[str, Sequence[WorkspaceTextEdit]],
+        expected_snapshots: Mapping[str, ExpectedSnapshot],
+    ) -> PatchResult:
+        """Serialize one guarded text-edit batch through commit and publication."""
+        with self._mutation_lock:
+            return self._apply_text_edits_locked(edits_by_path, expected_snapshots)
+
+    def _apply_text_edits_locked(
         self,
         edits_by_path: Mapping[str, Sequence[WorkspaceTextEdit]],
         expected_snapshots: Mapping[str, ExpectedSnapshot],
@@ -424,7 +472,7 @@ class WorkspaceService:
             if not isinstance(supplied_path, str):
                 raise WorkspaceTextEditError("Text-edit paths must be workspace-relative strings.")
             target = self._resolve_path(supplied_path)
-            key = self._relative_key(target)
+            key = self._path_identity(target)
             if key in targets:
                 raise WorkspaceTextEditError("Text edits must not name a file more than once.")
             if isinstance(supplied_edits, (str, bytes)):
@@ -440,8 +488,24 @@ class WorkspaceService:
             targets[key] = (target, edits)
         if set(targets) != set(expected_by_target):
             raise ExpectedSnapshotError("Expected snapshots must cover exactly the files in the text-edit batch.")
+        if sum(len(edits) for _, edits in targets.values()) > MAX_WORKSPACE_MUTATION_EDITS:
+            raise WorkspaceTextEditError("The text-edit batch exceeds the configured edit collection limit.")
+        total_replacement_bytes = 0
+        for _, edits in targets.values():
+            for edit in edits:
+                if not isinstance(edit.new_text, str) or "\x00" in edit.new_text:
+                    raise WorkspaceTextEditError("Text-edit replacements must be NUL-free UTF-8 text.")
+                try:
+                    total_replacement_bytes += len(edit.new_text.encode("utf-8"))
+                except UnicodeEncodeError as error:
+                    raise WorkspaceTextEditError("Text-edit replacements must be valid UTF-8 text.") from error
+                if total_replacement_bytes > self._policy.max_patch_bytes:
+                    raise WorkspaceFileTooLargeError(
+                        "Text-edit replacement data exceeds the configured batch size limit."
+                    )
 
         plans: list[_PlannedChange] = []
+        total_output_bytes = 0
         for key in sorted(targets):
             target, edits = targets[key]
             current = self._snapshot_path(target)
@@ -454,14 +518,16 @@ class WorkspaceService:
             source_text = self._read_text_for_snapshot(target, current)
             replacement = self._apply_text_replacements(source_text, edits)
             if replacement != source_text:
-                plans.append(
-                    _PlannedChange(
-                        target=target,
-                        before=current,
-                        kind=FileChangeKind.MODIFIED,
-                        after_text=replacement,
-                    )
+                plan = _PlannedChange(
+                    target=target,
+                    before=current,
+                    kind=FileChangeKind.MODIFIED,
+                    after_text=replacement,
                 )
+                total_output_bytes = self._add_bounded_mutation_output(
+                    total_output_bytes, plan.after_text
+                )
+                plans.append(plan)
 
         if not plans:
             return PatchResult(applied=True)
@@ -472,7 +538,7 @@ class WorkspaceService:
                 return PatchResult(applied=False)
         finally:
             self._cleanup_staging(staged)
-        changes = tuple(self._to_file_change(plan) for plan in plans)
+        changes = tuple(self._to_file_change(item) for item in staged)
         self._publish_mutations(plans, changes)
         self._logger.info("workspace_text_edits_applied", changed_files=len(changes))
         return PatchResult(applied=True, changes=changes)
@@ -482,15 +548,19 @@ class WorkspaceService:
         with os.scandir(directory) as entries:
             ordered_entries = sorted(entries, key=lambda entry: entry.name)
         for entry in ordered_entries:
-            if entry.is_symlink():
-                continue
             entry_path = Path(entry.path)
+            if _is_link_or_reparse_point(entry_path):
+                continue
             if entry.is_dir(follow_symlinks=False):
                 if self._policy.ignores_directory(entry.name):
                     continue
                 if recursive:
                     self._collect_files(entry_path, True, snapshots)
             elif entry.is_file(follow_symlinks=False):
+                if len(snapshots) >= MAX_WORKSPACE_LIST_FILES:
+                    raise WorkspaceFileTooLargeError(
+                        "The workspace file listing exceeds the configured collection limit."
+                    )
                 snapshots.append(self._snapshot_path(entry_path))
 
     def _resolve_path(self, path: str, *, apply_ignore_policy: bool = True) -> Path:
@@ -512,6 +582,7 @@ class WorkspaceService:
         parts = tuple(part for part in native_path.parts if part not in {".", ""})
         if any(part == ".." for part in parts):
             raise WorkspacePathError("Workspace paths must not contain parent traversal.")
+        self._reject_windows_special_components(parts)
 
         candidate = self._root
         for index, part in enumerate(parts):
@@ -573,6 +644,7 @@ class WorkspaceService:
         parts = tuple(part for part in native.parts if part not in {"", "."})
         if any(part == ".." for part in parts):
             raise WorkspacePathError("Generated-file paths must not contain parent traversal.")
+        self._reject_windows_special_components(parts)
         candidate = root
         for part in parts:
             candidate = candidate / part
@@ -592,7 +664,7 @@ class WorkspaceService:
             raise WorkspaceFileTooLargeError("Generated file contents exceed the configured size limit.")
         target = self._resolve_generated_child(directory, path)
         self._create_directory_without_symlinks(target.parent)
-        if target.is_symlink():
+        if _is_link_or_reparse_point(target):
             raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
         descriptor, temporary_name = tempfile.mkstemp(prefix=".forgemcp-generated-", dir=target.parent)
         temporary = Path(temporary_name)
@@ -605,7 +677,7 @@ class WorkspaceService:
                 raise WorkspaceNotFileError("The generated path is not a regular file.")
             os.replace(temporary, target)
         finally:
-            if temporary.exists() and not temporary.is_symlink():
+            if temporary.exists() and not _is_link_or_reparse_point(temporary):
                 temporary.unlink()
 
     def _read_generated_text(self, directory: str, path: str) -> str:
@@ -620,6 +692,59 @@ class WorkspaceService:
         except UnicodeDecodeError as error:
             raise WorkspaceEncodingError("The requested generated file is not valid UTF-8.") from error
 
+    def _read_generated_text_with_snapshot(
+        self, directory: str, path: str, *, maximum_bytes: int
+    ) -> tuple[str, FileSnapshot]:
+        """Read bounded generated metadata while binding its digest to those bytes."""
+        if not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool) or maximum_bytes <= 0:
+            raise WorkspaceFileTooLargeError("Generated file limit must be a positive byte count.")
+        target = self._resolve_generated_child(directory, path)
+        for _ in range(3):
+            if _is_link_or_reparse_point(target):
+                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
+            if not target.exists():
+                raise WorkspaceFileNotFoundError("The requested generated file does not exist.")
+            if not target.is_file():
+                raise WorkspaceNotFileError("The requested generated path is not a regular file.")
+            before = target.stat()
+            if before.st_size > maximum_bytes:
+                raise WorkspaceFileTooLargeError("The requested generated file exceeds the configured read limit.")
+            data = self._read_bytes_limited(target, maximum_bytes)
+            after = target.stat()
+            if (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+            ):
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise WorkspaceEncodingError("The requested generated file is not valid UTF-8.") from error
+            return (
+                text,
+                FileSnapshot(
+                    uri=target.as_uri(),
+                    exists=True,
+                    size_bytes=after.st_size,
+                    sha256=hashlib.sha256(data).hexdigest(),
+                    modified_at=datetime.fromtimestamp(after.st_mtime, UTC),
+                    captured_at=datetime.now(UTC),
+                ),
+            )
+        raise WorkspaceConcurrentModificationError(
+            "The generated file changed while it was being read; retry the operation."
+        )
+
+    def _generated_directory_is_empty(self, directory: str) -> bool:
+        """Inspect entry names only; never traverse a generated build tree."""
+        target = self._resolve_path(directory, apply_ignore_policy=False)
+        if not target.exists() or not target.is_dir():
+            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
+        with os.scandir(target) as entries:
+            return next(entries, None) is None
+
     def _list_generated_files(self, directory: str, path: str) -> tuple[str, ...]:
         """List direct regular files in a generated directory without following links."""
         target = self._resolve_generated_child(directory, path)
@@ -631,7 +756,7 @@ class WorkspaceService:
             return tuple(
                 entry.name
                 for entry in sorted(entries, key=lambda entry: entry.name)
-                if not entry.is_symlink() and entry.is_file(follow_symlinks=False)
+                if not _is_link_or_reparse_point(Path(entry.path)) and entry.is_file(follow_symlinks=False)
             )
 
     def _get_generated_snapshot(self, directory: str, path: str) -> FileSnapshot:
@@ -653,9 +778,13 @@ class WorkspaceService:
         """Return the canonical forward-slash workspace-relative key for a safe path."""
         return target.relative_to(self._root).as_posix()
 
+    def _path_identity(self, target: Path) -> str:
+        """Return a platform-canonical key for duplicate detection and ordering."""
+        return os.path.normcase(self._relative_key(target))
+
     def _snapshot_path(self, target: Path) -> FileSnapshot:
         """Snapshot an existing regular file, or represent an absent safe target."""
-        if target.is_symlink():
+        if _is_link_or_reparse_point(target):
             raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
         if not target.exists():
             return FileSnapshot(uri=target.as_uri(), exists=False, captured_at=datetime.now(UTC))
@@ -689,7 +818,7 @@ class WorkspaceService:
 
     def _read_bytes_limited(self, target: Path, maximum: int) -> bytes:
         """Read at most one configured byte limit plus a sentinel byte."""
-        if target.is_symlink():
+        if _is_link_or_reparse_point(target):
             raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
         with target.open("rb") as source:
             data = source.read(maximum + 1)
@@ -778,7 +907,7 @@ class WorkspaceService:
             if not isinstance(supplied_path, str):
                 raise ExpectedSnapshotError("Expected snapshot paths must be strings.")
             target = self._resolve_path(supplied_path)
-            key = self._relative_key(target)
+            key = self._path_identity(target)
             if key in normalized:
                 raise ExpectedSnapshotError("Expected snapshots must not name a file more than once.")
             if not isinstance(expected, (FileSnapshot, str)) and expected is not None:
@@ -831,7 +960,13 @@ class WorkspaceService:
         if new_text is None:
             return None
         kind = FileChangeKind.CREATED if creating else FileChangeKind.MODIFIED
-        return _PlannedChange(target=target, before=before, kind=kind, after_text=new_text)
+        return _PlannedChange(
+            target=target,
+            before=before,
+            kind=kind,
+            after_text=new_text,
+            no_op=not creating and new_text == source_text,
+        )
 
     def _read_patch_text(self, target: Path, snapshot: FileSnapshot) -> str:
         """Read a bounded UTF-8 patch source and ensure it still matches its snapshot."""
@@ -846,6 +981,20 @@ class WorkspaceService:
             return data.decode("utf-8")
         except UnicodeDecodeError as error:
             raise WorkspaceEncodingError("The patch source is not valid UTF-8.") from error
+
+    def _add_bounded_mutation_output(self, total: int, text: str | None) -> int:
+        """Cap aggregate staged UTF-8 data before the first filesystem write."""
+        if text is None:
+            return total
+        try:
+            next_total = total + len(text.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise WorkspaceEncodingError("Workspace mutation output must be valid UTF-8 text.") from error
+        if next_total > self._policy.max_patch_bytes:
+            raise WorkspaceFileTooLargeError(
+                "The workspace mutation exceeds the configured aggregate output limit."
+            )
+        return next_total
 
     def _stage_changes(self, plans: list[_PlannedChange]) -> list[_StagedChange]:
         """Write all desired files beside their targets before changing any target."""
@@ -894,6 +1043,8 @@ class WorkspaceService:
                     if item.temporary_path is not None:
                         os.replace(item.temporary_path, plan.target)
                         item.temporary_path = None
+                    if plan.kind is not FileChangeKind.DELETED:
+                        item.after_snapshot = self._snapshot_path(plan.target)
             except OSError as error:
                 self._restore_committed_changes(committed)
                 raise PatchCommitError("Patch commit failed; ForgeMCP restored the previous file state.") from error
@@ -925,14 +1076,15 @@ class WorkspaceService:
                 if path is None:
                     continue
                 try:
-                    if path.exists() and not path.is_symlink():
+                    if path.exists() and not _is_link_or_reparse_point(path):
                         path.unlink()
                 except OSError:
                     self._logger.warning("workspace_temporary_cleanup_failed")
 
-    def _to_file_change(self, plan: _PlannedChange) -> FileChange:
+    def _to_file_change(self, item: _StagedChange) -> FileChange:
         """Build a content-free success report after the staged commit completes."""
-        after = None if plan.kind is FileChangeKind.DELETED else self._snapshot_path(plan.target)
+        plan = item.plan
+        after = None if plan.kind is FileChangeKind.DELETED else item.after_snapshot
         before = None if plan.kind is FileChangeKind.CREATED else plan.before
         return FileChange(uri=plan.target.as_uri(), kind=plan.kind, before=before, after=after)
 
@@ -942,8 +1094,9 @@ class WorkspaceService:
         """Queue one ordered post-commit batch after staging cleanup is complete."""
         if self._mutations is None or not changes:
             return
-        self._mutation_operation += 1
-        operation_id = f"workspace-{self._mutation_operation}"
+        with self._filesystem_lock:
+            self._mutation_operation += 1
+            operation_id = f"workspace-{self._mutation_operation}"
         event_changes: list[tuple[str, FileChangeKind, FileSnapshot | None, FileSnapshot | None]] = []
         for plan, change in zip(plans, changes, strict=True):
             event_changes.append(
@@ -952,6 +1105,15 @@ class WorkspaceService:
         # Publication never invokes a subscriber while Workspace has staging
         # state. Failure or saturation is contained by the application bus.
         self._mutations.publish(tuple(event_changes), operation_id=operation_id)
+
+    @staticmethod
+    def _reject_windows_special_components(parts: Sequence[str]) -> None:
+        """Deny ADS and reserved device spellings on every platform."""
+        for part in parts:
+            if ":" in part or part.rstrip(" .") != part or _WINDOWS_RESERVED_COMPONENT.fullmatch(part):
+                raise WorkspacePathError(
+                    "Workspace paths must not use Windows device or alternate-data-stream names."
+                )
 
     def _parse_unified_patch(self, patch: str) -> tuple[_FilePatch, ...]:
         """Parse the deliberately small, text-only unified-diff subset we support."""

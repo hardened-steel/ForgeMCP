@@ -20,7 +20,9 @@ class _ProgressFixturePlugin(ForgePlugin):
                 execution_context.throw_if_cancelled()
                 await execution_context.report_progress(ProgressUpdate(step, 3, "Fixture working"))
                 await asyncio.sleep(0.08)
-            await execution_context.report_progress(ProgressUpdate(3, 3, "Fixture completed", terminal=True))
+            await execution_context.report_progress(
+                ProgressUpdate(3, 3, "Fixture completed", terminal=True, completed=True)
+            )
             return {"completed": True}
 
         context.tools.register(ToolContribution(

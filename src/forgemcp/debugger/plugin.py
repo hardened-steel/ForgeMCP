@@ -111,7 +111,9 @@ async def _run_lifecycle_progress(
         await context.report_progress(ProgressUpdate(0, None, f"{label} failed", terminal=True))
         raise
     else:
-        await context.report_progress(ProgressUpdate(1, None, f"{label} completed", terminal=True))
+        await context.report_progress(
+            ProgressUpdate(1, None, f"{label} completed", terminal=True, completed=True)
+        )
         return result
     finally:
         if heartbeat is not None:

@@ -176,30 +176,45 @@ categories, but is not an MCP response.
 
 ### Workspace MCP tools and compilation database coherence
 
-Workspace tools accept only workspace-relative UTF-8 paths, never absolute
-paths, binary files, arbitrary filesystem access, or Git operations. Start
-with `workspace__read_text` or `workspace__get_snapshot`; pass the returned
-SHA-256 to every mutation. A snapshot conflict changes nothing: read again
-before retrying. `workspace__apply_unified_patch` supports safe creation only
-when the new target is explicitly expected absent (`null`); delete and rename
-are intentionally not public tools. `workspace__apply_text_edits` edits only
-existing files. Neither tool logs source, edit, or patch text.
+Workspace tools accept only bounded workspace-relative UTF-8 paths and files:
+absolute, drive-relative, UNC/device, alternate-data-stream, traversal,
+symlink/junction/reparse, ignored-directory, and binary-file access are
+rejected. File listings are capped at 1,000 entries. Start with
+`workspace__read_text` or `workspace__get_snapshot`; pass the returned
+SHA-256 to every mutation. Existing files require that CAS value, while patch
+creation requires an explicit expected-absent `null`. A validation or snapshot
+conflict changes nothing; no-op edits publish no change. A text-edit batch has
+at most 1,000 edits, and patch/replacement input plus aggregate staged output
+are byte-bounded before any write. Delete and rename are intentionally not
+public tools. Both the published input and success/error result schemas forbid
+unknown fields. Source is returned only by `read_text` and is never logged,
+placed in status/progress/errors, or put on the mutation bus.
 
-Successful Workspace commits publish one content-free, application-local batch
-after filesystem cleanup. Active clangd documents receive a bounded full-text
-`didChange`; untracked documents remain lazy. CMakeLists, `.cmake`, preset, and
-configured in-workspace toolchain mutations mark CMake configuration stale but
-never auto-configure. There is no external filesystem watcher.
+Successful Workspace commits publish exactly one deterministically path-ordered,
+content-free, application-local batch after the filesystem lock and staging
+cleanup are released. Subscriber failure, timeout, or queue saturation never
+undoes a commit, but is sticky `DEGRADED` integration state; CMake is then
+conservatively stale and clangd synchronizes on the next safe request. Active
+clangd documents receive one full-text `didChange` for the committed snapshot;
+untracked documents remain lazy. CMakeLists, `.cmake`, preset, and configured
+in-workspace toolchain mutations mark CMake configuration stale but never
+auto-configure. There is no external filesystem watcher.
 
-`--compile-commands auto` adds `CMAKE_EXPORT_COMPILE_COMMANDS=ON`. For an
-empty unpinned tree with a qualified Ninja, ForgeMCP uses Ninja (on Windows
-with the discovered MSVC Developer environment); an explicit generator or
-preset wins, and an explicit Visual Studio generator is never replaced. Ninja,
-Ninja Multi-Config, and available Makefile generators are the only claimed
-database-capable families. Visual Studio generators configure normally but
-report the database limitation. CMake validates the generated database inside
-the selected build tree and shares metadata/fingerprint only; active clangd is
-reinitialized when that fingerprint changes. See [ADR 0014](docs/adr/0014-workspace-mutations-and-compilation-database-coherence.md).
+`--compile-commands` resolves CLI over `FORGEMCP_COMPILE_COMMANDS` over the
+default `auto`; the only modes are `auto`, `required`, and `off`.
+`auto` adds `CMAKE_EXPORT_COMPILE_COMMANDS=ON`. It selects Ninja only when
+there is no explicit generator or preset, no generator in an existing cache,
+the generated tree is empty, and qualified Ninja plus a compatible selected
+toolchain environment are available (the discovered MSVC Developer environment
+on Windows). Ninja, Ninja Multi-Config, and the named CMake Makefile families
+are the only claimed database-capable generators; Visual Studio generators are
+never replaced and are not claimed to produce a database. `required` rejects
+an explicit export `OFF` and unavailable/invalid databases; `off` permits
+clangd fallback commands. CMake validates only a bounded regular UTF-8
+database inside the selected build tree and shares metadata/fingerprint only.
+An active clangd session is controlled-restarted only when that fingerprint
+changes. A CMake mutation after configure starts leaves its result stale even
+if the process succeeds. See [ADR 0014](docs/adr/0014-workspace-mutations-and-compilation-database-coherence.md).
 
 ### CMake build-directory resolution
 
@@ -239,20 +254,28 @@ progress for `cmake__configure`, `cmake__build`, `cmake__ctest_run`,
 `clang_tidy__run`, `clangd__start`, `clangd__stop`, `debugger__launch`, and
 `debugger__stop`. Clients without a token, or clients whose progress transport
 is unavailable, receive the same result/error and the operation continues.
+MCP string tokens, numeric tokens, and numeric `0` are preserved verbatim per
+request; tokens never enter ForgeMCP models, logs, errors, or status data.
 
 Configure/build/test publish fixed safe phases and a bounded elapsed heartbeat
 while the tool is quiet. Ninja's strict `[completed/total]` form and strict
 CTest completion lines provide exact progress only when they are unambiguous;
 MSBuild and unknown generators deliberately remain heartbeat-only. Progress
-labels are short normalized status text. They never contain command argv,
+is monotonic across phase, heartbeat, exact, and terminal notifications. A
+successful exact operation reserves `total/total` for its terminal success;
+failure, timeout, and cancellation preserve the last observed value instead.
+Labels are short normalized status text. They never contain command argv,
 absolute paths, environment values, raw process output, source text, or
-secrets. Target/test labels are shown only after validation and length checks.
+secrets. Only model-validated, length-checked build target labels may be
+shown; project-controlled CTest output never contributes a test-name label.
 
 Delivery is rate-limited and synchronous per request (there are no unbounded
 notification tasks). Each request has an independent reporter; slow/failing
 progress delivery is disabled for that call rather than blocking a child
 process. A successful long operation sends a terminal update; failure,
 timeout, and cancellation send a terminal category without claiming 100%.
+Progress is not MCP Logging and is never mirrored as a raw log event. It does
+not extend a ForgeMCP operation timeout or the client's `tool_timeout_sec`.
 
 ### Windows and Codex examples
 

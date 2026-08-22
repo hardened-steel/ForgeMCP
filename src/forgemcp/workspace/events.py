@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import inspect
 import threading
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -20,6 +21,9 @@ from forgemcp.models import FileChangeKind, FileSnapshot
 
 MAX_MUTATION_SUBSCRIBERS = 16
 MAX_PENDING_MUTATION_BATCHES = 32
+MAX_MUTATION_HISTORY = 64
+SUBSCRIBER_HANDLER_TIMEOUT_SECONDS = 15.0
+SUBSCRIBER_CLOSE_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +88,10 @@ class WorkspaceMutationBus:
     commit.  One subscriber owns at most one worker task and one fixed queue.
     """
 
-    __slots__ = ("_logger", "_subscribers", "_generation", "_started", "_closed", "_degraded", "_publication_lock")
+    __slots__ = (
+        "_logger", "_subscribers", "_generation", "_started", "_closed", "_degraded",
+        "_publication_lock", "_history", "_retired_tasks",
+    )
 
     def __init__(self, logger: _Logger) -> None:
         self._logger = logger
@@ -94,6 +101,8 @@ class WorkspaceMutationBus:
         self._closed = False
         self._degraded = False
         self._publication_lock = threading.Lock()
+        self._history: deque[WorkspaceMutationBatch] = deque(maxlen=MAX_MUTATION_HISTORY)
+        self._retired_tasks: set[asyncio.Task[object]] = set()
 
     @property
     def generation(self) -> int:
@@ -104,6 +113,20 @@ class WorkspaceMutationBus:
     def degraded(self) -> bool:
         """Whether an integration handler failed or its bounded queue overflowed."""
         return self._degraded
+
+    def batches_since(self, generation: int) -> tuple[WorkspaceMutationBatch, ...] | None:
+        """Return bounded metadata batches after ``generation`` when retained.
+
+        ``None`` means the requested boundary fell out of bounded history.  A
+        consumer must conservatively treat that as degraded/unknown rather than
+        claiming a configure incorporated every intervening source mutation.
+        """
+        if not isinstance(generation, int) or generation < 0:
+            raise ValueError("Workspace mutation generation is invalid.")
+        with self._publication_lock:
+            if self._history and generation < self._history[0].generation - 1:
+                return None
+            return tuple(batch for batch in self._history if batch.generation > generation)
 
     async def start(self) -> None:
         """Bind bounded worker tasks to the current application event loop."""
@@ -124,7 +147,7 @@ class WorkspaceMutationBus:
             or len(name) > 64
             or not callable(handler)
             or name in self._subscribers
-            or len(self._subscribers) >= MAX_MUTATION_SUBSCRIBERS
+            or len(self._subscribers) + len(self._retired_tasks) >= MAX_MUTATION_SUBSCRIBERS
         ):
             raise ValueError("Workspace mutation subscription is unavailable.")
         subscriber = _Subscriber(name=name, handler=handler, queue=asyncio.Queue(MAX_PENDING_MUTATION_BATCHES))
@@ -142,8 +165,16 @@ class WorkspaceMutationBus:
             with contextlib.suppress(asyncio.QueueFull):
                 subscriber.queue.put_nowait(None)
             subscriber.worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await subscriber.worker
+            try:
+                await asyncio.wait_for(asyncio.shield(subscriber.worker), timeout=SUBSCRIBER_CLOSE_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                # This is the expected result of cancelling a cooperative
+                # queue worker during unregistration.
+                return
+            except (Exception, TimeoutError):
+                self._degraded = True
+                self._logger.warning("workspace_mutation_subscriber_degraded", subscriber=subscriber.name, reason="shutdown_timeout")
+                self._retire_task(subscriber.worker)
 
     def publish(self, changes: tuple[tuple[str, FileChangeKind, FileSnapshot | None, FileSnapshot | None], ...], *, operation_id: str) -> None:
         """Queue one ordered post-commit batch without awaiting a subscriber.
@@ -171,6 +202,7 @@ class WorkspaceMutationBus:
                     for path, kind, before, after in changes
                 ),
             )
+            self._history.append(batch)
             for subscriber in tuple(self._subscribers.values()):
                 try:
                     subscriber.queue.put_nowait(batch)
@@ -184,9 +216,7 @@ class WorkspaceMutationBus:
         if self._closed:
             return
         self._closed = True
-        subscribers = tuple(self._subscribers)
-        for name in subscribers:
-            await self.unsubscribe(name)
+        await asyncio.gather(*(self.unsubscribe(name) for name in tuple(self._subscribers)))
 
     def _start_worker(self, subscriber: _Subscriber) -> None:
         if subscriber.worker is None or subscriber.worker.done():
@@ -199,11 +229,25 @@ class WorkspaceMutationBus:
             batch = await subscriber.queue.get()
             if batch is None:
                 return
+            task: asyncio.Task[None] | None = None
             try:
                 result = subscriber.handler(batch)
-                if inspect.isawaitable(result):
-                    await asyncio.wait_for(result, timeout=15.0)
+                if not inspect.isawaitable(result):
+                    continue
+                task = asyncio.create_task(result)
+                done, _ = await asyncio.wait({task}, timeout=SUBSCRIBER_HANDLER_TIMEOUT_SECONDS)
+                if not done:
+                    self._degraded = True
+                    subscriber.failures += 1
+                    self._logger.warning("workspace_mutation_subscriber_degraded", subscriber=subscriber.name, reason="handler_timeout")
+                    task.cancel()
+                    self._retire_task(task)
+                    return
+                await task
             except asyncio.CancelledError:
+                if task is not None and not task.done():
+                    task.cancel()
+                    self._retire_task(task)
                 raise
             except Exception:
                 subscriber.failures += 1
@@ -211,3 +255,14 @@ class WorkspaceMutationBus:
                 # Deliberately only plugin identity/category: no source path,
                 # content, patch, exception value, or host information.
                 self._logger.warning("workspace_mutation_subscriber_degraded", subscriber=subscriber.name, reason="handler_failure")
+
+    def _retire_task(self, task: asyncio.Task[object]) -> None:
+        """Keep cancellation-suppressing work bounded and visible to capacity checks."""
+        self._retired_tasks.add(task)
+
+        def discard(completed: asyncio.Task[object]) -> None:
+            self._retired_tasks.discard(completed)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.result()
+
+        task.add_done_callback(discard)

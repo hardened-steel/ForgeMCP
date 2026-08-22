@@ -57,7 +57,7 @@ A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 
 Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
 
-Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` normally qualifies its local name as `<plugin_id>__<tool_name>` and rejects duplicates. A contribution may use another validated stable namespace only when its plugin metadata declares it; Quality uses `quality`, `clang_format`, `clang_tidy`, and `sanitizer` under one lifecycle. A legacy handler remains `handler(arguments)`. A handler may opt into the keyword-only `execution_context: ToolExecutionContext`, which provides only `ProgressReporter`, `supports_progress`, and cancellation checks. Contexts are constructed by `server.py` for one invocation, never stored by services, and contain no SDK request/session/transport objects. `ProgressUpdate` is immutable, bounded and path/control-text-safe; `NoOpProgressReporter` keeps in-process and token-less clients behaviourally identical. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model, including Pydantic required fields and bounds, into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
+Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` normally qualifies its local name as `<plugin_id>__<tool_name>` and rejects duplicates. A contribution may use another validated stable namespace only when its plugin metadata declares it; Quality uses `quality`, `clang_format`, `clang_tidy`, and `sanitizer` under one lifecycle. A legacy handler remains `handler(arguments)`. A handler opts into context only with the exact keyword-only `execution_context: ToolExecutionContext`; positional/default `context` parameters remain legacy input and are never rebound. Contexts are constructed by `server.py` for one invocation, never stored by services, reused, serialized, or placed in schemas, and contain no SDK request/session/transport objects. `ProgressUpdate` is immutable, bounded and path/control-text-safe; its private request state keeps phase, heartbeat, exact parser and terminal numbers monotonic. `NoOpProgressReporter` keeps in-process and token-less clients behaviourally identical. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model, including Pydantic required fields and bounds, into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
 
 The built-in CMake plugin owns the stable contributions `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local CMake service receives only the declared `workspace` and `process_runtime` services, never an application object or a transport object.
 
@@ -153,22 +153,47 @@ Its public `WorkspaceService` API is:
 - `open_generated_directory(path, create=False) -> GeneratedWorkspaceDirectory`
 - `validate_reported_path(path, relative_to=".") -> str`
 
-All supplied paths are workspace-relative strings. Absolute, drive-qualified, and parent-traversal paths are rejected. A requested path containing a symlink is rejected; directory listing does not follow and omits symlinks. The default immutable `WorkspacePolicy` excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories, and provides bounded UTF-8 reads and patch input. Callers can compose `WorkspaceService` with another policy when their generated-directory conventions differ.
+All supplied paths are workspace-relative strings. Absolute, drive-relative,
+UNC/device, alternate-data-stream, reserved-device, trailing-dot/space, and
+parent-traversal spellings are rejected. A requested path containing a symlink,
+junction, or other reparse point is rejected; directory listing omits them and
+is capped at 1,000 regular files. The default immutable `WorkspacePolicy`
+excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories,
+and provides bounded UTF-8 reads and patch input. Callers can compose
+`WorkspaceService` with another policy when their generated-directory
+conventions differ.
 
-After a successful staged commit and staging cleanup, Workspace emits exactly one
-ordered application-local mutation batch. It contains only generation,
-operation ID, relative path, change kind, and prior/current snapshot metadata.
-Each subscriber has one bounded worker/queue; failure or saturation is a safe
-degraded integration warning and cannot undo the filesystem commit. The bus is
-owned by one ForgeApplication and is not an external filesystem watcher.
+After a successful staged commit and staging cleanup, Workspace emits exactly
+one deterministically path-ordered, application-local mutation batch. It
+contains only an application-local monotonic generation, operation ID,
+relative path, change kind, and prior/current snapshot metadata. Publication
+and every subscriber run after the Workspace filesystem lock is released. Each
+subscriber has one bounded worker/queue; failure, timeout, cancellation
+suppression, or saturation is sticky degraded integration state and cannot undo
+the filesystem commit. The bounded history lets configure detect a relevant
+batch that arrived after its generation capture; a history gap is conservatively
+stale. The bus is owned by one ForgeApplication and is not an external
+filesystem watcher.
 
-Every patch target must carry a compare-and-swap expectation: preferably the `FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file; `None` represents an expected absent file for creation. A snapshot conflict or hunk mismatch returns `PatchResult(applied=False)` before source files are changed. Patches are text-only unified diffs, staged beside their targets and committed with rollback backups; patch input and file content never enter Workspace log context. File change events are intentionally not implemented yet.
+Every patch target must carry a compare-and-swap expectation: preferably the
+`FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file;
+`None` represents an expected absent file for creation. A snapshot conflict or
+hunk mismatch returns `PatchResult(applied=False)` before source files are
+changed. Patches are text-only unified diffs, staged beside their targets and
+committed with rollback backups; patch input and file content never enter
+Workspace log context, errors, status, progress, or mutation events. A
+validated no-op returns success without replacement or a mutation batch. The
+public listing and edit collections are bounded (1,000 files/edits), as are
+patch/replacement input and aggregate staged UTF-8 output before the first
+write.
 
 `GeneratedWorkspaceDirectory` is an intentionally narrow capability for a caller-declared generated directory: it can write and read bounded UTF-8 files, list direct non-symlink files, and snapshot generated files without exposing a `Path`. It applies the same workspace and symlink checks even when the directory matches the ordinary Workspace ignore policy. CMake uses it for `.cmake/api/v1/query/codemodel-v2` and File API replies; it does not directly manipulate build-tree paths.
 
 Workspace I/O itself is isolated in the separately composed Workspace module.
-MCP Workspace tool adapters remain intentionally unimplemented. The debugger
-uses only `validate_execution_path`, a separate validation-only capability for
+The builtin Workspace adapter exposes only bounded list/read/snapshot,
+unified-patch creation/modification, and existing-file text edits; its strict
+input and success/error result schemas forbid unknown fields. The debugger uses only
+`validate_execution_path`, a separate validation-only capability for
 workspace-contained generated execution paths; it grants neither file reads
 nor writes.
 
@@ -180,7 +205,18 @@ nor writes.
 
 `clangd__start` may receive an explicit workspace-contained, non-symlink compilation-database directory, otherwise it uses the latest CMake-validated profile. `off` permits fallback command inference. It launches only fixed clangd arguments and performs `initialize` followed by `initialized`. A validated database fingerprint change triggers one bounded controlled restart/reinitialize and reopens only previously tracked documents; a restart failure degrades clangd but does not revise the CMake configure result. clangd is an untrusted, fallible protocol peer: all incoming messages are size-bounded, parsed into normalized models at the adapter boundary, and neither raw payloads, compiler arguments, source/replacement text, nor stderr are logged. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed discard limit.
 
-Document text is read only through WorkspaceService. On first use ForgeMCP sends `didOpen`; when a new `FileSnapshot` SHA-256 is observed, it sends a full `didChange` with a monotonically increasing version. Workspace mutation batches invalidate cached actions/hierarchy/diagnostics, resynchronize only already tracked documents, and keep untracked paths dirty/lazy. Only snapshot, URI, version, and normalized diagnostics are retained, never a permanent source-text cache. `publishDiagnostics` is associated with the active snapshot/version. `clangd__diagnostics` reports completeness, timeout, and staleness; an empty current publication is a successful empty result.
+Document text is read only through WorkspaceService. On first use ForgeMCP sends
+`didOpen`; for each committed changed snapshot it sends at most one full
+`didChange` with a strictly increasing version. Workspace mutations (including
+clangd's own WorkspaceEdit) invalidate cached actions/hierarchy/diagnostics,
+resynchronize only already tracked documents, and keep untracked paths
+dirty/lazy. A notification failure leaves the older synchronized snapshot in
+place, marks synchronization pending/degraded, and is retried from the next
+safe document request; it never claims the stale snapshot was synchronized.
+Only snapshot, URI, version, and normalized diagnostics are retained, never a
+permanent source-text cache. `publishDiagnostics` is associated with the active
+snapshot/version. `clangd__diagnostics` reports completeness, timeout, and
+staleness; an empty current publication is a successful empty result.
 
 The public coordinate policy is Unicode code-point columns. LSP's negotiated `utf-8`, `utf-16`, or `utf-32` character offset is converted only at the LSP adapter boundary, rejecting positions that split an encoded character. Input document paths are workspace-relative and checked by WorkspaceService. Incoming file URIs are percent-decoded and revalidated through WorkspaceService; results outside the workspace are omitted and reported only through an omitted-result count. See [ADR 0007](adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md).
 
@@ -196,7 +232,7 @@ Code actions and hierarchy items are represented by opaque random handles, not c
 
 `forgemcp.processes` owns safe asyncio execution for CMake, CTest, and later clangd and DAP modules. It is transport-neutral and registers no MCP tools; `server.py` remains a thin stdio adapter. `ForgeApplication.create()` composes it under `application.services["process_runtime"]`.
 
-Short-command `run` optionally accepts a trusted local `ProcessOutputObserver`. It receives only decoded 4,096-character-bounded stdout/stderr chunks through one 32-event bounded queue and worker; stream ordering is not promised. Pipe drain and `ProcessResult` capture remain independent of observer speed. Overflow drops observations and marks safe `ProcessResult.observer_overflow`; observer exceptions are isolated and mark `observer_failed`. Raw chunks are never logged, retained after dispatch, or forwarded automatically to MCP. This is solely a local parser hook for fixed progress derivation; protocol `start` streams and stdin ownership remain unchanged.
+Short-command `run` optionally accepts a trusted local `ProcessOutputObserver`. It receives independently incrementally decoded 4,096-character-bounded stdout/stderr chunks through one 32-event bounded queue and worker; stream ordering is not promised. Pipe drain and `ProcessResult` capture remain independent of observer speed. Overflow drops observations and marks safe `ProcessResult.observer_overflow`; observer exceptions, a slow observer, or cancellation suppression are isolated and mark `observer_failed` without delaying the process result. A local observer may provide an optional bounded `aclose()` flush for an EOF-terminated partial line. Raw chunks are never logged, retained after dispatch, or forwarded automatically to MCP. This is solely a local parser hook for fixed progress derivation; protocol `start` streams and stdin ownership remain unchanged.
 
 Its public API has normal and trusted-adapter paths:
 
@@ -307,20 +343,27 @@ the LLDB/backend boundary.
 
 Every configure request supplies a workspace-contained `source_dir` and an explicitly selected workspace-contained generated `binary_dir`. Configure writes the File API `codemodel-v2` query via `GeneratedWorkspaceDirectory` and invokes `cmake -S ... -B ...` through Process Runtime. When a preset is selected, CMake receives `--preset`, but ForgeMCP still passes the validated `-B` value so the preset cannot direct execution to an external build tree. No raw shell command or generic extra-argument field is exposed. Optional cache values are restricted to CMake-style identifier keys and NUL-free scalar values.
 
-The immutable compile-commands policy is `auto` by default, `required`, or
-`off`. `auto` adds `CMAKE_EXPORT_COMPILE_COMMANDS=ON`; a qualified Ninja is
-selected only for a new unpinned tree, while an explicit Visual Studio generator
-or preset is preserved. Existing CMake cache generator changes are rejected
-with an empty-build-directory suggestion. After configure ForgeMCP reads the
-actual cache generator, validates a bounded regular UTF-8 JSON database inside
-the generated build tree, and exposes availability/support/count/fingerprint
-metadata only. Database commands and external paths are trusted project input
-for native tools and never returned or logged. Workspace CMake-file mutations
-only mark cached configuration stale; they do not configure automatically.
+The immutable compile-commands policy is CLI, then environment, then default
+`auto`; the allowed modes are `auto`, `required`, and `off`. `auto` adds
+`CMAKE_EXPORT_COMPILE_COMMANDS=ON`; qualified Ninja is selected only with no
+explicit generator/preset or cached generator, in an empty generated tree, and
+with a compatible selected toolchain environment. An explicit preset is
+preserved even when its inherited generator is not locally expanded. Existing
+CMake cache generator changes are rejected with an empty-build-directory
+suggestion. Only exact Ninja/Ninja Multi-Config and named Makefile generator
+families are database-capable; Visual Studio is not claimed to produce one.
+After configure ForgeMCP reads the actual cache generator, then validates a
+byte-bounded regular UTF-8 JSON database inside the generated build tree before
+parsing and exposes availability/support/count/fingerprint metadata only.
+Database commands and external paths are trusted project input for native
+tools, not sandboxed input, and are never returned or logged. Configure captures
+the Workspace generation before execution; a relevant later mutation keeps the
+successful result stale. Workspace CMake-file mutations only mark cached
+configuration stale; they do not configure automatically.
 
 Targets come only from CMake File API codemodel v2 replies, never `--target help`. Missing, stale, malformed, unsupported-version, symlinked, or out-of-workspace replies return a CMake domain error. Reported source, artifact, and build paths are revalidated through Workspace before they are exposed as workspace-relative strings. Build preserves a non-zero CMake exit as a `ProcessResult`, with optional multi-config name and bounded `parallel_jobs`. CTest test discovery uses `ctest --show-only=json-v1`; execution supports all tests or a generated escaped exact-name selection and exposes no client-supplied regex or arbitrary CTest arguments. Timeout and output bounds are those of Process Runtime.
 
-Long CMake operations consume only their invocation's execution context. Configure/build/test use fixed phase labels and a two-second bounded heartbeat. Exact values are emitted solely for strict Ninja `[completed/total]` and CTest completion formats; unrecognized/MSBuild output remains heartbeat-only. Local parsers never copy process lines into progress. Terminal failure/cancellation does not claim completion; `ProcessResult` additionally exposes derived duration and safe observer-health metadata.
+Long CMake operations consume only their invocation's execution context. Configure/build/test use fixed phase labels and a two-second bounded heartbeat. Exact values are emitted solely for strict Ninja `[completed/total]` and strict CTest completion formats; a reset, changed total, oversized line, unrecognized/MSBuild/localized output remains heartbeat-only. Local parsers never copy process lines or project-controlled CTest names into progress. Terminal failure/cancellation does not claim completion; exact `total/total` is deferred until success. Before terminal configure success ForgeMCP validates its bounded File API model, compilation database, and post-config workspace generation; unavailable/invalid File API and stale generation become fixed warning semantics for a successful process result. `ProcessResult` additionally exposes derived duration and safe observer-health metadata.
 
 Running configure, build, or tests is not sandboxing: CMake project scripts, custom commands, generators, build tools, and test executables may execute project-controlled code. The configured workspace is therefore a trust boundary, not an untrusted-input boundary. See ADR 0006.
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import forgemcp.workspace.events as workspace_events
+
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
@@ -46,6 +48,21 @@ def test_workspace_plugin_contributes_strict_schemas_and_cas_operations(tmp_path
                 }
             )
             assert created["applied"] is True
+            mixed_delete = await tools["workspace__apply_unified_patch"].handler(
+                {
+                    "patch": (
+                        "--- /dev/null\n+++ b/another.txt\n@@ -0,0 +1 @@\n+created\n"
+                        "--- a/note.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-after\n"
+                    ),
+                    "expected_snapshots": {
+                        "another.txt": None,
+                        "note.txt": (await tools["workspace__get_snapshot"].handler({"path": "note.txt"}))["snapshot"]["sha256"],
+                    },
+                }
+            )
+            assert mixed_delete["error"]["code"] == "workspace_request_error"
+            assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "after\n"
+            assert not (tmp_path / "another.txt").exists()
             current = await tools["workspace__get_snapshot"].handler({"path": "note.txt"})
             edited = await tools["workspace__apply_text_edits"].handler(
                 {
@@ -120,5 +137,64 @@ def test_workspace_mutation_subscriber_failure_degrades_without_rolling_back(tmp
         assert bus.degraded is True
         assert (tmp_path / "note.txt").read_bytes() == b"after\n"
         await bus.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_workspace_mutation_batch_is_path_sorted_and_noop_does_not_publish(tmp_path):
+    async def exercise() -> None:
+        (tmp_path / "one.txt").write_text("one\n", encoding="utf-8")
+        (tmp_path / "two.txt").write_text("two\n", encoding="utf-8")
+        logger = create_logger("CRITICAL")
+        bus = WorkspaceMutationBus(logger)
+        service = WorkspaceService(ForgeConfig(workspace_root=tmp_path), logger, mutations=bus)
+        received: list[WorkspaceMutationBatch] = []
+        bus.subscribe("test", received.append)
+        await bus.start()
+        result = service.apply_unified_patch(
+            _patch("two.txt", "two", "TWO") + _patch("one.txt", "one", "ONE"),
+            {"one.txt": service.get_snapshot("one.txt"), "two.txt": service.get_snapshot("two.txt")},
+        )
+        assert result.applied is True
+        await asyncio.sleep(0)
+        assert [change.path for change in received[0].changes] == ["one.txt", "two.txt"]
+        no_op = service.apply_unified_patch(
+            "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n ONE\n",
+            {"one.txt": service.get_snapshot("one.txt")},
+        )
+        assert no_op.applied is True and no_op.changes == ()
+        await asyncio.sleep(0)
+        assert len(received) == 1
+        await bus.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_workspace_mutation_bus_bounds_cancellation_suppressing_subscriber_shutdown(tmp_path, monkeypatch):
+    async def exercise() -> None:
+        (tmp_path / "note.txt").write_text("before\n", encoding="utf-8")
+        logger = create_logger("CRITICAL")
+        bus = WorkspaceMutationBus(logger)
+        service = WorkspaceService(ForgeConfig(workspace_root=tmp_path), logger, mutations=bus)
+        released = asyncio.Event()
+
+        async def suppress_cancel(_: WorkspaceMutationBatch) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await released.wait()
+
+        monkeypatch.setattr(workspace_events, "SUBSCRIBER_HANDLER_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(workspace_events, "SUBSCRIBER_CLOSE_TIMEOUT_SECONDS", 0.01)
+        bus.subscribe("stuck", suppress_cancel)
+        await bus.start()
+        assert service.apply_unified_patch(
+            _patch("note.txt", "before", "after"), {"note.txt": service.get_snapshot("note.txt")}
+        ).applied
+        await asyncio.sleep(0.03)
+        assert bus.degraded is True
+        await asyncio.wait_for(bus.aclose(), timeout=0.2)
+        released.set()
+        await asyncio.sleep(0)
 
     asyncio.run(exercise())

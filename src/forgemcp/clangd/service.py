@@ -101,6 +101,7 @@ MAX_CACHED_PAYLOAD_BYTES = 65_536
 MAX_WORKSPACE_EDIT_FILES = 100
 MAX_WORKSPACE_EDIT_TEXT_EDITS = 1_000
 MAX_WORKSPACE_EDIT_REPLACEMENT_BYTES = 1_048_576
+MAX_DIRTY_DOCUMENTS = 1_024
 _VERSION = re.compile(r"\bclangd version ([0-9][^\s]*)", re.IGNORECASE)
 _SYMBOL_KINDS = {
     1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
@@ -143,6 +144,7 @@ class ClangdProjectStatusCache:
     diagnostic_hint_count: int
     stale_diagnostic_count: int
     counts_truncated: bool
+    synchronization_degraded: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +186,7 @@ class ClangdService:
         self._workspace = workspace
         self._process_runtime = process_runtime
         self._toolchain = toolchain
-        self._mutations_enabled = mutations is not None
+        self._mutations = mutations
         self._compilation_database_registry = compilation_database
         self._state = ClangdSessionState.STOPPED
         self._compile_commands_dir: str | None = None
@@ -194,6 +196,7 @@ class ClangdService:
         self._client: LspClient | None = None
         self._documents: dict[str, _DocumentState] = {}
         self._dirty_generations: dict[str, int] = {}
+        self._sync_pending_paths: set[str] = set()
         self._actions: dict[str, _CachedAction] = {}
         self._hierarchy_items: dict[str, _CachedHierarchyItem] = {}
         self._failure: str | None = None
@@ -282,6 +285,9 @@ class ClangdService:
                 diagnostic_hint_count=diagnostic_hint_count,
                 stale_diagnostic_count=stale_diagnostic_count,
                 counts_truncated=len(self._documents) > MAX_PROJECT_STATUS_DOCUMENTS,
+                synchronization_degraded=bool(self._sync_pending_paths) or bool(
+                    self._mutations and self._mutations.degraded
+                ),
             )
 
     async def start(self, compile_commands_dir: str | None = None) -> ClangdStartResult:
@@ -301,6 +307,7 @@ class ClangdService:
             self._closing = False
             self._documents.clear()
             self._dirty_generations.clear()
+            self._sync_pending_paths.clear()
             self._clear_caches()
             self._stderr_characters = 0
             self._stderr_truncated = False
@@ -365,6 +372,7 @@ class ClangdService:
                                 await client.notify("textDocument/didClose", {"textDocument": {"uri": document.uri}})
                     self._documents.clear()
                     self._dirty_generations.clear()
+                    self._sync_pending_paths.clear()
                     self._clear_caches()
                 if client is not None and client.state is LspClientState.RUNNING:
                     with contextlib.suppress(LspError):
@@ -981,7 +989,7 @@ class ClangdService:
             raise ClangdEditConflictError("WorkspaceEdit could not be applied because the workspace changed.") from error
         if not result.applied:
             raise ClangdEditConflictError("WorkspaceEdit did not match the current workspace snapshots.")
-        if result.changes and not self._mutations_enabled:
+        if result.changes:
             await self._synchronize_changed_documents(result.changes)
         return WorkspaceEditSummary(
             applied=True,
@@ -1073,20 +1081,18 @@ class ClangdService:
                 except WorkspaceError as error:
                     self._set_failed("A changed open document could not be re-synchronized safely.")
                     raise ClangdFailedError(self._failure) from error
-                document.snapshot = snapshot
-                document.version += 1
+                if document.snapshot.sha256 == snapshot.sha256:
+                    continue
+                next_version = document.version + 1
                 document.diagnostics = ()
                 document.diagnostics_snapshot_sha256 = None
                 document.stale_diagnostics = True
                 document.diagnostic_event = asyncio.Event()
-                await self._notify(
-                    client,
-                    "textDocument/didChange",
-                    {
-                        "textDocument": {"uri": document.uri, "version": document.version},
-                        "contentChanges": [{"text": text}],
-                    },
-                )
+                if not await self._notify_did_change(client, document, next_version, text):
+                    continue
+                document.snapshot = snapshot
+                document.version = next_version
+                self._sync_pending_paths.discard(document.path)
         self._clear_caches()
 
     async def handle_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
@@ -1099,17 +1105,16 @@ class ClangdService:
         """
         if self._state is not ClangdSessionState.RUNNING or self._client is None:
             for change in batch.changes:
-                self._dirty_generations[change.path] = batch.generation
+                self._mark_dirty(change.path, batch.generation)
             return
         client = self._client
-        diagnostics_to_wait: list[asyncio.Event] = []
         async with self._mutation_lock:
             async with self._document_lock:
                 self._clear_caches()
                 for change in batch.changes:
                     document = self._document_for_path(change.path)
                     if document is None:
-                        self._dirty_generations[change.path] = batch.generation
+                        self._mark_dirty(change.path, batch.generation)
                         continue
                     after = change.after
                     if after is None or not after.exists or after.sha256 is None:
@@ -1117,40 +1122,33 @@ class ClangdService:
                         document.diagnostics_snapshot_sha256 = None
                         document.stale_diagnostics = True
                         document.diagnostic_event = asyncio.Event()
-                        self._dirty_generations[change.path] = batch.generation
+                        self._mark_dirty(change.path, batch.generation)
                         continue
                     try:
                         text, snapshot = self._workspace.read_text(document.path)
                     except WorkspaceError:
                         document.stale_diagnostics = True
-                        self._dirty_generations[change.path] = batch.generation
+                        self._mark_dirty(change.path, batch.generation)
                         continue
                     if snapshot.sha256 != after.sha256:
                         document.stale_diagnostics = True
-                        self._dirty_generations[change.path] = batch.generation
+                        self._mark_dirty(change.path, batch.generation)
                         continue
-                    document.snapshot = snapshot
-                    document.version += 1
+                    if document.snapshot.sha256 == snapshot.sha256:
+                        self._dirty_generations.pop(change.path, None)
+                        continue
+                    next_version = document.version + 1
                     document.diagnostics = ()
                     document.diagnostics_snapshot_sha256 = None
                     document.stale_diagnostics = True
                     document.diagnostic_event = asyncio.Event()
-                    await self._notify(
-                        client,
-                        "textDocument/didChange",
-                        {
-                            "textDocument": {"uri": document.uri, "version": document.version},
-                            "contentChanges": [{"text": text}],
-                        },
-                    )
+                    if not await self._notify_did_change(client, document, next_version, text):
+                        self._mark_dirty(change.path, batch.generation)
+                        continue
+                    document.snapshot = snapshot
+                    document.version = next_version
+                    self._sync_pending_paths.discard(document.path)
                     self._dirty_generations.pop(change.path, None)
-                    diagnostics_to_wait.append(document.diagnostic_event)
-        # The diagnostics model already validates document versions/snapshots.
-        # Bound the integration wait so a silent server cannot stall future
-        # workspace batches.
-        for event in diagnostics_to_wait:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(event.wait(), timeout=2.0)
 
     async def handle_compilation_database_update(self, status: CompilationDatabaseStatus) -> None:
         """Perform one bounded controlled reinitialize when the DB revision changes.
@@ -1183,6 +1181,12 @@ class ClangdService:
     def _document_for_path(self, path: str) -> _DocumentState | None:
         """Find the one open document by Workspace-normalized path, not wire URI spelling."""
         return next((document for document in self._documents.values() if document.path == path), None)
+
+    def _mark_dirty(self, path: str, generation: int) -> None:
+        """Bound lazy dirty state for documents that are not currently tracked."""
+        if path not in self._dirty_generations and len(self._dirty_generations) >= MAX_DIRTY_DOCUMENTS:
+            self._dirty_generations.pop(next(iter(self._dirty_generations)))
+        self._dirty_generations[path] = generation
 
     def _completion_item(self, value: object, text: str) -> CompletionItem | None:
         if not isinstance(value, Mapping):
@@ -1659,21 +1663,17 @@ class ClangdService:
                     },
                 )
             elif document.snapshot.sha256 != snapshot.sha256:
-                document.snapshot = snapshot
-                document.version += 1
+                next_version = document.version + 1
                 document.diagnostics = ()
                 document.diagnostics_snapshot_sha256 = None
-                document.stale_diagnostics = False
+                document.stale_diagnostics = True
                 document.diagnostic_event = asyncio.Event()
                 self._clear_caches()
-                await self._notify(
-                    client,
-                    "textDocument/didChange",
-                    {
-                        "textDocument": {"uri": document.uri, "version": document.version},
-                        "contentChanges": [{"text": text}],
-                    },
-                )
+                if not await self._notify_did_change(client, document, next_version, text):
+                    raise ClangdRequestError("clangd document synchronization is pending; retry the request.")
+                document.snapshot = snapshot
+                document.version = next_version
+                self._sync_pending_paths.discard(document.path)
             self._dirty_generations.pop(document.path, None)
             return document, text
 
@@ -1785,6 +1785,36 @@ class ClangdService:
         except LspError as error:
             self._set_failed("The managed clangd protocol stream failed.")
             raise ClangdFailedError(self._failure) from error
+
+    async def _notify_did_change(
+        self, client: LspClient, document: _DocumentState, version: int, text: str
+    ) -> bool:
+        """Send one committed snapshot without falsely advancing local sync state.
+
+        A failed notification cannot undo a Workspace commit.  Keep the prior
+        document snapshot/version, mark the path pending, and let the next
+        document request attempt a full resynchronization before it performs
+        any LSP request.
+        """
+        try:
+            await client.notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": document.uri, "version": version},
+                    "contentChanges": [{"text": text}],
+                },
+            )
+        except LspError:
+            if client.state is LspClientState.FAILED:
+                self._set_failed("The managed clangd protocol stream failed.")
+                return False
+            if len(self._sync_pending_paths) >= MAX_DIRTY_DOCUMENTS and document.path not in self._sync_pending_paths:
+                self._sync_pending_paths.pop()
+            self._sync_pending_paths.add(document.path)
+            document.stale_diagnostics = True
+            document.diagnostic_event = asyncio.Event()
+            return False
+        return True
 
     def _diagnostics_result(
         self, document: _DocumentState, *, complete: bool, timed_out: bool, stale: bool

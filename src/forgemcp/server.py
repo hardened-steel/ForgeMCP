@@ -75,9 +75,8 @@ class _McpProgressReporter:
         self._context = context
         self._enabled = getattr(metadata, "progressToken", None) is not None
         self._last_sent_at = float("-inf")
-        self._last_progress: float | None = None
-        self._last_total: float | None = None
         self._lock = asyncio.Lock()
+        self._delivery_task: asyncio.Task[None] | None = None
 
     @property
     def supports_progress(self) -> bool:
@@ -89,19 +88,11 @@ class _McpProgressReporter:
         async with self._lock:
             if not self._enabled:
                 return
-            # Progress is monotonic for one measurement mode.  A known exact
-            # total can intentionally replace an earlier phase-only update.
-            if self._last_total == update.total and self._last_progress is not None:
-                if update.progress < self._last_progress:
-                    return
             now = monotonic()
             if not update.terminal and now - self._last_sent_at < self._MINIMUM_INTERVAL_SECONDS:
                 return
             try:
-                await asyncio.wait_for(
-                    self._context.report_progress(update.progress, update.total, update.message),
-                    timeout=self._DELIVERY_TIMEOUT_SECONDS,
-                )
+                await self._deliver(update)
             except asyncio.CancelledError:
                 # Cancellation must reach the operation, whose ProcessRuntime
                 # cleanup path owns any subprocess tree.
@@ -112,8 +103,43 @@ class _McpProgressReporter:
                 self._enabled = False
                 return
             self._last_sent_at = now
-            self._last_progress = update.progress
-            self._last_total = update.total
+
+    async def _deliver(self, update: ProgressUpdate) -> None:
+        """Await one send for a fixed interval without trusting cancellation.
+
+        ``asyncio.wait_for`` waits again when a misbehaving coroutine catches
+        cancellation.  A transport callback is observational, so leave at
+        most one cancelled send detached for this reporter, consume its final
+        exception, and disable future delivery instead of extending the tool.
+        """
+        task = asyncio.create_task(
+            self._context.report_progress(update.progress, update.total, update.message)
+        )
+        self._delivery_task = task
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._DELIVERY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            self._detach_delivery(task)
+            raise
+        if task not in done:
+            self._detach_delivery(task)
+            raise TimeoutError("Progress delivery timed out.")
+        self._delivery_task = None
+        task.result()
+
+    def _detach_delivery(self, task: asyncio.Task[None]) -> None:
+        """Cancel one bounded outstanding send and always consume its outcome."""
+        self._delivery_task = None
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(self._consume_delivery_exception)
+
+    @staticmethod
+    def _consume_delivery_exception(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
 
 
 def _execution_context(context: Context | None) -> ToolExecutionContext:
@@ -212,7 +238,7 @@ def _tool_adapter(contribution: RegisteredToolContribution):
                 "context", kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context
             ),
             *parameters,
-        ])  # type: ignore[attr-defined]
+        ], return_annotation=contribution.output_type or object)  # type: ignore[attr-defined]
         return contributed_tool_with_schema
 
     return contributed_tool

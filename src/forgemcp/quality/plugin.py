@@ -371,7 +371,9 @@ class QualityPlugin(ForgePlugin):
         outcome = "success" if result.execution_state.value == "completed" else "failure"
         self._last_tidy = self._operation_cache("tidy", outcome, len(result.diagnostics), started)
         message = "clang-tidy analysis completed" if outcome == "success" else "clang-tidy analysis failed"
-        await execution_context.report_progress(ProgressUpdate(2, None, message, terminal=True))
+        await execution_context.report_progress(
+            ProgressUpdate(2, None, message, terminal=True, completed=outcome == "success")
+        )
         return result
 
     @staticmethod

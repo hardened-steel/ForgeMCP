@@ -58,7 +58,9 @@ async def _run_lifecycle_progress(
         await context.report_progress(ProgressUpdate(0, None, f"{label} failed", terminal=True))
         raise
     else:
-        await context.report_progress(ProgressUpdate(1, None, f"{label} completed", terminal=True))
+        await context.report_progress(
+            ProgressUpdate(1, None, f"{label} completed", terminal=True, completed=True)
+        )
         return result
     finally:
         if heartbeat is not None:
@@ -157,6 +159,8 @@ class _ClangdStatusProvider:
             and not cached.available
         ):
             state = ComponentState.DEGRADED
+        if state is ComponentState.ACTIVE and cached.synchronization_degraded:
+            state = ComponentState.DEGRADED
         facts = [
             StatusFact(name="availability_observed", value=cached.availability_observed),
             StatusFact(name="available", value=cached.available),
@@ -168,6 +172,7 @@ class _ClangdStatusProvider:
             StatusFact(name="diagnostic_hints", value=cached.diagnostic_hint_count),
             StatusFact(name="stale_diagnostics", value=cached.stale_diagnostic_count),
             StatusFact(name="diagnostic_counts_truncated", value=cached.counts_truncated),
+            StatusFact(name="synchronization_degraded", value=cached.synchronization_degraded),
         ]
         if cached.version is not None:
             facts.append(StatusFact(name="version", value=cached.version))
@@ -185,6 +190,8 @@ class _ClangdStatusProvider:
             warnings.append("workspace_relative_path_omitted")
         if cached.counts_truncated:
             warnings.append("cached_counts_truncated")
+        if cached.synchronization_degraded:
+            warnings.append("document_synchronization_pending")
         return ComponentStatus(
             id=self.id,
             display_name="clangd",
@@ -193,7 +200,7 @@ class _ClangdStatusProvider:
             summary="Cached clangd lifecycle and normalized diagnostic counters.",
             facts=tuple(facts),
             warnings=tuple(warnings),
-            stale=cached.stale_diagnostic_count > 0 or cached.counts_truncated,
+            stale=cached.stale_diagnostic_count > 0 or cached.counts_truncated or cached.synchronization_degraded,
             observed_at=utc_now(),
         )
 

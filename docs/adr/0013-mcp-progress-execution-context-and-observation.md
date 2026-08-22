@@ -18,17 +18,28 @@ as before. Contexts are per call, cannot be retained by Core/application
 services, contain no FastMCP/ServerSession types, and use normal asyncio
 cancellation. `server.py` creates a fresh reporter only when an SDK request has
 a progress token and sends `ctx.report_progress(progress, total, message)`.
-Missing token/capability, slow delivery, and non-cancellation transport errors
+String, numeric, and numeric-zero tokens are preserved only in that bridge;
+missing token/capability, slow delivery, and non-cancellation transport errors
 disable progress for that call without changing the tool result. Delivery is
 synchronous, serialized, rate-limited, bounded by a short notification timeout,
-and creates no unbounded tasks.
+and keeps at most one detached cancellation-resistant send for a disabled call;
+its outcome is consumed and it cannot create a notification flood.
+
+The context normalizes every notification monotonically across phase,
+heartbeat, and exact measurements. A terminal success may advance a known
+exact total to `total/total`; failure, timeout, and cancellation preserve the
+last real value. A contextual handler must explicitly declare the keyword-only
+`execution_context`; every other handler remains the legacy one-argument form.
 
 `ProcessRuntime.run` gains an optional local bounded output observer. It uses
 separate pipe drainers plus one bounded observer queue/worker. Overflow drops
 events and produces safe metadata; failures are isolated. The observer is not a
 protocol stream, does not change DAP/LSP/start stdin behavior, and never emits
-raw text itself. CMake is the first consumer and derives only fixed phases,
-two-second heartbeats, strict Ninja exact progress, and strict CTest progress.
+raw text itself. Incremental decoding is independent per stream and a bounded
+optional observer finalizer can flush an unterminated line. CMake is the first
+consumer and derives only fixed phases, two-second heartbeats, strict Ninja
+exact progress, and strict CTest progress; output-derived CTest names are never
+sent to clients.
 
 ## Consequences
 

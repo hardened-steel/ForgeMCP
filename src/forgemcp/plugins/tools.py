@@ -19,8 +19,8 @@ _PLUGIN_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_-]*$")
 LegacyToolHandler = Callable[[Mapping[str, object]], object | Awaitable[object]]
 """Mapping-only handler retained for external plugin compatibility."""
 
-ContextAwareToolHandler = Callable[[Mapping[str, object], ToolExecutionContext], object | Awaitable[object]]
-"""Handler shape for tools that opt into the request-scoped execution context."""
+ContextAwareToolHandler = Callable[..., object | Awaitable[object]]
+"""Handler shape for tools that opt into keyword-only ``execution_context``."""
 
 ToolHandler = LegacyToolHandler | ContextAwareToolHandler
 
@@ -38,18 +38,16 @@ class ToolHints:
 def handler_accepts_execution_context(handler: ToolHandler) -> bool:
     """Return whether a handler explicitly opts into the v1 context keyword.
 
-    Only the named keyword is considered an opt-in.  This avoids accidentally
-    binding context into a legacy handler's optional positional/default values.
+    Only the exact keyword-only ``execution_context`` parameter is an opt-in.
+    This avoids accidentally binding a new context into a legacy handler's
+    optional positional/default ``context`` value.
     """
     try:
         parameters = inspect.signature(handler).parameters
     except (TypeError, ValueError):
         return False
-    parameter = parameters.get("execution_context") or parameters.get("context")
-    return parameter is not None and parameter.kind in {
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    }
+    parameter = parameters.get("execution_context")
+    return parameter is not None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def invoke_tool_handler(
@@ -63,8 +61,7 @@ def invoke_tool_handler(
             parameters = inspect.signature(handler).parameters
         except (TypeError, ValueError):  # pragma: no cover - guarded above
             return handler(arguments)
-        name = "execution_context" if "execution_context" in parameters else "context"
-        return handler(arguments, **{name: execution_context})  # type: ignore[call-arg]
+        return handler(arguments, execution_context=execution_context)  # type: ignore[call-arg]
     return handler(arguments)
 
 
@@ -76,6 +73,7 @@ class ToolContribution:
     description: str
     handler: ToolHandler = field(repr=False, compare=False)
     input_model: type[BaseModel] | None = field(default=None, repr=False, compare=False)
+    output_type: object | None = field(default=None, repr=False, compare=False)
     namespace: str | None = field(default=None, repr=False, compare=False)
     hints: ToolHints | None = field(default=None, repr=False, compare=False)
 
@@ -129,6 +127,11 @@ class RegisteredToolContribution:
     def input_model(self) -> type[BaseModel] | None:
         """Return the optional transport-neutral Pydantic input contract."""
         return self.contribution.input_model
+
+    @property
+    def output_type(self) -> object | None:
+        """Return the optional transport-neutral structured result contract."""
+        return self.contribution.output_type
 
     @property
     def hints(self) -> ToolHints | None:
