@@ -25,7 +25,7 @@ See [ADR 0012](adr/0012-configuration-cli-and-windows-toolchain-discovery.md).
 
 The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
 
-`server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool contributions to the MCP SDK, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop.
+`server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool/resource/template/prompt/completion contributions to the MCP SDK, bridges one optional connection log sink, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop. SDK request/session types do not cross this adapter.
 
 ## Domain models
 
@@ -58,6 +58,26 @@ A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
 Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
 
 Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` normally qualifies its local name as `<plugin_id>__<tool_name>` and rejects duplicates. A contribution may use another validated stable namespace only when its plugin metadata declares it; Quality uses `quality`, `clang_format`, `clang_tidy`, and `sanitizer` under one lifecycle. A legacy handler remains `handler(arguments)`. A handler opts into context only with the exact keyword-only `execution_context: ToolExecutionContext`; positional/default `context` parameters remain legacy input and are never rebound. Contexts are constructed by `server.py` for one invocation, never stored by services, reused, serialized, or placed in schemas, and contain no SDK request/session/transport objects. `ProgressUpdate` is immutable, bounded and path/control-text-safe; its private request state keeps phase, heartbeat, exact parser and terminal numbers monotonic. `NoOpProgressReporter` keeps in-process and token-less clients behaviourally identical. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model, including Pydantic required fields and bounds, into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
+
+Phase C extends the same API version 1 context with application-owned
+`ResourceContribution`, `ResourceTemplateContribution`, `PromptContribution`,
+and `CompletionContribution` facades. Existing mapping-only
+`ToolContribution` plugins are unchanged. Static URI, URI-template, prompt name,
+and completion reference/argument keys are unique; each registry has a fixed
+capacity and returns lexical snapshots. A plugin startup failure unregisters
+all of that plugin's contribution kinds before reverse dependency rollback.
+Normal shutdown unregisters them in reverse lifecycle order and closes the
+application registry. There is no global mutable registry.
+
+The discovery registry admits at most 128 static resources, 128 templates, 128
+prompts, and 256 completion providers. Resource reads share an eight-slot gate,
+have a two-second cooperative deadline, and produce at most 256 KiB UTF-8.
+Prompt messages and arguments have independent count/character/byte limits.
+Completion has a 750 ms cooperative deadline, validates at most 16 context
+arguments, performs prefix filtering and deterministic deduplication, and emits
+at most the protocol maximum of 100 values with `total`/`hasMore`. A trusted
+in-process plugin can still block the event loop or bypass Python architectural
+boundaries; the external allow-list trust decision in ADR 0005 is unchanged.
 
 The built-in CMake plugin owns the stable contributions `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local CMake service receives only the declared `workspace` and `process_runtime` services, never an application object or a transport object.
 
@@ -371,7 +391,61 @@ Running configure, build, or tests is not sandboxing: CMake project scripts, cus
 
 Expected operational errors inherit from `ForgeMCPError` and are converted with `to_mcp_error_response`. The response includes only a stable code and an intentional public message.
 
-Logs are JSON records written to stderr, so they do not corrupt the MCP stdio protocol. Context keys related to file contents, credentials, tokens, cookies, and secrets are redacted.
+One `StructuredLogger` belongs to one `ForgeApplication`; it does not use the
+global Python logger registry. It creates one sanitized immutable event and
+fans that value to an independently thresholded JSON stderr sink, a 256-event/
+512-KiB deterministic recent ring, and any active connection-scoped MCP sink.
+Categories and scalar metadata keys are allow-listed and bounded. Source/file
+content, patch/edit text, raw subprocess output, argv/environment, absolute
+paths, compile commands, LSP/DAP payloads, diagnostic text, raw exception
+messages, PIDs/handles, and secret-like values cannot reach a sink.
+
+`FORGEMCP_LOG_LEVEL` controls stderr only. The ring retains all accepted levels
+and is cleared after the final application shutdown event. `logging/setLevel`
+replaces only that session's notification threshold; it never replays the ring.
+The SDK adapter's MCP sink has a 64-event queue, one worker and one active send,
+a 20-per-second rate ceiling, and a 500 ms delivery deadline. Saturation,
+timeout, disconnect, or cancellation suppression disables/drops observational
+delivery without delaying a tool or shutdown. Progress is never copied into
+logs, the recent-log read does not log itself, and ProjectStatus has no logging
+side effect.
+
+## MCP discovery surface
+
+The low-level SDK identity is explicitly `ForgeMCP` plus installed
+`forgemcp` package metadata, rather than the MCP SDK distribution version.
+Initialization contains a static 904-byte instruction string whose first 512
+characters contain the complete trust/workflow summary. Capabilities are
+handler-derived: Tools, Resources, Prompts, Logging, and Completions are present;
+Tasks and empty Experimental are absent. The supported wire protocol remains
+SDK 1.x legacy `2025-11-25` stdio.
+
+The versioned JSON resources are `forgemcp://about`,
+`forgemcp://project/status`, `forgemcp://workspace/files`,
+`forgemcp://cmake/targets`, and `forgemcp://logs/recent`. Workspace manifests
+retain at most 1,000 metadata entries and page 50 at a time. Opaque random
+cursors are application-local, stored in a 32-entry TTL cache, bound to the
+Workspace mutation generation, and reveal no offset, path, or generation.
+External filesystem changes are not watched, so a walk is explicitly
+non-transactional. CMake target profiles are opaque 10-minute application-local
+IDs for cached already-validated File API models; reads never configure, create
+a query, or run a process. Target resources expose only bounded name/type and
+validated workspace-relative artifact data.
+
+The five prompts are fixed ForgeMCP-authored workflows. Handlers only render
+messages and never invoke tools. Bounded project identifiers occupy a separate
+JSON-labeled data message and unknown arguments fail. Completion exists only
+for prompt and resource-template references because that is the legacy MCP
+contract; tool JSON arguments retain enums/defaults/descriptions and use list/
+status tools for dynamic discovery. Server instructions and prompt control text
+are trusted ForgeMCP code. Filenames, targets, tests, resource values, and log
+metadata are untrusted model-facing data. Allow-listed external plugin code is
+trusted in-process, but its authored resources/prompts remain a model-facing
+injection boundary operators must review.
+
+SDK 1.x advertises `resources.subscribe=false`; Phase C does not add an ad-hoc
+subscription protocol or resource-change notifications. Workspace/CMake/status
+state is therefore refreshed by ordinary reads. See ADR 0015.
 
 ## Quality feature
 

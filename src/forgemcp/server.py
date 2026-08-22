@@ -8,9 +8,10 @@ import inspect
 import json
 import sys
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from time import monotonic
+from types import MethodType
 from typing import Annotated
 
 # Current MCP releases can emit this third-party Pydantic forward-reference
@@ -25,15 +26,22 @@ warnings.filterwarnings(
 )
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp import types as mcp_types
 from mcp.types import ToolAnnotations
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict, Field
 from pydantic_core import PydanticUndefined
 
+from forgemcp import __version__
 from forgemcp.core.application import ForgeApplication
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import ConfigurationError
+from forgemcp.core.logging import LOG_LEVELS, StructuredLogEvent, StructuredLogger
+from forgemcp.discovery import SERVER_INSTRUCTIONS
 from forgemcp.plugins import (
+    CompletionReferenceKind,
+    CompletionRequest,
+    DiscoverySurfaceRegistry,
     NoOpProgressReporter,
     ProgressUpdate,
     RegisteredToolContribution,
@@ -50,6 +58,117 @@ from forgemcp.toolchain import ToolchainDiscoveryService
 # mapping.  Configure that common base before any tool is registered so every
 # published flat schema and every actual stdio invocation reject extra fields.
 ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+
+class _McpLogSink:
+    """One connection-scoped non-blocking MCP notification sink."""
+
+    _QUEUE_SIZE = 64
+    _MINIMUM_INTERVAL_SECONDS = 0.05
+    _DELIVERY_TIMEOUT_SECONDS = 0.5
+    _CLOSE_TIMEOUT_SECONDS = 0.25
+    _PRIORITY = {name: index for index, name in enumerate(LOG_LEVELS)}
+
+    def __init__(self, session: object, level: str) -> None:
+        if level not in self._PRIORITY:
+            raise ValueError("MCP logging level is invalid.")
+        self._session = session
+        self._threshold = self._PRIORITY[level]
+        self._queue: asyncio.Queue[StructuredLogEvent | None] = asyncio.Queue(self._QUEUE_SIZE)
+        self._worker = asyncio.create_task(self._run(), name="forgemcp-mcp-logging")
+        self._delivery: asyncio.Task[None] | None = None
+        self._closed = False
+        self._last_sent_at = float("-inf")
+
+    def emit(self, event: StructuredLogEvent) -> None:
+        """Queue one event without blocking the operation that produced it."""
+        if self._closed or self._PRIORITY[event.level] < self._threshold:
+            return
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Flood loss is deliberate and never creates a recursive log.
+            return
+
+    async def _run(self) -> None:
+        while True:
+            event = await self._queue.get()
+            if event is None:
+                return
+            delay = self._MINIMUM_INTERVAL_SECONDS - (monotonic() - self._last_sent_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                await self._send(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._closed = True
+                return
+            self._last_sent_at = monotonic()
+
+    async def _send(self, event: StructuredLogEvent) -> None:
+        sender = getattr(self._session, "send_log_message", None)
+        if sender is None:
+            raise RuntimeError("MCP session logging is unavailable.")
+        task = asyncio.create_task(
+            sender(
+                level=event.level,
+                data={
+                    "sequence": event.sequence,
+                    "timestamp": event.timestamp,
+                    "category": event.category,
+                    "metadata": dict(event.metadata),
+                },
+                logger=event.logger,
+            )
+        )
+        self._delivery = task
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._DELIVERY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            self._detach(task)
+            raise
+        if task not in done:
+            self._detach(task)
+            raise TimeoutError("MCP log delivery timed out.")
+        self._delivery = None
+        task.result()
+
+    def _detach(self, task: asyncio.Task[None]) -> None:
+        self._delivery = None
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(self._consume)
+
+    @staticmethod
+    def _consume(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
+
+    async def aclose(self) -> None:
+        if self._closed and self._worker.done():
+            return
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        self._worker.cancel()
+        delivery = self._delivery
+        if delivery is not None:
+            self._detach(delivery)
+        try:
+            done, _ = await asyncio.wait({self._worker}, timeout=self._CLOSE_TIMEOUT_SECONDS)
+            if self._worker in done:
+                self._consume(self._worker)
+            else:
+                self._worker.add_done_callback(self._consume)
+        except asyncio.CancelledError:
+            self._worker.add_done_callback(self._consume)
+            raise
 
 
 class _McpProgressReporter:
@@ -160,17 +279,91 @@ def create_server(
 ) -> FastMCP[ForgeApplication]:
     """Create the MCP adapter and own the application through its async lifespan."""
 
+    connection_sinks: dict[int, tuple[StructuredLogger, _McpLogSink]] = {}
+    surface_registered = False
+
     @asynccontextmanager
     async def application_lifespan(_: FastMCP[ForgeApplication]) -> AsyncIterator[ForgeApplication]:
+        nonlocal surface_registered
         application = application_factory()
         try:
             await application.start()
-            _register_contributed_tools(mcp, application.services.get("plugins").tools)
+            plugins = application.services.get("plugins")
+            _register_contributed_tools(mcp, plugins.tools)
+            if not surface_registered:
+                _register_contributed_surface(mcp, plugins.surface)
+                surface_registered = True
             yield application
         finally:
             await application.aclose()
+            logger = application.services.get("logger")
+            for key, (registered_logger, _) in tuple(connection_sinks.items()):
+                if registered_logger is logger:
+                    del connection_sinks[key]
 
-    mcp = FastMCP[ForgeApplication]("ForgeMCP", lifespan=application_lifespan)
+    mcp = FastMCP[ForgeApplication](
+        "ForgeMCP",
+        instructions=SERVER_INSTRUCTIONS,
+        lifespan=application_lifespan,
+        # SDK diagnostics are not ForgeMCP structured events and can include
+        # implementation source locations. Keep stdio-adjacent stderr owned by
+        # the application-scoped JSON sink instead.
+        log_level="CRITICAL",
+    )
+    # FastMCP 1.x otherwise reports the MCP SDK distribution version. This is
+    # the only SDK identity bridge; project metadata remains transport-neutral.
+    mcp._mcp_server.version = __version__  # type: ignore[attr-defined]
+    _omit_empty_experimental_capability(mcp)
+
+    @mcp.completion()
+    async def complete(
+        reference: mcp_types.PromptReference | mcp_types.ResourceTemplateReference,
+        argument: mcp_types.CompletionArgument,
+        context: mcp_types.CompletionContext | None,
+    ) -> mcp_types.Completion:
+        application = _current_application(mcp)
+        registry = _surface_registry(application)
+        if isinstance(reference, mcp_types.PromptReference):
+            kind = CompletionReferenceKind.PROMPT
+            name = reference.name
+        elif isinstance(reference, mcp_types.ResourceTemplateReference):
+            kind = CompletionReferenceKind.RESOURCE_TEMPLATE
+            name = reference.uri
+        else:  # pragma: no cover - SDK union validation
+            raise ValueError("Completion reference is unsupported.")
+        result = await registry.complete(
+            CompletionRequest(
+                reference_kind=kind,
+                reference=name,
+                argument=argument.name,
+                value=argument.value,
+                context={} if context is None or context.arguments is None else context.arguments,
+            )
+        )
+        return mcp_types.Completion(
+            values=list(result.values), total=result.total, hasMore=result.has_more
+        )
+
+    @mcp._mcp_server.set_logging_level()  # type: ignore[attr-defined]
+    async def set_logging_level(level: mcp_types.LoggingLevel) -> None:
+        if level not in LOG_LEVELS:
+            raise ValueError("MCP logging level is invalid.")
+        request_context = mcp._mcp_server.request_context  # type: ignore[attr-defined]
+        application = request_context.lifespan_context
+        if not isinstance(application, ForgeApplication):  # pragma: no cover - SDK invariant
+            raise RuntimeError("ForgeMCP application is unavailable.")
+        logger = application.services.get("logger")
+        if not isinstance(logger, StructuredLogger):
+            raise RuntimeError("ForgeMCP structured logger is unavailable.")
+        session = request_context.session
+        key = id(session)
+        prior = connection_sinks.pop(key, None)
+        if prior is not None:
+            prior[0].remove_sink(prior[1])
+            await prior[1].aclose()
+        sink = _McpLogSink(session, level)
+        logger.add_sink(sink)
+        connection_sinks[key] = (logger, sink)
 
     @mcp.tool(name="server_status")
     def server_status_tool(context: Context) -> dict[str, object]:
@@ -181,6 +374,36 @@ def create_server(
         return server_status(application)
 
     return mcp
+
+
+def _omit_empty_experimental_capability(mcp: FastMCP[ForgeApplication]) -> None:
+    """Adapt SDK 1.x's empty-dict default to an absent optional capability."""
+    server = mcp._mcp_server  # type: ignore[attr-defined]
+    original = server.get_capabilities
+
+    def get_capabilities(self, notification_options, experimental_capabilities):
+        capabilities = original(notification_options, experimental_capabilities)
+        if not capabilities.experimental:
+            return capabilities.model_copy(update={"experimental": None})
+        return capabilities
+
+    server.get_capabilities = MethodType(get_capabilities, server)
+
+
+def _current_application(mcp: FastMCP[ForgeApplication]) -> ForgeApplication:
+    """Resolve one request's lifespan application only inside the SDK adapter."""
+    application = mcp._mcp_server.request_context.lifespan_context  # type: ignore[attr-defined]
+    if not isinstance(application, ForgeApplication):  # pragma: no cover - SDK invariant
+        raise RuntimeError("ForgeMCP application is unavailable outside its MCP lifespan.")
+    return application
+
+
+def _surface_registry(application: ForgeApplication) -> DiscoverySurfaceRegistry:
+    plugins = application.services.get("plugins")
+    registry = getattr(plugins, "surface", None)
+    if not isinstance(registry, DiscoverySurfaceRegistry):
+        raise RuntimeError("ForgeMCP discovery surface is unavailable.")
+    return registry
 
 
 def _register_contributed_tools(
@@ -198,6 +421,116 @@ def _register_contributed_tools(
         mcp.tool(name=contribution.name, description=contribution.description, annotations=annotations)(
             _tool_adapter(contribution)
         )
+
+
+def _register_contributed_surface(
+    mcp: FastMCP[ForgeApplication], registry: DiscoverySurfaceRegistry
+) -> None:
+    """Adapt immutable non-tool contributions after successful plugin startup."""
+    for contribution in registry.resources():
+        mcp.resource(
+            contribution.uri,
+            name=contribution.name,
+            description=contribution.description,
+            mime_type=contribution.mime_type,
+        )(_resource_adapter(mcp, contribution.uri))
+    for contribution in registry.templates():
+        mcp.resource(
+            contribution.uri_template,
+            name=contribution.name,
+            description=contribution.description,
+            mime_type=contribution.mime_type,
+        )(
+            _resource_template_adapter(
+                mcp, contribution.uri_template, contribution.arguments
+            )
+        )
+    for contribution in registry.prompts():
+        mcp.prompt(name=contribution.name, description=contribution.description)(
+            _prompt_adapter(mcp, contribution.name, contribution.arguments)
+        )
+
+
+def _resource_adapter(mcp: FastMCP[ForgeApplication], uri: str):
+    async def contributed_resource() -> str:
+        return await _surface_registry(_current_application(mcp)).read_resource(uri)
+
+    return contributed_resource
+
+
+def _resource_template_adapter(
+    mcp: FastMCP[ForgeApplication], uri_template: str, argument_names: tuple[str, ...]
+):
+    async def contributed_resource_template(context: Context, **arguments: str) -> str:
+        application = context.request_context.lifespan_context
+        if not isinstance(application, ForgeApplication):  # pragma: no cover - SDK invariant
+            raise RuntimeError("ForgeMCP application is unavailable.")
+        return await _surface_registry(application).read_template(uri_template, arguments)
+
+    contributed_resource_template.__annotations__ = {
+        "context": Context,
+        **{name: str for name in argument_names},
+        "return": str,
+    }
+    contributed_resource_template.__signature__ = inspect.Signature(
+        [
+            inspect.Parameter(
+                "context", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context
+            ),
+            *(
+                inspect.Parameter(
+                    name,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    annotation=str,
+                )
+                for name in argument_names
+            ),
+        ],
+        return_annotation=str,
+    )  # type: ignore[attr-defined]
+    return contributed_resource_template
+
+
+def _prompt_adapter(mcp: FastMCP[ForgeApplication], name: str, argument_specs: tuple[object, ...]):
+    async def contributed_prompt(context: Context, **arguments: object) -> list[dict[str, object]]:
+        application = context.request_context.lifespan_context
+        if not isinstance(application, ForgeApplication):  # pragma: no cover - SDK invariant
+            raise RuntimeError("ForgeMCP application is unavailable.")
+        supplied = {key: value for key, value in arguments.items() if value is not None}
+        messages = await _surface_registry(application).get_prompt(name, supplied)
+        return [
+            {
+                "role": message.role,
+                "content": {"type": "text", "text": message.text},
+            }
+            for message in messages
+        ]
+
+    parameters = [
+        inspect.Parameter("context", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context)
+    ]
+    annotations: dict[str, object] = {"context": Context}
+    for specification in argument_specs:
+        required = bool(getattr(specification, "required", False))
+        annotation: object = Annotated[
+            str,
+            Field(
+                description=getattr(specification, "description", None),
+                max_length=getattr(specification, "max_length", 256),
+            ),
+        ]
+        parameters.append(
+            inspect.Parameter(
+                getattr(specification, "name"),
+                inspect.Parameter.KEYWORD_ONLY,
+                default=inspect.Parameter.empty if required else None,
+                annotation=annotation,
+            )
+        )
+        annotations[getattr(specification, "name")] = annotation
+    contributed_prompt.__annotations__ = annotations
+    contributed_prompt.__signature__ = inspect.Signature(parameters)  # type: ignore[attr-defined]
+    return contributed_prompt
 
 
 def _tool_adapter(contribution: RegisteredToolContribution):

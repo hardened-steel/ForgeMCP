@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections import OrderedDict
+from dataclasses import dataclass
 import os
+import re
+import secrets
+from time import monotonic
 from typing import Annotated, Literal
 from urllib.parse import unquote, urlsplit
 
@@ -12,14 +17,37 @@ from pydantic import ConfigDict, Field, ValidationError, field_validator, model_
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import FileSnapshot, Range
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution, ToolHints
-from forgemcp.workspace import WorkspaceRequestError, WorkspaceService, WorkspaceTextEdit
+from forgemcp.plugins import (
+    CompletionContribution,
+    CompletionReferenceKind,
+    CompletionRequest,
+    ForgePlugin,
+    PluginContext,
+    PluginMetadata,
+    ResourceContribution,
+    ResourceTemplateContribution,
+    ToolContribution,
+    ToolHints,
+)
+from forgemcp.workspace import (
+    WorkspaceMutationBus,
+    WorkspaceRequestError,
+    WorkspaceService,
+    WorkspaceTextEdit,
+)
 
 
 MAX_TOOL_PATH = 4096
 MAX_TOOL_FILES = 1_000
 MAX_TOOL_EDITS = 1_000
 MAX_TOOL_PATCH_CHARACTERS = 1_048_576
+WORKSPACE_FILES_URI = "forgemcp://workspace/files"
+WORKSPACE_FILES_TEMPLATE_URI = "forgemcp://workspace/files/{cursor}"
+MAX_MANIFEST_ENTRIES = 1_000
+MANIFEST_PAGE_SIZE = 50
+MAX_MANIFEST_CURSORS = 32
+MANIFEST_CURSOR_TTL_SECONDS = 300.0
+_CURSOR = re.compile(r"^[A-Za-z0-9_-]{32}$")
 
 WorkspacePath = Annotated[str, Field(min_length=1, max_length=MAX_TOOL_PATH)]
 Sha256 = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
@@ -171,14 +199,41 @@ def _public_change(change: object, workspace: WorkspaceService) -> dict[str, obj
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _ManifestEntry:
+    path: str
+    size_bytes: int
+    sha256: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {"path": self.path, "size_bytes": self.size_bytes, "sha256": self.sha256}
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestCursor:
+    entries: tuple[_ManifestEntry, ...]
+    offset: int
+    generation: int
+    complete_scan: bool
+    expires_at: float
+
+
 class WorkspacePlugin(ForgePlugin):
     """The MCP surface for guarded Workspace reads and CAS mutations."""
 
-    __slots__ = ("_service",)
+    __slots__ = ("_service", "_mutations", "_manifest_cursors")
 
     def __init__(self) -> None:
-        super().__init__(PluginMetadata(plugin_id="workspace", requires_services=("workspace",), provides=frozenset({"workspace.files"})))
+        super().__init__(
+            PluginMetadata(
+                plugin_id="workspace",
+                requires_services=("workspace", "workspace_mutations"),
+                provides=frozenset({"workspace.files"}),
+            )
+        )
         self._service: WorkspaceService | None = None
+        self._mutations: WorkspaceMutationBus | None = None
+        self._manifest_cursors: OrderedDict[str, _ManifestCursor] = OrderedDict()
 
     @property
     def service(self) -> WorkspaceService:
@@ -188,9 +243,13 @@ class WorkspacePlugin(ForgePlugin):
 
     async def start(self, context: PluginContext) -> None:
         service = context.services.get("workspace")
+        mutations = context.services.get("workspace_mutations")
         if not isinstance(service, WorkspaceService):
             raise TypeError("The Workspace plugin requires WorkspaceService.")
+        if not isinstance(mutations, WorkspaceMutationBus):
+            raise TypeError("The Workspace plugin requires WorkspaceMutationBus.")
         self._service = service
+        self._mutations = mutations
         tools = (
             ("list_files", "List bounded regular non-symlink files below a workspace-relative directory. Read a file or get its snapshot before mutation; ignored/generated directories are not exposed.", _ListFilesArguments, ListFilesOutput, self._list_files, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
             ("read_text", "Read one bounded UTF-8 workspace file and its SHA-256 snapshot. Before any mutation, use this or get_snapshot; after a conflict, read again before retrying.", _PathArguments, ReadTextOutput, self._read_text, ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False)),
@@ -200,9 +259,150 @@ class WorkspacePlugin(ForgePlugin):
         )
         for name, description, model, output_type, operation, hints in tools:
             context.tools.register(ToolContribution(name=name, description=description, input_model=model, output_type=output_type, handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op), hints=hints))
+        context.resources.register(
+            ResourceContribution(
+                uri=WORKSPACE_FILES_URI,
+                name="forgemcp_workspace_files",
+                description="First bounded page of deterministic workspace file metadata; no file content.",
+                handler=self._manifest_first_page,
+            )
+        )
+        context.resource_templates.register(
+            ResourceTemplateContribution(
+                uri_template=WORKSPACE_FILES_TEMPLATE_URI,
+                name="forgemcp_workspace_files_page",
+                description="Next bounded page from one application-local workspace manifest cursor.",
+                arguments=("cursor",),
+                handler=self._manifest_cursor_page,
+            )
+        )
+        context.completions.register(
+            CompletionContribution(
+                reference_kind=CompletionReferenceKind.PROMPT,
+                reference="forgemcp_analyze_file",
+                argument="path",
+                provider=self._complete_workspace_paths,
+            )
+        )
+        context.completions.register(
+            CompletionContribution(
+                reference_kind=CompletionReferenceKind.RESOURCE_TEMPLATE,
+                reference=WORKSPACE_FILES_TEMPLATE_URI,
+                argument="cursor",
+                provider=self._complete_manifest_cursors,
+            )
+        )
 
     async def stop(self) -> None:
+        self._manifest_cursors.clear()
+        self._mutations = None
         self._service = None
+
+    def _manifest_first_page(self) -> dict[str, object]:
+        try:
+            snapshots, complete_scan = self.service.list_manifest_files(
+                maximum=MAX_MANIFEST_ENTRIES
+            )
+            entries = tuple(
+                _ManifestEntry(
+                    path=_snapshot_path(snapshot, self.service),
+                    size_bytes=snapshot.size_bytes or 0,
+                    sha256=snapshot.sha256 or "0" * 64,
+                )
+                for snapshot in snapshots
+                if snapshot.exists and snapshot.sha256 is not None
+            )
+        except ForgeMCPError:
+            return self._manifest_error("manifest_unavailable")
+        generation = self._mutations.generation if self._mutations is not None else 0
+        return self._manifest_page(
+            _ManifestCursor(
+                entries=entries,
+                offset=0,
+                generation=generation,
+                complete_scan=complete_scan,
+                expires_at=monotonic() + MANIFEST_CURSOR_TTL_SECONDS,
+            )
+        )
+
+    def _manifest_cursor_page(self, arguments: Mapping[str, str]) -> dict[str, object]:
+        self._expire_manifest_cursors()
+        token = arguments["cursor"]
+        if not _CURSOR.fullmatch(token):
+            return self._manifest_error("invalid_cursor")
+        cursor = self._manifest_cursors.get(token)
+        if cursor is None:
+            return self._manifest_error("stale_cursor")
+        current_generation = self._mutations.generation if self._mutations is not None else 0
+        if cursor.expires_at <= monotonic() or cursor.generation != current_generation:
+            self._manifest_cursors.pop(token, None)
+            return self._manifest_error("stale_cursor")
+        return self._manifest_page(cursor)
+
+    def _manifest_page(self, cursor: _ManifestCursor) -> dict[str, object]:
+        end = min(len(cursor.entries), cursor.offset + MANIFEST_PAGE_SIZE)
+        page = cursor.entries[cursor.offset:end]
+        next_cursor = None
+        if end < len(cursor.entries):
+            next_cursor = self._store_manifest_cursor(
+                _ManifestCursor(
+                    entries=cursor.entries,
+                    offset=end,
+                    generation=cursor.generation,
+                    complete_scan=cursor.complete_scan,
+                    expires_at=monotonic() + MANIFEST_CURSOR_TTL_SECONDS,
+                )
+            )
+        truncated = not cursor.complete_scan
+        return {
+            "schema_version": "1",
+            "resource": WORKSPACE_FILES_URI,
+            "entries": [entry.as_dict() for entry in page],
+            "page_size": len(page),
+            "complete": next_cursor is None and cursor.complete_scan,
+            "truncated": truncated,
+            "next_cursor": next_cursor,
+            "transactional_snapshot": False,
+        }
+
+    def _store_manifest_cursor(self, cursor: _ManifestCursor) -> str:
+        self._expire_manifest_cursors()
+        while len(self._manifest_cursors) >= MAX_MANIFEST_CURSORS:
+            self._manifest_cursors.popitem(last=False)
+        token = secrets.token_urlsafe(24)
+        while token in self._manifest_cursors:  # pragma: no cover - cryptographic collision
+            token = secrets.token_urlsafe(24)
+        self._manifest_cursors[token] = cursor
+        return token
+
+    def _expire_manifest_cursors(self) -> None:
+        now = monotonic()
+        for token in tuple(self._manifest_cursors):
+            if self._manifest_cursors[token].expires_at <= now:
+                del self._manifest_cursors[token]
+
+    @staticmethod
+    def _manifest_error(code: str) -> dict[str, object]:
+        return {
+            "schema_version": "1",
+            "resource": WORKSPACE_FILES_URI,
+            "ok": False,
+            "error": {"code": code, "message": "The requested workspace manifest page is unavailable."},
+            "complete": False,
+            "truncated": True,
+            "next_cursor": None,
+        }
+
+    def _complete_workspace_paths(self, _request: CompletionRequest) -> tuple[str, ...]:
+        try:
+            paths, _ = self.service.list_file_paths(maximum=MAX_MANIFEST_ENTRIES)
+        except ForgeMCPError:
+            return ()
+        return paths
+
+    def _complete_manifest_cursors(self, _request: CompletionRequest) -> tuple[str, ...]:
+        self._expire_manifest_cursors()
+        return tuple(self._manifest_cursors)
 
     async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation):
         try:

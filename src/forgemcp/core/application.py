@@ -12,6 +12,7 @@ from forgemcp import __version__
 from forgemcp.cmake import CMakePlugin, CompilationDatabaseRegistry
 from forgemcp.clangd import ClangdPlugin
 from forgemcp.debugger import DebuggerPlugin
+from forgemcp.discovery import DiscoveryPlugin
 from forgemcp.quality import QualityPlugin
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import LifecycleError
@@ -80,6 +81,7 @@ class ForgeApplication:
         services.register("config", config)
         logger = create_logger(config.log_level)
         services.register("logger", logger)
+        services.register("recent_logs", logger.recent)
         mutations = WorkspaceMutationBus(logger)
         compilation_database = CompilationDatabaseRegistry(logger)
         workspace = WorkspaceService(config, logger, mutations=mutations)
@@ -103,7 +105,8 @@ class ForgeApplication:
         plugins = PluginManager(config=config, services=services, logger=logger)
         services.register("plugins", plugins)
         for plugin in (
-            WorkspacePlugin(), CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), ProjectPlugin(), QualityPlugin(),
+            WorkspacePlugin(), CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), DiscoveryPlugin(),
+            ProjectPlugin(), QualityPlugin(),
             *tuple(builtin_plugins),
         ):
             plugins.register_builtin(plugin)
@@ -189,6 +192,7 @@ class ForgeApplication:
             finally:
                 self._state = LifecycleState.STOPPED
                 self._logger.info("application_stopped")
+                await self._logger.aclose()
 
     def status(self) -> ServerStatus:
         """Return safe diagnostic state without inspecting project contents."""
@@ -201,6 +205,6 @@ class ForgeApplication:
             state=self.state,
             services=tuple(
                 name for name in self.services.names()
-                if name not in {"workspace_mutations", "compilation_database"}
+                if name not in {"workspace_mutations", "compilation_database", "recent_logs"}
             ),
         )

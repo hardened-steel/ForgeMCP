@@ -52,6 +52,14 @@ The sole new MCP operation is the ProjectPlugin `ToolContribution`
 `project__status {}`. It accepts no refresh, raw, or detail option. `server.py`
 continues only to adapt contributed tools to FastMCP.
 
+UX Stabilization Phase C additionally exposes the same service through the
+ProjectPlugin `ResourceContribution` `forgemcp://project/status`. A resource
+read calls the ordinary `ProjectStatusService.status()` cached-provider
+snapshot contract and wraps its result in versioned bounded JSON. It does not
+introduce refresh, persistence, provider probing, a second aggregation path, or
+a log side effect. Provider observations are still independently timed and the
+resource remains partial/non-transactional under exactly the rules below.
+
 Providers may copy only state already retained in memory. They do not run
 commands or qualification/version probes; configure, build, test, format, or
 analyze; start clangd or a debugger; read/list source files; request DAP/LSP
@@ -124,3 +132,5 @@ stale; those conditions are explicit. Phase 1 deliberately has no Git status or
 history, aggregated diagnostic messages, refresh operation, raw output/logs,
 background polling, file watchers, multi-workspace state, or persistence across
 restarts. Git requires its own freshness, ignore, nesting, and trust decision.
+The Phase C resource is only another read adapter over this view; it does not
+change those exclusions or cause resource-change notifications.

@@ -235,6 +235,48 @@ class WorkspaceService:
         self._collect_files(directory, recursive, snapshots)
         return tuple(snapshots)
 
+    def list_manifest_files(
+        self, path: str = ".", *, maximum: int = MAX_WORKSPACE_LIST_FILES
+    ) -> tuple[tuple[FileSnapshot, ...], bool]:
+        """Return a deterministic bounded recursive metadata manifest.
+
+        The boolean is false when more regular files existed than the retained
+        prefix. External filesystem changes can still make the walk slightly
+        inconsistent; this is not a transactional filesystem snapshot.
+        """
+        paths, complete = self._bounded_file_paths(path, recursive=True, maximum=maximum)
+        return tuple(self._snapshot_path(target) for target in paths), complete
+
+    def list_file_paths(
+        self,
+        path: str = ".",
+        *,
+        recursive: bool = True,
+        maximum: int = MAX_WORKSPACE_LIST_FILES,
+    ) -> tuple[tuple[str, ...], bool]:
+        """List a bounded prefix of workspace-relative paths without reading contents."""
+        paths, complete = self._bounded_file_paths(path, recursive=recursive, maximum=maximum)
+        return tuple(self._relative_key(target) for target in paths), complete
+
+    def _bounded_file_paths(
+        self, path: str, *, recursive: bool, maximum: int
+    ) -> tuple[tuple[Path, ...], bool]:
+        """Collect internal safe path objects for metadata operations."""
+        if (
+            not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or not 1 <= maximum <= MAX_WORKSPACE_LIST_FILES
+        ):
+            raise ValueError("Workspace path-list maximum is invalid.")
+        directory = self._resolve_path(path)
+        if not directory.exists():
+            raise WorkspaceFileNotFoundError("The requested workspace directory does not exist.")
+        if not directory.is_dir():
+            raise WorkspaceNotDirectoryError("The requested workspace path is not a directory.")
+        paths: list[Path] = []
+        complete = self._collect_paths_bounded(directory, recursive, paths, maximum)
+        return tuple(paths), complete
+
     def read_text(self, path: str) -> tuple[str, FileSnapshot]:
         """Read one regular UTF-8 file and a snapshot matching the returned text."""
         target = self._resolve_path(path)
@@ -562,6 +604,29 @@ class WorkspaceService:
                         "The workspace file listing exceeds the configured collection limit."
                     )
                 snapshots.append(self._snapshot_path(entry_path))
+
+    def _collect_paths_bounded(
+        self, directory: Path, recursive: bool, paths: list[Path], maximum: int
+    ) -> bool:
+        """Collect a stable prefix and stop immediately after the first omitted file."""
+        with os.scandir(directory) as entries:
+            ordered_entries = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered_entries:
+            entry_path = Path(entry.path)
+            if _is_link_or_reparse_point(entry_path):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                if self._policy.ignores_directory(entry.name):
+                    continue
+                if recursive and not self._collect_paths_bounded(
+                    entry_path, True, paths, maximum
+                ):
+                    return False
+            elif entry.is_file(follow_symlinks=False):
+                if len(paths) >= maximum:
+                    return False
+                paths.append(entry_path)
+        return True
 
     def _resolve_path(self, path: str, *, apply_ignore_policy: bool = True) -> Path:
         """Validate a relative path lexically and reject every symlink component."""

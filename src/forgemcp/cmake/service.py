@@ -7,6 +7,8 @@ import inspect
 import json
 import os
 import re
+import secrets
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -73,6 +75,8 @@ _CMAKE_GENERATOR_CACHE = re.compile(
 MAX_COMPILATION_DATABASE_BYTES = 4 * 1024 * 1024
 MAX_COMPILATION_DATABASE_ENTRIES = 100_000
 MAX_COMPILATION_DATABASE_DEPTH = 16
+MAX_CACHED_DISCOVERY_PROFILES = 16
+CACHED_DISCOVERY_PROFILE_TTL_SECONDS = 600.0
 
 CacheValue: TypeAlias = str | int | bool
 
@@ -103,6 +107,16 @@ class CMakeProjectStatusCache:
     configuration_stale: bool
     compilation_database: CompilationDatabaseStatus | None
     mutation_delivery_degraded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CachedCMakeTargetProfile:
+    """One opaque application-local handle to already validated File API state."""
+
+    profile_id: str
+    targets: CMakeTargetList
+    observed_at: datetime
+    expires_at: float
 
 
 class ProcessRunner(Protocol):
@@ -156,6 +170,10 @@ class CMakeService:
         self._configured_toolchain_file: str | None = None
         self._configured_source_dir: str | None = None
         self._last_relevant_mutation_generation = 0
+        self._cached_presets: CMakePresetList | None = None
+        self._cached_tests: dict[str, tuple[str, ...]] = {}
+        self._target_profiles: OrderedDict[str, CachedCMakeTargetProfile] = OrderedDict()
+        self._profile_by_binary_dir: dict[str, str] = {}
 
     def cached_project_status(self) -> CMakeProjectStatusCache:
         """Return content-free metadata without filesystem access or tool probes."""
@@ -171,6 +189,68 @@ class CMakeService:
             compilation_database=self._compilation_database,
             mutation_delivery_degraded=bool(self._mutations and self._mutations.degraded),
         )
+
+    def cached_target_profiles(self) -> tuple[CachedCMakeTargetProfile, ...]:
+        """Return live opaque profiles without filesystem access or process work."""
+        self._expire_target_profiles()
+        return tuple(self._target_profiles.values())
+
+    def cached_target_profile(
+        self, profile_id: str | None = None
+    ) -> CachedCMakeTargetProfile | None:
+        """Resolve one application-local profile, defaulting to the latest cache."""
+        self._expire_target_profiles()
+        if profile_id is None:
+            latest = next(reversed(self._target_profiles), None)
+            return None if latest is None else self._target_profiles[latest]
+        return self._target_profiles.get(profile_id)
+
+    def cached_configurations(self, profile_id: str | None = None) -> tuple[str, ...]:
+        profile = self.cached_target_profile(profile_id)
+        if profile is None:
+            return ()
+        return tuple(
+            sorted(
+                {configuration.name for configuration in profile.targets.configurations},
+                key=lambda value: (value.casefold(), value),
+            )
+        )
+
+    def cached_target_names(
+        self, profile_id: str | None = None, configuration: str | None = None
+    ) -> tuple[str, ...]:
+        profile = self.cached_target_profile(profile_id)
+        if profile is None:
+            return ()
+        names = {
+            target.name
+            for item in profile.targets.configurations
+            if configuration is None or item.name == configuration
+            for target in item.targets
+        }
+        return tuple(sorted(names, key=lambda value: (value.casefold(), value)))
+
+    def cached_test_names(self, profile_id: str | None = None) -> tuple[str, ...]:
+        profile = self.cached_target_profile(profile_id)
+        if profile is None:
+            return ()
+        return tuple(
+            sorted(
+                set(self._cached_tests.get(profile.targets.binary_dir, ())),
+                key=lambda value: (value.casefold(), value),
+            )
+        )
+
+    def cached_preset_names(self) -> tuple[str, ...]:
+        if self._cached_presets is None:
+            return ()
+        names = {preset.name for preset in self._cached_presets.configure_presets}
+        return tuple(sorted(names, key=lambda value: (value.casefold(), value)))
+
+    @property
+    def cached_targets_stale(self) -> bool:
+        """Whether cached target metadata may predate relevant Workspace changes."""
+        return self._configuration_stale or bool(self._mutations and self._mutations.degraded)
 
     async def status(self) -> CMakeStatus:
         """Discover CMake and CTest and report their parseable, supported versions."""
@@ -210,13 +290,15 @@ class CMakeService:
             configure.extend(self._configure_presets(document, path))
             build.extend(self._build_presets(document, path))
             test.extend(self._test_presets(document, path))
-        return CMakePresetList(
+        result = CMakePresetList(
             source_dir=source,
             preset_files=tuple(preset_files),
             configure_presets=tuple(configure),
             build_presets=tuple(build),
             test_presets=tuple(test),
         )
+        self._cached_presets = result
+        return result
 
     async def configure(
         self,
@@ -346,7 +428,9 @@ class CMakeService:
         generated = self._workspace.open_generated_directory(self._resolve_profile(binary_dir=binary_dir, source_dir=None, preset=None).binary_dir)
         codemodel = self._load_codemodel(generated)
         configurations = self._parse_target_configurations(codemodel, generated)
-        return CMakeTargetList(binary_dir=generated.relative_path, configurations=configurations)
+        result = CMakeTargetList(binary_dir=generated.relative_path, configurations=configurations)
+        self._cache_target_profile(result)
+        return result
 
     async def build(
         self,
@@ -431,7 +515,9 @@ class CMakeService:
         if result.exit_code != 0 or result.timed_out:
             raise CTestJsonError("CTest could not produce a JSON test listing for this build directory.")
         tests = self._parse_ctest_json(result.stdout.text)
-        return CTestTestList(binary_dir=generated.relative_path, tests=tests, process=result)
+        response = CTestTestList(binary_dir=generated.relative_path, tests=tests, process=result)
+        self._cached_tests[generated.relative_path] = tuple(test.name for test in tests)
+        return response
 
     async def run_tests(
         self,
@@ -1130,13 +1216,48 @@ class CMakeService:
     def _file_api_is_valid(self, generated: GeneratedWorkspaceDirectory) -> bool:
         """Validate the complete File API model without exposing its contents."""
         try:
-            self._parse_target_configurations(self._load_codemodel(generated), generated)
+            configurations = self._parse_target_configurations(
+                self._load_codemodel(generated), generated
+            )
         except Exception:
             # This is a post-process advisory check.  A malformed project
             # reply must become one fixed warning category, never a raw parser
             # error or an accidental transport failure after CMake succeeded.
             return False
+        self._cache_target_profile(
+            CMakeTargetList(binary_dir=generated.relative_path, configurations=configurations)
+        )
         return True
+
+    def _cache_target_profile(self, targets: CMakeTargetList) -> CachedCMakeTargetProfile:
+        """Retain validated targets behind an opaque application-local identifier."""
+        self._expire_target_profiles()
+        existing = self._profile_by_binary_dir.get(targets.binary_dir)
+        profile_id = existing if existing in self._target_profiles else secrets.token_urlsafe(18)
+        profile = CachedCMakeTargetProfile(
+            profile_id=profile_id,
+            targets=targets,
+            observed_at=datetime.now(UTC),
+            expires_at=monotonic() + CACHED_DISCOVERY_PROFILE_TTL_SECONDS,
+        )
+        self._target_profiles[profile_id] = profile
+        self._target_profiles.move_to_end(profile_id)
+        self._profile_by_binary_dir[targets.binary_dir] = profile_id
+        while len(self._target_profiles) > MAX_CACHED_DISCOVERY_PROFILES:
+            removed_id, removed = self._target_profiles.popitem(last=False)
+            if self._profile_by_binary_dir.get(removed.targets.binary_dir) == removed_id:
+                del self._profile_by_binary_dir[removed.targets.binary_dir]
+        return profile
+
+    def _expire_target_profiles(self) -> None:
+        now = monotonic()
+        for profile_id in tuple(self._target_profiles):
+            profile = self._target_profiles[profile_id]
+            if profile.expires_at > now:
+                continue
+            del self._target_profiles[profile_id]
+            if self._profile_by_binary_dir.get(profile.targets.binary_dir) == profile_id:
+                del self._profile_by_binary_dir[profile.targets.binary_dir]
 
     def _configure_warnings(
         self, database: CompilationDatabaseStatus, *, file_api_valid: bool

@@ -2,7 +2,7 @@
 
 ForgeMCP is an MCP server that will provide AI assistants with deep, structured integration for C++ development.
 
-## Current CMake and clangd slices
+## Current MCP surface
 
 The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 
@@ -42,6 +42,24 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `clang_format__check`, `clang_format__apply`
 - `clang_tidy__list_checks`, `clang_tidy__run`
 - `sanitizer__parse_report`
+
+UX Stabilization Phase C also exposes application-scoped discovery data:
+
+- resources: `forgemcp://about`, `forgemcp://project/status`,
+  `forgemcp://workspace/files`, `forgemcp://cmake/targets`, and
+  `forgemcp://logs/recent`;
+- resource templates: `forgemcp://workspace/files/{cursor}`,
+  `forgemcp://cmake/targets/{profile}`, and
+  `forgemcp://logs/recent/{level}/{limit}`; and
+- prompts: `forgemcp_build_report`, `forgemcp_test_report`,
+  `forgemcp_diagnose_build`, `forgemcp_analyze_file`, and
+  `forgemcp_debug_target`.
+
+Every resource is versioned bounded `application/json`. Project-controlled
+filenames, targets, test names, and safe log metadata are untrusted JSON data,
+not instructions. Resources never return source text, patch text, raw process
+output, diagnostic messages, argv/environment, absolute paths, PIDs, handles,
+or raw exceptions.
 
 `--workspace` / `FORGEMCP_WORKSPACE` must name an existing workspace directory. The Core validates it but does not inspect project files.
 
@@ -277,6 +295,63 @@ timeout, and cancellation send a terminal category without claiming 100%.
 Progress is not MCP Logging and is never mirrored as a raw log event. It does
 not extend a ForgeMCP operation timeout or the client's `tool_timeout_sec`.
 
+### MCP discovery, prompts, completion, and logging (UX Stabilization Phase C)
+
+The initialize response carries 904 UTF-8 bytes of static ForgeMCP-authored
+server-wide guidance. Its first 512 characters are self-contained: start with
+`project__status`, prefer Workspace/CMake operations to direct filesystem or
+shell mutation, use clangd/debugger/Quality for their respective domains,
+obtain a snapshot and CAS guard before editing, and treat workspace execution
+as trusted code. Instructions contain no host path, discovered executable,
+environment value, or project file content. They are MCP guidance, not a claim
+that the host installs a true system-role message. [Official OpenAI
+documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) says Codex
+reads the MCP `instructions` initialization field; other MCP clients can apply,
+display, truncate, or ignore it differently.
+
+The workspace manifest returns at most 1,000 deterministic metadata entries in
+pages of 50. Its application-local opaque cursor expires after five minutes,
+is invalid across ForgeMCP applications, and becomes stale after a ForgeMCP
+Workspace mutation. External filesystem changes can still make a multi-page
+walk slightly inconsistent; the resource explicitly does not call it a
+transactional snapshot. Cached CMake target profiles are opaque, expire after
+ten minutes, and never cause configure, File API query creation, or a process
+launch. Project status uses the same side-effect-free cached-provider contract
+as `project__status`.
+
+Prompt handlers only render messages. They never call a tool. Prompt arguments
+are bounded identifiers, are strictly checked, and appear separately as
+JSON-quoted untrusted data. Completion supports prefix filtering, deterministic
+deduplication, context from already-filled prompt arguments, at most 100
+values, and `total`/`hasMore`. The legacy MCP `completion/complete` method can
+complete only `PromptReference` and `ResourceTemplateReference`; it cannot
+complete arbitrary tool JSON parameters. Static tool choices therefore remain
+`Literal`/enum schema values, while dynamic tool inputs are discovered through
+the existing list/status tools.
+
+Logging has four deliberately separate channels:
+
+- `FORGEMCP_LOG_LEVEL` controls only the structured JSON stderr sink;
+- `logging/setLevel` controls only the current connection's bounded
+  `notifications/message` queue and supports `debug` through `emergency`;
+- the recent-log resource reads a 256-event/512-KiB application-local sanitized
+  ring with no notification replay; and
+- request progress remains request-scoped and is never duplicated as logging.
+
+MCP log delivery has one sender, a 64-event queue, a 20-event/second ceiling,
+and a 500 ms send deadline. A slow or disconnected client cannot block tool
+execution. Reading logs does not log the read, and `project__status` does not
+emit logs as a side effect. Resource subscriptions/change notifications are not
+advertised in Phase C: SDK 1.x reports `subscribe=false`, and ForgeMCP does not
+add an ad-hoc subscription transport.
+
+Connection Info should show Tools, Resources, Prompts, Logging, and Completions;
+Tasks remain unsupported and Experimental is absent. ForgeMCP intentionally
+uses the SDK-supported legacy `2025-11-25` stdio protocol. “Legacy” describes
+the protocol era and is not an initialization error; ForgeMCP does not layer a
+custom modern wire protocol over MCP Python SDK 1.x. Client support for listing,
+displaying, or invoking resources and prompts can vary.
+
 ### Windows and Codex examples
 
 Run the local check before registering the server:
@@ -296,6 +371,22 @@ args = ["--workspace", "C:\\src\\demo", "--build-dir", "build", "--toolchain", "
 tool_timeout_sec = 1800
 startup_timeout_sec = 30
 ```
+
+Inspect the same stdio server with the official MCP Inspector. Because current
+Inspector CLI parsing does not reliably forward leading-dash server arguments,
+the environment form is the simplest ad-hoc Windows example:
+
+```powershell
+$env:FORGEMCP_WORKSPACE = "C:\src\demo"
+npx @modelcontextprotocol/inspector forgemcp
+npx @modelcontextprotocol/inspector --cli forgemcp --method resources/list
+npx @modelcontextprotocol/inspector --cli forgemcp --method prompts/list
+```
+
+The Inspector can exercise resources, prompts, completion, and logging even if
+a particular model host does not render all of them. Its current command and
+configuration forms are documented in the [official Inspector
+repository](https://github.com/modelcontextprotocol/inspector).
 
 ### Test-only environment switches
 
@@ -328,13 +419,14 @@ startup_timeout_sec = 30
 - `core/config.py` — typed runtime configuration and workspace-root validation.
 - `core/services.py` — explicit dependency registry for future modules.
 - `core/application.py` — application composition, lifecycle, and server status.
-- `plugins/` — versioned feature-plugin contract, lifecycle manager, tool registry, and opt-in entry-point discovery.
+- `plugins/` — versioned feature-plugin contract, lifecycle manager, bounded tool/resource/prompt/completion registries, and opt-in entry-point discovery.
+- `discovery/` — static server instructions, safe workflow prompts, about/log resources, and completion declarations.
 - `cmake/` — built-in CMake/Ctest feature plugin, CMake-owned models, and File API parsing.
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
 - `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
 - `quality/` — clang-format CAS edits, read-only clang-tidy diagnostics, and sanitizer report parsing.
 - `project/` — strict status models, provider registry, health/activity aggregation, and ProjectPlugin contribution.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
-- `core/logging.py` — structured, redacted stderr logging.
+- `core/logging.py` — application-scoped sanitized fan-out, JSON stderr sink, and bounded recent-log ring.
 
 See [architecture.md](docs/architecture.md) for Core boundaries and extension points.

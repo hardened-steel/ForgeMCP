@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from forgemcp.core.config import ForgeConfig
+    from forgemcp.plugins.surface import (
+        PluginCompletionRegistry,
+        PluginPromptRegistry,
+        PluginResourceRegistry,
+        PluginResourceTemplateRegistry,
+    )
     from forgemcp.plugins.tools import PluginToolRegistry
 
 
@@ -102,6 +108,10 @@ class PluginContext:
     services: PluginServiceAccess
     logger: PluginLogger
     tools: PluginToolRegistry
+    resources: PluginResourceRegistry
+    resource_templates: PluginResourceTemplateRegistry
+    prompts: PluginPromptRegistry
+    completions: PluginCompletionRegistry
 
 
 class ForgePlugin(ABC):

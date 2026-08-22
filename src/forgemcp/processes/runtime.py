@@ -871,7 +871,11 @@ class ProcessRuntime:
             await handle.aclose()
             raise ProcessRuntimeClosedError("The process runtime is closing and cannot start processes.")
         self._handles.add(handle)
-        self._logger.info("process_started", pid=process.pid)
+        self._logger.info(
+            "process_started",
+            ownership_required=requested_ownership is ProcessTreeOwnership.REQUIRED,
+            ownership_established=ownership_established,
+        )
         return handle
 
     async def start_trusted_adapter(

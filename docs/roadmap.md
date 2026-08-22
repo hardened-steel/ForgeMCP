@@ -80,8 +80,15 @@ irreversible choices belong in [adr/](adr/).
   application-local post-commit mutation batches, CMake stale marking, source-
   aware compilation-database policy/validation, and clangd document/database
   coherence. The workspace/CMake/clangd coherence audit and opt-in real
-  Windows gate passed on 2026-08-22. See ADR 0014. No external watcher, Git,
-  resources, prompts, or completion surface is included.
+  Windows gate passed on 2026-08-22. See ADR 0014. That phase did not include
+  an external watcher, Git, or an MCP discovery surface.
+- UX Stabilization Phase C: bounded server instructions, Resources, Prompts,
+  legacy prompt/resource-template Completion, application-scoped structured
+  logging fan-out, a sanitized recent-log ring, and connection-scoped MCP
+  Logging. The official SDK stdio gate covers initialization, discovery,
+  reads, pagination, prompts, completion context, log filtering, cancellation,
+  and clean shutdown. See ADR 0015. Tasks, Experimental features, resource
+  subscriptions, Git, and an external watcher remain absent.
 
 ### In progress
 
@@ -97,6 +104,7 @@ irreversible choices belong in [adr/](adr/).
 | DAP debugger | ADR 0009, audited Process Runtime, Plugin System, workspace path policy, a runnable approved adapter | A managed debug-adapter session can launch within policy, prove strong tree ownership, terminate descendants, and expose bounded transport-neutral debug state. |
 | Quality tools | CMake target/build metadata and Process Runtime | Complete: lazy fixed-tool discovery, CAS formatting, bounded read-only diagnostics, and sanitizer parsing without shell access or secrets. |
 | Project Intelligence Phase 1 | Audited Core, Workspace, Process Runtime, plugins, and feature caches | Complete: bounded cached provider aggregation with explicit partial/freshness and no refresh side effects. |
+| UX Stabilization Phase C | Accepted Phase A, Phase B, and Workspace/CMake/clangd coherence baselines | Complete: bounded MCP discovery surface and connection logging pass the SDK protocol and adversarial gates. |
 | Git intelligence | Separate Git freshness, ignored-file, nesting, and trust design | Not started; intentionally absent from `project__status` Phase 1. |
 
 ## Completed milestone: clangd phase 1
@@ -230,8 +238,9 @@ resolve; each needs a bounded contract and safety review.
   (Create/Rename/DeleteFile), and arbitrary clangd argv passthrough.
 - Workspace MCP tools deliberately support bounded read/snapshot, guarded
   unified-patch creation, and existing-file text edits only; delete/rename,
-  binary files, arbitrary paths, external watcher, resources/prompts, and Git
-  integration remain unavailable.
+  binary files, arbitrary paths, an external watcher, and Git integration
+  remain unavailable. Phase C resources and prompts are bounded discovery
+  aids; they add no filesystem mutation operation.
   `project__status` reports cached safe component metadata only and deliberately
   has no aggregated diagnostic messages or refresh. DAP Phase 1 is launch-only LLDB-DAP
   source debugging for the passed standalone LLVM/DWARF gate; it is not an

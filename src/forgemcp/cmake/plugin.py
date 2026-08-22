@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+import json
+from pathlib import PurePosixPath, PureWindowsPath
 
 from pydantic import Field, ValidationError
 
@@ -12,10 +14,15 @@ from forgemcp.cmake.events import CompilationDatabaseRegistry
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    CompletionContribution,
+    CompletionReferenceKind,
+    CompletionRequest,
     ForgePlugin,
     NoOpProgressReporter,
     PluginContext,
     PluginMetadata,
+    ResourceContribution,
+    ResourceTemplateContribution,
     ToolContribution,
     ToolExecutionContext,
 )
@@ -79,6 +86,26 @@ class _RunTestsArguments(ForgeModel):
 
 
 ToolOperation = Callable[..., Awaitable[ForgeModel]]
+
+CMAKE_TARGETS_URI = "forgemcp://cmake/targets"
+CMAKE_TARGETS_TEMPLATE_URI = "forgemcp://cmake/targets/{profile}"
+MAX_RESOURCE_TARGETS = 512
+MAX_RESOURCE_TARGET_BYTES = 220 * 1024
+
+
+def _safe_relative_artifact(value: str) -> bool:
+    windows = PureWindowsPath(value)
+    posix = PurePosixPath(value)
+    return (
+        0 < len(value) <= 512
+        and not windows.is_absolute()
+        and not windows.drive
+        and not windows.root
+        and not posix.is_absolute()
+        and ".." not in windows.parts
+        and ".." not in posix.parts
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
 
 
 class _CMakeStatusProvider:
@@ -213,6 +240,24 @@ class CMakePlugin(ForgePlugin):
                 handler=lambda arguments, *, execution_context=None: self._dispatch(_StatusArguments, arguments, self._status, execution_context),
             )
         )
+        context.resources.register(
+            ResourceContribution(
+                uri=CMAKE_TARGETS_URI,
+                name="forgemcp_cmake_targets",
+                description="Latest cached validated CMake File API target metadata; never configures or runs a process.",
+                handler=lambda: self._targets_resource(None),
+            )
+        )
+        context.resource_templates.register(
+            ResourceTemplateContribution(
+                uri_template=CMAKE_TARGETS_TEMPLATE_URI,
+                name="forgemcp_cmake_targets_profile",
+                description="Cached validated CMake targets selected by an opaque application-local profile identifier.",
+                arguments=("profile",),
+                handler=lambda arguments: self._targets_resource(arguments["profile"]),
+            )
+        )
+        self._register_completions(context)
         context.tools.register(
             ToolContribution(
                 name="list_presets",
@@ -277,6 +322,175 @@ class CMakePlugin(ForgePlugin):
             self._status_registry.unregister("cmake")
             self._status_registry = None
         self._service = None
+
+    def _targets_resource(self, profile_id: str | None) -> dict[str, object]:
+        if self._service is None:
+            return self._targets_error("resource_unavailable")
+        profile = self._service.cached_target_profile(profile_id)
+        if profile is None:
+            return self._targets_error(
+                "profile_unavailable" if profile_id is not None else "targets_unavailable"
+            )
+        entries: list[dict[str, object]] = []
+        omitted = 0
+        serialized_bytes = 0
+        configurations = sorted(
+            profile.targets.configurations, key=lambda item: (item.name.casefold(), item.name)
+        )
+        for configuration in configurations:
+            for target in sorted(
+                configuration.targets, key=lambda item: (item.name.casefold(), item.name, item.type)
+            ):
+                if (
+                    len(entries) >= MAX_RESOURCE_TARGETS
+                    or len(target.name) > 256
+                    or len(target.type) > 64
+                    or len(configuration.name) > 128
+                ):
+                    omitted += 1
+                    continue
+                item = {
+                    "configuration": configuration.name,
+                    "name": target.name,
+                    "type": target.type,
+                    "artifacts": [
+                        artifact
+                        for artifact in target.artifacts[:8]
+                        if _safe_relative_artifact(artifact)
+                    ],
+                }
+                item_bytes = len(
+                    json.dumps(
+                        item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                )
+                if serialized_bytes + item_bytes > MAX_RESOURCE_TARGET_BYTES:
+                    omitted += 1
+                    continue
+                entries.append(item)
+                serialized_bytes += item_bytes
+        return {
+            "schema_version": "1",
+            "resource": CMAKE_TARGETS_URI,
+            "state": "stale" if self._service.cached_targets_stale else "available",
+            "profile": profile.profile_id,
+            "observed_at": profile.observed_at.isoformat(),
+            "targets": entries,
+            "complete": omitted == 0,
+            "truncated": omitted > 0,
+            "omitted_target_count": omitted,
+        }
+
+    @staticmethod
+    def _targets_error(code: str) -> dict[str, object]:
+        return {
+            "schema_version": "1",
+            "resource": CMAKE_TARGETS_URI,
+            "state": "unavailable",
+            "targets": [],
+            "complete": False,
+            "truncated": False,
+            "error": {"code": code, "message": "Cached validated CMake targets are unavailable."},
+        }
+
+    def _register_completions(self, context: PluginContext) -> None:
+        profile_references = (
+            "forgemcp_build_report",
+            "forgemcp_test_report",
+            "forgemcp_diagnose_build",
+            "forgemcp_debug_target",
+        )
+        for reference in profile_references:
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="profile",
+                    provider=self._complete_profiles,
+                )
+            )
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="configuration",
+                    provider=self._complete_configurations,
+                )
+            )
+        for reference in (
+            "forgemcp_build_report",
+            "forgemcp_test_report",
+            "forgemcp_diagnose_build",
+        ):
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="preset",
+                    provider=self._complete_presets,
+                )
+            )
+        for reference in (
+            "forgemcp_build_report",
+            "forgemcp_diagnose_build",
+            "forgemcp_debug_target",
+        ):
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="target",
+                    provider=self._complete_targets,
+                )
+            )
+        context.completions.register(
+            CompletionContribution(
+                reference_kind=CompletionReferenceKind.PROMPT,
+                reference="forgemcp_test_report",
+                argument="test",
+                provider=self._complete_tests,
+            )
+        )
+        context.completions.register(
+            CompletionContribution(
+                reference_kind=CompletionReferenceKind.RESOURCE_TEMPLATE,
+                reference=CMAKE_TARGETS_TEMPLATE_URI,
+                argument="profile",
+                provider=self._complete_profiles,
+            )
+        )
+
+    def _complete_profiles(self, _request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return tuple(profile.profile_id for profile in self._service.cached_target_profiles())
+
+    async def _complete_presets(self, _request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        if not self._service.cached_preset_names():
+            try:
+                await self._service.list_presets()
+            except ForgeMCPError:
+                return ()
+        return self._service.cached_preset_names()
+
+    def _complete_configurations(self, request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return self._service.cached_configurations(request.context.get("profile"))
+
+    def _complete_targets(self, request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return self._service.cached_target_names(
+            request.context.get("profile"), request.context.get("configuration")
+        )
+
+    def _complete_tests(self, request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return self._service.cached_test_names(request.context.get("profile"))
 
     def _on_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
         """Mark cached CMake state stale after a committed source transaction."""

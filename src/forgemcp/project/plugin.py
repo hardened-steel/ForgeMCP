@@ -9,7 +9,14 @@ from pydantic import ValidationError
 from forgemcp import __version__
 from forgemcp.core.errors import to_mcp_error_response
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginManager, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    PluginContext,
+    PluginManager,
+    PluginMetadata,
+    ResourceContribution,
+    ToolContribution,
+)
 from forgemcp.processes import ProcessRuntime
 from forgemcp.project.errors import ProjectStatusError, ProjectStatusRequestError
 from forgemcp.project.models import MAX_CAPABILITIES, ComponentState, ComponentStatus, StatusFact, utc_now
@@ -180,6 +187,14 @@ class ProjectPlugin(ForgePlugin):
                 handler=self._dispatch,
             )
         )
+        context.resources.register(
+            ResourceContribution(
+                uri="forgemcp://project/status",
+                name="forgemcp_project_status",
+                description="Side-effect-free bounded aggregation of cached ProjectStatusService providers.",
+                handler=self._resource,
+            )
+        )
 
     async def stop(self) -> None:
         self._service = None
@@ -200,3 +215,26 @@ class ProjectPlugin(ForgePlugin):
         except ProjectStatusError as error:
             return to_mcp_error_response(error).as_dict()
         return status.model_dump(mode="json")
+
+    async def _resource(self) -> dict[str, object]:
+        if self._service is None:
+            return {
+                "schema_version": "1",
+                "resource": "forgemcp://project/status",
+                "ok": False,
+                "error": {"code": "resource_unavailable", "message": "Cached project status is unavailable."},
+            }
+        try:
+            status = await self._service.status()
+        except ProjectStatusError:
+            return {
+                "schema_version": "1",
+                "resource": "forgemcp://project/status",
+                "ok": False,
+                "error": {"code": "status_unavailable", "message": "Cached project status is unavailable."},
+            }
+        return {
+            "schema_version": "1",
+            "resource": "forgemcp://project/status",
+            "status": status.model_dump(mode="json"),
+        }
