@@ -12,12 +12,14 @@ from pathlib import Path
 
 import pytest
 
+import forgemcp.cmake.events as cmake_events
 from forgemcp.cmake import (
     CMakeFileApiError,
     CMakePlugin,
     CMakePresetError,
     CMakeRequestError,
     CMakeService,
+    CompilationDatabaseRequirementError,
     CTestJsonError,
 )
 from forgemcp.core.application import ForgeApplication
@@ -26,10 +28,46 @@ from forgemcp.core.logging import create_logger
 from forgemcp.models import ProcessOutput, ProcessResult
 from forgemcp.processes import ProcessExecutableError, ProcessRuntime
 from forgemcp.server import create_server
-from forgemcp.workspace import SymlinkWorkspacePathError, WorkspacePathError, WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
+from forgemcp.workspace import (
+    SymlinkWorkspacePathError,
+    WorkspaceMutationBus,
+    WorkspacePathError,
+    WorkspaceService,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "cmake_file_api"
+
+
+def test_compilation_database_registry_bounds_cancellation_suppressing_consumer(monkeypatch):
+    async def exercise() -> None:
+        released = asyncio.Event()
+        registry = cmake_events.CompilationDatabaseRegistry(create_logger("CRITICAL"))
+
+        async def suppress_cancel(_: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await released.wait()
+
+        monkeypatch.setattr(cmake_events, "COMPILATION_DATABASE_HANDLER_TIMEOUT_SECONDS", 0.01)
+        registry.subscribe("stuck", suppress_cancel)
+        await asyncio.wait_for(
+            registry.publish(
+                cmake_events.CompilationDatabaseStatus(
+                    availability="available", generator_support="supported", generator="Ninja",
+                    binary_dir="build", fingerprint="a" * 64,
+                )
+            ),
+            timeout=0.2,
+        )
+        assert registry.degraded is True
+        assert not registry._handlers
+        released.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(exercise())
 
 
 def _real_cmake_tools() -> tuple[Path, Path] | None:
@@ -76,30 +114,44 @@ def _real_cmake_tools() -> tuple[Path, Path] | None:
     return None
 
 
-def _runtime_with_real_cmake_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProcessRuntime:
-    tools = _real_cmake_tools()
-    if tools is None:
-        pytest.skip("requires CMake and CTest in PATH or a standard Windows installation")
-    cmake, ctest = tools
-    assert cmake.parent == ctest.parent
-    search_directories = [cmake.parent]
-    ninja = shutil.which("ninja")
-    if ninja is not None:
-        search_directories.append(Path(ninja).parent)
-    elif os.name == "nt":
-        bundled_ninja = cmake.parent.parent.parent / "Ninja" / "ninja.exe"
-        if bundled_ninja.is_file():
-            search_directories.append(bundled_ninja.parent)
-    existing_path = os.environ.get("PATH", "")
-    monkeypatch.setenv(
-        "PATH", os.pathsep.join(str(directory) for directory in search_directories) + os.pathsep + existing_path
+def _runtime_with_real_cmake_tools(
+    tmp_path: Path,
+) -> tuple[ProcessRuntime, CMakeService]:
+    """Compose the production VS discovery and filtered toolchain runtime.
+
+    The live gates intentionally start with no inherited developer shell and
+    no usable PATH.  Testing an ad-hoc PATH would bypass the exact executable
+    and VsDevCmd trust boundary that the real application uses.
+    """
+    if os.name != "nt":
+        pytest.skip("requires the Windows Visual Studio discovery gate")
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.casefold().startswith("forgemcp_")
+        and not name.casefold().startswith("vscmd_")
+        and name.casefold() not in {"vcinstalldir", "vsinstalldir", "windowslibpath"}
+    }
+    environment["PATH"] = ""
+    config = ForgeConfig.from_sources(
+        environment=environment,
+        cli={"workspace_root": str(tmp_path), "toolchain": "msvc"},
+        cwd=tmp_path,
     )
-    if len(search_directories) > 1:
-        # Avoid relying on a Visual Studio developer-shell environment for the
-        # no-language File API check. A normal developer shell can still make
-        # a C++ compiler available for the full test below.
-        monkeypatch.setenv("CMAKE_GENERATOR", "Ninja")
-    return ProcessRuntime(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL"))
+    toolchain = ToolchainDiscoveryService(config)
+    if (
+        toolchain.executable("cmake") is None
+        or toolchain.executable("ctest") is None
+        or toolchain.toolchain_environment is None
+    ):
+        pytest.skip("requires a discoverable Visual Studio CMake/CTest and VsDevCmd environment")
+    runtime = ProcessRuntime(
+        config,
+        create_logger("CRITICAL"),
+        approved_executable_paths=toolchain.approved_executable_paths,
+    )
+    runtime.set_toolchain_environment(toolchain.toolchain_environment)
+    return runtime, CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime, config, toolchain)
 
 
 def process_result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ProcessResult:
@@ -314,6 +366,131 @@ def test_configure_writes_file_api_query_uses_argv_and_validated_cache_variables
         asyncio.run(service.configure(source_dir="src", binary_dir="build", cache_variables={"bad-key": "x"}))
 
 
+def test_compile_commands_policy_adds_export_rejects_known_visual_studio_required_and_marks_stale(tmp_path):
+    prepare_project(tmp_path)
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    runtime = FakeProcessRuntime([process_result(stdout="configured")])
+    service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime, config)
+
+    result = asyncio.run(service.configure(source_dir="src", binary_dir="build"))
+
+    assert result.compilation_database is not None
+    assert "-DCMAKE_EXPORT_COMPILE_COMMANDS:STRING=ON" in runtime.calls[0][0]
+    service.mark_workspace_mutation(("CMakeLists.txt",))
+    assert service.cached_project_status().configuration_stale is False
+    service.mark_workspace_mutation(("src/CMakeLists.txt",))
+    assert service.cached_project_status().configuration_stale is True
+
+    required = CMakeService(
+        WorkspaceService(
+            ForgeConfig(workspace_root=tmp_path, compile_commands="required", cmake_generator="Visual Studio 17 2022"),
+            create_logger("CRITICAL"),
+        ),
+        FakeProcessRuntime([]),
+        ForgeConfig(workspace_root=tmp_path, compile_commands="required", cmake_generator="Visual Studio 17 2022"),
+    )
+    with pytest.raises(CompilationDatabaseRequirementError):
+        asyncio.run(required.configure(source_dir="src", binary_dir="another-build"))
+
+
+def test_compilation_database_validation_returns_metadata_without_commands(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    generated = workspace.open_generated_directory("build", create=True)
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\r\n")
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "secret-compiler --token=never-return"}]),
+    )
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+
+    database = service._validate_compilation_database(generated)
+
+    assert database.availability == "available"
+    assert database.generator_support == "supported"
+    assert database.entry_count == 1
+    assert "secret-compiler" not in database.model_dump_json()
+
+
+def test_compilation_database_rejects_spoofed_generator_duplicate_and_control_entries(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    generated = workspace.open_generated_directory("build", create=True)
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Evil Makefiles\n")
+    generated.write_text("compile_commands.json", "[]")
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+    assert service._validate_compilation_database(generated).generator_support == "unsupported"
+
+    generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps(
+            [
+                {"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"},
+                {"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"},
+            ]
+        ),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "clang++\n--secret"}]),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+    generated.write_text(
+        "compile_commands.json",
+        json.dumps([{"file": "main.cpp", "command": "clang++ -c main.cpp"}]),
+    )
+    assert service._validate_compilation_database(generated).availability == "invalid"
+
+
+def test_configure_preserves_stale_when_a_cmake_file_commits_during_configure(tmp_path):
+    async def exercise() -> None:
+        (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.23)\n", encoding="utf-8")
+        config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto")
+        logger = create_logger("CRITICAL")
+        bus = WorkspaceMutationBus(logger)
+        workspace = WorkspaceService(config, logger, mutations=bus)
+        generated = workspace.open_generated_directory("build", create=True)
+        generated.write_text("CMakeCache.txt", "CMAKE_GENERATOR:INTERNAL=Ninja\n")
+        generated.write_text(
+            "compile_commands.json",
+            json.dumps([{"directory": str(tmp_path), "file": "main.cpp", "command": "clang++ -c main.cpp"}]),
+        )
+
+        class MutatingRuntime:
+            async def run(self, argv, **kwargs):
+                workspace.apply_unified_patch(
+                    "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -1 +1,2 @@\n cmake_minimum_required(VERSION 3.23)\n+# changed during configure\n",
+                    {"CMakeLists.txt": workspace.get_snapshot("CMakeLists.txt")},
+                )
+                return process_result(stdout="configured")
+
+        service = CMakeService(workspace, MutatingRuntime(), config, mutations=bus)
+        result = await service.configure(binary_dir="build")
+        assert result.process.exit_code == 0
+        assert service.cached_project_status().configuration_stale is True
+        await bus.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_compile_command_generator_and_build_type_policy_is_exact(tmp_path):
+    config = ForgeConfig(workspace_root=tmp_path, compile_commands="auto", default_configuration="Debug")
+    workspace = WorkspaceService(config, create_logger("CRITICAL"))
+    service = CMakeService(workspace, FakeProcessRuntime([]), config)
+
+    assert service._generator_supports_compile_commands("Ninja") is True
+    assert service._generator_supports_compile_commands("Ninja Multi-Config") is True
+    assert service._generator_supports_compile_commands("Unix Makefiles") is True
+    assert service._generator_supports_compile_commands("Spoofed Makefiles") is False
+    assert "CMAKE_BUILD_TYPE" not in " ".join(service._configure_cache_arguments({}, "Ninja Multi-Config"))
+    assert "-DCMAKE_BUILD_TYPE:STRING=Debug" in service._configure_cache_arguments({}, "Unix Makefiles")
+    assert "-DCMAKE_BUILD_TYPE:STRING=Release" in service._configure_cache_arguments(
+        {"CMAKE_BUILD_TYPE": "Release"}, "Ninja"
+    )
+
+
 def test_configure_rejects_workspace_escape_and_symlink_build_directory(tmp_path):
     prepare_project(tmp_path)
     service, _ = cmake_service(tmp_path, [process_result()])
@@ -445,6 +622,8 @@ def test_build_returns_nonzero_process_result_and_enforces_parallel_bound(tmp_pa
     )
     with pytest.raises(CMakeRequestError):
         asyncio.run(service.build(binary_dir="build", parallel_jobs=0))
+    with pytest.raises(CMakeRequestError, match="bounded"):
+        asyncio.run(service.build(binary_dir="build", targets=("x" * 257,)))
 
 
 def test_ctest_json_listing_and_failed_exact_name_run(tmp_path):
@@ -488,7 +667,7 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
                 "preset",
                 "cache_variables",
             }
-            assert tools["cmake__configure"].inputSchema["required"] == ["binary_dir"]
+            assert "required" not in tools["cmake__configure"].inputSchema
             statuses = {status.plugin_id: status.state.value for status in application.services.get("plugins").statuses()}
             assert statuses["cmake"] == "running"
         statuses = {status.plugin_id: status.state.value for status in application.services.get("plugins").statuses()}
@@ -497,16 +676,17 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
     asyncio.run(exercise())
 
 
-def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
+@pytest.mark.skipif(
+    not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_real_cmake_file_api_without_compiler(tmp_path):
     """Exercise configure and File API whenever CMake/CTest are available."""
     (tmp_path / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_file_api LANGUAGES NONE)\n",
         encoding="utf-8",
     )
-    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
-    service = CMakeService(
-        WorkspaceService(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL")), runtime
-    )
+    runtime, service = _runtime_with_real_cmake_tools(tmp_path)
 
     async def exercise() -> None:
         try:
@@ -522,16 +702,18 @@ def test_real_cmake_file_api_without_compiler(tmp_path, monkeypatch):
     asyncio.run(exercise())
 
 
-def test_optional_real_cmake_vertical_slice(tmp_path, monkeypatch):
+@pytest.mark.skipif(
+    not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_optional_real_cmake_vertical_slice(tmp_path):
     """Exercise configure, File API, build, and CTest when a C++ compiler is usable."""
     (tmp_path / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.23)\nproject(forgemcp_smoke LANGUAGES CXX)\nadd_executable(app main.cpp)\nenable_testing()\nadd_test(NAME app_runs COMMAND app)\n",
         encoding="utf-8",
     )
     (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
-    config = ForgeConfig(workspace_root=tmp_path)
-    runtime = _runtime_with_real_cmake_tools(tmp_path, monkeypatch)
-    service = CMakeService(WorkspaceService(config, create_logger("CRITICAL")), runtime)
+    runtime, service = _runtime_with_real_cmake_tools(tmp_path)
 
     async def exercise() -> None:
         try:

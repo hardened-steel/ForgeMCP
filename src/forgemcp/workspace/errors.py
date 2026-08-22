@@ -87,3 +87,9 @@ class WorkspaceTextEditError(WorkspaceError):
     """A structured text-edit batch has an invalid coordinate or overlap."""
 
     code = "workspace_text_edit_error"
+
+
+class WorkspaceRequestError(WorkspaceError):
+    """A public Workspace tool request fails schema-adjacent validation."""
+
+    code = "workspace_request_error"

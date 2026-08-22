@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from forgemcp.core.config import ForgeConfig
+from forgemcp.core.config import ConfigurationSource, ForgeConfig
 from forgemcp.core.services import ServiceRegistry
 
-__all__ = ["ForgeApplication", "ForgeConfig", "LifecycleState", "ServiceRegistry"]
+__all__ = ["ConfigurationSource", "ForgeApplication", "ForgeConfig", "LifecycleState", "ServiceRegistry"]
 
 
 def __getattr__(name: str) -> Any:

@@ -2,20 +2,70 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
 from pydantic import Field, ValidationError
 
 from forgemcp.clangd.errors import ClangdRequestError
 from forgemcp.clangd.service import ClangdService
+from forgemcp.cmake.events import CompilationDatabaseRegistry, CompilationDatabaseSubscription
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import Diagnostic, Position, Range
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    NoOpProgressReporter,
+    PluginContext,
+    PluginMetadata,
+    ProgressUpdate,
+    ToolContribution,
+    ToolExecutionContext,
+)
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
 from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import (
+    WorkspaceMutationBatch,
+    WorkspaceMutationBus,
+    WorkspaceMutationSubscription,
+    WorkspaceService,
+)
+from forgemcp.toolchain import ToolchainDiscoveryService
+
+
+async def _run_lifecycle_progress(
+    context: ToolExecutionContext, label: str, operation: Awaitable[object]
+) -> object:
+    """Report only phase/elapsed state for managed clangd lifecycle work."""
+    await context.report_progress(ProgressUpdate(0, None, label))
+    heartbeat: asyncio.Task[None] | None = None
+    if context.supports_progress:
+        async def pulse() -> None:
+            started = asyncio.get_running_loop().time()
+            while True:
+                await asyncio.sleep(2.0)
+                await context.report_progress(
+                    ProgressUpdate(0, None, f"{label} ({max(1, int(asyncio.get_running_loop().time() - started))}s)")
+                )
+        heartbeat = asyncio.create_task(pulse())
+    try:
+        result = await operation
+    except asyncio.CancelledError:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} cancelled", terminal=True))
+        raise
+    except Exception:
+        await context.report_progress(ProgressUpdate(0, None, f"{label} failed", terminal=True))
+        raise
+    else:
+        await context.report_progress(
+            ProgressUpdate(1, None, f"{label} completed", terminal=True, completed=True)
+        )
+        return result
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 class _StatusArguments(ForgeModel):
@@ -23,7 +73,7 @@ class _StatusArguments(ForgeModel):
 
 
 class _StartArguments(ForgeModel):
-    compile_commands_dir: str = Field(description="Workspace-relative directory containing compile_commands.json.")
+    compile_commands_dir: str | None = Field(default=None, description="Optional workspace-relative database directory. When omitted clangd uses the latest validated CMake profile, or fallback commands under the off policy.")
 
 
 class _StopArguments(ForgeModel):
@@ -85,7 +135,7 @@ class _HierarchyItemArguments(ForgeModel):
     limit: int | None = Field(default=None, description="Optional bounded result count from 1 through 500.")
 
 
-ToolOperation = Callable[[ClangdService, ForgeModel], Awaitable[ForgeModel | None]]
+ToolOperation = Callable[..., Awaitable[ForgeModel | None]]
 
 
 class _ClangdStatusProvider:
@@ -109,6 +159,8 @@ class _ClangdStatusProvider:
             and not cached.available
         ):
             state = ComponentState.DEGRADED
+        if state is ComponentState.ACTIVE and cached.synchronization_degraded:
+            state = ComponentState.DEGRADED
         facts = [
             StatusFact(name="availability_observed", value=cached.availability_observed),
             StatusFact(name="available", value=cached.available),
@@ -120,6 +172,7 @@ class _ClangdStatusProvider:
             StatusFact(name="diagnostic_hints", value=cached.diagnostic_hint_count),
             StatusFact(name="stale_diagnostics", value=cached.stale_diagnostic_count),
             StatusFact(name="diagnostic_counts_truncated", value=cached.counts_truncated),
+            StatusFact(name="synchronization_degraded", value=cached.synchronization_degraded),
         ]
         if cached.version is not None:
             facts.append(StatusFact(name="version", value=cached.version))
@@ -137,6 +190,8 @@ class _ClangdStatusProvider:
             warnings.append("workspace_relative_path_omitted")
         if cached.counts_truncated:
             warnings.append("cached_counts_truncated")
+        if cached.synchronization_degraded:
+            warnings.append("document_synchronization_pending")
         return ComponentStatus(
             id=self.id,
             display_name="clangd",
@@ -145,7 +200,7 @@ class _ClangdStatusProvider:
             summary="Cached clangd lifecycle and normalized diagnostic counters.",
             facts=tuple(facts),
             warnings=tuple(warnings),
-            stale=cached.stale_diagnostic_count > 0 or cached.counts_truncated,
+            stale=cached.stale_diagnostic_count > 0 or cached.counts_truncated or cached.synchronization_degraded,
             observed_at=utc_now(),
         )
 
@@ -153,18 +208,20 @@ class _ClangdStatusProvider:
 class ClangdPlugin(ForgePlugin):
     """Application-scoped clangd plugin; it creates no server until ``start`` tool use."""
 
-    __slots__ = ("_service", "_status_registry")
+    __slots__ = ("_service", "_status_registry", "_mutation_subscription", "_database_subscription")
 
     def __init__(self) -> None:
         super().__init__(
             PluginMetadata(
                 plugin_id="clangd",
-                requires_services=("workspace", "process_runtime", "project_status_registry"),
+                requires_services=("workspace", "workspace_mutations", "compilation_database", "process_runtime", "toolchain_discovery", "project_status_registry"),
                 provides=frozenset({"clangd"}),
             )
         )
         self._service: ClangdService | None = None
         self._status_registry: ProjectStatusRegistry | None = None
+        self._mutation_subscription: WorkspaceMutationSubscription | None = None
+        self._database_subscription: CompilationDatabaseSubscription | None = None
 
     @property
     def service(self) -> ClangdService:
@@ -176,24 +233,49 @@ class ClangdPlugin(ForgePlugin):
     async def start(self, context: PluginContext) -> None:
         workspace = context.services.get("workspace")
         process_runtime = context.services.get("process_runtime")
+        toolchain = context.services.get("toolchain_discovery")
+        mutations = context.services.get("workspace_mutations")
+        compilation_database = context.services.get("compilation_database")
         status_registry = context.services.get("project_status_registry")
         if not isinstance(workspace, WorkspaceService) or not isinstance(process_runtime, ProcessRuntime):
             raise TypeError("The clangd plugin requires WorkspaceService and ProcessRuntime.")
         if not isinstance(status_registry, ProjectStatusRegistry):
             raise TypeError("The clangd plugin requires ProjectStatusRegistry.")
-        self._service = ClangdService(context.config, workspace, process_runtime)
+        if not isinstance(toolchain, ToolchainDiscoveryService):
+            raise TypeError("The clangd plugin requires ToolchainDiscoveryService.")
+        if not isinstance(mutations, WorkspaceMutationBus):
+            raise TypeError("The clangd plugin requires WorkspaceMutationBus.")
+        if not isinstance(compilation_database, CompilationDatabaseRegistry):
+            raise TypeError("The clangd plugin requires CompilationDatabaseRegistry.")
+        self._service = ClangdService(context.config, workspace, process_runtime, toolchain, mutations, compilation_database)
+        self._mutation_subscription = mutations.subscribe("clangd", self._on_workspace_mutation)
+        self._database_subscription = compilation_database.subscribe("clangd", self._on_compilation_database)
         self._status_registry = status_registry
         status_registry.register(_ClangdStatusProvider(self._service))
         self._register_tools(context)
 
     async def stop(self) -> None:
         """Stop the managed server before Process Runtime closes its child handles."""
+        if self._mutation_subscription is not None:
+            await self._mutation_subscription.aclose()
+            self._mutation_subscription = None
+        if self._database_subscription is not None:
+            self._database_subscription.close()
+            self._database_subscription = None
         if self._status_registry is not None:
             self._status_registry.unregister("clangd")
             self._status_registry = None
         if self._service is not None:
             await self._service.aclose()
             self._service = None
+
+    async def _on_workspace_mutation(self, batch: WorkspaceMutationBatch) -> None:
+        if self._service is not None:
+            await self._service.handle_workspace_mutation(batch)
+
+    async def _on_compilation_database(self, status) -> None:
+        if self._service is not None:
+            await self._service.handle_compilation_database_update(status)
 
     def _register_tools(self, context: PluginContext) -> None:
         contributions = (
@@ -231,7 +313,7 @@ class ClangdPlugin(ForgePlugin):
                     name=name,
                     description=description,
                     input_model=model,
-                    handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op),
+                    handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context),
                 )
             )
 
@@ -240,6 +322,7 @@ class ClangdPlugin(ForgePlugin):
         model_type: type[ForgeModel],
         arguments: Mapping[str, object],
         operation: ToolOperation,
+        execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         try:
             request = model_type.model_validate(arguments)
@@ -248,7 +331,11 @@ class ClangdPlugin(ForgePlugin):
                 ClangdRequestError("Tool arguments do not match the published clangd schema.")
             ).as_dict()
         try:
-            result = await operation(self.service, request)
+            context = execution_context or ToolExecutionContext(NoOpProgressReporter())
+            if operation.__name__ in {"_start", "_stop"}:
+                result = await operation(self.service, request, context)
+            else:
+                result = await operation(self.service, request)
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
         return {"stopped": True} if result is None else result.model_dump(mode="json")
@@ -258,13 +345,15 @@ class ClangdPlugin(ForgePlugin):
         return await service.status()
 
     @staticmethod
-    async def _start(service: ClangdService, request: ForgeModel) -> ForgeModel:
+    async def _start(
+        service: ClangdService, request: ForgeModel, context: ToolExecutionContext
+    ) -> ForgeModel:
         assert isinstance(request, _StartArguments)
-        return await service.start(request.compile_commands_dir)
+        return await _run_lifecycle_progress(context, "Starting clangd", service.start(request.compile_commands_dir))
 
     @staticmethod
-    async def _stop(service: ClangdService, _: ForgeModel) -> None:
-        await service.aclose()
+    async def _stop(service: ClangdService, _: ForgeModel, context: ToolExecutionContext) -> None:
+        await _run_lifecycle_progress(context, "Stopping clangd", service.aclose())
         return None
 
     @staticmethod

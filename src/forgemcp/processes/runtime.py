@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import ctypes
+import inspect
 from ctypes import wintypes
 import os
 import shutil
@@ -30,6 +31,11 @@ from forgemcp.processes.errors import (
     ProcessWorkingDirectoryError,
 )
 from forgemcp.processes.policy import ProcessPolicy, _contains_link_or_reparse_point
+from forgemcp.processes.observer import (
+    MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS,
+    ProcessOutputEvent,
+    ProcessOutputObserver,
+)
 
 if TYPE_CHECKING:
     from asyncio.streams import StreamReader, StreamWriter
@@ -46,7 +52,7 @@ class ProcessRuntimeCachedStatus:
     required_ownership: bool
 
 
-def _known_llvm_quality_tools() -> tuple[Path, ...]:
+def _known_llvm_quality_tools(environment: Mapping[str, str]) -> tuple[Path, ...]:
     """Return fixed conventional LLVM quality-tool locations for policy approval.
 
     This intentionally does not scan arbitrary directories.  A candidate is
@@ -58,9 +64,9 @@ def _known_llvm_quality_tools() -> tuple[Path, ...]:
         roots.extend(
             Path(value)
             for value in (
-                os.environ.get("ProgramFiles"),
-                os.environ.get("ProgramW6432"),
-                os.environ.get("ProgramFiles(x86)"),
+                environment.get("ProgramFiles"),
+                environment.get("ProgramW6432"),
+                environment.get("ProgramFiles(x86)"),
             )
             if value
         )
@@ -292,6 +298,132 @@ class _BoundedTextCapture:
             self._truncated = True
 
 
+class _BoundedObserverDispatcher:
+    """Drain observer work through one bounded task without delaying pipe reads."""
+
+    _QUEUE_SIZE = 32
+    _DRAIN_TIMEOUT_SECONDS = 0.1
+    _CLOSE_TIMEOUT_SECONDS = 0.1
+
+    def __init__(self, observer: ProcessOutputObserver) -> None:
+        self._observer = observer
+        self._queue: asyncio.Queue[ProcessOutputEvent] = asyncio.Queue(maxsize=self._QUEUE_SIZE)
+        self._overflowed = False
+        self._failed = False
+        self._closed = False
+        self._decoders = {
+            "stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        }
+        self._consumer = asyncio.create_task(self._consume())
+
+    @property
+    def overflowed(self) -> bool:
+        return self._overflowed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def offer(self, stream: str, data: bytes) -> None:
+        """Enqueue decoded bounded chunks; never await from a pipe reader."""
+        if self._closed:
+            return
+        stream_name = "stdout" if stream == "stdout" else "stderr"
+        self._offer_text(stream_name, self._decoders[stream_name].decode(data, final=False))
+
+    def finish_stream(self, stream: str) -> None:
+        """Flush one stream's incremental decoder after its pipe reaches EOF."""
+        if self._closed:
+            return
+        stream_name = "stdout" if stream == "stdout" else "stderr"
+        self._offer_text(stream_name, self._decoders[stream_name].decode(b"", final=True))
+
+    def _offer_text(self, stream: str, text: str) -> None:
+        """Split decoded text deterministically before it reaches the queue."""
+        for start in range(0, len(text), MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS):
+            event = ProcessOutputEvent(
+                stream=stream,
+                text=text[start:start + MAX_PROCESS_OBSERVER_CHUNK_CHARACTERS],
+                observed_at=datetime.now(UTC),
+            )
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Coalescing raw text would create another disclosure store.
+                # The deterministic 4 KiB chunks are simply dropped and the
+                # consumer falls back to its independent heartbeat.
+                self._overflowed = True
+                return
+
+    async def aclose(self) -> None:
+        self._closed = True
+        try:
+            # Give a fast parser one bounded opportunity to consume final
+            # chunks (important when a short child exits immediately), but
+            # never make a slow observer part of process completion.
+            await asyncio.wait_for(self._queue.join(), timeout=self._DRAIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._overflowed = True
+        if not self._consumer.done():
+            self._consumer.cancel()
+        done, _ = await asyncio.wait({self._consumer}, timeout=self._CLOSE_TIMEOUT_SECONDS)
+        if self._consumer not in done:
+            # A local observer may illegally suppress cancellation.  It gets
+            # at most this one worker and this one bounded queue; do not let
+            # it extend a process result or application shutdown.
+            self._failed = True
+            self._consumer.add_done_callback(self._consume_task_exception)
+            return
+        self._consume_task_exception(self._consumer)
+        await self._finalize_observer()
+
+    async def _finalize_observer(self) -> None:
+        """Give a parser a bounded chance to flush an unterminated final line."""
+        close = getattr(self._observer, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            value = close()
+            if not inspect.isawaitable(value):
+                return
+            task = asyncio.create_task(value)
+            done, _ = await asyncio.wait({task}, timeout=self._CLOSE_TIMEOUT_SECONDS)
+            if task not in done:
+                self._failed = True
+                task.cancel()
+                task.add_done_callback(self._consume_task_exception)
+                return
+            self._consume_task_exception(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._failed = True
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task[object]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
+
+    async def _consume(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                value = self._observer(event)
+                if inspect.isawaitable(value):
+                    await value
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Observers are best effort and their exceptions are neither
+                # logged with raw chunks nor allowed to affect the process.
+                self._failed = True
+            finally:
+                self._queue.task_done()
+
+
 class ProcessHandle:
     """Streaming handle for a long-lived clangd or DAP-adapter process.
 
@@ -437,12 +569,21 @@ class ProcessRuntime:
         logger: StructuredLogger,
         *,
         policy: ProcessPolicy | None = None,
+        approved_executable_paths: frozenset[Path] = frozenset(),
     ) -> None:
         """Bind the runtime to one validated workspace and explicit policy."""
         self._root = config.workspace_root
         self._logger = logger
-        self._base_environment = dict(os.environ)
+        # ForgeMCP settings are input to composition, never an implicit child
+        # process API.  In particular an unknown FORGEMCP_* variable must not
+        # alter a project's configure/build/test subprocesses.
+        self._base_environment = {
+            key: value
+            for key, value in config.host_environment.items()
+            if not key.upper().startswith("FORGEMCP_")
+        }
         self._executable_search_path = self._base_environment.get("PATH")
+        self._toolchain_environment: Mapping[str, str] | None = None
         self._fixed_quality_executables: dict[str, Path] = {}
         for tool_name in _FIXED_QUALITY_EXECUTABLES:
             configured = (
@@ -454,17 +595,18 @@ class ProcessRuntime:
                 )
                 if discovered is not None:
                     self._fixed_quality_executables[tool_name] = discovered
-        configured_exact_paths: set[Path] = {
+        configured_exact_paths: set[Path] = set(approved_executable_paths)
+        configured_exact_paths.update({
             path
             for path in (config.clangd_path, config.lldb_dap_path)
             if path is not None and path.is_file() and not path.is_symlink()
-        }
+        })
         configured_exact_paths.update(
             candidate
             for path in (
                 config.clang_format_path,
                 config.clang_tidy_path,
-                *_known_llvm_quality_tools(),
+                *_known_llvm_quality_tools(config.host_environment),
                 *self._fixed_quality_executables.values(),
             )
             if path is not None
@@ -481,6 +623,54 @@ class ProcessRuntime:
         self._short_handles: set[ProcessHandle] = set()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    def set_toolchain_environment(self, environment: Mapping[str, str]) -> None:
+        """Install the filtered VS environment for CMake/CTest commands only.
+
+        The discovery service owns the filtering.  This method deliberately
+        copies only validated strings and never records values in logs/status.
+        """
+        if self._handles:
+            raise ProcessPolicyError("Toolchain environment must be installed before launching processes.")
+        checked: dict[str, str] = {}
+        for key, value in environment.items():
+            if not isinstance(key, str) or not isinstance(value, str) or "\x00" in key or "\x00" in value:
+                raise ProcessEnvironmentError("Toolchain environment must be a NUL-free string mapping.")
+            checked[key] = value
+        self._toolchain_environment = dict(checked)
+
+    async def run_toolchain(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float | None = None,
+        input_data: bytes | None = None,
+        observer: ProcessOutputObserver | None = None,
+    ) -> ProcessResult:
+        """Run only an exact selected CMake/CTest command with the VS environment.
+
+        This intentionally has no environment argument.  Feature plugins
+        cannot use it as a generic arbitrary-environment process launcher.
+        """
+        if isinstance(argv, str) or not isinstance(argv, Sequence) or not argv:
+            raise ProcessArgumentError("Commands must be a non-empty argv sequence, never a shell string.")
+        executable = Path(argv[0]) if isinstance(argv[0], str) else Path()
+        name = executable.stem.casefold() if os.name == "nt" else executable.name
+        if (
+            name not in {"cmake", "ctest"}
+            or not executable.is_absolute()
+            or not self._policy.approves_exact_executable(executable)
+        ):
+            raise ProcessExecutableError("Only exact discovered CMake and CTest executables may use the toolchain environment.")
+        return await self.run(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            input_data=input_data,
+            observer=observer,
+            _environment_base=self._toolchain_environment,
+        )
 
     @property
     def workspace_root(self) -> Path:
@@ -527,6 +717,8 @@ class ProcessRuntime:
         environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
         approved_path_directories: Sequence[Path] = (),
         require_exact_executable: bool = False,
+        _environment_base: Mapping[str, str] | None = None,
+        observer: ProcessOutputObserver | None = None,
     ) -> ProcessResult:
         """Run one bounded short command and return its completed result.
 
@@ -545,13 +737,15 @@ class ProcessRuntime:
             environment_mode=environment_mode,
             approved_path_directories=approved_path_directories,
             require_exact_executable=require_exact_executable,
+            _environment_base=_environment_base,
         )
         self._short_handles.add(handle)
         started_at = datetime.now(UTC)
         stdout_capture = _BoundedTextCapture(self._policy.max_output_characters)
         stderr_capture = _BoundedTextCapture(self._policy.max_output_characters)
-        stdout_task = asyncio.create_task(self._capture_stream(handle.stdout, stdout_capture))
-        stderr_task = asyncio.create_task(self._capture_stream(handle.stderr, stderr_capture))
+        dispatcher = _BoundedObserverDispatcher(observer) if observer is not None else None
+        stdout_task = asyncio.create_task(self._capture_stream(handle.stdout, stdout_capture, "stdout", dispatcher))
+        stderr_task = asyncio.create_task(self._capture_stream(handle.stderr, stderr_capture, "stderr", dispatcher))
         capture_tasks = (stdout_task, stderr_task)
         timed_out = False
         exit_code: int | None = None
@@ -580,6 +774,8 @@ class ProcessRuntime:
         finally:
             self._short_handles.discard(handle)
             self._forget(handle)
+            if dispatcher is not None:
+                await asyncio.shield(dispatcher.aclose())
 
         finished_at = datetime.now(UTC)
         result = ProcessResult(
@@ -589,6 +785,8 @@ class ProcessRuntime:
             finished_at=finished_at,
             stdout=stdout_capture.to_model(),
             stderr=stderr_capture.to_model(),
+            observer_overflow=False if dispatcher is None else dispatcher.overflowed,
+            observer_failed=False if dispatcher is None else dispatcher.failed,
         )
         self._logger.info(
             "process_finished",
@@ -612,6 +810,7 @@ class ProcessRuntime:
         environment_mode: ProcessEnvironmentMode = ProcessEnvironmentMode.INHERIT,
         approved_path_directories: Sequence[Path] = (),
         require_exact_executable: bool = False,
+        _environment_base: Mapping[str, str] | None = None,
     ) -> ProcessHandle:
         """Start an allow-listed protocol process with streaming stdin/stdout/stderr.
 
@@ -634,6 +833,7 @@ class ProcessRuntime:
             mode=requested_environment_mode,
             executable=Path(executable_argv[0]),
             approved_path_directories=approved_path_directories,
+            base_environment=_environment_base,
         )
         job = _WindowsProcessJob.create()
         if os.name == "nt" and requested_ownership is ProcessTreeOwnership.REQUIRED and job is None:
@@ -671,7 +871,11 @@ class ProcessRuntime:
             await handle.aclose()
             raise ProcessRuntimeClosedError("The process runtime is closing and cannot start processes.")
         self._handles.add(handle)
-        self._logger.info("process_started", pid=process.pid)
+        self._logger.info(
+            "process_started",
+            ownership_required=requested_ownership is ProcessTreeOwnership.REQUIRED,
+            ownership_established=ownership_established,
+        )
         return handle
 
     async def start_trusted_adapter(
@@ -892,6 +1096,7 @@ class ProcessRuntime:
         mode: ProcessEnvironmentMode,
         executable: Path,
         approved_path_directories: Sequence[Path],
+        base_environment: Mapping[str, str] | None,
     ) -> dict[str, str]:
         if mode is ProcessEnvironmentMode.SCRUBBED:
             if inherit_environment is not None:
@@ -926,7 +1131,7 @@ class ProcessRuntime:
             allowed = self._policy.allowed_environment_overrides
             if allowed is not None and key not in allowed:
                 raise ProcessEnvironmentError("An environment override is not allowed by process policy.")
-        values = dict(self._base_environment) if inherit else {}
+        values = dict(self._base_environment if base_environment is None else base_environment) if inherit else {}
         values.update(overrides)
         return values
 
@@ -1042,12 +1247,22 @@ class ProcessRuntime:
             raise ProcessPolicyError("Process timeout exceeds the configured maximum.")
         return float(timeout_seconds)
 
-    async def _capture_stream(self, stream: "StreamReader", capture: _BoundedTextCapture) -> None:
+    async def _capture_stream(
+        self,
+        stream: "StreamReader",
+        capture: _BoundedTextCapture,
+        stream_name: str,
+        observer: _BoundedObserverDispatcher | None = None,
+    ) -> None:
         try:
             while data := await stream.read(65_536):
                 capture.feed(data)
+                if observer is not None:
+                    observer.offer(stream_name, data)
         finally:
             capture.finish()
+            if observer is not None:
+                observer.finish_stream(stream_name)
 
     async def _finish_captures(
         self,

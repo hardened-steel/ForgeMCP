@@ -814,9 +814,11 @@ def test_multiple_applications_do_not_share_project_status_state(tmp_path: Path)
         first_registry.unregister("quality")
         assert "quality" not in first_registry.provider_ids()
         assert "quality" in second_registry.provider_ids()
-        assert (await first.services.get("project_status_service").status()).workspace_root != (
-            await second.services.get("project_status_service").status()
-        ).workspace_root
+        first_status = await first.services.get("project_status_service").status()
+        second_status = await second.services.get("project_status_service").status()
+        assert first_status.workspace_root == second_status.workspace_root == "configured"
+        assert str(first_root) not in first_status.model_dump_json()
+        assert str(second_root) not in second_status.model_dump_json()
         await first.aclose()
         await second.aclose()
 

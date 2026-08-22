@@ -41,6 +41,12 @@ class CMakeFileApiError(CMakeError):
     code = "cmake_file_api_error"
 
 
+class CompilationDatabaseRequirementError(CMakeError):
+    """The configured required compilation-database policy was not met."""
+
+    code = "compile_commands_required"
+
+
 class CTestJsonError(CMakeError):
     """CTest's documented JSON listing response is invalid or unsupported."""
 

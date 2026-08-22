@@ -24,6 +24,13 @@ from forgemcp.plugins.errors import (
     PluginStartError,
 )
 from forgemcp.plugins.tools import PluginToolRegistry, ToolRegistry
+from forgemcp.plugins.surface import (
+    DiscoverySurfaceRegistry,
+    PluginCompletionRegistry,
+    PluginPromptRegistry,
+    PluginResourceRegistry,
+    PluginResourceTemplateRegistry,
+)
 
 class PluginState(StrEnum):
     """Observable lifecycle state for one registered plugin."""
@@ -74,6 +81,7 @@ class PluginManager:
         self._records: dict[str, _PluginRecord] = {}
         self._capability_owners: dict[str, str] = {}
         self._tools = ToolRegistry()
+        self._surface = DiscoverySurfaceRegistry()
         self._started_ids: list[str] = []
         self._external_discovery_done = False
         self._closed = False
@@ -82,6 +90,11 @@ class PluginManager:
     def tools(self) -> ToolRegistry:
         """Return the application-owned, transport-neutral tool registry."""
         return self._tools
+
+    @property
+    def surface(self) -> DiscoverySurfaceRegistry:
+        """Return the application-owned non-tool contribution registry."""
+        return self._surface
 
     def register_builtin(self, plugin: ForgePlugin) -> None:
         """Explicitly register a trusted plugin composed by ForgeMCP itself."""
@@ -160,6 +173,10 @@ class PluginManager:
                 tools=PluginToolRegistry(
                     plugin_id, self._tools, record.plugin.metadata.tool_namespaces
                 ),
+                resources=PluginResourceRegistry(plugin_id, self._surface),
+                resource_templates=PluginResourceTemplateRegistry(plugin_id, self._surface),
+                prompts=PluginPromptRegistry(plugin_id, self._surface),
+                completions=PluginCompletionRegistry(plugin_id, self._surface),
             )
             try:
                 await record.plugin.start(context)
@@ -167,6 +184,7 @@ class PluginManager:
                 record.state = PluginState.FAILED
                 record.error = type(error).__name__
                 self._tools.unregister_plugin(plugin_id)
+                self._surface.unregister_plugin(plugin_id)
                 try:
                     # start() may already have registered status providers or
                     # acquired other application-scoped resources. Give the
@@ -177,9 +195,10 @@ class PluginManager:
                     self._logger.warning(
                         "plugin_failed_start_cleanup_failed",
                         plugin_id=plugin_id,
-                        error=type(cleanup_error).__name__,
+                        failure_category=type(cleanup_error).__name__,
                     )
                 await self._rollback_started()
+                await self._surface.aclose()
                 self._closed = True
                 raise PluginStartError(f"Plugin failed to start: {plugin_id}") from error
             record.state = PluginState.RUNNING
@@ -191,6 +210,7 @@ class PluginManager:
             return
         self._closed = True
         await self._rollback_started()
+        await self._surface.aclose()
 
     def _resolve_start_order(self) -> tuple[str, ...]:
         """Validate graph/service dependencies and return a stable Kahn ordering."""
@@ -242,9 +262,14 @@ class PluginManager:
             except Exception as error:  # pragma: no cover - defensive cleanup path
                 record.state = PluginState.FAILED
                 record.error = type(error).__name__
-                self._logger.warning("plugin_stop_failed", plugin_id=plugin_id, error=type(error).__name__)
+                self._logger.warning(
+                    "plugin_stop_failed",
+                    plugin_id=plugin_id,
+                    failure_category=type(error).__name__,
+                )
             else:
                 record.state = PluginState.STOPPED
                 record.error = None
             finally:
                 self._tools.unregister_plugin(plugin_id)
+                self._surface.unregister_plugin(plugin_id)

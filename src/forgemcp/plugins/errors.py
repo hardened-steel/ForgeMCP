@@ -54,3 +54,39 @@ class DuplicateToolNameError(PluginRegistrationError):
 
 class ToolNamespaceError(PluginRegistrationError):
     """A tool contribution has an invalid local tool namespace."""
+
+
+class DuplicateResourceUriError(PluginRegistrationError):
+    """Two registered static resources use the same public URI."""
+
+
+class DuplicateResourceTemplateError(PluginRegistrationError):
+    """Two registered resource templates use the same URI template."""
+
+
+class DuplicatePromptNameError(PluginRegistrationError):
+    """Two registered prompts use the same public name."""
+
+
+class DuplicateCompletionProviderError(PluginRegistrationError):
+    """Two completion providers claim the same reference argument."""
+
+
+class ContributionLimitError(PluginRegistrationError):
+    """An application exceeded a bounded contribution registry capacity."""
+
+
+class DiscoverySurfaceError(PluginError):
+    """A discovery-surface request failed with a fixed safe category."""
+
+
+class ResourceReadError(DiscoverySurfaceError):
+    """A resource contribution could not produce a bounded response."""
+
+
+class PromptRequestError(DiscoverySurfaceError):
+    """Prompt arguments did not satisfy the published contribution contract."""
+
+
+class CompletionRequestError(DiscoverySurfaceError):
+    """A completion request did not match a registered bounded provider."""

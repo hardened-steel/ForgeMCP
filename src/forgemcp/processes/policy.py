@@ -16,6 +16,13 @@ def _path_key(path: Path) -> str:
     return value.casefold() if os.name == "nt" else value
 
 
+def _uses_unsafe_windows_path_form(path: Path) -> bool:
+    """Reject network/device executable namespaces from exact process approval."""
+    raw = str(path)
+    windows = PureWindowsPath(raw)
+    return raw.startswith(("\\\\?\\", "\\\\.\\")) or windows.drive.startswith("\\\\")
+
+
 def _is_reparse_point(path: Path) -> bool:
     """Return whether a path entry is a Windows reparse point without following it."""
     try:
@@ -52,6 +59,8 @@ class _ExecutableApproval:
             raise ValueError("Allowed executable paths must be NUL-free.")
         if not raw_path.is_absolute():
             raise ValueError("Allowed executable paths must be absolute paths.")
+        if _uses_unsafe_windows_path_form(raw_path):
+            raise ValueError("Allowed executable paths must not use UNC or device path forms.")
         if _contains_link_or_reparse_point(raw_path):
             raise ValueError("Allowed executable paths must not traverse symlinks or reparse points.")
         try:

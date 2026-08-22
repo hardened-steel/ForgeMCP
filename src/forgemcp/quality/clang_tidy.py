@@ -21,6 +21,7 @@ from forgemcp.quality.models import (
     TidyRunResult,
 )
 from forgemcp.workspace import WorkspaceError, WorkspaceService
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 MAX_TIDY_FILES = 64
@@ -68,10 +69,14 @@ class _ToolSelection:
 class ClangTidyService:
     """Run only fixed clang-tidy modes against a trusted workspace compilation database."""
 
-    def __init__(self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRunner) -> None:
+    def __init__(
+        self, config: ForgeConfig, workspace: WorkspaceService, process_runtime: ProcessRunner,
+        toolchain: ToolchainDiscoveryService | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
         self._process_runtime = process_runtime
+        self._toolchain = toolchain
         self._cached_status: QualityToolInfo | None = None
 
     @property
@@ -155,11 +160,15 @@ class ClangTidyService:
 
     async def _qualify(self) -> _ToolSelection:
         candidates: list[str] = []
-        if self._config.clang_tidy_path is not None:
+        if self._toolchain is not None:
+            selected = self._toolchain.executable("clang-tidy")
+            if selected is not None:
+                candidates.append(str(selected))
+        elif self._config.clang_tidy_path is not None:
             candidates.append(str(self._config.clang_tidy_path))
         else:
             candidates.append("clang-tidy")
-            candidates.extend(str(path) for path in known_quality_candidates("clang-tidy"))
+            candidates.extend(str(path) for path in known_quality_candidates("clang-tidy", self._config.host_environment))
         for candidate in candidates:
             canonical = self._canonical(candidate)
             if canonical is None:

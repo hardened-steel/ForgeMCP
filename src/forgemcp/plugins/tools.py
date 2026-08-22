@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -10,11 +11,58 @@ from typing import Any
 from pydantic import BaseModel
 
 from forgemcp.plugins.errors import DuplicateToolNameError, ToolNamespaceError
+from forgemcp.plugins.execution import ToolExecutionContext
 
 _TOOL_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 _PLUGIN_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_-]*$")
 
-ToolHandler = Callable[[Mapping[str, object]], object | Awaitable[object]]
+LegacyToolHandler = Callable[[Mapping[str, object]], object | Awaitable[object]]
+"""Mapping-only handler retained for external plugin compatibility."""
+
+ContextAwareToolHandler = Callable[..., object | Awaitable[object]]
+"""Handler shape for tools that opt into keyword-only ``execution_context``."""
+
+ToolHandler = LegacyToolHandler | ContextAwareToolHandler
+
+
+@dataclass(frozen=True, slots=True)
+class ToolHints:
+    """SDK-neutral projection of standard MCP tool safety annotations."""
+
+    read_only: bool | None = None
+    destructive: bool | None = None
+    idempotent: bool | None = None
+    open_world: bool | None = None
+
+
+def handler_accepts_execution_context(handler: ToolHandler) -> bool:
+    """Return whether a handler explicitly opts into the v1 context keyword.
+
+    Only the exact keyword-only ``execution_context`` parameter is an opt-in.
+    This avoids accidentally binding a new context into a legacy handler's
+    optional positional/default ``context`` value.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get("execution_context")
+    return parameter is not None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def invoke_tool_handler(
+    handler: ToolHandler,
+    arguments: Mapping[str, object],
+    execution_context: ToolExecutionContext,
+) -> object | Awaitable[object]:
+    """Invoke old or context-aware contribution handlers without SDK leakage."""
+    if handler_accepts_execution_context(handler):
+        try:
+            parameters = inspect.signature(handler).parameters
+        except (TypeError, ValueError):  # pragma: no cover - guarded above
+            return handler(arguments)
+        return handler(arguments, execution_context=execution_context)  # type: ignore[call-arg]
+    return handler(arguments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +73,9 @@ class ToolContribution:
     description: str
     handler: ToolHandler = field(repr=False, compare=False)
     input_model: type[BaseModel] | None = field(default=None, repr=False, compare=False)
+    output_type: object | None = field(default=None, repr=False, compare=False)
     namespace: str | None = field(default=None, repr=False, compare=False)
+    hints: ToolHints | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not _TOOL_IDENTIFIER.fullmatch(self.name):
@@ -42,6 +92,8 @@ class ToolContribution:
             not isinstance(self.namespace, str) or not _PLUGIN_IDENTIFIER.fullmatch(self.namespace)
         ):
             raise ToolNamespaceError("Tool contribution namespaces must be lower-case plugin-style identifiers.")
+        if self.hints is not None and not isinstance(self.hints, ToolHints):
+            raise TypeError("Tool contribution hints must be ToolHints when supplied.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +127,16 @@ class RegisteredToolContribution:
     def input_model(self) -> type[BaseModel] | None:
         """Return the optional transport-neutral Pydantic input contract."""
         return self.contribution.input_model
+
+    @property
+    def output_type(self) -> object | None:
+        """Return the optional transport-neutral structured result contract."""
+        return self.contribution.output_type
+
+    @property
+    def hints(self) -> ToolHints | None:
+        """Return SDK-neutral MCP safety annotations for this operation."""
+        return self.contribution.hints
 
 
 class ToolRegistry:

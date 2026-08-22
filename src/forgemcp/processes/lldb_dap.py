@@ -81,13 +81,15 @@ class LldbDapQualifier:
     ) -> None:
         self._config = config
         self._logger = logger
-        self._environment = dict(os.environ if environment is None else environment)
+        self._environment = dict(config.host_environment if environment is None else environment)
         self._runtime_factory = runtime_factory or self._create_runtime
 
     def discover(self) -> tuple[LldbDapCandidate, ...]:
         """Return local candidates in the deliberate discovery order without executing them."""
         raw: list[tuple[Path, str]] = []
         if self._config.lldb_dap_path is not None:
+            # Legacy qualifier diagnostics retain this stable source label;
+            # the path itself still comes only from immutable Core config.
             raw.append((self._config.lldb_dap_path, "FORGEMCP_LLDB_DAP"))
 
         path_candidate = shutil.which("lldb-dap", path=self._environment.get("PATH"))

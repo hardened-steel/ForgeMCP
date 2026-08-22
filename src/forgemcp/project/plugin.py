@@ -9,13 +9,20 @@ from pydantic import ValidationError
 from forgemcp import __version__
 from forgemcp.core.errors import to_mcp_error_response
 from forgemcp.models._base import ForgeModel
-from forgemcp.plugins import ForgePlugin, PluginContext, PluginManager, PluginMetadata, ToolContribution
+from forgemcp.plugins import (
+    ForgePlugin,
+    PluginContext,
+    PluginManager,
+    PluginMetadata,
+    ResourceContribution,
+    ToolContribution,
+)
 from forgemcp.processes import ProcessRuntime
 from forgemcp.project.errors import ProjectStatusError, ProjectStatusRequestError
 from forgemcp.project.models import MAX_CAPABILITIES, ComponentState, ComponentStatus, StatusFact, utc_now
 from forgemcp.project.registry import ProjectStatusProvider, ProjectStatusRegistry
 from forgemcp.project.service import ProjectStatusService
-from forgemcp.workspace import WorkspaceService
+from forgemcp.workspace import WorkspaceMutationBus, WorkspaceService
 
 
 class _ProjectStatusArguments(ForgeModel):
@@ -53,15 +60,16 @@ class WorkspaceStatusProvider:
 
     id = "workspace"
 
-    def __init__(self, workspace: WorkspaceService) -> None:
+    def __init__(self, workspace: WorkspaceService, mutations: WorkspaceMutationBus | None = None) -> None:
         self._workspace = workspace
+        self._mutations = mutations
 
     async def snapshot_status(self) -> ComponentStatus:
         policy = self._workspace.policy
         return ComponentStatus(
             id=self.id,
             display_name="Workspace",
-            state=ComponentState.AVAILABLE,
+            state=ComponentState.DEGRADED if self._mutations is not None and self._mutations.degraded else ComponentState.AVAILABLE,
             capabilities=("workspace.read", "workspace.patch", "workspace.generated_directory"),
             summary="Configured workspace root and immutable access policy are available.",
             facts=(
@@ -69,7 +77,9 @@ class WorkspaceStatusProvider:
                 StatusFact(name="write_policy", value=True),
                 StatusFact(name="max_read", value=policy.max_read_bytes, unit="bytes"),
                 StatusFact(name="max_patch", value=policy.max_patch_bytes, unit="bytes"),
+                StatusFact(name="mutation_generation", value=self._mutations.generation if self._mutations is not None else 0),
             ),
+            warnings=("mutation_subscriber_degraded",) if self._mutations is not None and self._mutations.degraded else (),
             observed_at=utc_now(),
         )
 
@@ -177,6 +187,14 @@ class ProjectPlugin(ForgePlugin):
                 handler=self._dispatch,
             )
         )
+        context.resources.register(
+            ResourceContribution(
+                uri="forgemcp://project/status",
+                name="forgemcp_project_status",
+                description="Side-effect-free bounded aggregation of cached ProjectStatusService providers.",
+                handler=self._resource,
+            )
+        )
 
     async def stop(self) -> None:
         self._service = None
@@ -197,3 +215,26 @@ class ProjectPlugin(ForgePlugin):
         except ProjectStatusError as error:
             return to_mcp_error_response(error).as_dict()
         return status.model_dump(mode="json")
+
+    async def _resource(self) -> dict[str, object]:
+        if self._service is None:
+            return {
+                "schema_version": "1",
+                "resource": "forgemcp://project/status",
+                "ok": False,
+                "error": {"code": "resource_unavailable", "message": "Cached project status is unavailable."},
+            }
+        try:
+            status = await self._service.status()
+        except ProjectStatusError:
+            return {
+                "schema_version": "1",
+                "resource": "forgemcp://project/status",
+                "ok": False,
+                "error": {"code": "status_unavailable", "message": "Cached project status is unavailable."},
+            }
+        return {
+            "schema_version": "1",
+            "resource": "forgemcp://project/status",
+            "status": status.model_dump(mode="json"),
+        }

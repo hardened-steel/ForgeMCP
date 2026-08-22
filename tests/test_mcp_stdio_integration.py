@@ -13,10 +13,14 @@ import pytest
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp import types as mcp_types
+from mcp.shared.exceptions import McpError
 
 
 _EXPECTED_TOOLS = {
     "server_status",
+    "workspace__list_files", "workspace__read_text", "workspace__get_snapshot",
+    "workspace__apply_unified_patch", "workspace__apply_text_edits",
     "project__status",
     "cmake__status",
     "cmake__list_presets",
@@ -105,6 +109,8 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     project_status_result = await session.call_tool("project__status", {})
                     assert project_status_result.isError is False
                     project_status = _json_tool_content(project_status_result)
+                    assert project_status["workspace_root"] == "configured"
+                    assert str(tmp_path) not in json.dumps(project_status)
                     assert project_status["partial"] is False
                     assert project_status["health"] in {"healthy", "degraded", "failed"}
                     assert project_status["activity"] in {"idle", "busy", "paused"}
@@ -119,6 +125,10 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert status.isError is False
                     status_payload = _json_tool_content(status)
                     assert {"available", "cmake", "ctest", "minimum_cmake_version"} <= status_payload.keys()
+
+                    core_status = _json_tool_content(await session.call_tool("server_status", {}))
+                    assert core_status["workspace_root"] == "configured"
+                    assert str(tmp_path) not in json.dumps(core_status)
 
                     clangd_status = await session.call_tool("clangd__status")
                     assert clangd_status.isError is False
@@ -179,6 +189,366 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
     server_errors = asyncio.run(exercise())
 
     assert '"event": "application_stopped"' in server_errors
+    assert str(tmp_path) not in server_errors
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows MCP toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_environment(
+    tmp_path: Path,
+):
+    """Run the CMake vertical slice through SDK stdio with CLI-only configuration."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.23)\n"
+        "project(forgemcp_cli_mcp_gate LANGUAGES CXX)\n"
+        "add_executable(app main.cpp)\n"
+        "enable_testing()\n"
+        "add_test(NAME app_runs COMMAND app)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+
+    async def exercise() -> str:
+        errors_path = tmp_path / "server-stderr.log"
+        # The child gets no ForgeMCP setting and no inherited Developer/PATH
+        # state.  VS discovery and VsDevCmd must establish the CMake toolchain.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("FORGEMCP_")
+            and key.upper() not in {"VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR"}
+        }
+        environment["PATH"] = ""
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m", "forgemcp.server", "--workspace", str(tmp_path),
+                "--toolchain", "msvc", "--configure-timeout-sec", "300",
+                "--build-timeout-sec", "300", "--test-timeout-sec", "300",
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+        )
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    progress: list[tuple[float, float | None, str | None]] = []
+
+                    async def observe(value: float, total: float | None, message: str | None) -> None:
+                        progress.append((value, total, message))
+
+                    initialized = await session.initialize()
+                    assert initialized.serverInfo.name == "ForgeMCP"
+                    tools = {tool.name for tool in (await session.list_tools()).tools}
+                    assert {
+                        "project__status", "cmake__status", "cmake__configure",
+                        "cmake__build", "cmake__ctest_list_tests", "cmake__ctest_run",
+                        "workspace__read_text", "workspace__apply_unified_patch",
+                    } <= tools
+                    status = _json_tool_content(await session.call_tool("project__status", {}))
+                    assert status["workspace_root"] == "configured"
+                    cmake_status = _json_tool_content(await session.call_tool("cmake__status", {}))
+                    assert cmake_status["available"] is True
+                    configured = _json_tool_content(await session.call_tool(
+                        "cmake__configure", {"binary_dir": "build"}, progress_callback=observe
+                    ))
+                    assert configured["process"]["exit_code"] == 0
+                    assert configured["compilation_database"]["availability"] == "available"
+                    source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "main.cpp"}))
+                    patched = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/main.cpp\n+++ b/main.cpp\n@@ -1 +1 @@\n-int main() { return 0; }\n+int main() { return 0; } // workspace-sync\n",
+                            "expected_snapshots": {"main.cpp": source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert patched["applied"] is True
+                    assert "workspace-sync" in _json_tool_content(
+                        await session.call_tool("workspace__read_text", {"path": "main.cpp"})
+                    )["text"]
+                    await asyncio.sleep(0.1)
+                    stale_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    cmake_component = next(item for item in stale_status["components"] if item["id"] == "cmake")
+                    assert "configuration_stale" not in cmake_component["warnings"]
+                    built = _json_tool_content(await session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}, progress_callback=observe
+                    ))
+                    assert built["process"]["exit_code"] == 0
+                    tests = _json_tool_content(await session.call_tool(
+                        "cmake__ctest_list_tests", {"binary_dir": "build"}
+                    ))
+                    assert [item["name"] for item in tests["tests"]] == ["app_runs"]
+                    executed = _json_tool_content(await session.call_tool(
+                        "cmake__ctest_run", {"binary_dir": "build"}, progress_callback=observe
+                    ))
+                    assert executed["process"]["exit_code"] == 0
+                    cmake_source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "CMakeLists.txt"}))
+                    cmake_changed = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -5 +5,2 @@\n add_test(NAME app_runs COMMAND app)\n+# workspace-triggered reconfigure\n",
+                            "expected_snapshots": {"CMakeLists.txt": cmake_source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert cmake_changed["applied"] is True
+                    await asyncio.sleep(0.1)
+                    stale_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    cmake_component = next(item for item in stale_status["components"] if item["id"] == "cmake")
+                    assert "configuration_stale" in cmake_component["warnings"]
+                    reconfigured = _json_tool_content(await session.call_tool("cmake__configure", {"binary_dir": "build"}))
+                    assert reconfigured["process"]["exit_code"] == 0
+                    assert len(progress) >= 3
+                    assert any(message == "Configure completed" for _, _, message in progress)
+                    assert any(message == "Build completed" for _, _, message in progress)
+                    assert any(message == "Test run completed" for _, _, message in progress)
+                    final_status = _json_tool_content(await session.call_tool("project__status", {}))
+                    runtime = next(item for item in final_status["components"] if item["id"] == "process_runtime")
+                    facts = {item["name"]: item["value"] for item in runtime["facts"]}
+                    assert facts["active_processes"] == 0
+        return errors_path.read_text(encoding="utf-8")
+
+    errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in errors
+    assert str(tmp_path) not in errors
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows MCP progress gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_real_windows_mcp_progress_heartbeat_exact_cancellation_and_recovery_gate(tmp_path: Path):
+    """Prove live CMake output, request cancellation, recovery, and shutdown."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.23)\n"
+        "project(forgemcp_progress_gate LANGUAGES CXX)\n"
+        "add_executable(app main.cpp)\n"
+        "add_custom_target(silent_build COMMAND ${CMAKE_COMMAND} -E sleep 3)\n"
+        "add_custom_target(cancel_build COMMAND ${CMAKE_COMMAND} -E sleep 20)\n"
+        "enable_testing()\n"
+        "add_test(NAME app_runs COMMAND app)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+
+    async def exercise() -> str:
+        errors_path = tmp_path / "progress-gate-stderr.log"
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("FORGEMCP_")
+            and key.upper() not in {"VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR"}
+        }
+        environment["PATH"] = ""
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m", "forgemcp.server", "--workspace", str(tmp_path), "--toolchain", "msvc",
+                "--configure-timeout-sec", "300", "--build-timeout-sec", "300", "--test-timeout-sec", "300",
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+        )
+        updates: dict[str, list[tuple[float, float | None, str | None]]] = {
+            "configure": [], "build": [], "silent": [], "test": [], "cancel": [],
+        }
+
+        def callback(name: str):
+            async def observe(progress: float, total: float | None, message: str | None) -> None:
+                updates[name].append((progress, total, message))
+            return observe
+
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    configured = _json_tool_content(await session.call_tool(
+                        "cmake__configure", {"binary_dir": "build"}, progress_callback=callback("configure")
+                    ))
+                    assert configured["process"]["exit_code"] == 0
+                    built = _json_tool_content(await session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}, progress_callback=callback("build")
+                    ))
+                    assert built["process"]["exit_code"] == 0
+                    silent = _json_tool_content(await session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["silent_build"]}, progress_callback=callback("silent")
+                    ))
+                    assert silent["process"]["exit_code"] == 0
+                    tested = _json_tool_content(await session.call_tool(
+                        "cmake__ctest_run", {"binary_dir": "build"}, progress_callback=callback("test")
+                    ))
+                    assert tested["process"]["exit_code"] == 0
+
+                    request_id = session._request_id  # type: ignore[attr-defined]
+                    pending = asyncio.create_task(session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["cancel_build"]}, progress_callback=callback("cancel")
+                    ))
+                    await asyncio.sleep(0.5)
+                    await session.send_notification(
+                        mcp_types.ClientNotification(
+                            mcp_types.CancelledNotification(
+                                params=mcp_types.CancelledNotificationParams(
+                                    requestId=request_id, reason="progress_gate_cancel"
+                                )
+                            )
+                        )
+                    )
+                    with pytest.raises(McpError, match="Request cancelled"):
+                        await asyncio.wait_for(pending, timeout=10.0)
+
+                    recovered = _json_tool_content(await session.call_tool(
+                        "cmake__build", {"binary_dir": "build", "targets": ["app"]}
+                    ))
+                    assert recovered["process"]["exit_code"] == 0
+                    status = _json_tool_content(await session.call_tool("project__status", {}))
+                    runtime = next(item for item in status["components"] if item["id"] == "process_runtime")
+                    facts = {item["name"]: item["value"] for item in runtime["facts"]}
+                    assert facts["active_processes"] == 0
+
+        assert updates["configure"] and updates["build"] and updates["silent"] and updates["test"]
+        assert any(total is not None for _, total, _ in updates["build"])
+        assert any(total is not None for _, total, _ in updates["test"])
+        assert any(message == "Build running (2s)" for _, _, message in updates["silent"])
+        assert updates["cancel"]
+        return errors_path.read_text(encoding="utf-8")
+
+    errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in errors
+    assert str(tmp_path) not in errors
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
+    reason="opt-in real Windows Workspace/CMake/clangd coherence gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
+)
+def test_real_windows_workspace_cmake_clangd_coherence_gate(tmp_path: Path):
+    """Exercise the Phase B.1 contract through the official SDK client."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.23)\n"
+        "project(forgemcp_coherence LANGUAGES CXX)\n"
+        "add_executable(app main.cpp)\n"
+        "target_compile_definitions(app PRIVATE GATE_VERSION=1)\n"
+        "enable_testing()\n"
+        "add_test(NAME app_runs COMMAND app)\n",
+        encoding="utf-8",
+    )
+    source_text = (
+        "int add(int value) { return value + GATE_VERSION; }\n"
+        "int main() { return add(0) == GATE_VERSION ? 0 : 1; }\n"
+    )
+    (tmp_path / "main.cpp").write_text(source_text, encoding="utf-8")
+
+    async def exercise() -> str:
+        errors_path = tmp_path / "coherence-server-stderr.log"
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("FORGEMCP_")
+            and key.upper() not in {"VSCMD_VER", "VCINSTALLDIR", "VSINSTALLDIR"}
+        }
+        environment["PATH"] = ""
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m", "forgemcp.server", "--workspace", str(tmp_path), "--toolchain", "msvc",
+                "--configure-timeout-sec", "300", "--build-timeout-sec", "300", "--test-timeout-sec", "300",
+            ],
+            cwd=Path.cwd(),
+            env=environment,
+        )
+        with errors_path.open("w", encoding="utf-8") as server_errors:
+            async with stdio_client(parameters, errlog=server_errors) as streams:
+                async with ClientSession(*streams) as session:
+                    initialized = await session.initialize()
+                    assert initialized.serverInfo.name == "ForgeMCP"
+                    tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                    workspace_tools = {
+                        "workspace__list_files", "workspace__read_text", "workspace__get_snapshot",
+                        "workspace__apply_unified_patch", "workspace__apply_text_edits",
+                    }
+                    assert workspace_tools <= tools.keys()
+                    for tool_name in workspace_tools:
+                        assert tools[tool_name].inputSchema["additionalProperties"] is False
+                        output_schema = tools[tool_name].outputSchema
+                        assert output_schema is not None
+                        assert all(
+                            definition.get("additionalProperties") is False
+                            for definition in output_schema.get("$defs", {}).values()
+                        )
+                    invalid = await session.call_tool("workspace__read_text", {"path": "main.cpp", "unknown": True})
+                    assert invalid.isError is True
+
+                    configured = _json_tool_content(await session.call_tool("cmake__configure", {"binary_dir": "build"}))
+                    database = configured["compilation_database"]
+                    assert configured["process"]["exit_code"] == 0
+                    assert database["availability"] == "available"
+                    assert database["generator"] == "Ninja"
+                    first_fingerprint = database["fingerprint"]
+                    assert isinstance(first_fingerprint, str)
+
+                    started = _json_tool_content(await session.call_tool("clangd__start", {}))
+                    assert started["status"]["state"] == "running"
+                    diagnostics = _json_tool_content(
+                        await session.call_tool("clangd__diagnostics", {"path": "main.cpp", "timeout_seconds": 10.0})
+                    )
+                    assert diagnostics["snapshot"]["exists"] is True
+                    assert _json_tool_content(
+                        await session.call_tool("clangd__definition", {"path": "main.cpp", "position": {"line": 1, "column": 20}})
+                    )["locations"]
+
+                    source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "main.cpp"}))
+                    patched = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/main.cpp\n+++ b/main.cpp\n@@ -1 +1 @@\n-int add(int value) { return value + GATE_VERSION; }\n+int add(int value) { return value + GATE_VERSION; } // tracked-workspace-change\n",
+                            "expected_snapshots": {"main.cpp": source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert patched["applied"] is True
+                    await asyncio.sleep(0.1)
+                    refreshed = _json_tool_content(
+                        await session.call_tool("clangd__diagnostics", {"path": "main.cpp", "timeout_seconds": 10.0})
+                    )
+                    assert refreshed["snapshot"]["sha256"] != source["snapshot"]["sha256"]
+                    assert refreshed["document_version"] > diagnostics["document_version"]
+
+                    cmake_source = _json_tool_content(await session.call_tool("workspace__read_text", {"path": "CMakeLists.txt"}))
+                    cmake_change = _json_tool_content(await session.call_tool(
+                        "workspace__apply_unified_patch",
+                        {
+                            "patch": "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -4 +4 @@\n-target_compile_definitions(app PRIVATE GATE_VERSION=1)\n+target_compile_definitions(app PRIVATE GATE_VERSION=2)\n",
+                            "expected_snapshots": {"CMakeLists.txt": cmake_source["snapshot"]["sha256"]},
+                        },
+                    ))
+                    assert cmake_change["applied"] is True
+                    await asyncio.sleep(0.1)
+                    stale = _json_tool_content(await session.call_tool("project__status", {}))
+                    cmake_component = next(item for item in stale["components"] if item["id"] == "cmake")
+                    assert cmake_component["stale"] is True
+                    assert "configuration_stale" in cmake_component["warnings"]
+
+                    reconfigured = _json_tool_content(await session.call_tool("cmake__configure", {"binary_dir": "build"}))
+                    second_database = reconfigured["compilation_database"]
+                    assert reconfigured["process"]["exit_code"] == 0
+                    assert second_database["fingerprint"] != first_fingerprint
+                    await asyncio.sleep(0.1)
+                    restarted_diagnostics = _json_tool_content(
+                        await session.call_tool("clangd__diagnostics", {"path": "main.cpp", "timeout_seconds": 10.0})
+                    )
+                    assert restarted_diagnostics["snapshot"]["exists"] is True
+
+                    built = _json_tool_content(await session.call_tool("cmake__build", {"binary_dir": "build", "targets": ["app"]}))
+                    tested = _json_tool_content(await session.call_tool("cmake__ctest_run", {"binary_dir": "build"}))
+                    assert built["process"]["exit_code"] == 0
+                    assert tested["process"]["exit_code"] == 0
+                    assert _json_tool_content(await session.call_tool("clangd__stop", {}))["stopped"] is True
+        return errors_path.read_text(encoding="utf-8")
+
+    errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in errors
+    assert source_text not in errors
+    assert "tracked-workspace-change" not in errors
 
 
 @pytest.mark.parametrize(
@@ -260,6 +630,89 @@ def test_stdio_mcp_concurrent_project_status_calls_are_single_flight(tmp_path: P
                     )
                     facts = {item["name"]: item["value"] for item in component["facts"]}
                     assert facts["snapshot_calls"] == 1
+
+    asyncio.run(exercise())
+
+
+def test_stdio_mcp_progress_token_is_request_scoped_and_optional(tmp_path: Path):
+    """The real SDK callback receives monotonic terminal progress only with a token."""
+
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "progress_stdio_server.py"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env={**os.environ, "FORGEMCP_WORKSPACE": str(tmp_path)},
+        )
+        updates: list[tuple[float, float | None, str | None]] = []
+
+        async def observe(progress: float, total: float | None, message: str | None) -> None:
+            updates.append((progress, total, message))
+
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                with_token = await session.call_tool(
+                    "progress_fixture__slow", {}, progress_callback=observe
+                )
+                assert _json_tool_content(with_token) == {"completed": True}
+                assert len(updates) >= 2
+                assert [item[0] for item in updates] == sorted(item[0] for item in updates)
+                assert updates[-1] == (3.0, 3.0, "Fixture completed")
+
+                without_token = await session.call_tool("progress_fixture__slow", {})
+                assert _json_tool_content(without_token) == {"completed": True}
+                assert len(updates) >= 2
+
+    asyncio.run(exercise())
+
+
+def test_stdio_mcp_progress_accepts_string_and_numeric_zero_without_cross_call_mixup(tmp_path: Path):
+    """Exercise explicit protocol tokens through the SDK session transport."""
+
+    async def exercise() -> None:
+        fixture = Path(__file__).parent / "fixtures" / "progress_stdio_server.py"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(fixture)],
+            env={**os.environ, "FORGEMCP_WORKSPACE": str(tmp_path)},
+        )
+        received: dict[str | int, list[tuple[float, float | None, str | None]]] = {
+            0: [], "second-call": [],
+        }
+
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+
+                async def call_with_token(token: str | int):
+                    async def observe(progress: float, total: float | None, message: str | None) -> None:
+                        received[token].append((progress, total, message))
+
+                    # The SDK's public convenience method allocates its own
+                    # token when passed a callback.  Its lower-level request
+                    # API preserves the caller token; register only the
+                    # corresponding test callback before sending it.
+                    session._progress_callbacks[token] = observe  # type: ignore[attr-defined]
+                    request = mcp_types.ClientRequest(
+                        mcp_types.CallToolRequest(
+                            params=mcp_types.CallToolRequestParams(
+                                name="progress_fixture__slow",
+                                arguments={},
+                                _meta=mcp_types.RequestParams.Meta(progressToken=token),
+                            )
+                        )
+                    )
+                    return await session.send_request(request, mcp_types.CallToolResult)
+
+                first, second = await asyncio.gather(call_with_token(0), call_with_token("second-call"))
+                assert _json_tool_content(first) == {"completed": True}
+                assert _json_tool_content(second) == {"completed": True}
+
+        for token, updates in received.items():
+            assert len(updates) >= 2, token
+            assert [value for value, _, _ in updates] == sorted(value for value, _, _ in updates)
+            assert updates[-1] == (3.0, 3.0, "Fixture completed")
 
     asyncio.run(exercise())
 
