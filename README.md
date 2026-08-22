@@ -11,6 +11,7 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `workspace__apply_unified_patch`, `workspace__apply_text_edits`
 - `project__status`
 - `cmake__status`
+- `cmake__list_kits`, `cmake__select_kit`, `cmake__list_build_trees`
 - `cmake__list_presets`
 - `cmake__configure`
 - `cmake__list_targets`
@@ -168,6 +169,7 @@ forgemcp --workspace C:\src\demo --build-dir build
 | `--target-arch ARCH` | `FORGEMCP_TARGET_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | MSVC compiler target | Used only in fixed VS developer-environment setup. |
 | `--visual-studio-instance SELECTOR` | `FORGEMCP_VISUAL_STUDIO_INSTANCE` | deterministic eligible instance | exact bounded instance ID, product, display-name, or version | Select a VS instance | Paths and command fragments are rejected; no selector enters a shell command. |
 | `--cmake-generator NAME` | `FORGEMCP_CMAKE_GENERATOR` | none | bounded name | Generator outside a preset | Mutually exclusive with a configured preset. |
+| `--cmake-kit ID` | `FORGEMCP_CMAKE_KIT` | automatic | opaque kit ID | Initial ForgeMCP CMake kit | Path-free ID from `cmake__list_kits`; selection is application-local. |
 | `--configure-preset NAME` | `FORGEMCP_CONFIGURE_PRESET` | none | bounded name | Default configure preset | Its direct `binaryDir` is rechecked in workspace policy. |
 | `--configuration NAME` | `FORGEMCP_DEFAULT_CONFIGURATION` | none | bounded name | Default multi-config configuration | Passed as one argv value only. |
 | `--compile-commands MODE` | `FORGEMCP_COMPILE_COMMANDS` | `auto` | `auto`, `required`, `off` | CMake compilation database policy | `required` rejects unsupported/missing databases; `off` uses clangd fallback commands. |
@@ -253,6 +255,46 @@ other macros, and missing `binaryDir` are left to CMake; if ForgeMCP needs a
 pre-configure build location in those cases, the caller must supply `binary_dir`
 explicitly. ForgeMCP does not claim that a Visual Studio generator produces
 `compile_commands.json`.
+
+### CMake Kits and existing build trees (Phase D1)
+
+`cmake__list_kits {}` returns cached immutable ForgeMCP kits. A kit is a
+path-free toolchain profile: opaque ID, compiler family/version identity,
+host/target architecture, safe Visual Studio identity/version, filtered
+environment-profile category, compatible/preferred generators, compilation
+database capability, debugger compatibility, readiness, and fixed reasons.
+Compiler paths, installation paths, Developer environment values, raw probe
+output, and commands are never returned through MCP. Select one with
+`cmake__select_kit {"kit":"kit-..."}`; this changes only the current
+application session, increments a CAS generation, does not configure, delete
+cache files, or mutate ForgeMCP's process environment. Initial selection order
+is configure `kit`, runtime selection, `--cmake-kit`, `FORGEMCP_CMAKE_KIT`,
+then deterministic qualified automatic selection.
+
+Generator precedence is configure `generator`, CLI/environment generator,
+existing build-tree generator, preset-owned generator, selected-kit preference,
+then safe automatic selection. A kit's Ninja preference is never allowed to
+rewrite an existing generator. For command-line generators ForgeMCP supplies
+private canonical C/C++ compiler paths and the filtered kit environment to
+CMake; Visual Studio generators use their native generator/platform semantics.
+
+ForgeMCP kits have a similar purpose to CMake Tools Kits but are not its
+serialized format. ForgeMCP never reads VS Code global storage, active-kit
+state, user `cmake-tools-kits.json`, `.vscode/settings.json`, setup scripts,
+environment variables, or command fields. `.vscode/cmake-kits.json` is an
+unsupported external format. CMake Presets are a separate standard workflow;
+an explicit preset and explicit ForgeMCP kit are rejected as a structured
+conflict rather than silently mixed.
+
+`cmake__list_build_trees {}` performs a bounded read-only scan of conventional
+workspace build directories (`build`, `build-*`, `cmake-build-*`,
+`out/build/*`, configured/known profiles). It can adopt a compatible existing
+tree—including one created by VS Code—using ordinary target/build/test work,
+validated File API, and a valid compile database. It never identifies VS Code
+as the owner. Incompatible source/generator/compiler metadata is reported and
+never reconfigured or deleted. With an explicit kit and no binary directory,
+the deterministic suggestion is `build/forgemcp/<safe-kit-id>`; separate
+binary directories prevent unsafe kit/generator cache switching.
 
 ### Timeout scopes
 

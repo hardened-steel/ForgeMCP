@@ -49,6 +49,11 @@ CMake/CTest commands receive it.
 `cppvsdbg` and `OpenDebugAD7` remain availability-only discoveries. They are
 not automatic backends and do not alter the LLVM/DWARF DAP baseline in ADR 0009.
 
+Phase D1 additionally derives CMake kits from this same cached discovery
+service. `--cmake-kit` / `FORGEMCP_CMAKE_KIT` are opaque path-free initial
+selection inputs; exact compiler paths and filtered environments remain private
+application capabilities. See ADR 0016 for selection and existing-tree rules.
+
 ## Consequences
 
 Applications are isolated from each other's CLI/environment snapshots, CMake

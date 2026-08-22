@@ -51,6 +51,11 @@ structured error if known generator support is absent or the post-configure
 database is missing/invalid; filesystem changes from configure are not called
 atomic and are not rolled back.
 
+Phase D1 keeps the same rule for an existing tree selected through a ForgeMCP
+kit: generator/compiler-family mismatch produces a safe separate-directory
+suggestion and never a cache rewrite or deletion. Compatible external trees
+may feed the existing File API/database paths; see ADR 0016.
+
 clangd subscribes to Workspace batches. It sends exactly one bounded
 full-document `didChange` for a committed tracked-document snapshot, including
 WorkspaceEdits initiated by clangd itself, invalidates stale diagnostics/opaque

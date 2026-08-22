@@ -665,6 +665,8 @@ def test_builtin_plugin_lifecycle_registers_stable_tools_with_flat_input_schemas
                 "source_dir",
                 "binary_dir",
                 "preset",
+                "kit",
+                "generator",
                 "cache_variables",
             }
             assert "required" not in tools["cmake__configure"].inputSchema

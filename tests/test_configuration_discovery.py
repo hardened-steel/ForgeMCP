@@ -317,13 +317,14 @@ def test_doctor_json_and_print_config_are_sanitized(tmp_path: Path, capsys: pyte
     assert str(tmp_path) not in doctor
     assert '"tools"' in doctor
     payload = json.loads(doctor)
-    assert set(payload) == {"configuration", "discovery"}
+    assert set(payload) == {"configuration", "discovery", "kits"}
     assert set(payload["discovery"]) == {
         "toolchain", "host_arch", "target_arch", "visual_studio", "tools", "rejections",
     }
     assert len(payload["discovery"]["tools"]) == 13
     assert all(set(item) == {"tool", "available", "source", "rejection"} for item in payload["discovery"]["tools"])
     assert len(payload["discovery"]["rejections"]) <= 64
+    assert set(payload["kits"]) == {"kits", "discovery_state", "complete"}
 
 
 def test_cli_configuration_errors_are_stderr_only_before_transport(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

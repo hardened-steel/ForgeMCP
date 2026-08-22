@@ -23,6 +23,15 @@ stricter executable/environment policies. Its public diagnostics contain availab
 source category and rejection category, never host paths or raw environment.
 See [ADR 0012](adr/0012-configuration-cli-and-windows-toolchain-discovery.md).
 
+Phase D1 derives immutable path-free `CMakeKit` records from that same cached
+service; it does not introduce a second compiler scanner. Public kits contain
+only opaque identity, safe compiler/VS metadata, architectures, environment
+profile category, qualified generator/capability state, and fixed reasons.
+Exact compiler paths and filtered environments are private `ToolchainProfile`
+capabilities consumed only by CMake argv/process composition. Application-local
+kit selection is owned by the CMake service, is CAS-generation guarded, and is
+cleared at application shutdown. `project__status` reads only its cache.
+
 The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
 
 `server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool/resource/template/prompt/completion contributions to the MCP SDK, bridges one optional connection log sink, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop. SDK request/session types do not cross this adapter.
@@ -79,7 +88,14 @@ at most the protocol maximum of 100 values with `total`/`hasMore`. A trusted
 in-process plugin can still block the event loop or bypass Python architectural
 boundaries; the external allow-list trust decision in ADR 0005 is unchanged.
 
-The built-in CMake plugin owns the stable contributions `cmake__status`, `cmake__list_presets`, `cmake__configure`, `cmake__list_targets`, `cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local CMake service receives only the declared `workspace` and `process_runtime` services, never an application object or a transport object.
+The built-in CMake plugin owns the stable contributions `cmake__status`,
+`cmake__list_kits`, `cmake__select_kit`, `cmake__list_build_trees`,
+`cmake__list_presets`, `cmake__configure`, `cmake__list_targets`,
+`cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local
+CMake service receives only the declared `workspace` and `process_runtime`
+services, never an application object or a transport object. Existing build
+tree inspection is bounded to conventional patterns and validates every cache
+path through Workspace before adopting metadata.
 
 External plugins use Python entry points in the `forgemcp.plugins` group. Discovery is disabled by default and is enabled only by both `ForgeConfig.external_plugins_enabled=True` (or `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true`) and a non-empty explicit `ForgeConfig.external_plugin_allowlist` (or comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`). The allow-list contains entry-point names, which must exactly equal the loaded plugin's `plugin_id`. ForgeMCP does not enumerate entry-point metadata while discovery is disabled and calls `EntryPoint.load()` only for listed names; all other advertised packages remain unimported.
 

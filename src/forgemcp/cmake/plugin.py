@@ -24,6 +24,7 @@ from forgemcp.plugins import (
     ResourceContribution,
     ResourceTemplateContribution,
     ToolContribution,
+    ToolHints,
     ToolExecutionContext,
 )
 from forgemcp.project import (
@@ -50,10 +51,25 @@ class _ListPresetsArguments(ForgeModel):
     source_dir: str | None = Field(default=None, description="Optional workspace-relative source directory; configured default is used when omitted.")
 
 
+class _ListKitsArguments(ForgeModel):
+    """List only application-cached path-free CMake kit state."""
+
+
+class _SelectKitArguments(ForgeModel):
+    kit: str = Field(min_length=8, max_length=96, description="Opaque CMake kit identifier returned by cmake__list_kits.")
+    expected_selection_generation: int | None = Field(default=None, ge=0, description="Optional monotonic selection generation for compare-and-swap.")
+
+
+class _ListBuildTreesArguments(ForgeModel):
+    source_dir: str | None = Field(default=None, description="Optional workspace-relative source directory used to assess source compatibility.")
+
+
 class _ConfigureArguments(ForgeModel):
     source_dir: str | None = Field(default=None, description="Optional workspace-relative source directory; configured default is used when omitted.")
     binary_dir: str | None = Field(default=None, description="Optional workspace-relative generated build directory; resolved default is used when omitted.")
     preset: str | None = Field(default=None, description="Optional CMake configure preset name.")
+    kit: str | None = Field(default=None, min_length=8, max_length=96, description="Optional opaque ForgeMCP kit identifier; cannot be combined with a preset.")
+    generator: str | None = Field(default=None, max_length=256, description="Optional explicit CMake generator; cannot be combined with a preset.")
     cache_variables: dict[str, str | int | bool] | None = Field(
         default=None,
         description="Optional validated scalar CMake cache values; environment values are not accepted.",
@@ -89,6 +105,8 @@ ToolOperation = Callable[..., Awaitable[ForgeModel]]
 
 CMAKE_TARGETS_URI = "forgemcp://cmake/targets"
 CMAKE_TARGETS_TEMPLATE_URI = "forgemcp://cmake/targets/{profile}"
+CMAKE_KITS_URI = "forgemcp://cmake/kits"
+CMAKE_KITS_TEMPLATE_URI = "forgemcp://cmake/kits/{kit}"
 MAX_RESOURCE_TARGETS = 512
 MAX_RESOURCE_TARGET_BYTES = 220 * 1024
 
@@ -248,6 +266,23 @@ class CMakePlugin(ForgePlugin):
                 handler=lambda: self._targets_resource(None),
             )
         )
+        context.resources.register(
+            ResourceContribution(
+                uri=CMAKE_KITS_URI,
+                name="forgemcp_cmake_kits",
+                description="Cached path-free CMake kit discovery; never starts a probe or process.",
+                handler=lambda: self._kits_resource(None),
+            )
+        )
+        context.resource_templates.register(
+            ResourceTemplateContribution(
+                uri_template=CMAKE_KITS_TEMPLATE_URI,
+                name="forgemcp_cmake_kit",
+                description="One cached path-free CMake kit by opaque identifier.",
+                arguments=("kit",),
+                handler=lambda arguments: self._kits_resource(arguments["kit"]),
+            )
+        )
         context.resource_templates.register(
             ResourceTemplateContribution(
                 uri_template=CMAKE_TARGETS_TEMPLATE_URI,
@@ -258,6 +293,31 @@ class CMakePlugin(ForgePlugin):
             )
         )
         self._register_completions(context)
+        context.tools.register(
+            ToolContribution(
+                name="list_kits",
+                description="List cached qualified CMake compiler kits without probing tools or reading VS Code state.",
+                input_model=_ListKitsArguments,
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_ListKitsArguments, arguments, self._list_kits, execution_context),
+            )
+        )
+        context.tools.register(
+            ToolContribution(
+                name="select_kit",
+                description="Select a path-free CMake kit for this application session; no configure or filesystem deletion occurs.",
+                input_model=_SelectKitArguments,
+                hints=ToolHints(read_only=False, destructive=False, idempotent=False, open_world=False),
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_SelectKitArguments, arguments, self._select_kit, execution_context),
+            )
+        )
+        context.tools.register(
+            ToolContribution(
+                name="list_build_trees",
+                description="Boundedly inspect conventional existing workspace CMake build trees without configuring them.",
+                input_model=_ListBuildTreesArguments,
+                handler=lambda arguments, *, execution_context=None: self._dispatch(_ListBuildTreesArguments, arguments, self._list_build_trees, execution_context),
+            )
+        )
         context.tools.register(
             ToolContribution(
                 name="list_presets",
@@ -321,6 +381,8 @@ class CMakePlugin(ForgePlugin):
         if self._status_registry is not None:
             self._status_registry.unregister("cmake")
             self._status_registry = None
+        if self._service is not None:
+            self._service.clear_selection()
         self._service = None
 
     def _targets_resource(self, profile_id: str | None) -> dict[str, object]:
@@ -381,6 +443,32 @@ class CMakePlugin(ForgePlugin):
             "omitted_target_count": omitted,
         }
 
+    def _kits_resource(self, kit_id: str | None) -> dict[str, object]:
+        if self._service is None:
+            return {
+                "schema_version": "1", "resource": CMAKE_KITS_URI,
+                "state": "unavailable", "kits": [], "complete": False,
+                "error": {"code": "resource_unavailable", "message": "Cached CMake kits are unavailable."},
+            }
+        listing = self._service.list_kits()
+        if kit_id is not None:
+            kit = next((item for item in listing.kits if item.id == kit_id), None)
+            if kit is None:
+                return {
+                    "schema_version": "1", "resource": CMAKE_KITS_URI,
+                    "state": "unavailable", "kits": [], "complete": False,
+                    "error": {"code": "kit_unavailable", "message": "The requested cached CMake kit is unavailable."},
+                }
+            return {
+                "schema_version": "1", "resource": CMAKE_KITS_URI, "state": "available",
+                "kit": kit.model_dump(mode="json"), "complete": True,
+            }
+        return {
+            "schema_version": "1", "resource": CMAKE_KITS_URI,
+            "state": listing.discovery_state, "kits": [item.model_dump(mode="json") for item in listing.kits],
+            "complete": listing.complete,
+        }
+
     @staticmethod
     def _targets_error(code: str) -> dict[str, object]:
         return {
@@ -415,6 +503,14 @@ class CMakePlugin(ForgePlugin):
                     reference=reference,
                     argument="configuration",
                     provider=self._complete_configurations,
+                )
+            )
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="generator",
+                    provider=self._complete_generators,
                 )
             )
         for reference in (
@@ -454,16 +550,43 @@ class CMakePlugin(ForgePlugin):
         context.completions.register(
             CompletionContribution(
                 reference_kind=CompletionReferenceKind.RESOURCE_TEMPLATE,
+                reference=CMAKE_KITS_TEMPLATE_URI,
+                argument="kit",
+                provider=self._complete_kits,
+            )
+        )
+        for reference in profile_references:
+            context.completions.register(
+                CompletionContribution(
+                    reference_kind=CompletionReferenceKind.PROMPT,
+                    reference=reference,
+                    argument="kit",
+                    provider=self._complete_kits,
+                )
+            )
+        context.completions.register(
+            CompletionContribution(
+                reference_kind=CompletionReferenceKind.RESOURCE_TEMPLATE,
                 reference=CMAKE_TARGETS_TEMPLATE_URI,
                 argument="profile",
                 provider=self._complete_profiles,
             )
         )
 
-    def _complete_profiles(self, _request: CompletionRequest) -> tuple[str, ...]:
+    def _complete_profiles(self, request: CompletionRequest) -> tuple[str, ...]:
         if self._service is None:
             return ()
-        return tuple(profile.profile_id for profile in self._service.cached_target_profiles())
+        return self._service.cached_profile_ids(compatible_kit=request.context.get("kit"))
+
+    def _complete_kits(self, _request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return tuple(item.id for item in self._service.list_kits().kits if item.readiness != "rejected")
+
+    def _complete_generators(self, request: CompletionRequest) -> tuple[str, ...]:
+        if self._service is None:
+            return ()
+        return self._service.compatible_generators(request.context.get("kit"))
 
     async def _complete_presets(self, _request: CompletionRequest) -> tuple[str, ...]:
         if self._service is None:
@@ -534,9 +657,30 @@ class CMakePlugin(ForgePlugin):
             source_dir=request.source_dir,
             binary_dir=request.binary_dir,
             preset=request.preset,
+            kit=request.kit,
+            generator=request.generator,
             cache_variables=request.cache_variables,
             execution_context=execution_context,
         )
+
+    @staticmethod
+    async def _list_kits(service: CMakeService, _: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
+        return service.list_kits()
+
+    @staticmethod
+    async def _select_kit(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
+        assert isinstance(request, _SelectKitArguments)
+        return await service.select_kit(
+            request.kit, expected_selection_generation=request.expected_selection_generation
+        )
+
+    @staticmethod
+    async def _list_build_trees(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:
+        assert isinstance(request, _ListBuildTreesArguments)
+        # Generic tool output remains a strict Pydantic model; package the
+        # bounded immutable values in a tiny local result model at dispatch.
+        from forgemcp.cmake.models import CMakeBuildTreeList
+        return CMakeBuildTreeList(build_trees=service.list_build_trees(source_dir=request.source_dir))
 
     @staticmethod
     async def _list_targets(service: CMakeService, request: ForgeModel, __: ToolExecutionContext) -> ForgeModel:

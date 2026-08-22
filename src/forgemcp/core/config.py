@@ -38,6 +38,7 @@ _PATH_FIELDS = frozenset(
 _RELATIVE_DIRECTORY_FIELDS = frozenset({"cmake_source_dir", "build_dir"})
 _PLUGIN_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _VISUAL_STUDIO_SELECTOR = re.compile(r"^[\w .-]{1,256}$", re.UNICODE)
+_CMAKE_KIT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,95}$")
 _SOURCE_DEFAULTS = {
     "workspace_root": ConfigurationSource.DEFAULT,
     "log_level": ConfigurationSource.DEFAULT,
@@ -56,6 +57,7 @@ _SOURCE_DEFAULTS = {
     "target_arch": ConfigurationSource.DEFAULT,
     "visual_studio_instance": ConfigurationSource.DEFAULT,
     "cmake_generator": ConfigurationSource.DEFAULT,
+    "cmake_kit": ConfigurationSource.DEFAULT,
     "configure_preset": ConfigurationSource.DEFAULT,
     "default_configuration": ConfigurationSource.DEFAULT,
     "compile_commands": ConfigurationSource.DEFAULT,
@@ -86,6 +88,7 @@ class ForgeConfig:
     target_arch: str = "auto"
     visual_studio_instance: str | None = None
     cmake_generator: str | None = None
+    cmake_kit: str | None = None
     configure_preset: str | None = None
     default_configuration: str | None = None
     compile_commands: str = "auto"
@@ -133,6 +136,7 @@ class ForgeConfig:
                 raise ConfigurationError(f"{field_name} must be auto, x64, x86, or arm64.")
         _validate_visual_studio_selector(self.visual_studio_instance)
         _validate_short_text(self.cmake_generator, "cmake_generator")
+        _validate_cmake_kit(self.cmake_kit)
         _validate_short_text(self.configure_preset, "configure_preset")
         _validate_short_text(self.default_configuration, "default_configuration")
         if self.compile_commands not in {"auto", "required", "off"}:
@@ -194,6 +198,8 @@ class ForgeConfig:
             "cmake": {
                 "generator_configured": self.cmake_generator is not None,
                 "generator_source": self.source_of("cmake_generator").value,
+                "kit_configured": self.cmake_kit is not None,
+                "kit_source": self.source_of("cmake_kit").value,
                 "preset_configured": self.configure_preset is not None,
                 "preset_source": self.source_of("configure_preset").value,
                 "configuration_configured": self.default_configuration is not None,
@@ -261,6 +267,7 @@ class ForgeConfig:
             "target_arch": choose("target_arch", "FORGEMCP_TARGET_ARCH", "auto"),
             "visual_studio_instance": choose("visual_studio_instance", "FORGEMCP_VISUAL_STUDIO_INSTANCE", None),
             "cmake_generator": choose("cmake_generator", "FORGEMCP_CMAKE_GENERATOR", None),
+            "cmake_kit": choose("cmake_kit", "FORGEMCP_CMAKE_KIT", None),
             "configure_preset": choose("configure_preset", "FORGEMCP_CONFIGURE_PRESET", None),
             "default_configuration": choose("default_configuration", "FORGEMCP_DEFAULT_CONFIGURATION", None),
             "compile_commands": choose("compile_commands", "FORGEMCP_COMPILE_COMMANDS", "auto"),
@@ -344,6 +351,15 @@ def _validate_visual_studio_selector(value: object) -> None:
         raise ConfigurationError(
             "visual_studio_instance must be a bounded VS instance selector, not a path or command fragment."
         )
+
+
+def _validate_cmake_kit(value: object) -> None:
+    """Accept an opaque selection ID only; paths/commands cannot be a kit."""
+    if value is not None and (
+        not isinstance(value, str)
+        or _CMAKE_KIT_ID.fullmatch(value) is None
+    ):
+        raise ConfigurationError("cmake_kit must be a bounded opaque ForgeMCP kit identifier.")
 
 
 def _validated_environment(environment: Mapping[str, str]) -> dict[str, str]:

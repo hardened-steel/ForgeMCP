@@ -672,6 +672,40 @@ class ProcessRuntime:
             _environment_base=self._toolchain_environment,
         )
 
+    async def run_cmake_toolchain(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float | None = None,
+        environment: Mapping[str, str] | None = None,
+        observer: ProcessOutputObserver | None = None,
+    ) -> ProcessResult:
+        """Run exact CMake/CTest with one discovery-owned filtered kit environment.
+
+        The method is intentionally narrower than :meth:`run`: it admits only
+        the exact application-approved CMake/CTest paths and callers receive
+        no process-environment mutation capability.  ``environment`` is an
+        internal already-filtered discovery profile, never MCP input.
+        """
+        if isinstance(argv, str) or not isinstance(argv, Sequence) or not argv:
+            raise ProcessArgumentError("Commands must be a non-empty argv sequence, never a shell string.")
+        executable = Path(argv[0]) if isinstance(argv[0], str) else Path()
+        name = executable.stem.casefold() if os.name == "nt" else executable.name
+        if (
+            name not in {"cmake", "ctest"}
+            or not executable.is_absolute()
+            or not self._policy.approves_exact_executable(executable)
+        ):
+            raise ProcessExecutableError("Only exact discovered CMake and CTest executables may use a kit environment.")
+        return await self.run(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            observer=observer,
+            _environment_base=self._toolchain_environment if environment is None else environment,
+        )
+
     @property
     def workspace_root(self) -> Path:
         """Return the resolved root to which all working directories are scoped."""

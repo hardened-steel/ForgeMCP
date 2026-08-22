@@ -57,6 +57,11 @@ one 32-entry application cache for five minutes, bind to the application and
 Workspace mutation generation, and reveal no path, offset, or generation.
 External changes can still race the walk, so `transactional_snapshot=false`.
 
+Phase D1 adds cached path-free `forgemcp://cmake/kits` and
+`forgemcp://cmake/kits/{kit}`. These resource/completion reads never refresh
+discovery, execute a compiler or CMake process, or disclose private toolchain
+paths or environment values.
+
 CMake caches only already validated File API target models under random opaque
 profile IDs for ten minutes, at most 16 profiles. A resource read never
 configures, creates a File API query, or invokes a subprocess. It emits a fixed

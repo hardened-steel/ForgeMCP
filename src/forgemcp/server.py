@@ -597,6 +597,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-arch", choices=("auto", "x64", "x86", "arm64"), help="Compiler target architecture.")
     parser.add_argument("--visual-studio-instance", metavar="SELECTOR", help="Exact VS product, display-name, or version selector.")
     parser.add_argument("--cmake-generator", metavar="NAME", help="Generator used only when no configure preset is active.")
+    parser.add_argument("--cmake-kit", metavar="ID", help="Initial opaque ForgeMCP CMake kit selection.")
     parser.add_argument("--configure-preset", metavar="NAME", help="Default configure preset.")
     parser.add_argument("--configuration", dest="default_configuration", metavar="NAME", help="Default multi-config configuration.")
     parser.add_argument("--compile-commands", choices=("auto", "required", "off"), help="Compilation database policy for CMake and clangd.")
@@ -638,7 +639,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     if arguments.command == "doctor":
         discovery = ToolchainDiscoveryService(config)
-        payload = {"configuration": config.sanitized_effective_config(), "discovery": discovery.snapshot().as_dict()}
+        payload = {
+            "configuration": config.sanitized_effective_config(),
+            "discovery": discovery.snapshot().as_dict(),
+            "kits": discovery.kits().model_dump(mode="json"),
+        }
         if arguments.json:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         else:
@@ -646,6 +651,17 @@ def main(argv: list[str] | None = None) -> None:
             for item in payload["discovery"]["tools"]:  # type: ignore[index]
                 state = "available" if item["available"] else f"unavailable ({item['rejection']})"  # type: ignore[index]
                 print(f"{item['tool']}: {state} [{item['source']}]")  # type: ignore[index]
+            print("CMake kits")
+            for kit in payload["kits"]["kits"]:  # type: ignore[index]
+                generators = ", ".join(kit["compatible_generators"]) or "none"
+                version = kit["compiler_version"] or "unknown"
+                reason = ", ".join(kit["reasons"]) or "qualified"
+                print(
+                    f"{kit['display_name']}: {kit['compiler_family']} {version} "
+                    f"{kit['host_arch']}->{kit['target_arch']}; preferred={kit['preferred_generator'] or 'none'}; "
+                    f"generators={generators}; compile_commands={kit['compile_commands']}; "
+                    f"debugger={kit['debugger_compatibility']}; {kit['readiness']} ({reason})"
+                )
         return
     # Compatibility contract: no subcommand remains stdio MCP server startup.
     create_server(lambda: ForgeApplication.create(config)).run(transport="stdio")

@@ -516,6 +516,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         "forgemcp://project/status",
                         "forgemcp://workspace/files",
                         "forgemcp://cmake/targets",
+                        "forgemcp://cmake/kits",
                         "forgemcp://logs/recent",
                     } <= uris
                     templates = await session.list_resource_templates()
@@ -523,6 +524,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                     assert {
                         "forgemcp://workspace/files/{cursor}",
                         "forgemcp://cmake/targets/{profile}",
+                        "forgemcp://cmake/kits/{kit}",
                         "forgemcp://logs/recent/{level}/{limit}",
                     } <= template_uris
 
@@ -537,6 +539,10 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         await session.read_resource(AnyUrl("forgemcp://cmake/targets"))
                     )
                     assert cmake["state"] == "unavailable"
+                    kits = _resource_json(
+                        await session.read_resource(AnyUrl("forgemcp://cmake/kits"))
+                    )
+                    assert {"schema_version", "resource", "state", "kits", "complete"} <= kits.keys()
                     with pytest.raises(McpError):
                         await session.read_resource(AnyUrl("forgemcp://unknown"))
 

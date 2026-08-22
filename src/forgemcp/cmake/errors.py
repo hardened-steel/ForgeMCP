@@ -51,3 +51,27 @@ class CTestJsonError(CMakeError):
     """CTest's documented JSON listing response is invalid or unsupported."""
 
     code = "ctest_json_error"
+
+
+class CMakeKitError(CMakeError):
+    """A requested cached ForgeMCP kit cannot be used safely."""
+
+    code = "cmake_kit_error"
+
+
+class CMakeKitSelectionConflictError(CMakeKitError):
+    """A selection compare-and-swap generation is stale."""
+
+    code = "kit_selection_conflict"
+
+
+class CMakePresetKitConflictError(CMakeKitError):
+    """A CMake Preset workflow cannot be silently mixed with a ForgeMCP kit."""
+
+    code = "preset_kit_conflict"
+
+
+class CMakeBuildTreeIncompatibleError(CMakeError):
+    """An existing CMake cache cannot be safely reconfigured with this selection."""
+
+    code = "build_tree_incompatible"

@@ -1,10 +1,14 @@
 """CMake feature plugin and its transport-neutral public API."""
 
 from forgemcp.cmake.errors import (
+    CMakeBuildTreeIncompatibleError,
     CMakeError,
     CMakeFileApiError,
+    CMakeKitError,
+    CMakeKitSelectionConflictError,
     CompilationDatabaseRequirementError,
     CMakePresetError,
+    CMakePresetKitConflictError,
     CMakeRequestError,
     CMakeToolUnavailableError,
     CMakeVersionError,
@@ -13,9 +17,12 @@ from forgemcp.cmake.errors import (
 from forgemcp.cmake.models import (
     CMakeBuildPreset,
     CMakeBuildResult,
+    CMakeBuildTree,
+    CMakeBuildTreeList,
     CMakeConfigurationTargets,
     CMakeConfigurePreset,
     CMakeConfigureResult,
+    CMakeDiagnostic,
     CMakePresetList,
     CMakeResolvedProfile,
     CMakeStatus,
@@ -32,19 +39,30 @@ from forgemcp.cmake.models import (
 from forgemcp.cmake.plugin import CMakePlugin
 from forgemcp.cmake.events import CompilationDatabaseRegistry, CompilationDatabaseSubscription
 from forgemcp.cmake.service import CMakeService, MAX_PARALLEL_JOBS, MINIMUM_CMAKE_VERSION
+from forgemcp.toolchain import CMakeKit, CMakeKitList, CMakeKitSelection, ToolchainProfile
 
 __all__ = [
     "CMakeBuildPreset",
     "CMakeBuildResult",
+    "CMakeBuildTree",
+    "CMakeBuildTreeList",
+    "CMakeBuildTreeIncompatibleError",
     "CMakeConfigurationTargets",
     "CMakeConfigurePreset",
     "CMakeConfigureResult",
+    "CMakeDiagnostic",
     "CMakeError",
     "CMakeFileApiError",
+    "CMakeKit",
+    "CMakeKitError",
+    "CMakeKitList",
+    "CMakeKitSelection",
+    "CMakeKitSelectionConflictError",
     "CMakePlugin",
     "CompilationDatabaseRegistry",
     "CompilationDatabaseSubscription",
     "CMakePresetError",
+    "CMakePresetKitConflictError",
     "CMakePresetList",
     "CMakeResolvedProfile",
     "CMakeRequestError",
@@ -65,4 +83,5 @@ __all__ = [
     "CTestTestList",
     "MAX_PARALLEL_JOBS",
     "MINIMUM_CMAKE_VERSION",
+    "ToolchainProfile",
 ]

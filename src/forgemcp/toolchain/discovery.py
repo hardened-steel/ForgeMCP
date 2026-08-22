@@ -10,6 +10,7 @@ non-link/reparse, workspace exclusion and metadata-capture guarantees used by
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import re
@@ -26,6 +27,7 @@ from typing import Final
 
 from forgemcp.core.config import ConfigurationSource, ForgeConfig
 from forgemcp.processes.policy import _contains_link_or_reparse_point
+from forgemcp.toolchain.models import CMakeKit, CMakeKitList
 
 
 _TOOLS: Final = (
@@ -122,6 +124,21 @@ class ToolchainSnapshot:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ToolchainProfile:
+    """Private launch data behind one public :class:`CMakeKit`.
+
+    This is intentionally not a Pydantic/MCP model.  Its paths and filtered
+    environment are application-private capabilities used only to construct a
+    CMake argv and a Process Runtime launch.
+    """
+
+    kit: CMakeKit
+    c_compiler_path: Path | None
+    cxx_compiler_path: Path | None
+    environment: Mapping[str, str] | None
+
+
 class ToolchainDiscoveryService:
     """Discover once per application and retain only exact approved candidates.
 
@@ -148,6 +165,8 @@ class ToolchainDiscoveryService:
         self._instances: tuple[VisualStudioInstance, ...] = ()
         self._selected_vs: VisualStudioInstance | None = None
         self._developer_environment: Mapping[str, str] | None = None
+        self._kits: tuple[CMakeKit, ...] = ()
+        self._kit_profiles: Mapping[str, ToolchainProfile] = MappingProxyType({})
         self.refresh()
 
     @property
@@ -179,6 +198,24 @@ class ToolchainDiscoveryService:
             rejections=tuple(self._rejections[:64]),
         )
 
+    def kits(self) -> CMakeKitList:
+        """Return only cached, path-free kit metadata; never probe or refresh."""
+        complete = not any(reason.startswith("kit:") for reason in self._rejections)
+        return CMakeKitList(
+            kits=self._kits,
+            discovery_state="cached" if self._kits else "unavailable",
+            complete=complete,
+        )
+
+    def kit(self, kit_id: str) -> CMakeKit | None:
+        """Resolve one public cached kit without exposing private launch data."""
+        profile = self._kit_profiles.get(kit_id)
+        return None if profile is None else profile.kit
+
+    def kit_profile(self, kit_id: str) -> ToolchainProfile | None:
+        """Return private launch capability to an in-process CMake consumer only."""
+        return self._kit_profiles.get(kit_id)
+
     def refresh(self) -> ToolchainSnapshot:
         """Perform bounded discovery and optional fixed Developer-shell capture."""
         self._rejections.clear()
@@ -187,7 +224,284 @@ class ToolchainDiscoveryService:
         self._developer_environment = self._discover_developer_environment()
         for tool in _TOOLS:
             self._selections[tool] = self._select_tool(tool)
+        self._kits, self._kit_profiles = self._build_kits()
         return self.snapshot()
+
+    def _build_kits(self) -> tuple[tuple[CMakeKit, ...], Mapping[str, ToolchainProfile]]:
+        """Derive kits from this service's already-bounded discovery inputs.
+
+        This deliberately does not consult VS Code state, CMake Tools kit
+        files, arbitrary scripts, or a second environment scanner.  Additional
+        compiler paths are resolved through the same candidate/safety methods
+        used by the common tool discovery service.
+        """
+        candidates: list[ToolchainProfile] = []
+        cmake_available = self.executable("cmake") is not None
+        ninja_available = self.executable("ninja") is not None
+
+        # One MSVC kit per discovered eligible VS instance/toolset.  Only the
+        # selected instance has a captured, filtered developer environment and
+        # can be ready for command-line CMake generators.
+        for instance in self._instances:
+            if not instance.has_vc_tools:
+                continue
+            paths = self._visual_studio_tool_paths(instance, "cl")
+            for compiler in paths:
+                safe, _ = self._safe_candidate(compiler, "cl")
+                if safe is None:
+                    continue
+                environment = self._developer_environment if instance == self._selected_vs else None
+                candidates.append(self._kit_profile(
+                    source="visual_studio",
+                    family="msvc",
+                    c_compiler=safe,
+                    cxx_compiler=safe,
+                    environment=environment,
+                    visual_studio=instance,
+                    cmake_available=cmake_available,
+                    ninja_available=ninja_available,
+                ))
+
+        # clang-cl is not clang++.  It is a separate MSVC-ABI driver workflow
+        # and requires the same filtered MSVC/SDK environment as an MSVC kit.
+        clang_cl, clang_cl_source = self._kit_executable("clang-cl")
+        if clang_cl is not None:
+            candidates.append(self._kit_profile(
+                source=clang_cl_source,
+                family="clang-cl",
+                c_compiler=clang_cl,
+                cxx_compiler=clang_cl,
+                environment=self._developer_environment,
+                visual_studio=self._selected_vs if self._developer_environment is not None else None,
+                cmake_available=cmake_available,
+                ninja_available=ninja_available,
+            ))
+
+        clang, clang_source = self._kit_executable("clang")
+        clangxx, clangxx_source = self._kit_executable("clang++")
+        if clang is not None and clangxx is not None:
+            clang_combined_source = self._combined_source(clang_source, clangxx_source)
+            candidates.append(self._kit_profile(
+                source=clang_combined_source,
+                family="clang",
+                c_compiler=clang,
+                cxx_compiler=clangxx,
+                environment=self._developer_environment if clang_combined_source == "visual_studio" else None,
+                visual_studio=self._selected_vs if clang_combined_source == "visual_studio" else None,
+                cmake_available=cmake_available,
+                ninja_available=ninja_available,
+            ))
+        elif clang is not None or clangxx is not None:
+            candidates.append(self._rejected_compiler_pair(
+                self._combined_source(clang_source, clangxx_source), "clang", clang, clangxx
+            ))
+
+        gcc, gcc_source = self._kit_executable("gcc")
+        gxx, gxx_source = self._kit_executable("g++")
+        if gcc is not None and gxx is not None:
+            candidates.append(self._kit_profile(
+                source=self._combined_source(gcc_source, gxx_source),
+                family="gcc",
+                c_compiler=gcc,
+                cxx_compiler=gxx,
+                environment=None,
+                visual_studio=None,
+                cmake_available=cmake_available,
+                ninja_available=ninja_available,
+            ))
+        elif gcc is not None or gxx is not None:
+            candidates.append(self._rejected_compiler_pair(
+                self._combined_source(gcc_source, gxx_source), "gcc", gcc, gxx
+            ))
+
+        # Canonical public identity intentionally has no filesystem component.
+        unique: dict[str, ToolchainProfile] = {}
+        for profile in candidates:
+            incumbent = unique.get(profile.kit.id)
+            if incumbent is None or self._readiness_rank(profile.kit.readiness) > self._readiness_rank(incumbent.kit.readiness):
+                unique[profile.kit.id] = profile
+        ordered = tuple(sorted(unique.values(), key=lambda item: (
+            self._preference_rank(item.kit.compiler_family),
+            self._readiness_rank(item.kit.readiness) * -1,
+            item.kit.display_name.casefold(), item.kit.id,
+        )))
+        return tuple(item.kit for item in ordered), MappingProxyType({item.kit.id: item for item in ordered})
+
+    def _preference_rank(self, family: str) -> int:
+        preferred = {
+            "msvc": "msvc", "llvm": "clang", "auto": "msvc",
+        }.get(self._config.toolchain)
+        return 0 if family == preferred else 1
+
+    @staticmethod
+    def _readiness_rank(value: str) -> int:
+        return {"ready": 3, "degraded": 2, "rejected": 1}.get(value, 0)
+
+    @staticmethod
+    def _combined_source(first: str, second: str) -> str:
+        return first if first == second else "standalone"
+
+    def _kit_executable(self, tool: str) -> tuple[Path | None, str]:
+        selected = self._selections.get(tool)
+        if selected is not None and selected.path is not None:
+            return selected.path, str(selected.source)
+        for candidate, source in self._candidates(tool):
+            safe, _ = self._safe_candidate(candidate, tool)
+            if safe is not None:
+                return safe, str(source)
+        return None, "discovery"
+
+    def _kit_profile(
+        self,
+        *,
+        source: str,
+        family: str,
+        c_compiler: Path,
+        cxx_compiler: Path,
+        environment: Mapping[str, str] | None,
+        visual_studio: VisualStudioInstance | None,
+        cmake_available: bool,
+        ninja_available: bool,
+    ) -> ToolchainProfile:
+        version = self._safe_compiler_version(cxx_compiler, family)
+        if family == "msvc":
+            version = self._msvc_toolset_version(c_compiler)
+        reasons: list[str] = []
+        compatible: list[str] = []
+        if family in {"msvc", "clang-cl"}:
+            if environment is not None:
+                compatible.append(self._visual_studio_generator(visual_studio))
+            else:
+                reasons.append("environment_incomplete")
+            if environment is not None and not self._environment_has_tool(environment, "link"):
+                reasons.append("linker_not_found")
+            if environment is not None and not any(
+                key.startswith("WINDOWSSDK") or key in {"UCRTVERSION", "UNIVERSALCRTSDKDIR"}
+                for key in environment
+            ):
+                reasons.append("windows_sdk_missing")
+            if ninja_available and environment is not None:
+                compatible.extend(("Ninja", "Ninja Multi-Config"))
+            elif environment is not None:
+                reasons.append("build_tool_missing")
+        elif ninja_available:
+            compatible.extend(("Ninja", "Ninja Multi-Config"))
+        else:
+            reasons.append("build_tool_missing")
+        if not cmake_available:
+            reasons.append("cmake_missing")
+        if not compatible:
+            reasons.append("generator_unavailable")
+        readiness = "ready" if not reasons else "degraded"
+        preferred = "Ninja" if "Ninja" in compatible else (compatible[0] if compatible else None)
+        compile_commands = "supported" if any(
+            generator in {"Ninja", "Ninja Multi-Config"} for generator in compatible
+        ) else "unavailable"
+        debugger = (
+            "compatible" if family == "clang" and self.executable("lldb-dap") is not None
+            else "incompatible" if family in {"msvc", "clang-cl"}
+            else "unavailable"
+        )
+        c_identity = "cl" if family == "msvc" else ("clang-cl" if family == "clang-cl" else family)
+        identity = {
+            "source": source,
+            "family": family,
+            "version": version or "unknown",
+            "toolset": self._msvc_toolset_version(c_compiler) if family == "msvc" else None,
+            "host": self._host_arch,
+            "target": self._target_arch,
+            "vs": None if visual_studio is None else visual_studio.instance_id,
+            "vs_version": None if visual_studio is None else visual_studio.installation_version,
+        }
+        identifier = "kit-" + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
+        display_bits = [family.upper() if family != "clang-cl" else "clang-cl", version or "unknown", self._target_arch]
+        if visual_studio is not None:
+            display_bits.insert(0, "Visual Studio")
+        kit = CMakeKit(
+            id=identifier,
+            display_name=" ".join(display_bits),
+            source=source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone",
+            compiler_family=family,
+            c_compiler=c_identity,
+            cxx_compiler=c_identity if family in {"msvc", "clang-cl"} else f"{family}++",
+            compiler_version=version,
+            host_arch=self._host_arch,
+            target_arch=self._target_arch,
+            visual_studio_instance=None if visual_studio is None else visual_studio.instance_id,
+            visual_studio_version=None if visual_studio is None else visual_studio.installation_version,
+            environment_profile="filtered_visual_studio" if environment is not None else "none",
+            compatible_generators=tuple(dict.fromkeys(compatible)),
+            preferred_generator=preferred,
+            compile_commands=compile_commands,
+            debugger_compatibility=debugger,
+            readiness=readiness,
+            reasons=tuple(dict.fromkeys(reasons)),
+        )
+        return ToolchainProfile(kit, c_compiler, cxx_compiler, environment)
+
+    def _rejected_compiler_pair(
+        self, source: str, family: str, c_compiler: Path | None, cxx_compiler: Path | None
+    ) -> ToolchainProfile:
+        identity = {"source": source, "family": family, "host": self._host_arch, "target": self._target_arch, "pair": "missing"}
+        identifier = "kit-" + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
+        kit = CMakeKit(
+            id=identifier, display_name=f"{family} incomplete {self._target_arch}",
+            source=source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone",
+            compiler_family=family, c_compiler=family, cxx_compiler=f"{family}++",
+            host_arch=self._host_arch, target_arch=self._target_arch,
+            environment_profile="none", compatible_generators=(), compile_commands="unavailable",
+            debugger_compatibility="unavailable", readiness="rejected", reasons=("compiler_pair_missing",),
+        )
+        return ToolchainProfile(kit, c_compiler, cxx_compiler, None)
+
+    def _safe_compiler_version(self, compiler: Path, family: str) -> str | None:
+        """Return safe static version metadata without adding startup probes.
+
+        Compiler executables are deliberately not launched during application
+        composition: a healthy C/C++ pair, linker/SDK environment, generator,
+        and ABI are qualified by the ordinary bounded CMake configure path.
+        The public field remains optional rather than exposing raw version
+        output or making cached discovery unbounded on a damaged host.
+        """
+        del compiler, family
+        return None
+
+    def _environment_has_tool(self, environment: Mapping[str, str], tool: str) -> bool:
+        """Confirm one exact executable from the already filtered kit PATH."""
+        candidate = self._which(tool, environment.get("PATH"))
+        if candidate is None:
+            return False
+        safe, _ = self._safe_candidate(candidate, tool)
+        return safe is not None
+
+    @staticmethod
+    def _msvc_toolset_version(compiler: Path) -> str | None:
+        """Extract only the version-shaped MSVC toolset directory segment."""
+        parts = compiler.parts
+        for index, part in enumerate(parts[:-1]):
+            if part.casefold() != "msvc" or index + 1 >= len(parts):
+                continue
+            candidate = parts[index + 1]
+            if re.fullmatch(r"\d+(?:\.\d+){1,3}", candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _visual_studio_generator(instance: VisualStudioInstance | None) -> str:
+        if instance is None:
+            return "Visual Studio"
+        match = re.match(r"(\d+)", instance.installation_version)
+        major = match.group(1) if match else "17"
+        # CMake generator names are fixed product contracts, not inferred from
+        # a filesystem path. Keep an unknown future major unavailable rather
+        # than publishing a syntactically plausible but unusable generator.
+        years = {"15": "2017", "16": "2019", "17": "2022", "18": "2026"}
+        year = years.get(major)
+        return f"Visual Studio {major} {year}" if year is not None else "Visual Studio"
 
     def _select_tool(self, tool: str) -> ToolSelection:
         rejected: list[str] = []
@@ -477,7 +791,7 @@ class ToolchainDiscoveryService:
             ))
         elif tool == "cl":
             paths.extend(root.glob(f"VC/Tools/MSVC/*/bin/Host{self._host_arch}/{self._target_arch}/cl.exe"))
-        elif tool in {"clang", "clang++", "clangd", "clang-format", "clang-tidy", "lldb-dap"}:
+        elif tool in {"clang", "clang++", "clang-cl", "clangd", "clang-format", "clang-tidy", "lldb-dap"}:
             name = f"{_DISPLAY_NAMES.get(tool, tool)}.exe"
             paths.extend((root / "VC" / "Tools" / "Llvm" / architecture / "bin" / name) for architecture in ("x64", "ARM64", "x86"))
         elif tool in {"cppvsdbg", "opendebugad7"}:

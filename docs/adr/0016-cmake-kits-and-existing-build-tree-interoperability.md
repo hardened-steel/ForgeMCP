@@ -1,0 +1,61 @@
+# ADR 0016: CMake kits are cached, path-free selections with separate build trees
+
+## Context
+
+Windows C++ hosts commonly expose multiple Visual Studio toolsets, `clang-cl`,
+standalone LLVM, and PATH compilers.  A CMake cache is not safely portable
+between all compiler/generator choices, while existing workspace build trees
+may have been created by VS Code or another CMake client.
+
+## Decision
+
+`ToolchainDiscoveryService` remains the sole application-scoped native-tool
+scanner.  It derives immutable public `CMakeKit` records and keeps exact C/C++
+compiler paths plus a filtered VS environment in private `ToolchainProfile`
+records. Kit IDs are deterministic hashes of canonical safe identity metadata,
+not filesystem paths. MCP never returns executable/install paths, raw version
+or probe output, Developer environment values, or compiler commands.
+
+The CMake service owns application-local selected-kit state. Selection is a
+non-filesystem mutation guarded by a monotonic optional CAS generation and is
+discarded at application shutdown. Configure selection precedence is operation
+kit, runtime selected kit, CLI `--cmake-kit`, `FORGEMCP_CMAKE_KIT`, then a
+deterministic ready kit. An explicit CMake preset and an explicit ForgeMCP kit
+are different toolchain workflows and return a structured conflict rather than
+being silently combined.
+
+Generator precedence is operation generator, configured CLI/environment
+generator, existing cache generator, preset generator, selected kit preference,
+then safe automatic selection. Existing cache generators are never changed.
+For command-line generators CMake receives the private selected C/C++ compiler
+paths and filtered environment; Visual Studio generators use their own
+generator/toolset/platform semantics and do not receive incompatible compiler
+cache values.
+
+An explicit kit with no binary directory selects the workspace-relative
+`build/forgemcp/<kit-id>` suggestion. Existing explicit directories, configured
+build directories, preset `binaryDir`, and the legacy `build` default remain
+backward-compatible. ForgeMCP never deletes an incompatible cache. It reports
+the cached/requested generator and compiler family plus the safe suggested
+directory.
+
+`cmake__list_build_trees` is a read-only bounded scan of conventional build
+patterns. It validates cache/File API metadata through Workspace policy, rejects
+links/reparse/external source trees, and reports only safe summary metadata.
+Compatible externally-created trees are adopted through normal File API,
+build/CTest, and validated compilation-database paths; ForgeMCP neither knows
+nor needs to know whether VS Code created them.
+
+ForgeMCP does not read CMake Tools global state, active selection, user-local
+kit files, `.vscode/settings.json`, setup scripts, arbitrary environments, or
+commands. `.vscode/cmake-kits.json` is documented as unsupported external
+format. CMake Presets remain the standard alternative workflow.
+
+## Consequences
+
+Multiple MCP clients can safely coordinate selection without configuration side
+effects. A client that wants a different kit gets an isolated build directory
+rather than an automatic cache deletion or generator rewrite. Discovery and
+all read-only kit/resources/completion surfaces use cached state only. This is
+not a sandbox: trusted CMake configure/build still executes project logic and
+the selected compiler through CMake.

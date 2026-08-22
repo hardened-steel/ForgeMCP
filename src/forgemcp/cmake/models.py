@@ -6,6 +6,7 @@ from pydantic import Field
 
 from forgemcp.models import ProcessResult
 from forgemcp.models._base import ForgeModel
+from forgemcp.toolchain.models import CMakeKit, CMakeKitSelection
 
 
 class CMakeVersion(ForgeModel):
@@ -63,6 +64,8 @@ class CMakeStatus(ForgeModel):
     ctest: CMakeToolStatus = Field(description="CTest executable status.")
     profile: CMakeResolvedProfile | None = Field(default=None, description="Resolved safe workspace CMake profile.")
     compilation_database: CompilationDatabaseStatus | None = Field(default=None, description="Cached validated compilation-database metadata.")
+    kit_selection: CMakeKitSelection | None = Field(default=None, description="Cached application-scoped kit selection and effective kit.")
+    selected_kit_compatibility: str = Field(default="unknown", description="Compatible, stale, incompatible, or unknown relative to the cached build profile.")
     warnings: tuple[str, ...] = Field(default=(), description="Bounded safe warnings such as configuration_stale.")
 
 
@@ -120,6 +123,11 @@ class CMakeConfigureResult(ForgeModel):
     preset: str | None = Field(default=None, description="Selected configure preset, if any.")
     process: ProcessResult = Field(description="Structured configure command result.")
     compilation_database: CompilationDatabaseStatus | None = Field(default=None, description="Validated generated compilation-database metadata after configure.")
+    effective_kit: CMakeKit | None = Field(default=None, description="Effective path-free kit used for this configure operation.")
+    generator: str | None = Field(default=None, description="Effective CMake generator when safely known.")
+    compiler_family: str | None = Field(default=None, description="Effective compiler family when a ForgeMCP kit owns it.")
+    diagnostic_category: str | None = Field(default=None, description="Fixed safe configure result category when a failure was classified.")
+    diagnostics: tuple["CMakeDiagnostic", ...] = Field(default=(), description="Bounded sanitized configure diagnostics.")
     warnings: tuple[str, ...] = Field(default=(), description="Bounded safe configure warnings.")
 
 
@@ -156,6 +164,45 @@ class CMakeBuildResult(ForgeModel):
     targets: tuple[str, ...] = Field(default=(), description="Requested targets; empty means the default build.")
     configuration: str | None = Field(default=None, description="Requested multi-config configuration, if any.")
     process: ProcessResult = Field(description="Structured build command result, including non-zero exits.")
+    outcome: str = Field(default="unknown", description="success, success_with_warnings, compile_failure, linker_failure, build_system_failure, timeout, or cancelled.")
+    diagnostics: tuple["CMakeDiagnostic", ...] = Field(default=(), description="Bounded sanitized compiler/linker diagnostics.")
+    omitted_external_diagnostics: int = Field(default=0, ge=0, description="External diagnostic locations omitted.")
+    invalid_diagnostics: int = Field(default=0, ge=0, description="Malformed or unsafe diagnostic records omitted.")
+    complete: bool = Field(default=True, description="Whether capture and bounded parsing were complete.")
+
+
+class CMakeDiagnostic(ForgeModel):
+    """Path-safe compiler, linker, or configure diagnostic."""
+
+    category: str = Field(min_length=1, description="configure, compiler, linker, or build_system.")
+    severity: str = Field(min_length=1, description="error, warning, or information.")
+    message: str = Field(min_length=1, max_length=1024, description="Bounded sanitized message without source/caret text or host paths.")
+    code: str | None = Field(default=None, max_length=128, description="Safe compiler/linker code when present.")
+    file: str | None = Field(default=None, max_length=4096, description="Workspace-relative file when proven.")
+    line: int | None = Field(default=None, ge=0, description="Zero-based source line when proven.")
+    column: int | None = Field(default=None, ge=0, description="Zero-based source column when proven.")
+
+
+class CMakeBuildTree(ForgeModel):
+    """Read-only summary of a bounded discovered existing CMake build tree."""
+
+    profile_id: str = Field(min_length=8, max_length=96, description="Opaque deterministic existing-tree profile identifier.")
+    binary_dir: str = Field(min_length=1, description="Workspace-relative binary directory.")
+    source_matches_workspace: bool = Field(description="Whether CMakeCache source metadata resolves to the requested workspace source directory.")
+    generator: str | None = Field(default=None, description="Cached CMake generator if safely read.")
+    compiler_family: str | None = Field(default=None, description="Compiler family only when cache metadata safely confirms it.")
+    compiler_version: str | None = Field(default=None, description="Safe compiler version when confirmed.")
+    configuration_type: str = Field(min_length=1, description="single_config, multi_config, or unknown.")
+    compilation_database: CompilationDatabaseStatus | None = Field(default=None, description="Validated compile_commands metadata.")
+    stale: bool = Field(description="Whether known configuration state may be stale.")
+    selected_kit_compatibility: str = Field(min_length=1, description="compatible, incompatible, stale, or unknown.")
+    category: str = Field(min_length=1, description="adoptable, buildable, incompatible, or rejected.")
+
+
+class CMakeBuildTreeList(ForgeModel):
+    """Bounded read-only existing CMake build-tree discovery result."""
+
+    build_trees: tuple[CMakeBuildTree, ...] = Field(default=(), description="Conventional workspace build trees discovered without running CMake.")
 
 
 class CTestTest(ForgeModel):

@@ -23,6 +23,9 @@ _EXPECTED_TOOLS = {
     "workspace__apply_unified_patch", "workspace__apply_text_edits",
     "project__status",
     "cmake__status",
+    "cmake__list_kits",
+    "cmake__select_kit",
+    "cmake__list_build_trees",
     "cmake__list_presets",
     "cmake__configure",
     "cmake__list_targets",
@@ -124,7 +127,16 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     status = await session.call_tool("cmake__status")
                     assert status.isError is False
                     status_payload = _json_tool_content(status)
-                    assert {"available", "cmake", "ctest", "minimum_cmake_version"} <= status_payload.keys()
+                    assert {"available", "cmake", "ctest", "minimum_cmake_version", "kit_selection"} <= status_payload.keys()
+                    kits = _json_tool_content(await session.call_tool("cmake__list_kits", {}))
+                    assert {"kits", "discovery_state", "complete"} == kits.keys()
+                    if kits["kits"]:
+                        selected = _json_tool_content(await session.call_tool(
+                            "cmake__select_kit", {"kit": kits["kits"][0]["id"], "expected_selection_generation": 0}
+                        ))
+                        assert selected["selection_generation"] == 1
+                    trees = _json_tool_content(await session.call_tool("cmake__list_build_trees", {}))
+                    assert "build_trees" in trees
 
                     core_status = _json_tool_content(await session.call_tool("server_status", {}))
                     assert core_status["workspace_root"] == "configured"
