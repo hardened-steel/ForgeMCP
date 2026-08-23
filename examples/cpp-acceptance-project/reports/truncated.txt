@@ -1,0 +1,2 @@
+==8==ERROR: AddressSanitizer: heap-use-after-free
+    #0 0x00000000 in fixture::add src/math.cpp:5:12

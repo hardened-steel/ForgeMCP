@@ -110,6 +110,29 @@ See [ADR 0010](docs/adr/0010-quality-tools-formatting-analysis-and-trust-boundar
 
 Requires Python 3.11 or later.
 
+### C++ acceptance fixture and D2 gates
+
+`examples/cpp-acceptance-project` is the permanent, dependency-free C++
+acceptance project. It contains successful static-library/application/debug
+targets, a warning target, intentionally broken compile/link targets, CTest
+cases, clangd/format/tidy anchors, and synthetic sanitizer reports. Build only
+a disposable copy: generated build directories, compile databases, binaries,
+PDBs, and clangd caches are ignored and must never be committed.
+
+The portable fixture workflow is `cmake --preset ninja-debug`, then
+`cmake --build --preset build-ninja-debug`, and `ctest --preset test-ninja-debug`.
+`fixture_compile_error` and `fixture_link_error` are `EXCLUDE_FROM_ALL`;
+negative CTest cases require the `ninja-debug-negative-tests` preset. Select
+ForgeMCP kits through `cmake__list_kits` and `cmake__select_kit`, or use a
+CMake preset—those are alternative workflows and a combined explicit
+preset/kit is rejected. The full LLVM/DWARF debugger profile requires a
+qualified Clang kit and `lldb-dap`; MSVC/PDB is not claimed.
+
+Always-run tests verify fixture content, ignored artifacts, and the real MCP
+surface/matrix. The portable live gate runs automatically whenever CMake and
+Ninja are available; see [the acceptance matrix](docs/acceptance-matrix.md)
+for tool-by-tool scope and the unit/fake/live distinction.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1

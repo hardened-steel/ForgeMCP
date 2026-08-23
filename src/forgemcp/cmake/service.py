@@ -208,6 +208,7 @@ class CMakeService:
         self._configured_toolchain_file: str | None = None
         self._configured_source_dir: str | None = None
         self._configured_compiler_family: str | None = None
+        self._configured_kit_profile: ToolchainProfile | None = None
         self._selected_kit_incompatible = False
         self._last_relevant_mutation_generation = 0
         self._cached_presets: CMakePresetList | None = None
@@ -808,6 +809,11 @@ class CMakeService:
                 self._configured_toolchain_file = self._toolchain_file_from_request(cache_variables, source)
                 self._configured_source_dir = source
                 self._configured_compiler_family = None if effective_kit is None else effective_kit.compiler_family
+                # Build and CTest must use the same privately retained,
+                # already-qualified Developer environment as configure.  The
+                # profile is an application-local capability and never enters
+                # an MCP model, log event, or subprocess argv.
+                self._configured_kit_profile = kit_profile
                 self._selected_kit_incompatible = False
                 if self._compile_commands_mode == "required" and database.availability != "available":
                     self._last_configure = self._operation_cache(
@@ -890,7 +896,7 @@ class CMakeService:
         try:
             context.throw_if_cancelled()
             await context.report_progress(ProgressUpdate(0, None, "Preparing build"))
-            kit, _, _ = self._effective_kit()
+            kit, _, kit_profile = self._effective_kit()
             profile = self._resolve_profile(
                 binary_dir=binary_dir, source_dir=None, preset=None,
                 explicit_kit=kit if self._kit_is_explicit() else None,
@@ -919,6 +925,7 @@ class CMakeService:
             result, progress_observer = await self._run_with_progress(
                 "cmake", argv, timeout_seconds=self._default_timeout("build"),
                 context=context, operation="build",
+                kit_profile=kit_profile or self._configured_kit_profile,
             )
             diagnostics, omitted, invalid, complete = self._safe_diagnostics(result, category="build")
             response = CMakeBuildResult(
@@ -956,7 +963,7 @@ class CMakeService:
 
     async def list_tests(self, *, binary_dir: str | None = None) -> CTestTestList:
         """List tests through CTest's documented ``json-v1`` output format."""
-        kit, _, _ = self._effective_kit()
+        kit, _, kit_profile = self._effective_kit()
         generated = self._workspace.open_generated_directory(self._resolve_profile(
             binary_dir=binary_dir, source_dir=None, preset=None,
             explicit_kit=kit if self._kit_is_explicit() else None,
@@ -964,6 +971,7 @@ class CMakeService:
         result = await self._run_required(
             "ctest", [self._tool_executable("ctest"), "--test-dir", generated.relative_path, "--show-only=json-v1"],
             timeout_seconds=self._default_timeout("test"),
+            kit_profile=kit_profile or self._configured_kit_profile,
         )
         if result.exit_code != 0 or result.timed_out:
             raise CTestJsonError("CTest could not produce a JSON test listing for this build directory.")
@@ -991,7 +999,7 @@ class CMakeService:
         try:
             context.throw_if_cancelled()
             await context.report_progress(ProgressUpdate(0, None, "Preparing test run"))
-            kit, _, _ = self._effective_kit()
+            kit, _, kit_profile = self._effective_kit()
             profile = self._resolve_profile(
                 binary_dir=binary_dir, source_dir=None, preset=None,
                 explicit_kit=kit if self._kit_is_explicit() else None,
@@ -1019,6 +1027,7 @@ class CMakeService:
                 ),
                 context=context,
                 operation="test",
+                kit_profile=kit_profile or self._configured_kit_profile,
             )
             failed_tests = self._failed_tests(result)
             response = CTestRunResult(

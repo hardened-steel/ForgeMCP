@@ -95,11 +95,18 @@ irreversible choices belong in [adr/](adr/).
   safe configure/build diagnostics; kit resources, prompts, completions, CLI
   configuration, and operator doctor matrix. CMake Tools state/scripts remain
   intentionally unsupported; see ADR 0016.
+- ForgeMCP Stabilization Phase D2: permanent dependency-free C++ acceptance
+  fixture, disposable-workspace CMake/CTest/Quality live gates, and a
+  version-controlled real-MCP tool-surface inventory/matrix. Phase C and D
+  still await one combined final audit; this fixture is its evidence base.
 
 ### In progress
 
 - Real LLVM feature gates remain portable conditional tests on hosts without
   separately installed qualified tools.
+- The D2 Windows MSVC and full LLVM/DWARF debugger acceptance paths remain in
+  the combined Phase C+D audit queue; neither implies an MSVC/PDB debugger
+  compatibility claim.
 
 ## Delivery sequence and dependencies
 
@@ -112,6 +119,7 @@ irreversible choices belong in [adr/](adr/).
 | Project Intelligence Phase 1 | Audited Core, Workspace, Process Runtime, plugins, and feature caches | Complete: bounded cached provider aggregation with explicit partial/freshness and no refresh side effects. |
 | UX Stabilization Phase C | Accepted Phase A, Phase B, and Workspace/CMake/clangd coherence baselines | Complete: bounded MCP discovery surface and connection logging pass the SDK protocol and adversarial gates. |
 | Stabilization Phase D1 | Phase B accepted, Workspace/CMake/clangd coherence accepted, Phase C implemented | CMake kit selection, safe compiler/generator propagation, and compatible existing-tree adoption work without cache deletion. |
+| Stabilization Phase D2 | D1 baseline and permanent C++ fixture | Full real-MCP surface is recorded against disposable fixture copies; Phase C+D share the final audit. |
 | Git intelligence | Separate Git freshness, ignored-file, nesting, and trust design | Not started; intentionally absent from `project__status` Phase 1. |
 
 ## Completed milestone: clangd phase 1

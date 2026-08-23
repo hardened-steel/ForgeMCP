@@ -1,0 +1,3 @@
+==7==ERROR: AddressSanitizer: stack-use-after-return
+    #0 0x00000000 in external_library C:/external/library.cpp:7:1
+SUMMARY: AddressSanitizer: stack-use-after-return

@@ -1,0 +1,4 @@
+==42==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x00000000
+    #0 0x00000000 in fixture::add src/math.cpp:5:12
+    #1 0x00000000 in main app/good_main.cpp:5:12
+SUMMARY: AddressSanitizer: heap-buffer-overflow

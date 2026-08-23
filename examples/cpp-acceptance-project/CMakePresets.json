@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ninja-debug",
+      "displayName": "Ninja Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ninja-debug-negative-tests",
+      "inherits": "ninja-debug",
+      "binaryDir": "${sourceDir}/build/ninja-debug-negative-tests",
+      "cacheVariables": { "FIXTURE_ENABLE_NEGATIVE_TESTS": "ON" }
+    },
+    {
+      "name": "ninja-llvm-dwarf-debug",
+      "inherits": "ninja-debug",
+      "binaryDir": "${sourceDir}/build/ninja-llvm-dwarf-debug",
+      "cacheVariables": { "FIXTURE_LLVM_DWARF": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "build-ninja-debug", "configurePreset": "ninja-debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-ninja-debug",
+      "configurePreset": "ninja-debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

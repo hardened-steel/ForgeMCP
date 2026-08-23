@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+examples/cpp-acceptance-project/build/
+examples/cpp-acceptance-project/**/compile_commands.json
+examples/cpp-acceptance-project/**/*.pdb
+examples/cpp-acceptance-project/**/*.exe
+examples/cpp-acceptance-project/.cache/
