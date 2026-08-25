@@ -277,21 +277,24 @@ class ToolchainDiscoveryService:
                 ninja_available=ninja_available,
             ))
 
-        clang, clang_source = self._kit_executable("clang")
-        clangxx, clangxx_source = self._kit_executable("clang++")
-        if clang is not None and clangxx is not None:
-            clang_combined_source = self._combined_source(clang_source, clangxx_source)
+        # Discover every safe clang pair, not merely the globally selected
+        # executable.  The common executable selector intentionally prefers an
+        # active VS environment; using it alone collapsed standalone LLVM and
+        # VS LLVM into one kit and made --toolchain llvm host-order dependent.
+        for clang, clangxx, clang_source in self._clang_pairs():
             candidates.append(self._kit_profile(
-                source=clang_combined_source,
+                source=clang_source,
                 family="clang",
                 c_compiler=clang,
                 cxx_compiler=clangxx,
-                environment=self._developer_environment if clang_combined_source == "visual_studio" else None,
-                visual_studio=self._selected_vs if clang_combined_source == "visual_studio" else None,
+                environment=self._developer_environment if clang_source == "visual_studio" else None,
+                visual_studio=self._selected_vs if clang_source == "visual_studio" else None,
                 cmake_available=cmake_available,
                 ninja_available=ninja_available,
             ))
-        elif clang is not None or clangxx is not None:
+        clang, clang_source = self._kit_executable("clang")
+        clangxx, clangxx_source = self._kit_executable("clang++")
+        if not self._clang_pairs() and (clang is not None or clangxx is not None):
             candidates.append(self._rejected_compiler_pair(
                 self._combined_source(clang_source, clangxx_source), "clang", clang, clangxx
             ))
@@ -322,16 +325,64 @@ class ToolchainDiscoveryService:
                 unique[profile.kit.id] = profile
         ordered = tuple(sorted(unique.values(), key=lambda item: (
             self._preference_rank(item.kit.compiler_family),
+            self._origin_rank(item.kit),
             self._readiness_rank(item.kit.readiness) * -1,
             item.kit.display_name.casefold(), item.kit.id,
         )))
         return tuple(item.kit for item in ordered), MappingProxyType({item.kit.id: item for item in ordered})
+
+    def _clang_pairs(self) -> tuple[tuple[Path, Path, str], ...]:
+        """Return deterministic distinct clang/clang++ provider pairs.
+
+        A provider is derived from the exact approved executable location, not
+        from PATH discovery order.  A PATH entry pointing at the conventional
+        standalone LLVM install therefore remains a standalone kit.
+        """
+        def candidates(tool: str) -> dict[str, Path]:
+            found: dict[str, Path] = {}
+            for candidate, _source in self._candidates(tool):
+                safe, _ = self._safe_candidate(candidate, tool)
+                if safe is None:
+                    continue
+                origin = self._compiler_origin(safe)
+                found.setdefault(origin, safe)
+            return found
+
+        c = candidates("clang")
+        cxx = candidates("clang++")
+        return tuple(
+            (c[origin], cxx[origin], origin)
+            for origin in sorted(set(c) & set(cxx))
+        )
+
+    def _compiler_origin(self, compiler: Path) -> str:
+        """Classify a safe compiler without serializing its location."""
+        resolved = compiler.resolve()
+        if any(_is_under(resolved, instance.installation_path) for instance in self._instances):
+            return "visual_studio"
+        conventional = tuple(path.resolve() for path in self._standalone_tool_paths("clang"))
+        if any(resolved == path for path in conventional):
+            return "standalone"
+        # A non-VS approved compiler discovered through PATH is still a
+        # standalone toolchain provider for CMake-kit semantics.
+        return "standalone"
 
     def _preference_rank(self, family: str) -> int:
         preferred = {
             "msvc": "msvc", "llvm": "clang", "auto": "msvc",
         }.get(self._config.toolchain)
         return 0 if family == preferred else 1
+
+    def _origin_rank(self, kit: CMakeKit) -> int:
+        """Stable provider ranking after family/readiness selection.
+
+        LLVM means the clang family.  Standalone LLVM is preferred because it
+        is the only qualified DAP/DWARF path; VS LLVM and clang-cl remain
+        separately selectable through their opaque public kit IDs.
+        """
+        if self._config.toolchain == "llvm" and kit.compiler_family == "clang":
+            return 0 if kit.origin == "standalone" else 1
+        return 0
 
     @staticmethod
     def _readiness_rank(value: str) -> int:
@@ -403,9 +454,14 @@ class ToolchainDiscoveryService:
             else "unavailable"
         )
         c_identity = "cl" if family == "msvc" else ("clang-cl" if family == "clang-cl" else family)
+        origin = source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone"
+        driver_mode = "cl" if family == "msvc" else ("clang-cl" if family == "clang-cl" else f"{family}++")
+        abi = "msvc" if family in {"msvc", "clang-cl"} or origin == "visual_studio" else ("llvm" if family == "clang" else "gnu" if family == "gcc" else "unknown")
         identity = {
-            "source": source,
+            "origin": origin,
             "family": family,
+            "driver": driver_mode,
+            "abi": abi,
             "version": version or "unknown",
             "toolset": self._msvc_toolset_version(c_compiler) if family == "msvc" else None,
             "host": self._host_arch,
@@ -422,8 +478,11 @@ class ToolchainDiscoveryService:
         kit = CMakeKit(
             id=identifier,
             display_name=" ".join(display_bits),
-            source=source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone",
+            source=origin,
+            origin=origin,
             compiler_family=family,
+            driver_mode=driver_mode,
+            abi=abi,
             c_compiler=c_identity,
             cxx_compiler=c_identity if family in {"msvc", "clang-cl"} else f"{family}++",
             compiler_version=version,
@@ -444,14 +503,15 @@ class ToolchainDiscoveryService:
     def _rejected_compiler_pair(
         self, source: str, family: str, c_compiler: Path | None, cxx_compiler: Path | None
     ) -> ToolchainProfile:
-        identity = {"source": source, "family": family, "host": self._host_arch, "target": self._target_arch, "pair": "missing"}
+        origin = source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone"
+        identity = {"origin": origin, "family": family, "host": self._host_arch, "target": self._target_arch, "pair": "missing"}
         identifier = "kit-" + hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()[:20]
         kit = CMakeKit(
             id=identifier, display_name=f"{family} incomplete {self._target_arch}",
-            source=source if source in {"explicit", "visual_studio", "standalone", "path"} else "standalone",
-            compiler_family=family, c_compiler=family, cxx_compiler=f"{family}++",
+            source=origin, origin=origin,
+            compiler_family=family, driver_mode=f"{family}++", abi="unknown", c_compiler=family, cxx_compiler=f"{family}++",
             host_arch=self._host_arch, target_arch=self._target_arch,
             environment_profile="none", compatible_generators=(), compile_commands="unavailable",
             debugger_compatibility="unavailable", readiness="rejected", reasons=("compiler_pair_missing",),

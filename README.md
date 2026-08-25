@@ -187,7 +187,7 @@ forgemcp --workspace C:\src\demo --build-dir build
 | `--clang-format PATH` | `FORGEMCP_CLANG_FORMAT` | discovery | local absolute executable | clang-format executable | Same exact-file policy; `-i` remains unavailable. |
 | `--clang-tidy PATH` | `FORGEMCP_CLANG_TIDY` | discovery | local absolute executable | clang-tidy executable | Same exact-file policy; no arbitrary arguments/fixes. |
 | `--lldb-dap PATH` | `FORGEMCP_LLDB_DAP` | discovery | local absolute executable | LLVM DAP adapter | Exact-file qualification and strict adapter policy still apply. |
-| `--toolchain MODE` | `FORGEMCP_TOOLCHAIN` | `auto` | `auto`, `msvc`, `llvm` | Discovery preference | Does not enable a new debugger backend. |
+| `--toolchain MODE` | `FORGEMCP_TOOLCHAIN` | `auto` | `auto`, `msvc`, `llvm` | Compiler-family preference | `llvm` prefers ready standalone `clang++`; exact provider remains path-free and is selected by CMake kit. |
 | `--host-arch ARCH` | `FORGEMCP_HOST_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | Tool process architecture | Incompatible PE candidates are rejected. |
 | `--target-arch ARCH` | `FORGEMCP_TARGET_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | MSVC compiler target | Used only in fixed VS developer-environment setup. |
 | `--visual-studio-instance SELECTOR` | `FORGEMCP_VISUAL_STUDIO_INSTANCE` | deterministic eligible instance | exact bounded instance ID, product, display-name, or version | Select a VS instance | Paths and command fragments are rejected; no selector enters a shell command. |
@@ -283,6 +283,7 @@ explicitly. ForgeMCP does not claim that a Visual Studio generator produces
 
 `cmake__list_kits {}` returns cached immutable ForgeMCP kits. A kit is a
 path-free toolchain profile: opaque ID, compiler family/version identity,
+origin, driver mode, ABI marker,
 host/target architecture, safe Visual Studio identity/version, filtered
 environment-profile category, compatible/preferred generators, compilation
 database capability, debugger compatibility, readiness, and fixed reasons.

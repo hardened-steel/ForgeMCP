@@ -1104,7 +1104,12 @@ def test_stdio_mcp_real_clangd_rename_stop_and_transport_shutdown(tmp_path: Path
                             "clangd__definition", {"path": "main.cpp", "position": {"line": 1, "column": 20}}
                         )
                     )
-                    assert "locations" in definition
+                    # This is a deterministic semantic readiness barrier for
+                    # the TU/include graph, not a timing sleep. The header is
+                    # deliberately never opened through MCP: the ensuing
+                    # multi-file edit must keep and apply its closed-document
+                    # change atomically.
+                    assert any(location["path"] == "shared.hpp" for location in definition["locations"])
 
                     prepared = _json_tool_content(
                         await session.call_tool(
@@ -1137,6 +1142,7 @@ def test_stdio_mcp_real_clangd_rename_stop_and_transport_shutdown(tmp_path: Path
                         )
                     )
                     assert renamed["edit"]["applied"] is True
+                    assert renamed["edit"]["affected_files"] == 2
                     assert "renamed_value" in main.read_text(encoding="utf-8")
                     assert "renamed_value" in header.read_text(encoding="utf-8")
 

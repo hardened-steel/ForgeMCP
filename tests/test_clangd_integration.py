@@ -827,6 +827,40 @@ def test_workspace_edit_engine_converts_non_bmp_lsp_coordinates_and_commits_mult
     asyncio.run(exercise())
 
 
+def test_workspace_edit_text_document_edits_apply_to_a_closed_header_atomically(tmp_path: Path):
+    """A TextDocumentEdit must not discard a closed include-file edit."""
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        main = tmp_path / "main.cpp"
+        header = tmp_path / "shared.hpp"
+        main.write_text('#include "shared.hpp"\nint main() { return value; }\n', encoding="utf-8")
+        header.write_text("inline int value = 1;\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        # shared.hpp has no tracked _DocumentState and therefore exercises the
+        # closed-file TextDocumentEdit path rather than a synthetic didOpen.
+        result = await service._apply_workspace_edit(
+            {"documentChanges": [
+                {"textDocument": {"uri": document.uri, "version": document.version}, "edits": [
+                    {"range": {"start": {"line": 1, "character": 20}, "end": {"line": 1, "character": 25}}, "newText": "renamed_value"}
+                ]},
+                {"textDocument": {"uri": header.as_uri()}, "edits": [
+                    {"range": {"start": {"line": 0, "character": 11}, "end": {"line": 0, "character": 16}}, "newText": "renamed_value"}
+                ]},
+            ]},
+            anchor=document,
+        )
+        assert result.applied is True and result.affected_files == 2
+        assert "renamed_value" in main.read_text(encoding="utf-8")
+        assert "renamed_value" in header.read_text(encoding="utf-8")
+        assert service._document_for_path("shared.hpp") is None
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_builtin_clangd_plugin_registers_every_phase_one_tool_with_flat_schemas(tmp_path: Path):
     async def exercise() -> None:
         application = ForgeApplication.create(ForgeConfig(workspace_root=tmp_path))

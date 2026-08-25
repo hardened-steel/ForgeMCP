@@ -16,6 +16,16 @@ records. Kit IDs are deterministic hashes of canonical safe identity metadata,
 not filesystem paths. MCP never returns executable/install paths, raw version
 or probe output, Developer environment values, or compiler commands.
 
+Each kit also carries path-free `origin`, `driver_mode`, and `abi` markers.
+Standalone LLVM `clang++`, Visual Studio LLVM `clang++`, `clang-cl`, and MSVC
+are therefore distinct public profiles even where their compiler family is
+`clang`. `--toolchain llvm` selects the clang family; within it deterministic
+automatic ranking prefers ready standalone LLVM, then ready Visual Studio LLVM,
+then degraded candidates. Exact provider choice is made with an opaque kit ID
+from `cmake__list_kits` through runtime `cmake__select_kit`, `--cmake-kit`, or
+`FORGEMCP_CMAKE_KIT`; neither filesystem enumeration order nor opaque ID order
+participates in ranking.
+
 The CMake service owns application-local selected-kit state. Selection is a
 non-filesystem mutation guarded by a monotonic optional CAS generation and is
 discarded at application shutdown. Configure selection precedence is operation

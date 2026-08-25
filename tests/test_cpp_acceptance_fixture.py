@@ -18,7 +18,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from tests.acceptance_manifest import OPTIONAL, REAL, TOOL_ACCEPTANCE
+from tests.acceptance_manifest import TOOL_ACCEPTANCE
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "examples" / "cpp-acceptance-project"
@@ -114,8 +114,7 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     await session.initialize()
                     names = [tool.name for tool in (await session.list_tools()).tools]
                     assert len(names) == len(set(names))
-                    assert set(names) == set(TOOL_ACCEPTANCE)
-                    assert {TOOL_ACCEPTANCE[name] for name in names} <= {REAL, OPTIONAL}
+                    assert set(names) == {entry.tool_name for entry in TOOL_ACCEPTANCE}
                     visited: set[str] = set()
 
                     async def call(name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
@@ -203,7 +202,11 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     await call("clang_tidy__run", {"paths": ["analysis/tidy_me.cpp"], "compile_commands_dir": "build", "checks": "-*,modernize-use-nullptr"})
                     report = (root / "reports" / "asan.txt").read_text(encoding="utf-8")
                     await call("sanitizer__parse_report", {"output": report})
-                    assert {name for name, kind in TOOL_ACCEPTANCE.items() if kind == REAL} <= visited
+                    mandatory = {
+                        entry.tool_name for entry in TOOL_ACCEPTANCE
+                        if entry.subsystem in {"core", "cmake", "quality"}
+                    }
+                    assert mandatory <= visited
         text = errors.read_text(encoding="utf-8")
         assert str(root) not in text
 

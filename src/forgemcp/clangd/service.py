@@ -634,6 +634,15 @@ class ClangdService:
         document, text = await self._synchronize_document(path)
         request_snapshot = document.snapshot
         self._require_expected_sha256(request_snapshot, expected_sha256)
+        # clangd accepts rename before its background index has necessarily
+        # parsed the include graph. A bounded semantic request is the LSP
+        # observable readiness barrier: it shares the exact open snapshot and
+        # returns only after clangd has handled the TU. It intentionally has
+        # no timer/sleep and does not expose its raw response.
+        await self._request(
+            "textDocument/definition",
+            {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
+        )
         response = await self._request(
             "textDocument/rename",
             {
