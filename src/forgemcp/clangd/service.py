@@ -639,7 +639,7 @@ class ClangdService:
         # observable readiness barrier: it shares the exact open snapshot and
         # returns only after clangd has handled the TU. It intentionally has
         # no timer/sleep and does not expose its raw response.
-        await self._request(
+        definition_response = await self._request(
             "textDocument/definition",
             {"textDocument": {"uri": document.uri}, "position": self._to_lsp_position(text, position)},
         )
@@ -651,6 +651,43 @@ class ClangdService:
                 "newName": new_name,
             },
         )
+        # Some clangd builds answer a use-site rename before their background
+        # index has attached a closed header's declaration.  The definition
+        # request above is the bounded semantic barrier.  When it identifies a
+        # different workspace document but the initial edit omitted it, issue
+        # the same semantic request at that definition *without didOpen* and
+        # merge only non-overlapping file contributions.  This keeps closed
+        # headers closed while restoring the atomic cross-file WorkspaceEdit.
+        definition_target = self._rename_definition_target(definition_response, document.uri)
+        if definition_target is not None and self._workspace_edit_paths(response) <= {document.path}:
+            target_uri, target_range = definition_target
+            target_path = self._path_from_uri(target_uri)
+            if target_path is not None:
+                try:
+                    target_text, _ = self._workspace.read_text(target_path)
+                    target_position = self._from_lsp_range(target_text, target_range).start
+                    header_response = await self._request(
+                        "textDocument/rename",
+                        {
+                            "textDocument": {"uri": target_uri},
+                            "position": self._to_lsp_position(target_text, target_position),
+                            "newName": new_name,
+                        },
+                    )
+                except (WorkspaceError, ClangdProtocolError):
+                    header_response = None
+                # clangd may still answer an empty/header-incomplete edit for
+                # a closed include even after resolving its definition.  The
+                # definition's target-selection range is already a validated
+                # semantic spelling of the same symbol, so it is the safe,
+                # bounded final contribution to the one atomic edit.
+                if target_path not in self._workspace_edit_paths(header_response):
+                    header_response = {
+                        "changes": {
+                            target_uri: [{"range": target_range, "newText": new_name}],
+                        }
+                    }
+                response = self._merge_rename_workspace_edits(response, header_response)
         return RenameResult(
             edit=await self._apply_workspace_edit_for_snapshot(response, document, request_snapshot)
         )
@@ -1076,6 +1113,63 @@ class ClangdService:
                     raise ClangdProtocolError("WorkspaceEdit TextDocumentEdit has invalid document identity.")
                 entries.append((uri, edits, version))
         return tuple(entries)
+
+    def _rename_definition_target(
+        self, response: object, current_uri: str
+    ) -> tuple[str, Mapping[str, object]] | None:
+        """Extract one workspace-contained closed definition target safely."""
+        values: Sequence[object]
+        if isinstance(response, list):
+            values = response
+        elif isinstance(response, Mapping):
+            values = (response,)
+        else:
+            return None
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            uri = value.get("targetUri", value.get("uri"))
+            source_range = value.get("targetSelectionRange", value.get("targetRange", value.get("range")))
+            if not isinstance(uri, str) or uri == current_uri or not isinstance(source_range, Mapping):
+                continue
+            if self._path_from_uri(uri) is not None:
+                return uri, source_range
+        return None
+
+    def _workspace_edit_paths(self, raw_edit: object) -> set[str]:
+        """Best-effort safe path view used only to decide rename fallback."""
+        if not isinstance(raw_edit, Mapping):
+            return set()
+        try:
+            entries = self._workspace_edit_entries(raw_edit)
+        except ClangdProtocolError:
+            return set()
+        return {
+            path for uri, _, _ in entries
+            if (path := self._path_from_uri(uri)) is not None
+        }
+
+    def _merge_rename_workspace_edits(self, primary: object, secondary: object) -> object:
+        """Combine disjoint ``changes`` results, otherwise retain one valid edit.
+
+        clangd's ordinary rename uses the ``changes`` representation.  Any
+        other WorkspaceEdit shape is left to the strict common adapter rather
+        than broaden this race-recovery path into a second edit parser.
+        """
+        if not isinstance(primary, Mapping) or not isinstance(secondary, Mapping):
+            return primary
+        primary_changes, secondary_changes = primary.get("changes"), secondary.get("changes")
+        if not isinstance(primary_changes, Mapping) or not isinstance(secondary_changes, Mapping):
+            return primary
+        merged = dict(primary_changes)
+        for uri, edits in secondary_changes.items():
+            if uri not in merged:
+                merged[uri] = edits
+        if len(merged) == len(primary_changes):
+            return primary
+        result = dict(primary)
+        result["changes"] = merged
+        return result
 
     async def _synchronize_changed_documents(self, changes: Sequence[object]) -> None:
         client = self._require_client()
@@ -1582,6 +1676,12 @@ class ClangdService:
                 "textDocument": {
                     "publishDiagnostics": {"relatedInformation": False},
                     "completion": {"completionItem": {"snippetSupport": True}},
+                    # clangd is permitted to return null when the client did
+                    # not advertise either document-symbol representation.
+                    # We normalize the hierarchical form, so request it
+                    # explicitly instead of silently accepting an empty live
+                    # document-symbol surface.
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
                     "signatureHelp": {},
                     "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": [""]}}, "resolveSupport": {"properties": ["edit"]}},
                     "rename": {"prepareSupport": True},

@@ -128,6 +128,17 @@ CMake preset—those are alternative workflows and a combined explicit
 preset/kit is rejected. The full LLVM/DWARF debugger profile requires a
 qualified Clang kit and `lldb-dap`; MSVC/PDB is not claimed.
 
+Run the complete real-clangd MCP fixture gate (SDK stdio, production discovery,
+all currently published `clangd__*` tools) with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q -m clangd_fixture_mcp
+```
+
+It first discovers clangd and a ready standalone LLVM kit through ForgeMCP.
+It can skip only when that production discovery is unavailable; a qualified
+host runs against a disposable copy and verifies the committed fixture hash.
+
 Always-run tests verify fixture content, ignored artifacts, and the real MCP
 surface/matrix. The portable live gate runs automatically whenever CMake and
 Ninja are available; see [the acceptance matrix](docs/acceptance-matrix.md)

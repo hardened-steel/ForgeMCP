@@ -20,5 +20,9 @@ expected to fail when built. The default tests are `fixture_pass` and the
 timeout test scenarios.
 
 The `analysis` files exist for real clangd, clang-format, and clang-tidy
-scenarios. `reports` contains synthetic sanitizer text only; it contains no
-host paths or secrets.
+scenarios. `shared.hpp` is a deliberately closed-header
+cross-file-rename anchor; `analysis/clangd_anchors.cpp` provides deterministic
+completion, signature, call-hierarchy, and type-hierarchy anchors.  They are
+compiled only into the generated compilation database through an
+`EXCLUDE_FROM_ALL` target. `reports` contains synthetic sanitizer text only;
+it contains no host paths or secrets.

@@ -17,6 +17,7 @@ target_include_directories(fixture_core PUBLIC include)
 
 add_executable(fixture_good app/good_main.cpp)
 target_link_libraries(fixture_good PRIVATE fixture_core)
+target_include_directories(fixture_good PRIVATE .)
 
 add_executable(fixture_warning app/warning_main.cpp)
 target_link_libraries(fixture_warning PRIVATE fixture_core)
@@ -47,6 +48,17 @@ endif()
 
 add_executable(fixture_tests tests/test_main.cpp)
 target_link_libraries(fixture_tests PRIVATE fixture_core)
+
+# This target intentionally never participates in the default build.  CMake
+# still emits its entries to compile_commands.json, allowing real clangd tests
+# to exercise malformed completion/code-action anchors without making the
+# portable configure/build gate fail.
+add_library(fixture_clangd_anchors OBJECT EXCLUDE_FROM_ALL
+    analysis/clangd_anchors.cpp
+    analysis/code_action.cpp
+    analysis/format_me.cpp
+)
+target_include_directories(fixture_clangd_anchors PRIVATE include)
 
 enable_testing()
 add_test(NAME fixture_pass COMMAND fixture_tests)

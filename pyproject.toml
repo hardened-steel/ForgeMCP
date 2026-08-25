@@ -26,3 +26,6 @@ packages = ["src/forgemcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "clangd_fixture_mcp: complete real-MCP clangd acceptance gate on the disposable C++ fixture",
+]

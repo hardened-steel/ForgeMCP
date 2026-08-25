@@ -861,6 +861,56 @@ def test_workspace_edit_text_document_edits_apply_to_a_closed_header_atomically(
     asyncio.run(exercise())
 
 
+def test_rename_definition_barrier_recovers_a_closed_header_omitted_by_clangd(tmp_path: Path):
+    """A semantic definition target repairs a partial real-world rename edit.
+
+    The fake deliberately returns only the use-site change and then no edit
+    for the closed header.  ForgeMCP must use the already validated definition
+    selection range, merge it before the one WorkspaceService commit, and
+    never manufacture a tracked/open header document.
+    """
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        main = tmp_path / "main.cpp"
+        header = tmp_path / "shared.hpp"
+        header.write_text("inline int value = 1;\n", encoding="utf-8")
+        main.write_text('#include "shared.hpp"\nint main() { return value; }\n', encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        original_request = service._request
+
+        async def partial_rename(method: str, params: dict[str, object]) -> object:
+            if method == "textDocument/definition":
+                return [{
+                    "uri": header.as_uri(),
+                    "range": {"start": {"line": 0, "character": 11}, "end": {"line": 0, "character": 16}},
+                }]
+            if method == "textDocument/rename":
+                text_document = params["textDocument"]
+                assert isinstance(text_document, dict)
+                if text_document["uri"] == document.uri:
+                    return {"changes": {document.uri: [{
+                        "range": {"start": {"line": 1, "character": 20}, "end": {"line": 1, "character": 25}},
+                        "newText": "renamed_value",
+                    }]}}
+                return None
+            return await original_request(method, params)
+
+        service._request = partial_rename  # type: ignore[method-assign]
+        result = await service.rename(
+            "main.cpp", Position(line=1, column=20), "renamed_value", expected_sha256=document.snapshot.sha256
+        )
+        assert result.edit.applied is True and result.edit.affected_files == 2
+        assert "renamed_value" in main.read_text(encoding="utf-8")
+        assert "renamed_value" in header.read_text(encoding="utf-8")
+        assert service._document_for_path("shared.hpp") is None
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_builtin_clangd_plugin_registers_every_phase_one_tool_with_flat_schemas(tmp_path: Path):
     async def exercise() -> None:
         application = ForgeApplication.create(ForgeConfig(workspace_root=tmp_path))

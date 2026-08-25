@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 from forgemcp.clangd.errors import ClangdRequestError
 from forgemcp.clangd.service import ClangdService
@@ -116,9 +116,32 @@ class _RenameArguments(_PositionArguments):
 
 class _CodeActionsArguments(_DocumentArguments):
     range: Range = Field(description="Zero-based code-point range for actions.")
-    diagnostics: list[Diagnostic] = Field(default_factory=list, description="Optional normalized current diagnostics.")
+    # Keep the SDK-facing schema as JSON objects.  FastMCP validates signature
+    # annotations before this Pydantic model gets a chance to normalize enum
+    # strings from a prior ``clangd__diagnostics`` result.
+    diagnostics: list[dict[str, object]] = Field(default_factory=list, description="Optional normalized current diagnostics.")
     kinds: list[str] = Field(default_factory=list, description="Optional code-action kind filter.")
     limit: int | None = Field(default=None, description="Optional bounded action count from 1 through 100.")
+
+    @field_validator("diagnostics", mode="before")
+    @classmethod
+    def _normalize_public_diagnostics(cls, value: object) -> object:
+        """Accept the JSON shape emitted by ``clangd__diagnostics``.
+
+        Domain models are deliberately strict once constructed, but MCP input
+        is JSON: enum values arrive as strings.  Normalizing only this
+        explicitly published re-input field preserves strictness for every
+        other argument while making diagnostic-driven code actions composable.
+        """
+        if not isinstance(value, list):
+            return value
+        normalized: list[object] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                normalized.append(item)
+                continue
+            normalized.append(Diagnostic.model_validate(item, strict=False).model_dump(mode="python"))
+        return normalized
 
 
 class _ApplyCodeActionArguments(ForgeModel):
@@ -428,8 +451,9 @@ class ClangdPlugin(ForgePlugin):
     @staticmethod
     async def _code_actions(service: ClangdService, request: ForgeModel) -> ForgeModel:
         assert isinstance(request, _CodeActionsArguments)
+        diagnostics = tuple(Diagnostic.model_validate(item) for item in request.diagnostics)
         return await service.code_actions(
-            request.path, request.range, request.diagnostics, request.kinds, limit=request.limit
+            request.path, request.range, diagnostics, request.kinds, limit=request.limit
         )
 
     @staticmethod
