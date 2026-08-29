@@ -43,7 +43,11 @@ if(FIXTURE_LLVM_DWARF)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR "FIXTURE_LLVM_DWARF requires a qualified Clang kit.")
     endif()
-    target_compile_options(fixture_debug PRIVATE -g -Xclang -gdwarf)
+    # Clang's driver flag is portable to the standalone Windows distribution;
+    # do not use a frontend-only `-Xclang -gdwarf` spelling (unsupported by
+    # current LLVM releases).  The fixture gate verifies the resulting
+    # PE/COFF + DWARF debuggee through the real LLDB-DAP path.
+    target_compile_options(fixture_debug PRIVATE -g -gdwarf-4)
 endif()
 
 add_executable(fixture_tests tests/test_main.cpp)

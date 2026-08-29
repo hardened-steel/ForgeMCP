@@ -91,6 +91,8 @@ def test_cpp_acceptance_fixture_is_complete_and_has_no_generated_artifacts() -> 
     assert "WILL_FAIL" in cmake
     assert "FIXTURE_ENABLE_NEGATIVE_TESTS" in cmake
     assert "FIXTURE_BREAKPOINT_MARKER" in (FIXTURE_ROOT / "debug/debug_main.cpp").read_text(encoding="utf-8")
+    assert "FIXTURE_STEP_OVER_MARKER" in (FIXTURE_ROOT / "debug/debug_main.cpp").read_text(encoding="utf-8")
+    assert "FIXTURE_STEP_IN_MARKER" in (FIXTURE_ROOT / "debug/debug_main.cpp").read_text(encoding="utf-8")
     assert "RANGE_FORMAT_BEGIN" in (FIXTURE_ROOT / "analysis/format_me.cpp").read_text(encoding="utf-8")
     assert "shared_value" in (FIXTURE_ROOT / "shared.hpp").read_text(encoding="utf-8")
 
@@ -472,6 +474,226 @@ def test_cpp_acceptance_fixture_real_clangd_all_tools_mcp_gate(tmp_path: Path) -
                         clangd_tools, registered_scenarios=observed, observed_calls=observed,
                         available_capabilities=frozenset({"mcp_stdio", "clangd", "compile_commands"}),
                         subsystems=frozenset({"clangd"}),
+                    )
+        return errors.read_text(encoding="utf-8")
+
+    server_errors = asyncio.run(exercise())
+    assert '"event": "application_stopped"' in server_errors
+    assert str(root) not in server_errors
+    assert _tree_hashes(FIXTURE_ROOT) == committed_before
+
+
+@pytest.mark.debugger_fixture_mcp
+@pytest.mark.skipif(not _portable_prerequisites(), reason="debugger_fixture_unavailable: CMake or Ninja is unavailable")
+def test_cpp_acceptance_fixture_real_debugger_all_tools_mcp_gate(tmp_path: Path) -> None:
+    """Exercise every published debugger tool over real MCP stdio and LLDB-DAP.
+
+    The gate deliberately uses no debugger-service calls or compiler command
+    outside MCP.  Discovery is production-equivalent and the only permissible
+    skip is a single capability summary before a qualified chain exists.
+    """
+    committed_before = _tree_hashes(FIXTURE_ROOT)
+    root = _copy_fixture(tmp_path)
+
+    async def exercise() -> str:
+        errors = tmp_path / "debugger-server-stderr.log"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "forgemcp.server"],
+            cwd=Path.cwd(),
+            env={**os.environ, "FORGEMCP_WORKSPACE": str(root), "FORGEMCP_LOG_LEVEL": "INFO"},
+        )
+        with errors.open("w", encoding="utf-8") as stderr:
+            async with stdio_client(parameters, errlog=stderr) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    debugger_tools = {tool.name for tool in listed.tools if tool.name.startswith("debugger__")}
+                    manifest_tools = {entry.tool_name for entry in TOOL_ACCEPTANCE if entry.subsystem == "debugger"}
+                    assert debugger_tools == manifest_tools
+                    assert len(debugger_tools) == 16
+                    assert "debugger__step_over" in debugger_tools  # Public name for DAP `next`.
+
+                    collector = McpToolCallCollector("debugger_fixture")
+
+                    async def call(name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
+                        result = await collector.call(session, name, arguments)
+                        payload = _json(result)
+                        assert getattr(result, "isError") is False and "error" not in payload, (name, payload)
+                        return payload
+
+                    async def expect_error(name: str, arguments: dict[str, object]) -> dict[str, object]:
+                        result = await session.call_tool(name, arguments)
+                        payload = _json(result)
+                        assert getattr(result, "isError") or "error" in payload, (name, payload)
+                        return payload
+
+                    async def wait_for_state(*states: str, timeout: float = 12.0) -> dict[str, object]:
+                        deadline = asyncio.get_running_loop().time() + timeout
+                        while True:
+                            status = await call("debugger__status")
+                            if status.get("state") in states:
+                                return status
+                            if asyncio.get_running_loop().time() >= deadline:
+                                raise AssertionError(f"debugger did not reach {states}: {status}")
+                            await asyncio.sleep(0.05)
+
+                    def current_thread(payload: dict[str, object]) -> str:
+                        threads = payload.get("threads")
+                        assert isinstance(threads, list) and threads
+                        current = next((item for item in threads if isinstance(item, dict) and item.get("is_current") is True), None)
+                        assert isinstance(current, dict), threads
+                        token = current.get("thread_id")
+                        assert isinstance(token, str)
+                        return token
+
+                    initial = await call("debugger__status")
+                    adapters = await call("debugger__list_adapters")
+                    adapter_values = adapters.get("adapters")
+                    assert isinstance(adapter_values, list) and len(adapter_values) == 1
+                    adapter = adapter_values[0]
+                    assert isinstance(adapter, dict)
+                    kits = await call("cmake__list_kits")
+                    kit_values = kits.get("kits")
+                    assert isinstance(kit_values, list)
+                    standalone = next((kit for kit in kit_values if isinstance(kit, dict)
+                        and kit.get("readiness") == "ready" and kit.get("origin") == "standalone"
+                        and kit.get("compiler_family") == "clang" and kit.get("driver_mode") == "clang++"
+                        and kit.get("abi") == "llvm" and kit.get("debugger_compatibility") == "compatible"), None)
+                    if not adapter.get("available") or standalone is None:
+                        reason = "debugger_fixture_unavailable: no qualified standalone LLVM/Clang/DWARF/lldb-dap chain"
+                        assert initial.get("state") in {"stopped", "unavailable"}
+                        pytest.skip(reason)
+                    assert adapter.get("backend_id") == "lldb-dap"
+                    assert adapter.get("source") == "standalone"
+                    assert "path" not in json.dumps(adapter).lower()
+                    assert "\\\\" not in json.dumps(adapter)
+                    kit_id = standalone.get("id")
+                    assert isinstance(kit_id, str)
+                    selected = await call("cmake__select_kit", {"kit": kit_id, "expected_selection_generation": 0})
+                    assert selected.get("selection_generation") == 1
+                    configured = await call("cmake__configure", {
+                        "binary_dir": "build-debugger", "generator": "Ninja",
+                        "cache_variables": {"CMAKE_BUILD_TYPE": "Debug", "FIXTURE_LLVM_DWARF": True},
+                    })
+                    assert configured.get("process", {}).get("exit_code") == 0
+                    assert configured.get("effective_kit", {}).get("id") == kit_id
+                    built = await call("cmake__build", {"binary_dir": "build-debugger", "targets": ["fixture_debug"]})
+                    assert built.get("process", {}).get("exit_code") == 0
+                    targets = await call("cmake__list_targets", {"binary_dir": "build-debugger"})
+                    fixture_target = next(
+                        target for configuration in targets.get("configurations", []) if isinstance(configuration, dict)
+                        for target in configuration.get("targets", []) if isinstance(target, dict) and target.get("name") == "fixture_debug"
+                    )
+                    artifacts = fixture_target.get("artifacts")
+                    assert isinstance(artifacts, list)
+                    program = next(item for item in artifacts if isinstance(item, str) and item.endswith(".exe"))
+                    assert isinstance(program, str) and program.endswith(".exe") and not Path(program).is_absolute()
+                    debug_text = (root / "debug/debug_main.cpp").read_text(encoding="utf-8")
+                    breakpoint_line = _position(debug_text, "FIXTURE_STEP_OVER_MARKER", offset=len("FIXTURE_STEP_OVER_MARKER") + 1)["line"]
+
+                    # Session one: entry stop -> verified breakpoint -> inspection -> steps -> terminal.
+                    launched = await call("debugger__launch", {"program": program, "cwd": "build-debugger", "stop_on_entry": True})
+                    assert launched.get("state") in {"initialized", "configuring", "running", "paused"}
+                    await wait_for_state("paused")
+                    breakpoints = await call("debugger__set_breakpoints", {
+                        "path": "debug/debug_main.cpp", "breakpoints": [{"line": breakpoint_line}],
+                    })
+                    values = breakpoints.get("breakpoints")
+                    assert isinstance(values, list) and values and values[0].get("verified") is True
+                    entry_threads = await call("debugger__threads")
+                    entry_thread = current_thread(entry_threads)
+                    await call("debugger__continue", {"thread_id": entry_thread})
+                    paused = await wait_for_state("paused")
+                    assert paused.get("stop_generation", 0) >= 2
+                    paused_threads = await call("debugger__threads")
+                    thread_id = current_thread(paused_threads)
+                    frames_payload = await call("debugger__stack_trace", {"thread_id": thread_id})
+                    frames = frames_payload.get("frames")
+                    assert isinstance(frames, list) and frames
+                    frame = next((item for item in frames if isinstance(item, dict) and item.get("source", {}).get("path") == "debug/debug_main.cpp"), None)
+                    assert isinstance(frame, dict), [(item.get("name"), item.get("source"), item.get("line")) for item in frames if isinstance(item, dict)]
+                    frame_id = frame["frame_id"]
+                    assert isinstance(frame_id, str)
+                    scopes_payload = await call("debugger__scopes", {"frame_id": frame_id})
+                    scopes = scopes_payload.get("scopes")
+                    assert isinstance(scopes, list) and scopes
+                    variables_id = next(item["variables_id"] for item in scopes if isinstance(item, dict) and item.get("variables_id"))
+                    variables = await call("debugger__variables", {"variables_id": variables_id})
+                    assert any(item.get("name") == "seed" and "40" in item.get("value", "") for item in variables.get("variables", []) if isinstance(item, dict))
+                    evaluated = await call("debugger__evaluate", {"frame_id": frame_id, "expression": "seed"})
+                    assert "40" in str(evaluated.get("result")) and evaluated.get("side_effects_possible") is True
+                    for expression in ("seed.member", "seed[0]", "*seed", "call()", "seed + 1", " seed", "seéd"):
+                        result = await session.call_tool("debugger__evaluate", {"frame_id": frame_id, "expression": expression})
+                        rejected = _json(result)
+                        assert getattr(result, "isError") or "error" in rejected, (expression, rejected)
+                        assert rejected.get("error", {}).get("code") in {"debugger_unsupported", "debugger_request_error"}
+                    rejected_extra = await session.call_tool("debugger__evaluate", {"frame_id": frame_id, "expression": "seed", "unexpected": True})
+                    assert getattr(rejected_extra, "isError") is True
+
+                    before_line = frame.get("line")
+                    await call("debugger__step_over", {"thread_id": thread_id})
+                    await wait_for_state("paused")
+                    stale = await expect_error("debugger__stack_trace", {"thread_id": thread_id})
+                    assert stale.get("error", {}).get("code") in {"debugger_handle_expired", "debugger_stopped_data_stale"}
+                    step_threads = await call("debugger__threads")
+                    step_thread = current_thread(step_threads)
+                    step_frames = await call("debugger__stack_trace", {"thread_id": step_thread})
+                    step_frame = step_frames["frames"][0]
+                    assert step_frame.get("line") != before_line
+                    await call("debugger__step_in", {"thread_id": step_thread})
+                    await wait_for_state("paused")
+                    in_thread = current_thread(await call("debugger__threads"))
+                    in_frames = (await call("debugger__stack_trace", {"thread_id": in_thread}))["frames"]
+                    assert any("debug_middle" in str(item.get("name")) for item in in_frames if isinstance(item, dict)), [(item.get("name"), item.get("source"), item.get("line")) for item in in_frames if isinstance(item, dict)]
+                    await call("debugger__step_out", {"thread_id": in_thread})
+                    await wait_for_state("paused")
+                    out_thread = current_thread(await call("debugger__threads"))
+                    out_frames = (await call("debugger__stack_trace", {"thread_id": out_thread}))["frames"]
+                    assert any(str(item.get("name", "")).startswith("main") for item in out_frames if isinstance(item, dict))
+                    await call("debugger__continue", {"thread_id": out_thread})
+                    terminal = await wait_for_state("terminated", "stopped")
+                    assert terminal.get("state") == "terminated"
+                    events = await call("debugger__events", {"limit": 256})
+                    event_values = events.get("events")
+                    assert isinstance(event_values, list) and event_values
+                    sequences = [event["sequence"] for event in event_values if isinstance(event, dict)]
+                    assert sequences == sorted(sequences) and any(event.get("kind") == "stopped" for event in event_values if isinstance(event, dict))
+                    assert any(event.get("kind") == "terminated" for event in event_values if isinstance(event, dict))
+                    first_terminal_cursor = events.get("next_cursor")
+                    stopped = await call("debugger__stop")
+                    assert stopped.get("state") == "terminated" and stopped.get("debuggee_termination_confirmed") is True
+
+                    # Session two: prove a real RUNNING -> PAUSED pause flow and session-bound stale handles.
+                    running = await call("debugger__launch", {"program": program, "cwd": "build-debugger", "args": ["bounded-running"], "stop_on_entry": False})
+                    assert running.get("state") in {"running", "paused"}
+                    await wait_for_state("running")
+                    old_session = await expect_error("debugger__stack_trace", {"thread_id": entry_thread})
+                    assert old_session.get("error", {}).get("code") == "debugger_invalid_state"
+                    await call("debugger__pause")
+                    await wait_for_state("paused")
+                    stale_session = await expect_error("debugger__stack_trace", {"thread_id": entry_thread})
+                    assert stale_session.get("error", {}).get("code") == "debugger_handle_expired"
+                    pause_threads = await call("debugger__threads")
+                    pause_thread = current_thread(pause_threads)
+                    assert (await call("debugger__stack_trace", {"thread_id": pause_thread}))["frames"]
+                    paused_stop = await call("debugger__stop")
+                    assert paused_stop.get("state") == "terminated"
+                    retained = await call("debugger__events", {"after_sequence": 0, "limit": 256})
+                    assert retained.get("next_cursor", 0) >= 1 and retained.get("next_cursor") != first_terminal_cursor
+
+                    # Session three: stop a genuinely running debuggee before natural completion.
+                    await call("debugger__launch", {"program": program, "cwd": "build-debugger", "args": ["bounded-running"], "stop_on_entry": False})
+                    await wait_for_state("running")
+                    running_stop = await call("debugger__stop")
+                    assert running_stop.get("state") == "terminated" and running_stop.get("debuggee_termination_confirmed") is True
+                    assert (await call("debugger__stop")).get("state") == "terminated"
+
+                    observed = {entry.scenario_id: collector.called_tools for entry in TOOL_ACCEPTANCE if entry.subsystem == "debugger"}
+                    validate_manifest(
+                        debugger_tools, registered_scenarios=observed, observed_calls=observed,
+                        available_capabilities=frozenset({"mcp_stdio", "standalone_llvm", "lldb_dap", "dwarf_debuggee"}),
+                        subsystems=frozenset({"debugger"}),
                     )
         return errors.read_text(encoding="utf-8")
 

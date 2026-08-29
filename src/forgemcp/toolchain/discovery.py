@@ -603,12 +603,22 @@ class ToolchainDiscoveryService:
             path = self._which(tool, self._environment.get("PATH"))
             if path is not None:
                 candidates.append((path, "developer_environment"))
-        if self._selected_vs is not None:
+        # LLDB-DAP is the DWARF backend and this feature's safe compatibility
+        # claim is deliberately the separately installed standalone LLVM
+        # distribution.  Visual Studio's copies remain discoverable by the
+        # diagnostic qualifier, but must never become the automatic adapter
+        # fallback: their loader/runtime layout is not an approved standalone
+        # LLDB-DAP contract.  Prefer the standalone candidate even over an
+        # ambient PATH entry, which may itself point inside Visual Studio.
+        if tool == "lldb-dap":
+            candidates.extend((path, "standalone") for path in self._standalone_tool_paths(tool))
+        if self._selected_vs is not None and tool != "lldb-dap":
             candidates.extend((path, "visual_studio") for path in self._visual_studio_tool_paths(self._selected_vs, tool))
         path = self._which(tool, self._environment.get("PATH"))
         if path is not None:
             candidates.append((path, "path"))
-        candidates.extend((path, "standalone") for path in self._standalone_tool_paths(tool))
+        if tool != "lldb-dap":
+            candidates.extend((path, "standalone") for path in self._standalone_tool_paths(tool))
         return candidates
 
     def _discover_visual_studio(self) -> tuple[VisualStudioInstance, ...]:

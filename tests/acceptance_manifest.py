@@ -103,12 +103,42 @@ _QUALITY = ("quality__status", "clang_format__check", "clang_format__apply", "cl
 _CLANGD = ("clangd__status", "clangd__start", "clangd__stop", "clangd__diagnostics", "clangd__hover", "clangd__definition", "clangd__references", "clangd__document_symbols", "clangd__workspace_symbols", "clangd__completion", "clangd__signature_help", "clangd__declaration", "clangd__type_definition", "clangd__implementation", "clangd__prepare_rename", "clangd__rename", "clangd__code_actions", "clangd__apply_code_action", "clangd__format_document", "clangd__format_range", "clangd__prepare_call_hierarchy", "clangd__incoming_calls", "clangd__outgoing_calls", "clangd__prepare_type_hierarchy", "clangd__supertypes", "clangd__subtypes", "clangd__switch_source_header")
 _DEBUGGER = ("debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop", "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over", "debugger__step_in", "debugger__step_out", "debugger__threads", "debugger__stack_trace", "debugger__scopes", "debugger__variables", "debugger__evaluate", "debugger__events")
 
+_DEBUGGER_DETAILS: dict[str, tuple[str, str, str, str]] = {
+    "debugger__status": ("managed fixture session", "observes stopped/running/paused/terminated generations", "initialized SDK session", "application shutdown returns no active session"),
+    "debugger__list_adapters": ("production discovery", "qualified standalone LLVM LLDB-DAP is available with path-free metadata", "initialized SDK session", "no adapter starts during discovery"),
+    "debugger__launch": ("fixture_debug PE/COFF + DWARF", "launch reaches a managed paused/running state", "selected standalone Clang kit and CMake-built target", "stop removes the test-owned adapter tree"),
+    "debugger__stop": ("paused and running fixture sessions", "idempotent stop returns terminated with a terminal event", "active managed session", "adapter/debuggee ownership is released"),
+    "debugger__set_breakpoints": ("debug/debug_main.cpp FIXTURE_STEP_OVER_MARKER", "adapter verifies and reaches the source breakpoint", "launched entry-stop session", "breakpoint handles do not survive a new session"),
+    "debugger__continue": ("main -> debug_middle flow", "changes stop generation and reaches the configured breakpoint", "paused entry-stop session", "stale paused handles are rejected"),
+    "debugger__pause": ("debug_bounded_running", "RUNNING becomes PAUSED with a pause event", "bounded-running debuggee", "stop from PAUSED succeeds"),
+    "debugger__step_over": ("FIXTURE_STEP_OVER_MARKER", "source location advances to the call anchor", "paused breakpoint frame", "prior frame handles become stale"),
+    "debugger__step_in": ("FIXTURE_STEP_IN_MARKER", "top workspace frame enters debug_middle", "paused main call anchor", "prior thread/frame handles become stale"),
+    "debugger__step_out": ("debug_middle", "top workspace frame returns to main", "paused debug_middle frame", "prior thread/frame handles become stale"),
+    "debugger__threads": ("paused fixture breakpoint", "returns an opaque current stopped thread", "stopped event observed", "thread handle expires on resume/stop"),
+    "debugger__stack_trace": ("paused fixture breakpoint", "contains workspace debug_main.cpp frame", "opaque current thread", "frame handle expires on resume/stop"),
+    "debugger__scopes": ("main paused frame", "returns a scope with opaque variables handle", "opaque current frame", "scope/variables handles expire on resume"),
+    "debugger__variables": ("main seed local", "Variables contains seed with value 40", "opaque current variables handle", "stale variables read is structured"),
+    "debugger__evaluate": ("main seed local", "hover identifier lookup returns 40 and policy rejects expressions", "opaque current frame", "no evaluation handle survives resume"),
+    "debugger__events": ("full fixture lifecycle", "cursor ordering includes stopped/continued/terminal events", "managed session events", "terminal event is cleared only at application shutdown"),
+}
+
+
+def _debugger_entries() -> tuple[ToolAcceptance, ...]:
+    return tuple(
+        ToolAcceptance(
+            name, "debugger", f"debugger_fixture.{name.replace('__', '_')}",
+            frozenset({"mcp_stdio", "standalone_llvm", "lldb_dap", "dwarf_debuggee"}), LIVE_MCP, None,
+            "test_cpp_acceptance_fixture_real_debugger_all_tools_mcp_gate", *_DEBUGGER_DETAILS[name],
+        )
+        for name in _DEBUGGER
+    )
+
 TOOL_ACCEPTANCE = (
     _entries("core", _CORE, "core_fixture", frozenset({"mcp_stdio"}), "test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flow")
     + _entries("cmake", _CMAKE, "cmake_fixture", frozenset({"mcp_stdio", "cmake", "ninja"}), "test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flow")
     + _entries("quality", _QUALITY, "quality_fixture", frozenset({"mcp_stdio", "cmake", "ninja"}), "test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flow")
     + _clangd_entries()
-    + _entries("debugger", _DEBUGGER, "debugger_fixture", frozenset({"mcp_stdio", "standalone_llvm", "lldb_dap"}), "test_stdio_mcp_real_debugger_fixture")
+    + _debugger_entries()
 )
 
 
@@ -123,7 +153,7 @@ def validate_manifest(public_tools: Iterable[str], *, registered_scenarios: Iter
     for entry in selected:
         if not entry.scenario_id or not entry.test_scenario or entry.scenario_id not in registered:
             raise AssertionError(f"Manifest scenario is not registered: {entry.scenario_id}")
-        if entry.subsystem == "clangd" and not all((
+        if entry.subsystem in {"clangd", "debugger"} and not all((
             entry.fixture_anchor, entry.meaningful_success_assertion,
             entry.required_precondition, entry.cleanup_assertion,
         )):

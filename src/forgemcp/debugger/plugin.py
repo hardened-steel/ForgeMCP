@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
-from pydantic import Field, ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.debugger.backends import LldbDapBackend
@@ -81,6 +81,11 @@ class _VariablesArguments(ForgeModel):
 
 
 class _EvaluateArguments(_FrameArguments):
+    # The evaluate allow-list is intentionally lexical: whitespace must reach
+    # DebuggerService unchanged so it is rejected rather than normalized into
+    # a different expression.
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, str_strip_whitespace=False)
+
     expression: str = Field(min_length=1, max_length=1024, description="Single ASCII identifier lookup in the selected frame; native evaluation can still have side effects.")
 
 

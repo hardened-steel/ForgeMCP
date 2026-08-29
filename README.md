@@ -139,6 +139,20 @@ It first discovers clangd and a ready standalone LLVM kit through ForgeMCP.
 It can skip only when that production discovery is unavailable; a qualified
 host runs against a disposable copy and verifies the committed fixture hash.
 
+Run the complete real debugger MCP fixture gate (SDK stdio, production
+discovery, all currently published `debugger__*` tools) with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q -m debugger_fixture_mcp
+```
+
+It selects a ready standalone Clang kit using only the public kit identity,
+builds `fixture_debug` with `FIXTURE_LLVM_DWARF=ON` through CMake MCP, and
+qualifies the standalone LLDB-DAP adapter through MCP. The gate covers paused
+inspection and stepping plus running pause/stop and sequential-session handle
+expiry. Identifier hover evaluation remains potentially side-effecting even
+though the public policy only accepts one ASCII identifier.
+
 Always-run tests verify fixture content, ignored artifacts, and the real MCP
 surface/matrix. The portable live gate runs automatically whenever CMake and
 Ninja are available; see [the acceptance matrix](docs/acceptance-matrix.md)

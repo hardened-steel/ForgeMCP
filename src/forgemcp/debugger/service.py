@@ -385,7 +385,24 @@ class DebuggerService:
         async with self._mutating_lock:
             self._require_state(DebuggerState.RUNNING)
             native = None if thread_id is None else self._resolve(thread_id, "thread")
-            await self._request("pause", {} if native is None else {"threadId": native})
+            try:
+                await self._request("pause", {} if native is None else {"threadId": native})
+            except DebuggerRequestError:
+                # LLDB-DAP 22 on Windows rejects a protocol-optional omitted
+                # threadId.  Keep that adapter quirk entirely behind the
+                # service boundary: obtain one native thread id and retry,
+                # never manufacture or expose an MCP handle while RUNNING.
+                if native is not None:
+                    raise
+                body = await self._request("threads", {})
+                threads = body.get("threads")
+                native = next(
+                    (int(item["id"]) for item in threads if isinstance(item, Mapping) and _positive_int(item.get("id"))),
+                    None,
+                ) if isinstance(threads, list) else None
+                if native is None:
+                    raise DebuggerRequestError("The debug adapter returned no pausable thread.") from None
+                await self._request("pause", {"threadId": native})
             return await self.status()
 
     async def step_over(self, thread_id: str) -> DebugSessionStatus:
@@ -470,7 +487,7 @@ class DebuggerService:
 
     async def evaluate(self, frame_id: str, expression: str) -> EvaluateResult:
         if not isinstance(expression, str) or not expression or len(expression) > 1024 or not _SAFE_EVALUATE.fullmatch(expression):
-            raise DebuggerUnsupportedError("Evaluate accepts only conservative variable/member/index inspection expressions.")
+            raise DebuggerUnsupportedError("Evaluate accepts only one ASCII identifier for hover lookup; native evaluation may still have side effects.")
         generation = self._require_paused()
         native_frame = self._resolve(frame_id, "frame")
         body = await self._read_request("evaluate", {"expression": expression, "frameId": native_frame, "context": "hover"}, generation)

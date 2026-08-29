@@ -12,13 +12,13 @@ rejects missing, extra, or duplicate manifest names.
 | All `cmake__*` tools | real | Cached discovery plus Ninja Debug configure/build/CTest. |
 | All Quality tools | real | Disposable format/tidy fixture and synthetic report parsing. |
 | Every `clangd__*` tool | real SDK stdio gate | `pytest -m clangd_fixture_mcp` obtains the exact live inventory, selects a ready standalone LLVM kit, configures Ninja, validates the generated database, and calls every tool on a disposable fixture copy. Qualified discovery forbids a skip. |
-| Every `debugger__*` tool | optional platform gate | Needs qualified Windows PE/COFF + DWARF Clang build and compatible `lldb-dap`; MSVC/PDB is not claimed. |
+| Every `debugger__*` tool | real SDK stdio fixture gate | `pytest -m debugger_fixture_mcp` performs production discovery, chooses a ready path-free standalone Clang kit, builds `fixture_debug` through CMake MCP with DWARF enabled, and calls every published debugger tool. It skips only for one structured, genuinely absent capability reason; a qualified host cannot skip. MSVC/PDB is not claimed. |
 
 `tests/acceptance_manifest.py` is the machine-readable per-tool manifest. The
 grouping above is explanatory only; its exact mapping is checked against the
 real server surface.
 
-For each clangd entry the manifest also records a fixture anchor, meaningful
+For each clangd and debugger entry the manifest also records a fixture anchor, meaningful
 success assertion, setup condition, and cleanup assertion. The scenario call
 collector records every official `ClientSession.call_tool` invocation; a listed
 clangd tool cannot be counted merely because `tools/list` advertised it.

@@ -28,4 +28,5 @@ packages = ["src/forgemcp"]
 testpaths = ["tests"]
 markers = [
     "clangd_fixture_mcp: complete real-MCP clangd acceptance gate on the disposable C++ fixture",
+    "debugger_fixture_mcp: complete real-MCP standalone LLVM LLDB-DAP gate on the disposable C++ fixture",
 ]
