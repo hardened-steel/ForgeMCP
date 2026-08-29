@@ -134,3 +134,9 @@ loss under flood or slow clients is intentional. Cooperative deadlines cannot
 pre-empt CPU-blocking trusted Python plugin code. Tasks, modern protocol-era
 features, Git, filesystem watching, delete/rename, binary writes, Apps/UI, and
 resource subscriptions remain out of scope.
+
+D2.4 crawls each published resource/template, prompt, and completion through
+SDK stdio. They remain discovery aids, not authority to run tools or trusted
+instructions. Channel-specific recursive canaries forbid host paths, secrets,
+argv, raw output/payloads, and handles outside explicitly documented result
+fields.

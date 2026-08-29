@@ -1,4 +1,4 @@
-# D2 acceptance matrix
+# D2.4 acceptance matrix
 
 The committed C++ fixture is copied to a test-owned temporary directory before
 every mutation. No acceptance test writes the committed example. The live
@@ -7,12 +7,12 @@ rejects missing, extra, or duplicate manifest names.
 
 | Surface | Coverage | Reason / scenario |
 | --- | --- | --- |
-| `server_status`, `project__status` | real | Real stdio status and sanitized response checks. |
-| Workspace read/snapshot/mutation tools | real | Read, creation patch, CAS edit, stale-CAS rejection, re-read. |
-| All `cmake__*` tools | real | Cached discovery plus Ninja Debug configure/build/CTest. |
-| All Quality tools | real | Disposable format/tidy fixture and synthetic report parsing. |
-| Every `clangd__*` tool | real SDK stdio gate | `pytest -m clangd_fixture_mcp` obtains the exact live inventory, selects a ready standalone LLVM kit, configures Ninja, validates the generated database, and calls every tool on a disposable fixture copy. Qualified discovery forbids a skip. |
-| Every `debugger__*` tool | real SDK stdio fixture gate | `pytest -m debugger_fixture_mcp` performs production discovery, chooses a ready path-free standalone Clang kit, builds `fixture_debug` through CMake MCP with DWARF enabled, and calls every published debugger tool. It skips only for one structured, genuinely absent capability reason; a qualified host cannot skip. MSVC/PDB is not claimed. |
+| Core/workspace/CMake/Quality (23 tools) | real SDK stdio | `core_fixture.*`, `cmake_fixture.*`, and `quality_fixture.*` cover normal and expected-error fixture paths. |
+| clangd (27 tools) | real SDK stdio | `clangd_fixture.*` selects a ready standalone LLVM kit, configures Ninja, validates the database, and calls every published `clangd__*` tool. |
+| debugger (16 tools) | real SDK stdio | `debugger_fixture.*` qualifies LLDB-DAP, uses the public `debugger__step_over` name, and covers paused/running stop paths. MSVC/PDB is not claimed. |
+| Existing build trees | real SDK stdio and hostile unit matrix | An IDE-like external Ninja/Clang tree with CRLF cache, File API, and compilation database is created before the ForgeMCP session. Listing is hash-proved read-only; targets, build, CTest, and status follow without configure. Unit cases reject mismatch, stale/malformed/oversized metadata, source mismatch, and workspace escape. |
+| Progress | SDK stdio and adversarial parser/transport tests | CMake/CTest, numeric-zero/string/no-token isolation, strict exactness, heartbeats, cancellation, slow delivery, partial UTF-8/final line, and observer overflow are covered. clangd, clang-tidy, and debugger lifecycle progress share the request-scoped contract. |
+| Discovery/disclosure | SDK stdio and recursive sanitization tests | Initialize, resources/templates, prompts, completion, logging, pagination/TTL/invalidation, bounded queues, and canary-safe channel separation are covered. |
 
 `tests/acceptance_manifest.py` is the machine-readable per-tool manifest. The
 grouping above is explanatory only; its exact mapping is checked against the
@@ -22,3 +22,19 @@ For each clangd and debugger entry the manifest also records a fixture anchor, m
 success assertion, setup condition, and cleanup assertion. The scenario call
 collector records every official `ClientSession.call_tool` invocation; a listed
 clangd tool cannot be counted merely because `tools/list` advertised it.
+
+The machine-readable manifest is exactly **66 tools**: 23 Core/workspace/CMake/
+Quality, 27 clangd, and 16 debugger. The unified runner wraps official SDK
+`call_tool` (never handlers/services), emits one bounded host-local record per
+tool/scenario with call count, meaningful-success state, and
+success/expected-error category, and rejects duplicates/orphans. `tools/list`,
+imports, direct service calls, and `optional_platform_gate` cannot satisfy
+coverage. Use:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q --run-forgemcp-live-acceptance
+```
+
+Its capability report includes only availability/source categories and public
+kit families—never installation or executable paths. Portable `pytest -q`
+retains skips only where production discovery proves a capability absent.

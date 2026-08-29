@@ -158,6 +158,23 @@ surface/matrix. The portable live gate runs automatically whenever CMake and
 Ninja are available; see [the acceptance matrix](docs/acceptance-matrix.md)
 for tool-by-tool scope and the unit/fake/live distinction.
 
+Run the complete host-qualified acceptance tier with one switch:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q --run-forgemcp-live-acceptance
+```
+
+It uses production-equivalent Toolchain Discovery and writes path-free,
+host-local capability and bounded 66-tool SDK-coverage JSON reports under the
+temporary directory (never the repository). It runs MSVC gates for a ready
+MSVC kit and standalone LLVM/clangd/Quality/DAP gates for their qualified
+chain, failing if a discovered capability is skipped or has no meaningful SDK
+call. Plain `pytest -q` remains portable and conditionally skips only proven
+absent native capabilities. Resources and prompts are discovery aids, not
+authority; progress is best-effort. Build/test/debug execute trusted workspace
+code, and adopted IDE build trees remain validated project input—not a sandbox
+or trust grant.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1

@@ -20,6 +20,8 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from tests.acceptance_manifest import McpToolCallCollector, TOOL_ACCEPTANCE, validate_manifest
+from forgemcp.core.config import ForgeConfig
+from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "examples" / "cpp-acceptance-project"
@@ -124,6 +126,85 @@ def test_cpp_acceptance_fixture_real_cmake_gate_uses_a_disposable_copy(tmp_path:
     assert not (FIXTURE_ROOT / "build").exists()
 
 
+@pytest.mark.skipif(not _portable_prerequisites(), reason="capability_absent: real build-tree adoption requires CMake and Ninja")
+def test_cpp_acceptance_fixture_adopts_an_external_build_tree_over_mcp(tmp_path: Path) -> None:
+    """A pre-existing, File-API-ready tree is read before ForgeMCP uses it.
+
+    The setup models an IDE-owned configuration: no ForgeMCP application is
+    running while CMake creates the cache, database, and File API reply.
+    """
+    committed_before = _tree_hashes(FIXTURE_ROOT)
+    root = _copy_fixture(tmp_path)
+    discovery = ToolchainDiscoveryService(ForgeConfig(workspace_root=root))
+    candidates = [
+        discovery.kit_profile(kit.id) for kit in discovery.kits().kits
+        if kit.readiness == "ready" and kit.origin == "standalone" and kit.compiler_family == "clang"
+    ]
+    profile = next((item for item in candidates if item is not None), None)
+    if profile is None or profile.c_compiler_path is None or profile.cxx_compiler_path is None:
+        pytest.skip("capability_absent: production discovery found no ready standalone Clang kit")
+    build = root / "build-adopted"
+    query = build / ".cmake" / "api" / "v1" / "query" / "codemodel-v2"
+    query.parent.mkdir(parents=True)
+    query.write_text("", encoding="utf-8")
+    environment = dict(os.environ)
+    if profile.environment is not None:
+        environment.update(profile.environment)
+    configured = subprocess.run(
+        [
+            str(discovery.executable("cmake")), "-S", str(root), "-B", str(build), "-G", "Ninja",
+            f"-DCMAKE_C_COMPILER:FILEPATH={profile.c_compiler_path}",
+            f"-DCMAKE_CXX_COMPILER:FILEPATH={profile.cxx_compiler_path}",
+            "-DCMAKE_BUILD_TYPE=Debug", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ],
+        cwd=root, env=environment, text=True, capture_output=True, timeout=120, check=False,
+    )
+    assert configured.returncode == 0
+    # Explicit CRLF is part of the cache-reader interoperability contract.
+    cache = build / "CMakeCache.txt"
+    cache.write_bytes(cache.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    assert (build / "compile_commands.json").is_file()
+    assert any((build / ".cmake" / "api" / "v1" / "reply").glob("index-*.json"))
+    before_read_only = _tree_hashes(build)
+
+    async def exercise() -> None:
+        parameters = StdioServerParameters(
+            command=sys.executable, args=["-m", "forgemcp.server"], cwd=Path.cwd(),
+            env={**os.environ, "FORGEMCP_WORKSPACE": str(root), "FORGEMCP_LOG_LEVEL": "INFO"},
+        )
+        async with stdio_client(parameters) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+                listed = _json(await session.call_tool("cmake__list_build_trees", {}))
+                trees = listed["build_trees"]
+                adopted = next(item for item in trees if item["binary_dir"] == "build-adopted")
+                assert adopted["category"] == "adoptable"
+                assert adopted["source_matches_workspace"] is True
+                assert adopted["generator"] == "Ninja"
+                assert adopted["compilation_database"]["availability"] == "available"
+                # list/adoption discovery is observably read-only: no configure
+                # call has been made and all generated metadata is unchanged.
+                assert _tree_hashes(build) == before_read_only
+                kits = _json(await session.call_tool("cmake__list_kits", {}))["kits"]
+                selected = next(item for item in kits if item["id"] == profile.kit.id)
+                assert _json(await session.call_tool("cmake__select_kit", {
+                    "kit": selected["id"], "expected_selection_generation": 0,
+                }))["selection_generation"] == 1
+                targets = _json(await session.call_tool("cmake__list_targets", {"binary_dir": "build-adopted"}))
+                assert any(target["name"] == "fixture_good" for config in targets["configurations"] for target in config["targets"])
+                built = _json(await session.call_tool("cmake__build", {"binary_dir": "build-adopted"}))
+                assert built["process"]["exit_code"] == 0
+                tests = _json(await session.call_tool("cmake__ctest_list_tests", {"binary_dir": "build-adopted"}))
+                assert {item["name"] for item in tests["tests"]} >= {"fixture_pass", "fixture_expected_failure"}
+                ran = _json(await session.call_tool("cmake__ctest_run", {"binary_dir": "build-adopted"}))
+                assert ran["process"]["exit_code"] == 0
+                status = _json(await session.call_tool("project__status", {}))
+                assert any(item["id"] == "cmake" for item in status["components"])
+
+    asyncio.run(exercise())
+    assert _tree_hashes(FIXTURE_ROOT) == committed_before
+
+
 @pytest.mark.skipif(not _portable_prerequisites(), reason="real portable D2 MCP gate requires installed CMake and Ninja")
 def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flow(tmp_path: Path) -> None:
     root = _copy_fixture(tmp_path)
@@ -143,11 +224,12 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     names = [tool.name for tool in (await session.list_tools()).tools]
                     assert len(names) == len(set(names))
                     assert set(names) == {entry.tool_name for entry in TOOL_ACCEPTANCE}
+                    collector = McpToolCallCollector("core_fixture")
                     visited: set[str] = set()
 
                     async def call(name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
                         visited.add(name)
-                        return _json(await session.call_tool(name, arguments or {}))
+                        return _json(await collector.call(session, name, arguments or {}))
 
                     await call("server_status")
                     await call("project__status")
@@ -235,6 +317,16 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                         if entry.subsystem in {"core", "cmake", "quality"}
                     }
                     assert mandatory <= visited
+                    observed = {
+                        entry.scenario_id: collector.called_tools
+                        for entry in TOOL_ACCEPTANCE
+                        if entry.subsystem in {"core", "cmake", "quality"}
+                    }
+                    validate_manifest(
+                        mandatory, registered_scenarios=observed, observed_calls=observed,
+                        available_capabilities=frozenset({"mcp_stdio", "cmake", "ninja"}),
+                        subsystems=frozenset({"core", "cmake", "quality"}),
+                    )
         text = errors.read_text(encoding="utf-8")
         assert str(root) not in text
 
@@ -523,7 +615,7 @@ def test_cpp_acceptance_fixture_real_debugger_all_tools_mcp_gate(tmp_path: Path)
                         return payload
 
                     async def expect_error(name: str, arguments: dict[str, object]) -> dict[str, object]:
-                        result = await session.call_tool(name, arguments)
+                        result = await collector.call(session, name, arguments)
                         payload = _json(result)
                         assert getattr(result, "isError") or "error" in payload, (name, payload)
                         return payload

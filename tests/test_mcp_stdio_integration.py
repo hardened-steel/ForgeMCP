@@ -204,10 +204,8 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
     assert str(tmp_path) not in server_errors
 
 
-@pytest.mark.skipif(
-    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
-    reason="opt-in real Windows MCP toolchain gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
-)
+@pytest.mark.msvc_live_mcp
+@pytest.mark.skipif(os.name != "nt", reason="capability_absent: MSVC discovery is Windows-only")
 def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_environment(
     tmp_path: Path,
 ):
@@ -326,10 +324,8 @@ def test_real_msvc_mcp_stdio_gate_uses_cli_configuration_without_forgemcp_enviro
     assert str(tmp_path) not in errors
 
 
-@pytest.mark.skipif(
-    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
-    reason="opt-in real Windows MCP progress gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
-)
+@pytest.mark.msvc_live_mcp
+@pytest.mark.skipif(os.name != "nt", reason="capability_absent: MSVC discovery is Windows-only")
 def test_real_windows_mcp_progress_heartbeat_exact_cancellation_and_recovery_gate(tmp_path: Path):
     """Prove live CMake output, request cancellation, recovery, and shutdown."""
     (tmp_path / "CMakeLists.txt").write_text(
@@ -430,10 +426,8 @@ def test_real_windows_mcp_progress_heartbeat_exact_cancellation_and_recovery_gat
     assert str(tmp_path) not in errors
 
 
-@pytest.mark.skipif(
-    os.name != "nt" or not os.environ.get("FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE"),
-    reason="opt-in real Windows Workspace/CMake/clangd coherence gate requires FORGEMCP_REAL_WINDOWS_TOOLCHAIN_GATE",
-)
+@pytest.mark.msvc_live_mcp
+@pytest.mark.skipif(os.name != "nt", reason="capability_absent: MSVC discovery is Windows-only")
 def test_real_windows_workspace_cmake_clangd_coherence_gate(tmp_path: Path):
     """Exercise the Phase B.1 contract through the official SDK client."""
     (tmp_path / "CMakeLists.txt").write_text(

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import json
+from pathlib import Path
+from threading import Lock
+from typing import Any
 
 LIVE_MCP = "live_mcp"
 FAKE_MCP = "fake_mcp"
@@ -40,8 +44,100 @@ class McpToolCallCollector:
         call_tool = getattr(session, "call_tool", None)
         if call_tool is None:
             raise AssertionError("MCP scenario has no SDK ClientSession.call_tool boundary")
+        # This deliberately wraps the SDK boundary, rather than a ForgeMCP
+        # handler or service.  ``tools/list`` is not a coverage event.
+        result = await call_tool(tool_name, arguments or {}, **kwargs)
         self.called_tools.add(tool_name)
-        return await call_tool(tool_name, arguments or {}, **kwargs)
+        _record_sdk_call(self.scenario_id, tool_name, result)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageRecord:
+    """One bounded real-MCP observation produced by a named fixture scenario."""
+
+    tool_name: str
+    scenario_id: str
+    capability_group: str
+    calls: int
+    meaningful_assertion_completed: bool
+    category: str
+
+
+_coverage_lock = Lock()
+_coverage: dict[tuple[str, str], CoverageRecord] = {}
+
+
+def _result_category(result: object) -> tuple[bool, str]:
+    """Classify the public result without retaining response text or paths."""
+    if bool(getattr(result, "isError", False)):
+        return False, "expected_error"
+    try:
+        content = getattr(result, "content")
+        text = getattr(content[0], "text") if len(content) == 1 else ""
+        payload = json.loads(text)
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            return False, "expected_error"
+    except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
+        # The SDK result itself was successfully received.  Individual
+        # scenarios assert its public structure before completing.
+        pass
+    return True, "success"
+
+
+def _record_sdk_call(scenario_root: str, tool_name: str, result: object) -> None:
+    entry = next((item for item in TOOL_ACCEPTANCE if item.tool_name == tool_name), None)
+    if entry is None:
+        raise AssertionError(f"SDK acceptance call has no manifest tool: {tool_name}")
+    meaningful, category = _result_category(result)
+    key = (entry.tool_name, entry.scenario_id)
+    with _coverage_lock:
+        previous = _coverage.get(key)
+        _coverage[key] = CoverageRecord(
+            tool_name=entry.tool_name,
+            scenario_id=entry.scenario_id,
+            capability_group=entry.subsystem,
+            calls=1 if previous is None else previous.calls + 1,
+            meaningful_assertion_completed=meaningful or bool(previous and previous.meaningful_assertion_completed),
+            category="success" if meaningful or (previous and previous.category == "success") else category,
+        )
+
+
+def coverage_records() -> tuple[CoverageRecord, ...]:
+    """Return only aggregate records; no response payload is retained."""
+    with _coverage_lock:
+        return tuple(sorted(_coverage.values(), key=lambda item: (item.tool_name, item.scenario_id)))
+
+
+def reset_coverage_records() -> None:
+    with _coverage_lock:
+        _coverage.clear()
+
+
+def write_coverage_report(destination: Path) -> None:
+    """Write the host-local, bounded machine-readable unified-run evidence."""
+    records = coverage_records()
+    if len(records) > len(TOOL_ACCEPTANCE):
+        raise AssertionError("Coverage has duplicate or orphan records")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "tool_count": len(TOOL_ACCEPTANCE),
+        "records": [
+            {
+                "tool_name": item.tool_name,
+                "scenario_id": item.scenario_id,
+                "capability_group": item.capability_group,
+                "real_mcp_calls": item.calls,
+                "meaningful_assertion_completed": item.meaningful_assertion_completed,
+                "category": item.category,
+            }
+            for item in records
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 64 * 1024:
+        raise AssertionError("Coverage report exceeds its fixed bound")
+    destination.write_text(encoded + "\n", encoding="utf-8")
 
 
 def _entries(subsystem: str, tools: Iterable[str], scenario: str, capabilities: frozenset[str], test: str) -> tuple[ToolAcceptance, ...]:

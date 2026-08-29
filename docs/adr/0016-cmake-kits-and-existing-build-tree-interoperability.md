@@ -69,3 +69,12 @@ rather than an automatic cache deletion or generator rewrite. Discovery and
 all read-only kit/resources/completion surfaces use cached state only. This is
 not a sandbox: trusted CMake configure/build still executes project logic and
 the selected compiler through CMake.
+
+D2.4 records an external configuration before the ForgeMCP session starts and
+hash-proves `cmake__list_build_trees` is read-only before adoption. Compatible
+Ninja trees with a CRLF cache are exercised through File API targets, build and
+CTest. Mismatched generators/driver modes/ABI/compiler families and malformed,
+stale, oversized, escaped, excluded, replaced or source-mismatched metadata are
+rejected without selecting a new kit, configuring, invoking a compiler, or
+disclosing cached executable paths. Adoption validates interoperability only;
+an IDE-owned tree is never a sandbox or trust grant.

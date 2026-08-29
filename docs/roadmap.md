@@ -95,18 +95,17 @@ irreversible choices belong in [adr/](adr/).
   safe configure/build diagnostics; kit resources, prompts, completions, CLI
   configuration, and operator doctor matrix. CMake Tools state/scripts remain
   intentionally unsupported; see ADR 0016.
-- ForgeMCP Stabilization Phase D2: permanent dependency-free C++ acceptance
-  fixture, disposable-workspace CMake/CTest/Quality live gates, and a
-  version-controlled real-MCP tool-surface inventory/matrix. Phase C and D
-  still await one combined final audit; this fixture is its evidence base.
+- ForgeMCP Stabilization Phase D2.4: one-switch production-discovery live
+  acceptance, host-local 66-tool SDK evidence, external build-tree adoption,
+  and Phase C discovery/progress/disclosure gates on a disposable C++ fixture.
 
 ### In progress
 
 - Real LLVM feature gates remain portable conditional tests on hosts without
   separately installed qualified tools.
-- The D2 Windows MSVC and full LLVM/DWARF debugger acceptance paths remain in
-  the combined Phase C+D audit queue; neither implies an MSVC/PDB debugger
-  compatibility claim.
+- The host-qualified runner invokes MSVC for a ready MSVC kit and standalone
+  LLVM/DWARF debugger gates only for a qualified chain; it adds no MSVC/PDB
+  debugger compatibility claim.
 
 ## Delivery sequence and dependencies
 

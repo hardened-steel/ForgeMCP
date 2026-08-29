@@ -49,3 +49,8 @@ failure, timeout, and cancellation never claim false completion. No resources,
 prompts, completion, Git integration, arbitrary CTest options/regex, or raw
 compiler-output MCP API is introduced. Exact percentage remains generator and
 format dependent; MSBuild and unknown output use activity heartbeats.
+
+D2.4 exercises numeric-zero and string tokens, no-token calls, request
+isolation, exact/heartbeat parsing, slow/failing transport, and
+timeout/cancellation through SDK stdio. This is acceptance evidence only:
+progress cannot extend a deadline or change a tool result.

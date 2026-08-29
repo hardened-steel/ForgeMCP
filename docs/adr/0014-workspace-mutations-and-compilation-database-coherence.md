@@ -75,3 +75,8 @@ fallback command inference. Raw `compile_commands.json` remains trusted
 project input for native tooling, not a sandbox boundary. Resources, prompts,
 completion, external watching, Git, arbitrary filesystem access, binary edits,
 and unrestricted writes remain out of scope.
+
+D2.4 treats an externally created compilation database as untrusted project
+input: adoption validates bounded metadata and containment but never returns a
+compile command, compiler path, argv, or source text. Read-only discovery does
+not configure or mutate the existing tree.
