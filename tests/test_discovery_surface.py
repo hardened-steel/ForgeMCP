@@ -519,6 +519,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         "forgemcp://cmake/kits",
                         "forgemcp://git/status",
                         "forgemcp://logs/recent",
+                        "ui://forgemcp/git/status",
                     } <= uris
                     templates = await session.list_resource_templates()
                     template_uris = {template.uriTemplate for template in templates.resourceTemplates}

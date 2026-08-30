@@ -60,6 +60,18 @@ class DuplicateResourceUriError(PluginRegistrationError):
     """Two registered static resources use the same public URI."""
 
 
+class DuplicateAppResourceUriError(PluginRegistrationError):
+    """Two registered MCP App resources use the same ui:// URI."""
+
+
+class DuplicateToolAppBindingError(PluginRegistrationError):
+    """Two App contributions try to bind the same public tool."""
+
+
+class MissingAppResourceError(PluginRegistrationError):
+    """An App binding references an unavailable resource or public tool."""
+
+
 class DuplicateResourceTemplateError(PluginRegistrationError):
     """Two registered resource templates use the same URI template."""
 

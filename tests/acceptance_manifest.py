@@ -257,6 +257,13 @@ _CORE = ("server_status", "project__status", "workspace__list_files", "workspace
 _CMAKE = ("cmake__status", "cmake__list_kits", "cmake__select_kit", "cmake__list_build_trees", "cmake__list_presets", "cmake__configure", "cmake__list_targets", "cmake__build", "cmake__ctest_list_tests", "cmake__ctest_run")
 _QUALITY = ("quality__status", "clang_format__check", "clang_format__apply", "clang_tidy__list_checks", "clang_tidy__run", "sanitizer__parse_report")
 _GIT = ("git__status", "git__diff", "git__log", "git__show_commit", "git__blame", "git__list_branches")
+MCP_APP_RESOURCE_INVENTORY = (
+    {
+        "tool_name": "git__status",
+        "uri": "ui://forgemcp/git/status",
+        "mime_type": "text/html;profile=mcp-app",
+    },
+)
 _CLANGD = ("clangd__status", "clangd__start", "clangd__stop", "clangd__diagnostics", "clangd__hover", "clangd__definition", "clangd__references", "clangd__document_symbols", "clangd__workspace_symbols", "clangd__completion", "clangd__signature_help", "clangd__declaration", "clangd__type_definition", "clangd__implementation", "clangd__prepare_rename", "clangd__rename", "clangd__code_actions", "clangd__apply_code_action", "clangd__format_document", "clangd__format_range", "clangd__prepare_call_hierarchy", "clangd__incoming_calls", "clangd__outgoing_calls", "clangd__prepare_type_hierarchy", "clangd__supertypes", "clangd__subtypes", "clangd__switch_source_header")
 _DEBUGGER = ("debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop", "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over", "debugger__step_in", "debugger__step_out", "debugger__threads", "debugger__stack_trace", "debugger__scopes", "debugger__variables", "debugger__evaluate", "debugger__events")
 

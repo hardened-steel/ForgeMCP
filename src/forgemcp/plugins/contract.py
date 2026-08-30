@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from forgemcp.core.config import ForgeConfig
+    from forgemcp.plugins.apps import PluginAppRegistry
     from forgemcp.plugins.surface import (
         PluginCompletionRegistry,
         PluginPromptRegistry,
@@ -112,6 +113,7 @@ class PluginContext:
     resource_templates: PluginResourceTemplateRegistry
     prompts: PluginPromptRegistry
     completions: PluginCompletionRegistry
+    apps: PluginAppRegistry
 
 
 class ForgePlugin(ABC):

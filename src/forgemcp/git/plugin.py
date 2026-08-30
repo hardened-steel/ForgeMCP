@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from importlib.resources import files
 from typing import Literal
 
 from pydantic import Field, ValidationError, model_validator
@@ -31,6 +32,9 @@ from forgemcp.plugins import (
     PromptContribution,
     PromptMessage,
     ResourceContribution,
+    AppCsp,
+    AppResourceContribution,
+    ToolAppBinding,
     ToolContribution,
     ToolHints,
 )
@@ -41,6 +45,7 @@ from forgemcp.workspace import WorkspaceMutationBatch, WorkspaceMutationBus, Wor
 
 
 GIT_STATUS_URI = "forgemcp://git/status"
+GIT_STATUS_APP_URI = "ui://forgemcp/git/status"
 GIT_REVIEW_PROMPT = "forgemcp_review_changes"
 
 
@@ -176,6 +181,7 @@ class GitPlugin(ForgePlugin):
         self._mutation_subscription = mutations.subscribe("git", self._on_workspace_mutation)
         self._register_tools(context)
         self._register_surface(context)
+        self._register_status_app(context)
 
     async def stop(self) -> None:
         if self._mutation_subscription is not None:
@@ -231,6 +237,27 @@ class GitPlugin(ForgePlugin):
                 argument=argument,
                 provider=(lambda _request, fixed=values, kind=argument: fixed if fixed is not None else self.service.cached_completion_values(kind)),
             ))
+
+    @staticmethod
+    def _register_status_app(context: PluginContext) -> None:
+        """Register the immutable package asset without exposing a filesystem path."""
+        try:
+            html = files("forgemcp.apps.assets").joinpath("git-status.html").read_text(encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+            raise RuntimeError("Git Status App asset is unavailable.") from error
+        context.apps.register_resource(AppResourceContribution(
+            uri=GIT_STATUS_APP_URI,
+            name="forgemcp_git_status_app",
+            description="Interactive read-only Git status dashboard.",
+            html=html,
+            csp=AppCsp(
+                connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=(),
+            ),
+            prefers_border=True,
+        ))
+        context.apps.bind_tool(ToolAppBinding(
+            tool_name="git__status", resource_uri=GIT_STATUS_APP_URI, visibility=("model", "app"),
+        ))
 
     async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: object) -> object:
         try:

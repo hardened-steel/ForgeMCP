@@ -23,6 +23,7 @@ forgemcp = "forgemcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/forgemcp"]
+include = ["src/forgemcp/apps/assets/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

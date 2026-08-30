@@ -39,7 +39,10 @@ from forgemcp.core.errors import ConfigurationError
 from forgemcp.core.logging import LOG_LEVELS, StructuredLogEvent, StructuredLogger
 from forgemcp.discovery import SERVER_INSTRUCTIONS
 from forgemcp.plugins import (
+    AppRegistry,
     CompletionReferenceKind,
+    MCP_APPS_EXTENSION_ID,
+    MCP_APP_HTML_MIME_TYPE,
     CompletionRequest,
     DiscoverySurfaceRegistry,
     NoOpProgressReporter,
@@ -289,9 +292,10 @@ def create_server(
         try:
             await application.start()
             plugins = application.services.get("plugins")
-            _register_contributed_tools(mcp, plugins.tools)
+            _register_contributed_tools(mcp, plugins.tools, plugins.apps)
             if not surface_registered:
                 _register_contributed_surface(mcp, plugins.surface)
+                _register_contributed_apps(mcp, plugins.apps)
                 surface_registered = True
             yield application
         finally:
@@ -313,7 +317,18 @@ def create_server(
     # FastMCP 1.x otherwise reports the MCP SDK distribution version. This is
     # the only SDK identity bridge; project metadata remains transport-neutral.
     mcp._mcp_server.version = __version__  # type: ignore[attr-defined]
-    _omit_empty_experimental_capability(mcp)
+    _install_sdk1_apps_compatibility_adapter(mcp)
+
+    @mcp._mcp_server.list_tools()  # type: ignore[attr-defined]
+    async def tools_for_connection() -> list[mcp_types.Tool]:
+        """Project static tool definitions to the request's negotiated UI support."""
+        tools = await mcp.list_tools()
+        if _connection_supports_mcp_apps(mcp):
+            return tools
+        return [
+            tool.model_copy(update={"meta": None}) if _is_app_tool_metadata(tool.meta) else tool
+            for tool in tools
+        ]
 
     @mcp.completion()
     async def complete(
@@ -376,18 +391,62 @@ def create_server(
     return mcp
 
 
-def _omit_empty_experimental_capability(mcp: FastMCP[ForgeApplication]) -> None:
-    """Adapt SDK 1.x's empty-dict default to an absent optional capability."""
+def _install_sdk1_apps_compatibility_adapter(mcp: FastMCP[ForgeApplication]) -> None:
+    """Expose the stable Apps extension until a future SDK 2.x migration.
+
+    MCP Python SDK 1.x preserves unknown generic ``_meta`` fields but has no
+    typed ``ServerCapabilities.extensions`` member or App registration API.
+    This deliberately small adapter changes only initialization serialization;
+    it does not alter SDK models or retain connection capability state. Remove
+    it when the SDK exposes the stable Apps APIs directly.
+    """
     server = mcp._mcp_server  # type: ignore[attr-defined]
     original = server.get_capabilities
 
     def get_capabilities(self, notification_options, experimental_capabilities):
         capabilities = original(notification_options, experimental_capabilities)
+        updates: dict[str, object] = {
+            "extensions": {MCP_APPS_EXTENSION_ID: {}},
+        }
         if not capabilities.experimental:
-            return capabilities.model_copy(update={"experimental": None})
-        return capabilities
+            updates["experimental"] = None
+        return capabilities.model_copy(update=updates)
 
     server.get_capabilities = MethodType(get_capabilities, server)
+
+
+def client_supports_mcp_apps(capabilities: object) -> bool:
+    """Return whether one client declares support for the static App MIME type."""
+    if isinstance(capabilities, Mapping):
+        raw_extensions = capabilities.get("extensions")
+    else:
+        raw_extensions = getattr(capabilities, "extensions", None)
+        if raw_extensions is None:
+            extra = getattr(capabilities, "model_extra", None)
+            raw_extensions = extra.get("extensions") if isinstance(extra, Mapping) else None
+    if not isinstance(raw_extensions, Mapping):
+        return False
+    ui_capabilities = raw_extensions.get(MCP_APPS_EXTENSION_ID)
+    if not isinstance(ui_capabilities, Mapping):
+        return False
+    mime_types = ui_capabilities.get("mimeTypes")
+    return isinstance(mime_types, (list, tuple)) and MCP_APP_HTML_MIME_TYPE in mime_types
+
+
+def _connection_supports_mcp_apps(mcp: FastMCP[ForgeApplication]) -> bool:
+    """Read one SDK 1.x connection capability object without retaining it globally."""
+    try:
+        session = mcp._mcp_server.request_context.session  # type: ignore[attr-defined]
+    except (LookupError, ValueError):
+        return False
+    # SDK 1.x has no public extensions accessor on ServerSession. Keep this
+    # read-only compatibility lookup here with the initialization adapter.
+    parameters = getattr(session, "_client_params", None)
+    return client_supports_mcp_apps(getattr(parameters, "capabilities", None))
+
+
+def _is_app_tool_metadata(meta: object) -> bool:
+    return isinstance(meta, Mapping) and isinstance(meta.get("ui"), Mapping) and "resourceUri" in meta["ui"]
 
 
 def _current_application(mcp: FastMCP[ForgeApplication]) -> ForgeApplication:
@@ -407,7 +466,7 @@ def _surface_registry(application: ForgeApplication) -> DiscoverySurfaceRegistry
 
 
 def _register_contributed_tools(
-    mcp: FastMCP[ForgeApplication], registry: ToolRegistry
+    mcp: FastMCP[ForgeApplication], registry: ToolRegistry, apps: AppRegistry
 ) -> None:
     """Adapt transport-neutral contributions after plugin startup, never exposing FastMCP to them."""
     for contribution in registry.contributions():
@@ -418,7 +477,13 @@ def _register_contributed_tools(
             idempotentHint=hints.idempotent,
             openWorldHint=hints.open_world,
         )
-        mcp.tool(name=contribution.name, description=contribution.description, annotations=annotations)(
+        binding = apps.binding_for(contribution.name)
+        mcp.tool(
+            name=contribution.name,
+            description=contribution.description,
+            annotations=annotations,
+            meta=None if binding is None else binding.tool_meta(),
+        )(
             _tool_adapter(contribution)
         )
 
@@ -449,6 +514,25 @@ def _register_contributed_surface(
         mcp.prompt(name=contribution.name, description=contribution.description)(
             _prompt_adapter(mcp, contribution.name, contribution.arguments)
         )
+
+
+def _register_contributed_apps(mcp: FastMCP[ForgeApplication], registry: AppRegistry) -> None:
+    """Register static ui:// resources after transport-neutral validation."""
+    for contribution in registry.resources():
+        mcp.resource(
+            contribution.uri,
+            name=contribution.name,
+            description=contribution.description,
+            mime_type=MCP_APP_HTML_MIME_TYPE,
+            meta=contribution.resource_meta(),
+        )(_app_resource_adapter(contribution.html))
+
+
+def _app_resource_adapter(html: str):
+    async def static_app_resource() -> str:
+        return html
+
+    return static_app_resource
 
 
 def _resource_adapter(mcp: FastMCP[ForgeApplication], uri: str):

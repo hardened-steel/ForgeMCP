@@ -59,7 +59,10 @@ UX Stabilization Phase C also exposes application-scoped discovery data:
   `forgemcp_diagnose_build`, `forgemcp_analyze_file`, and
   `forgemcp_debug_target`, plus `forgemcp_review_changes`.
 
-Every resource is versioned bounded `application/json`. Project-controlled
+Every discovery resource is versioned bounded `application/json`. The Git
+Status App separately exposes the static `ui://forgemcp/git/status` resource as
+`text/html;profile=mcp-app`; it carries no project data and is rendered only by
+clients that negotiate the stable MCP Apps extension. Project-controlled
 filenames, targets, test names, and safe log metadata are untrusted JSON data,
 not instructions. Resources never return source text, patch text, raw process
 output, diagnostic messages, argv/environment, absolute paths, PIDs, handles,
@@ -460,6 +463,7 @@ advertised in Phase C: SDK 1.x reports `subscribe=false`, and ForgeMCP does not
 add an ad-hoc subscription transport.
 
 Connection Info should show Tools, Resources, Prompts, Logging, and Completions;
+it also advertises `extensions.io.modelcontextprotocol/ui={}` for MCP Apps.
 Tasks remain unsupported and Experimental is absent. ForgeMCP intentionally
 uses the SDK-supported legacy `2025-11-25` stdio protocol. “Legacy” describes
 the protocol era and is not an initialization error; ForgeMCP does not layer a
@@ -493,8 +497,11 @@ the environment form is the simplest ad-hoc Windows example:
 ```powershell
 $env:FORGEMCP_WORKSPACE = "C:\src\demo"
 npx @modelcontextprotocol/inspector forgemcp
-npx @modelcontextprotocol/inspector --cli forgemcp --method resources/list
-npx @modelcontextprotocol/inspector --cli forgemcp --method prompts/list
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method resources/list
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method prompts/list
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method tools/call --tool-name git__status --app-info
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method resources/read --uri ui://forgemcp/git/status --format json
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method tools/call --tool-name git__status --format json
 ```
 
 The Inspector can exercise resources, prompts, completion, and logging even if
@@ -554,18 +561,57 @@ project data, not instructions. Git is not a sandbox, and Phase 1 performs no
 network operation. `project__status` consumes only the cached scalar Git
 summary and never probes Git.
 
+### Git Status MCP App
+
+Apps-capable hosts which declare
+`extensions.io.modelcontextprotocol/ui.mimeTypes=["text/html;profile=mcp-app"]`
+receive nested metadata on `git__status`:
+
+```json
+{
+  "_meta": {
+    "ui": {
+      "resourceUri": "ui://forgemcp/git/status",
+      "visibility": ["model", "app"]
+    }
+  }
+}
+```
+
+The resource uses the exact App MIME, explicit empty CSP domain lists, omitted
+permissions/domain, and `prefersBorder=true`. It renders repository state,
+bounded HEAD, divergence/counts, warnings, and grouped safe-text file rows with
+All/Staged/Modified/Untracked/Conflicted filters. Refresh calls only
+`git__status`; there are no App-only writes. Hosts without the extension retain
+the unmodified plain tool schema, structured content, and textual fallback.
+
+The checked-in source and offline build are under `frontend/git-status`. Node
+is not a ForgeMCP runtime dependency:
+
+```powershell
+Push-Location frontend\git-status
+npm run build
+npm test
+Pop-Location
+```
+
+`npm run build` regenerates `src/forgemcp/apps/assets/git-status.html`; the
+embedded source SHA-256 makes drift fail the frontend test. See
+[ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md).
+
 ## Core structure
 
 - `core/config.py` — typed runtime configuration and workspace-root validation.
 - `core/services.py` — explicit dependency registry for future modules.
 - `core/application.py` — application composition, lifecycle, and server status.
-- `plugins/` — versioned feature-plugin contract, lifecycle manager, bounded tool/resource/prompt/completion registries, and opt-in entry-point discovery.
+- `plugins/` — versioned feature-plugin contract, lifecycle manager, bounded tool/resource/prompt/completion/App registries, and opt-in entry-point discovery.
 - `discovery/` — static server instructions, safe workflow prompts, about/log resources, and completion declarations.
 - `cmake/` — built-in CMake/Ctest feature plugin, CMake-owned models, and File API parsing.
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
 - `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
 - `quality/` — clang-format CAS edits, read-only clang-tidy diagnostics, and sanitizer report parsing.
 - `git/` — bounded porcelain/protocol parsing, fixed read-only Git service, and GitPlugin MCP contributions.
+- `apps/assets/` — immutable built MCP App HTML loaded from package resources, never workspace paths.
 - `project/` — strict status models, provider registry, health/activity aggregation, and ProjectPlugin contribution.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — application-scoped sanitized fan-out, JSON stderr sink, and bounded recent-log ring.

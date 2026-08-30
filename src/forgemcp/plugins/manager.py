@@ -24,6 +24,7 @@ from forgemcp.plugins.errors import (
     PluginStartError,
 )
 from forgemcp.plugins.tools import PluginToolRegistry, ToolRegistry
+from forgemcp.plugins.apps import AppRegistry, PluginAppRegistry
 from forgemcp.plugins.surface import (
     DiscoverySurfaceRegistry,
     PluginCompletionRegistry,
@@ -82,6 +83,7 @@ class PluginManager:
         self._capability_owners: dict[str, str] = {}
         self._tools = ToolRegistry()
         self._surface = DiscoverySurfaceRegistry()
+        self._apps = AppRegistry()
         self._started_ids: list[str] = []
         self._external_discovery_done = False
         self._closed = False
@@ -95,6 +97,11 @@ class PluginManager:
     def surface(self) -> DiscoverySurfaceRegistry:
         """Return the application-owned non-tool contribution registry."""
         return self._surface
+
+    @property
+    def apps(self) -> AppRegistry:
+        """Return application-owned MCP App resource and tool bindings."""
+        return self._apps
 
     def register_builtin(self, plugin: ForgePlugin) -> None:
         """Explicitly register a trusted plugin composed by ForgeMCP itself."""
@@ -177,6 +184,7 @@ class PluginManager:
                 resource_templates=PluginResourceTemplateRegistry(plugin_id, self._surface),
                 prompts=PluginPromptRegistry(plugin_id, self._surface),
                 completions=PluginCompletionRegistry(plugin_id, self._surface),
+                apps=PluginAppRegistry(plugin_id, self._apps),
             )
             try:
                 await record.plugin.start(context)
@@ -185,6 +193,7 @@ class PluginManager:
                 record.error = type(error).__name__
                 self._tools.unregister_plugin(plugin_id)
                 self._surface.unregister_plugin(plugin_id)
+                self._apps.unregister_plugin(plugin_id)
                 try:
                     # start() may already have registered status providers or
                     # acquired other application-scoped resources. Give the
@@ -199,10 +208,19 @@ class PluginManager:
                     )
                 await self._rollback_started()
                 await self._surface.aclose()
+                await self._apps.aclose()
                 self._closed = True
                 raise PluginStartError(f"Plugin failed to start: {plugin_id}") from error
             record.state = PluginState.RUNNING
             self._started_ids.append(plugin_id)
+        try:
+            self._apps.validate(contribution.name for contribution in self._tools.contributions())
+        except Exception as error:
+            await self._rollback_started()
+            await self._surface.aclose()
+            await self._apps.aclose()
+            self._closed = True
+            raise PluginStartError("MCP App contribution validation failed.") from error
 
     async def aclose(self) -> None:
         """Stop every successfully started plugin in reverse start order exactly once."""
@@ -211,6 +229,7 @@ class PluginManager:
         self._closed = True
         await self._rollback_started()
         await self._surface.aclose()
+        await self._apps.aclose()
 
     def _resolve_start_order(self) -> tuple[str, ...]:
         """Validate graph/service dependencies and return a stable Kahn ordering."""
@@ -273,3 +292,4 @@ class PluginManager:
             finally:
                 self._tools.unregister_plugin(plugin_id)
                 self._surface.unregister_plugin(plugin_id)
+                self._apps.unregister_plugin(plugin_id)

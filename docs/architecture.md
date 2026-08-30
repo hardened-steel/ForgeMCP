@@ -78,6 +78,15 @@ all of that plugin's contribution kinds before reverse dependency rollback.
 Normal shutdown unregisters them in reverse lifecycle order and closes the
 application registry. There is no global mutable registry.
 
+MCP Apps Phase 1 adds a parallel transport-neutral App registry with
+`AppResourceContribution` and `ToolAppBinding`. Static App resources have
+unique `ui://` URIs, immutable bounded HTML, explicit CSP/permission/domain/
+border metadata, and plugin ownership; one binding links an existing qualified
+tool name to one registered App resource and declares `model`/`app` visibility.
+The registry validates every reference after startup, removes contributions on
+failed-start rollback and reverse shutdown, and has no connection state. Git
+uses this only to bind `git__status` to `ui://forgemcp/git/status`.
+
 The discovery registry admits at most 128 static resources, 128 templates, 128
 prompts, and 256 completion providers. Resource reads share an eight-slot gate,
 have a two-second cooperative deadline, and produce at most 256 KiB UTF-8.
@@ -407,7 +416,8 @@ Running configure, build, or tests is not sandboxing: CMake project scripts, cus
 
 `forgemcp.git` is a builtin transport-neutral feature plugin. `GitService`
 owns the fixed read-only Git grammar and immutable Pydantic response models;
-`GitPlugin` contributes six tools, `forgemcp://git/status`, the
+`GitPlugin` contributes six tools, `forgemcp://git/status`, the static
+`ui://forgemcp/git/status` App, the
 `forgemcp_review_changes` prompt, and cached legacy prompt completions. No
 FastMCP type, public `Path`, Git config value, gitdir path, raw argv, or raw
 process output crosses this boundary.
@@ -472,7 +482,12 @@ Initialization contains a static 904-byte instruction string whose first 512
 characters contain the complete trust/workflow summary. Capabilities are
 handler-derived: Tools, Resources, Prompts, Logging, and Completions are present;
 Tasks and empty Experimental are absent. The supported wire protocol remains
-SDK 1.x legacy `2025-11-25` stdio.
+SDK 1.x legacy `2025-11-25` stdio. Apps Phase 1 adds the stable
+`capabilities.extensions.io.modelcontextprotocol/ui={}` wire extension, never
+`experimental`. SDK 1.x has no typed Apps capability surface, so `server.py`
+holds the isolated temporary initialization and current-request capability
+adapter described in ADR 0018. It accepts UI behavior only when a connection
+declares `text/html;profile=mcp-app`; no capability state crosses connections.
 
 The versioned JSON resources are `forgemcp://about`,
 `forgemcp://project/status`, `forgemcp://workspace/files`,
@@ -486,6 +501,15 @@ non-transactional. CMake target profiles are opaque 10-minute application-local
 IDs for cached already-validated File API models; reads never configure, create
 a query, or run a process. Target resources expose only bounded name/type and
 validated workspace-relative artifact data.
+
+The sole App resource is `ui://forgemcp/git/status` with exact MIME
+`text/html;profile=mcp-app`. It is a package asset read with
+`importlib.resources` during Git plugin composition, never from the current
+directory or workspace. Resource metadata has empty `connectDomains`,
+`resourceDomains`, `frameDomains`, and `baseUriDomains`, omits permissions and
+domain, and requests a border. The static view receives only ordinary
+`git__status` tool results, renders untrusted branch/path values with
+`textContent`, and Refresh calls only `git__status` through the host bridge.
 
 The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
 messages and never invoke tools. Bounded project identifiers occupy a separate

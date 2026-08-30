@@ -11,6 +11,8 @@ from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
 from forgemcp.core.services import ServiceRegistry
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     DuplicateCapabilityError,
     DuplicatePluginIdError,
     DuplicateToolNameError,
@@ -25,6 +27,7 @@ from forgemcp.plugins import (
     PluginStartError,
     PluginState,
     ToolContribution,
+    ToolAppBinding,
     ToolRegistry,
 )
 
@@ -43,6 +46,7 @@ class RecordingPlugin(ForgePlugin):
         api_version: str = "1",
         fail_start: bool = False,
         register_tool: bool = False,
+        register_app: bool = False,
     ) -> None:
         super().__init__(
             PluginMetadata(
@@ -56,6 +60,7 @@ class RecordingPlugin(ForgePlugin):
         self._events = events
         self._fail_start = fail_start
         self._register_tool = register_tool
+        self._register_app = register_app
         self.context: PluginContext | None = None
 
     async def start(self, context: PluginContext) -> None:
@@ -65,6 +70,16 @@ class RecordingPlugin(ForgePlugin):
             context.tools.register(
                 ToolContribution(name="inspect", description="Inspect a configured feature.", handler=lambda _: {})
             )
+        if self._register_app:
+            resource = AppResourceContribution(
+                uri="ui://example/inspect",
+                name="example_inspect",
+                description="A bounded static test App.",
+                html="<!doctype html><html><body>test</body></html>",
+                csp=AppCsp(),
+            )
+            context.apps.register_resource(resource)
+            context.apps.bind_tool(ToolAppBinding("alpha__inspect", resource.uri))
         if self._fail_start:
             raise RuntimeError("expected startup failure")
 
@@ -177,7 +192,7 @@ def test_tool_registry_uses_plugin_namespace_and_rejects_duplicates():
 def test_start_failure_rolls_back_already_started_plugins_and_tools(tmp_path):
     manager, _ = manager_for(tmp_path)
     events: list[str] = []
-    manager.register_builtin(RecordingPlugin("alpha", events, register_tool=True))
+    manager.register_builtin(RecordingPlugin("alpha", events, register_tool=True, register_app=True))
     manager.register_builtin(RecordingPlugin("beta", events, requires=("alpha",), fail_start=True))
 
     with pytest.raises(PluginStartError, match="beta"):
@@ -185,6 +200,8 @@ def test_start_failure_rolls_back_already_started_plugins_and_tools(tmp_path):
 
     assert events == ["start:alpha", "start:beta", "stop:beta", "stop:alpha"]
     assert manager.tools.contributions() == ()
+    assert manager.apps.resources() == ()
+    assert manager.apps.bindings() == ()
     statuses = {status.plugin_id: status for status in manager.statuses()}
     assert statuses["alpha"].state is PluginState.STOPPED
     assert statuses["beta"].state is PluginState.FAILED
