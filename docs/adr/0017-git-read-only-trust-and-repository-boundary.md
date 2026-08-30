@@ -21,16 +21,23 @@ selection never falls back. A selection is a canonical regular file outside the
 workspace without symlink/reparse traversal; ProcessRuntime rechecks captured
 metadata at every launch. Git is invoked only by ProcessRuntime with
 `shell=False`, a scrubbed non-interactive environment, `--no-optional-locks`,
-no pager, fsmonitor disabled, credential helper disabled, and fixed diff
-controls. Patches disable external diff and textconv. Raw output and all
-project-controlled Git strings are excluded from logs/status.
+no pager, fsmonitor disabled, credential helper disabled, lazy fetch disabled,
+and fixed diff controls. Patches disable external diff and textconv. Raw output
+and all project-controlled Git strings are excluded from logs/status.
 
 The worktree root reported by Git must equal `ForgeConfig.workspace_root`.
-Linked worktrees are permitted even when their internal gitdir is outside the
-workspace, because the gitdir remains metadata and is never disclosed. Every
-reported path is independently validated through WorkspaceService. Protocol
-parsers fail closed on malformed, replacement-decoded, contradictory,
-oversized, or truncated structured data.
+The workspace `.git` entry is independently validated before every operational
+Git argv. A normal repository needs a regular, non-reparse `.git` directory.
+For a linked worktree, the regular non-reparse `.git` file must point to a
+canonical admin directory exactly under `<common-git-dir>/worktrees/<name>`;
+its `commondir` and reverse `gitdir` pointer must in turn lead back to that
+exact workspace `.git` file. Administrative paths remain private. Any malformed
+or replaced entry fails closed. A non-empty `objects/info/alternates` file is
+also rejected, rather than granting reads from a second object store. This
+allows Git's explicitly qualified common object store for linked worktrees but
+does not allow arbitrary alternates. Every reported path is independently
+validated through WorkspaceService. Protocol parsers fail closed on malformed,
+replacement-decoded, contradictory, oversized, or truncated structured data.
 
 ## Consequences
 

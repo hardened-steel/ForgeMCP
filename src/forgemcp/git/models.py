@@ -110,6 +110,10 @@ class GitLogResult(ForgeModel):
 
 
 class GitShowCommitResult(ForgeModel):
+    # A patch is an intentional byte-derived disclosure; preserve its leading
+    # and trailing whitespace exactly as Git produced it.
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, str_strip_whitespace=False)
+
     commit: GitCommit
     patch: str = Field(max_length=MAX_GIT_PATCH_CHARACTERS)
     patch_truncated: bool

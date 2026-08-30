@@ -11,7 +11,14 @@ from pydantic import Field, ValidationError, model_validator
 
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.git.errors import GitRequestError
-from forgemcp.git.models import GitStatus
+from forgemcp.git.models import (
+    GitBlameResult,
+    GitBranchList,
+    GitDiffResult,
+    GitLogResult,
+    GitShowCommitResult,
+    GitStatus,
+)
 from forgemcp.git.service import GitService
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
@@ -184,16 +191,17 @@ class GitPlugin(ForgePlugin):
 
     def _register_tools(self, context: PluginContext) -> None:
         tools = (
-            ("status", "Refresh bounded porcelain-v2 Git status for the configured workspace without changing repository state.", _EmptyArguments, self._status),
-            ("diff", "Return a bounded read-only staged or unstaged patch with external diff and text conversion disabled.", _DiffArguments, self._diff),
-            ("log", "Return bounded local commit metadata using an opaque application-local cursor.", _LogArguments, self._log),
-            ("show_commit", "Show only one exact full Git object identifier with bounded metadata and a read-only patch.", _ShowCommitArguments, self._show_commit),
-            ("blame", "Return bounded line-to-commit attribution for one workspace UTF-8 text file without duplicating source text.", _BlameArguments, self._blame),
-            ("list_branches", "List bounded local branches from local metadata only; no remote/network operation occurs.", _EmptyArguments, self._list_branches),
+            ("status", "Refresh bounded porcelain-v2 Git status for the configured workspace without changing repository state.", _EmptyArguments, GitStatus, self._status),
+            ("diff", "Return a bounded read-only staged or unstaged patch with external diff and text conversion disabled.", _DiffArguments, GitDiffResult, self._diff),
+            ("log", "Return bounded local commit metadata using an opaque application-local cursor.", _LogArguments, GitLogResult, self._log),
+            ("show_commit", "Show only one exact full Git object identifier with bounded metadata and a read-only patch.", _ShowCommitArguments, GitShowCommitResult, self._show_commit),
+            ("blame", "Return bounded line-to-commit attribution for one workspace UTF-8 text file without duplicating source text.", _BlameArguments, GitBlameResult, self._blame),
+            ("list_branches", "List bounded local branches from local metadata only; no remote/network operation occurs.", _EmptyArguments, GitBranchList, self._list_branches),
         )
-        for name, description, model, operation in tools:
+        for name, description, model, output_type, operation in tools:
             context.tools.register(ToolContribution(
                 name=name, description=description, input_model=model,
+                output_type=output_type,
                 hints=ToolHints(read_only=True, destructive=False, idempotent=True, open_world=False),
                 handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op),
             ))
@@ -224,7 +232,7 @@ class GitPlugin(ForgePlugin):
                 provider=(lambda _request, fixed=values, kind=argument: fixed if fixed is not None else self.service.cached_completion_values(kind)),
             ))
 
-    async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: object) -> dict[str, object]:
+    async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: object) -> object:
         try:
             request = model.model_validate(arguments)
         except ValidationError:
@@ -233,7 +241,10 @@ class GitPlugin(ForgePlugin):
             result = await operation(request)  # type: ignore[operator]
         except ForgeMCPError as error:
             return to_mcp_error_response(error).as_dict()
-        return result.model_dump(mode="json")
+        # Preserve the declared Pydantic result at the SDK boundary so FastMCP
+        # can validate and emit the published strict output schema instead of
+        # treating the payload as an untyped JSON blob.
+        return result
 
     async def _status(self, _: ForgeModel) -> GitStatus:
         return await self.service.status()

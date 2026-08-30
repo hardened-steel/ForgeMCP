@@ -83,7 +83,7 @@ def _known_llvm_quality_tools(environment: Mapping[str, str]) -> tuple[Path, ...
 _FIXED_QUALITY_EXECUTABLES = ("clang-format", "clang-tidy")
 _GIT_ENVIRONMENT_KEYS = frozenset({
     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS",
-    "GIT_TERMINAL_PROMPT",
+    "GIT_TERMINAL_PROMPT", "GIT_NO_LAZY_FETCH",
 })
 
 
@@ -867,6 +867,11 @@ class ProcessRuntime:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_TERMINAL_PROMPT": "0",
+                # A promisor/partial clone is allowed to make ordinary object
+                # lookups invoke an implicit fetch.  Git Intelligence is a
+                # local-only capability, so a missing object must fail rather
+                # than consulting any remote or remote helper.
+                "GIT_NO_LAZY_FETCH": "1",
             },
             environment_mode=ProcessEnvironmentMode.SCRUBBED,
             require_exact_executable=True,

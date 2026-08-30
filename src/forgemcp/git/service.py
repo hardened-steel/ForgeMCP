@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from forgemcp.core.config import ForgeConfig
 from forgemcp.git.errors import GitOutputError, GitRequestError, GitUnavailableError
@@ -34,6 +36,7 @@ from forgemcp.git.models import (
 )
 from forgemcp.models import ProcessResult
 from forgemcp.processes import ProcessError
+from forgemcp.processes.policy import _contains_link_or_reparse_point
 from forgemcp.toolchain import ToolchainDiscoveryService
 from forgemcp.workspace import WorkspaceError, WorkspaceService
 
@@ -44,6 +47,10 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _MAX_CURSOR_CACHE = 32
 _MAX_CACHED_BRANCHES = 128
 _MAX_CACHED_PATHS = 128
+_MAX_GIT_METADATA_FILE_BYTES = 16 * 1024
+_MAX_GIT_ALTERNATES_BYTES = 64 * 1024
+_CURSOR_TTL = timedelta(minutes=10)
+_OBJECT_FORMAT_OID_LENGTH = {"sha1": 40, "sha256": 64}
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,30 @@ class _Qualification:
 @dataclass(frozen=True, slots=True)
 class _Cursor:
     skip: int
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _PathFingerprint:
+    """Private identity for Git administrative entries trusted for one call."""
+
+    path: Path
+    is_directory: bool
+    device: int
+    inode: int
+    size: int
+    modified_nanoseconds: int
+    content_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RepositoryLayout:
+    """Private normal/linked-worktree layout guard; host paths never escape it."""
+
+    entry: _PathFingerprint
+    admin: _PathFingerprint
+    common: _PathFingerprint
+    linked: bool
 
 
 class GitService:
@@ -70,6 +101,7 @@ class GitService:
         "_config", "_workspace", "_runtime", "_toolchain", "_qualification",
         "_qualification_error", "_cached_status", "_cached_at", "_cursors",
         "_cached_branches", "_cached_paths", "_invalidated",
+        "_repository_layout", "_object_format",
     )
 
     def __init__(
@@ -91,6 +123,8 @@ class GitService:
         self._cached_branches: tuple[str, ...] = ()
         self._cached_paths: tuple[str, ...] = ()
         self._invalidated = False
+        self._repository_layout: _RepositoryLayout | None = None
+        self._object_format: str | None = None
 
     @property
     def cached_status(self) -> GitStatus | None:
@@ -120,6 +154,7 @@ class GitService:
 
     def cached_completion_values(self, kind: str) -> tuple[str, ...]:
         """Return bounded cached values for legacy prompt/template completion only."""
+        self._discard_expired_cursors()
         if kind == "branch":
             return self._cached_branches
         if kind == "cursor":
@@ -182,7 +217,7 @@ class GitService:
         result = await self._run(tuple(command), timeout_seconds=20.0)
         if result.timed_out or result.exit_code != 0:
             raise GitUnavailableError("Git diff could not complete safely.")
-        patch = result.stdout.text
+        patch = self._require_clean_protocol_text(result.stdout.text)
         summary = GitPatchSummary(
             scope=scope,
             patch_truncated=result.stdout.truncated,
@@ -199,6 +234,7 @@ class GitService:
         skip = 0
         if cursor is not None:
             token = self._validate_cursor(cursor)
+            self._discard_expired_cursors()
             saved = self._cursors.get(token)
             if saved is None:
                 raise GitRequestError("cursor is not available in this application session.")
@@ -239,7 +275,7 @@ class GitService:
         ), timeout_seconds=20.0)
         if patch_result.timed_out or patch_result.exit_code != 0:
             raise GitUnavailableError("The requested commit patch is unavailable.")
-        patch = patch_result.stdout.text
+        patch = self._require_clean_protocol_text(patch_result.stdout.text)
         return GitShowCommitResult(
             commit=commits[0], patch=patch, patch_truncated=patch_result.stdout.truncated,
             binary_file_count=patch.count("Binary files ") + patch.count("GIT binary patch"),
@@ -304,7 +340,7 @@ class GitService:
             if len(fields) != 4:
                 raise GitOutputError("Git returned malformed branch metadata.")
             head, name, oid, upstream = fields
-            if head not in {"*", " "} or not name or not _OID.fullmatch(oid):
+            if head not in {"*", " "} or not name or not self._is_current_format_oid(oid):
                 raise GitOutputError("Git returned malformed branch metadata.")
             if len(branches) >= MAX_GIT_BRANCHES:
                 truncated = True
@@ -320,6 +356,10 @@ class GitService:
         qualification = await self._qualify()
         if qualification is None:
             return self._unavailable(self._qualification_error or "Git is not configured or available.")
+        try:
+            self._repository_layout = self._validate_repository_layout()
+        except GitOutputError:
+            return self._unavailable("Git repository administrative metadata is unsafe or malformed.", error=True)
         result = await self._run(("rev-parse", "--is-inside-work-tree", "--show-toplevel"), timeout_seconds=8.0)
         if result.timed_out or result.stdout.truncated or result.stderr.truncated:
             return self._unavailable("Git repository boundary could not be verified.", error=True)
@@ -334,6 +374,19 @@ class GitService:
             return self._unavailable("Git repository root is outside the configured workspace.")
         if root != ".":
             return self._unavailable("Git repository root does not match the configured workspace.")
+        format_result = await self._run(("rev-parse", "--show-object-format"), timeout_seconds=8.0)
+        if (
+            format_result.timed_out or format_result.exit_code != 0
+            or format_result.stdout.truncated or format_result.stderr.truncated
+        ):
+            return self._unavailable("Git object format could not be verified.", error=True)
+        try:
+            object_format = self._require_clean_protocol_text(format_result.stdout.text).strip()
+        except GitOutputError:
+            return self._unavailable("Git object format could not be verified.", error=True)
+        if object_format not in _OBJECT_FORMAT_OID_LENGTH:
+            return self._unavailable("Git object format is unsupported.", error=True)
+        self._object_format = object_format
         return None
 
     async def _require_repository(self) -> None:
@@ -369,6 +422,10 @@ class GitService:
         qualification = await self._qualify()
         if qualification is None:
             raise GitUnavailableError(self._qualification_error or "Git is unavailable.")
+        try:
+            self._ensure_repository_layout_unchanged()
+        except GitOutputError as error:
+            raise GitUnavailableError("Git repository administrative metadata changed during validation.") from error
         return await self._run_raw(qualification.executable, command, timeout_seconds=timeout_seconds)
 
     async def _run_raw(self, executable: Path, command: Sequence[str], *, timeout_seconds: float) -> ProcessResult:
@@ -391,6 +448,148 @@ class GitService:
         if not isinstance(result, ProcessResult):
             raise GitUnavailableError("Git Process Runtime returned an invalid result.")
         return result
+
+    def _validate_repository_layout(self) -> _RepositoryLayout:
+        """Validate the private normal or linked-worktree administrative layout.
+
+        Git's ``--show-toplevel`` alone is insufficient: a workspace ``.git``
+        file can redirect Git to an unrelated repository whose ``core.worktree``
+        happens to name the workspace.  The only supported redirect is Git's
+        own linked-worktree structure, including its reverse pointer.
+        """
+        entry = self._config.workspace_root / ".git"
+        if self._unsafe_path_form(entry):
+            raise GitOutputError("Git administrative metadata is unsafe.")
+        if entry.is_dir():
+            common = self._capture_administrative_path(entry, directory=True)
+            self._reject_external_alternates(common.path)
+            return _RepositoryLayout(entry=common, admin=common, common=common, linked=False)
+        entry_file = self._capture_administrative_path(entry, directory=False, digest=True)
+        admin_path = self._metadata_reference(entry_file.path, prefix="gitdir: ")
+        admin = self._capture_administrative_path(admin_path, directory=True)
+        common_path = self._metadata_reference(admin.path / "commondir")
+        common = self._capture_administrative_path(common_path, directory=True)
+        worktrees = common.path / "worktrees"
+        if (
+            admin.path.parent != worktrees.resolve(strict=True)
+            or not admin.path.name
+            or _contains_link_or_reparse_point(worktrees)
+        ):
+            raise GitOutputError("Git linked-worktree metadata is malformed.")
+        reverse = self._metadata_reference(admin.path / "gitdir")
+        if reverse != entry_file.path:
+            raise GitOutputError("Git linked-worktree metadata is malformed.")
+        self._reject_external_alternates(common.path)
+        return _RepositoryLayout(entry=entry_file, admin=admin, common=common, linked=True)
+
+    def _ensure_repository_layout_unchanged(self) -> None:
+        """Recheck the private layout immediately before each operational argv."""
+        layout = self._repository_layout
+        if layout is None:
+            return
+        current = self._validate_repository_layout()
+        if (
+            current.linked != layout.linked
+            or not self._same_fingerprint(current.entry, layout.entry)
+            or not self._same_fingerprint(current.admin, layout.admin)
+            or not self._same_fingerprint(current.common, layout.common)
+        ):
+            raise GitOutputError("Git repository administrative metadata changed during validation.")
+
+    @staticmethod
+    def _same_fingerprint(current: _PathFingerprint, expected: _PathFingerprint) -> bool:
+        return current == expected
+
+    def _capture_administrative_path(
+        self, path: Path, *, directory: bool, digest: bool = False,
+    ) -> _PathFingerprint:
+        if self._unsafe_path_form(path) or _contains_link_or_reparse_point(path):
+            raise GitOutputError("Git administrative metadata is unsafe.")
+        try:
+            canonical = path.resolve(strict=True)
+            metadata = canonical.stat()
+        except OSError as error:
+            raise GitOutputError("Git administrative metadata is missing.") from error
+        if directory != stat.S_ISDIR(metadata.st_mode):
+            raise GitOutputError("Git administrative metadata has an invalid type.")
+        content_digest: str | None = None
+        if digest:
+            try:
+                content = canonical.read_bytes()
+            except OSError as error:
+                raise GitOutputError("Git administrative metadata could not be read.") from error
+            if len(content) > _MAX_GIT_METADATA_FILE_BYTES:
+                raise GitOutputError("Git administrative metadata exceeds its size limit.")
+            content_digest = hashlib.sha256(content).hexdigest()
+        return _PathFingerprint(
+            path=canonical,
+            is_directory=directory,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            size=metadata.st_size,
+            modified_nanoseconds=metadata.st_mtime_ns,
+            content_digest=content_digest,
+        )
+
+    def _metadata_reference(self, source: Path, *, prefix: str | None = None) -> Path:
+        """Read one small Git administrative pointer without accepting syntax tricks."""
+        record = self._capture_administrative_path(source, directory=False, digest=True)
+        try:
+            raw = record.path.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise GitOutputError("Git administrative metadata is malformed.") from error
+        if not 0 < len(raw) <= _MAX_GIT_METADATA_FILE_BYTES or "\x00" in text:
+            raise GitOutputError("Git administrative metadata is malformed.")
+        if text.endswith("\r\n"):
+            text = text[:-2]
+        elif text.endswith("\n"):
+            text = text[:-1]
+        else:
+            raise GitOutputError("Git administrative metadata is malformed.")
+        if "\n" in text or "\r" in text:
+            raise GitOutputError("Git administrative metadata is malformed.")
+        if prefix is not None:
+            if not text.startswith(prefix):
+                raise GitOutputError("Git administrative metadata is malformed.")
+            text = text[len(prefix):]
+        if not text:
+            raise GitOutputError("Git administrative metadata is malformed.")
+        candidate = Path(text)
+        if not candidate.is_absolute():
+            candidate = source.parent / candidate
+        if self._unsafe_path_form(candidate):
+            raise GitOutputError("Git administrative metadata is unsafe.")
+        try:
+            return candidate.resolve(strict=True)
+        except OSError as error:
+            raise GitOutputError("Git administrative metadata is missing.") from error
+
+    def _reject_external_alternates(self, common_git_dir: Path) -> None:
+        """Reject any non-empty alternates file before Git can read another store."""
+        alternates = common_git_dir / "objects" / "info" / "alternates"
+        if self._unsafe_path_form(alternates) or _contains_link_or_reparse_point(alternates):
+            raise GitOutputError("Git object-store metadata is unsafe.")
+        try:
+            metadata = alternates.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise GitOutputError("Git object-store metadata could not be inspected.") from error
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_GIT_ALTERNATES_BYTES:
+            raise GitOutputError("Git object-store metadata is unsafe.")
+        try:
+            value = alternates.read_bytes()
+        except OSError as error:
+            raise GitOutputError("Git object-store metadata could not be read.") from error
+        if value.strip():
+            raise GitOutputError("Git repositories with object alternates are unavailable.")
+
+    @staticmethod
+    def _unsafe_path_form(path: Path) -> bool:
+        raw = str(path)
+        windows = PureWindowsPath(raw)
+        return raw.startswith(("\\\\?\\", "\\\\.\\")) or windows.drive.startswith("\\\\")
 
     def _parse_status(self, text: str) -> GitStatus:
         text = self._require_clean_protocol_text(text)
@@ -422,7 +621,7 @@ class GitService:
                 elif key == "branch.oid":
                     unborn = value == "(initial)"
                     if not unborn:
-                        if not _OID.fullmatch(value):
+                        if not self._is_current_format_oid(value):
                             raise GitOutputError("Git returned malformed HEAD metadata.")
                         head_oid = value
                 elif key == "branch.ab":
@@ -488,7 +687,7 @@ class GitService:
         commits: list[GitCommit] = []
         for index in range(0, len(fields) - 1, 5):
             oid, parents, author, timestamp, subject = fields[index:index + 5]
-            if not _OID.fullmatch(oid):
+            if not self._is_current_format_oid(oid):
                 raise GitOutputError("Git returned malformed commit metadata.")
             try:
                 parsed_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -496,7 +695,7 @@ class GitService:
             except (ValueError, AttributeError):
                 raise GitOutputError("Git returned malformed commit timestamps.") from None
             parent_values = tuple(parents.split()) if parents else ()
-            if any(_OID.fullmatch(parent) is None for parent in parent_values):
+            if any(not self._is_current_format_oid(parent) for parent in parent_values):
                 raise GitOutputError("Git returned malformed parent metadata.")
             if len(commits) >= MAX_GIT_COMMITS:
                 raise GitOutputError("Git returned more commits than the request permits.")
@@ -516,6 +715,8 @@ class GitService:
             if not raw:
                 continue
             header = re.fullmatch(r"([0-9a-f]{40}|[0-9a-f]{64}) (\d+) (\d+) (\d+)", raw)
+            if header is not None and not self._is_current_format_oid(header.group(1)):
+                raise GitOutputError("Git returned an object identifier for the wrong object format.")
             if header is not None:
                 if current is not None:
                     blocks.append(self._blame_block(current))
@@ -602,11 +803,19 @@ class GitService:
             raise GitOutputError("Git returned an invalid workspace path.")
         return relative
 
-    @staticmethod
-    def _validate_oid(value: str) -> str:
-        if not isinstance(value, str) or _OID.fullmatch(value) is None:
-            raise GitRequestError("commit_oid must be one full SHA-1 or SHA-256 hexadecimal object identifier.")
+    def _validate_oid(self, value: str) -> str:
+        if not isinstance(value, str) or not self._is_current_format_oid(value):
+            raise GitRequestError("commit_oid must be one full object identifier for this repository's object format.")
         return value
+
+    def _is_current_format_oid(self, value: str) -> bool:
+        expected_length = _OBJECT_FORMAT_OID_LENGTH.get(self._object_format or "")
+        return bool(
+            isinstance(value, str)
+            and _OID.fullmatch(value)
+            and expected_length is not None
+            and len(value) == expected_length
+        )
 
     @staticmethod
     def _validate_cursor(value: str) -> str:
@@ -615,13 +824,20 @@ class GitService:
         return value
 
     def _new_cursor(self, skip: int) -> str:
+        self._discard_expired_cursors()
         token = secrets.token_urlsafe(18)
         while token in self._cursors:
             token = secrets.token_urlsafe(18)
         if len(self._cursors) >= _MAX_CURSOR_CACHE:
             del self._cursors[next(iter(self._cursors))]
-        self._cursors[token] = _Cursor(skip=skip)
+        self._cursors[token] = _Cursor(skip=skip, expires_at=datetime.now(UTC) + _CURSOR_TTL)
         return token
+
+    def _discard_expired_cursors(self) -> None:
+        now = datetime.now(UTC)
+        for token, cursor in tuple(self._cursors.items()):
+            if cursor.expires_at <= now:
+                del self._cursors[token]
 
     @staticmethod
     def _require_clean_protocol_text(value: str) -> str:

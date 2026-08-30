@@ -383,13 +383,13 @@ def test_git_wrapper_scrubs_credentials_and_forces_read_only_environment(tmp_pat
         service = runtime(
             tmp_path,
             allowed_environment_overrides=frozenset({
-                "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
+                "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT", "GIT_NO_LAZY_FETCH",
             }),
         )
         code = (
             "import json, os; print(json.dumps({key: os.getenv(key) for key in "
             "('FORGEMCP_TEST_SECRET', 'GIT_EXTERNAL_DIFF', 'GIT_CONFIG_GLOBAL', "
-            "'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT')}))"
+            "'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'GIT_NO_LAZY_FETCH')}))"
         )
         result = await service.run_git([sys.executable, "-c", code])
         observed = json.loads(result.stdout.text)
@@ -400,6 +400,7 @@ def test_git_wrapper_scrubs_credentials_and_forces_read_only_environment(tmp_pat
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_LAZY_FETCH": "1",
         }
         assert service.cached_status().active_processes == 0
         await service.aclose()
