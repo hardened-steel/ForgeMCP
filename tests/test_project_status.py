@@ -700,7 +700,7 @@ def test_application_registers_all_builtin_providers_and_status_is_side_effect_f
         registry = application.services.get("project_status_registry")
         assert isinstance(registry, ProjectStatusRegistry)
         assert registry.provider_ids() == (
-            "clangd", "cmake", "core", "debugger", "plugin_manager",
+            "clangd", "cmake", "core", "debugger", "git", "plugin_manager",
             "process_runtime", "quality", "workspace",
         )
         runtime = application.services.get("process_runtime")
@@ -761,7 +761,7 @@ def test_application_registers_all_builtin_providers_and_status_is_side_effect_f
             cmake._configured_binary_dir = "long-cmake-path-" + "x" * 300
             clangd._compile_commands_dir = "long-clangd-path-" + "y" * 300
             first, second = await asyncio.gather(service.status(), service.status())
-            assert len(first.components) == len(second.components) == 8
+            assert len(first.components) == len(second.components) == 9
             assert first.partial is False
             assert first.generated_at.tzinfo is not None
             assert first.generated_at.utcoffset() == timedelta(0)

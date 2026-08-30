@@ -517,6 +517,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         "forgemcp://workspace/files",
                         "forgemcp://cmake/targets",
                         "forgemcp://cmake/kits",
+                        "forgemcp://git/status",
                         "forgemcp://logs/recent",
                     } <= uris
                     templates = await session.list_resource_templates()
@@ -595,6 +596,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         "forgemcp_diagnose_build",
                         "forgemcp_analyze_file",
                         "forgemcp_debug_target",
+                        "forgemcp_review_changes",
                     }
                     prompt_arguments = {
                         "forgemcp_build_report": {},
@@ -602,6 +604,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         "forgemcp_diagnose_build": {},
                         "forgemcp_analyze_file": {"path": "file-000.cpp"},
                         "forgemcp_debug_target": {"target": "app"},
+                        "forgemcp_review_changes": {},
                     }
                     for prompt_name, arguments in prompt_arguments.items():
                         rendered = await session.get_prompt(prompt_name, arguments)

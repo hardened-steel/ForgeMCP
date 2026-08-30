@@ -32,7 +32,7 @@ class ConfigurationSource(StrEnum):
 _PATH_FIELDS = frozenset(
     {
         "cmake_path", "ctest_path", "clangd_path", "clang_format_path",
-        "clang_tidy_path", "lldb_dap_path",
+        "clang_tidy_path", "lldb_dap_path", "git_path",
     }
 )
 _RELATIVE_DIRECTORY_FIELDS = frozenset({"cmake_source_dir", "build_dir"})
@@ -52,6 +52,7 @@ _SOURCE_DEFAULTS = {
     "clang_format_path": ConfigurationSource.DISCOVERY,
     "clang_tidy_path": ConfigurationSource.DISCOVERY,
     "lldb_dap_path": ConfigurationSource.DISCOVERY,
+    "git_path": ConfigurationSource.DISCOVERY,
     "toolchain": ConfigurationSource.DEFAULT,
     "host_arch": ConfigurationSource.DEFAULT,
     "target_arch": ConfigurationSource.DEFAULT,
@@ -83,6 +84,7 @@ class ForgeConfig:
     clang_format_path: Path | None = None
     clang_tidy_path: Path | None = None
     lldb_dap_path: Path | None = None
+    git_path: Path | None = None
     toolchain: str = "auto"
     host_arch: str = "auto"
     target_arch: str = "auto"
@@ -286,7 +288,7 @@ class ForgeConfig:
         }
         for name, variable in {
             "cmake_path": "FORGEMCP_CMAKE", "ctest_path": "FORGEMCP_CTEST", "clangd_path": "FORGEMCP_CLANGD",
-            "clang_format_path": "FORGEMCP_CLANG_FORMAT", "clang_tidy_path": "FORGEMCP_CLANG_TIDY", "lldb_dap_path": "FORGEMCP_LLDB_DAP",
+            "clang_format_path": "FORGEMCP_CLANG_FORMAT", "clang_tidy_path": "FORGEMCP_CLANG_TIDY", "lldb_dap_path": "FORGEMCP_LLDB_DAP", "git_path": "FORGEMCP_GIT",
         }.items():
             raw = choose(name, variable, None)
             selected[name] = Path(raw) if raw is not None and str(raw).strip() else None
@@ -306,7 +308,7 @@ def _normalise_tool_path(value: object, field_name: str) -> Path:
         variable = {
             "clangd_path": "FORGEMCP_CLANGD", "lldb_dap_path": "FORGEMCP_LLDB_DAP",
             "clang_format_path": "FORGEMCP_CLANG_FORMAT", "clang_tidy_path": "FORGEMCP_CLANG_TIDY",
-            "cmake_path": "FORGEMCP_CMAKE", "ctest_path": "FORGEMCP_CTEST",
+            "cmake_path": "FORGEMCP_CMAKE", "ctest_path": "FORGEMCP_CTEST", "git_path": "FORGEMCP_GIT",
         }[field_name]
         raise ConfigurationError(f"{variable} must be an absolute executable path.")
     return value.absolute()

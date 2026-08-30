@@ -8,6 +8,7 @@ rejects missing, extra, or duplicate manifest names.
 | Surface | Coverage | Reason / scenario |
 | --- | --- | --- |
 | Core/workspace/CMake/Quality (23 tools) | real SDK stdio | `core_fixture.*`, `cmake_fixture.*`, and `quality_fixture.*` cover normal and expected-error fixture paths. |
+| Git (6 tools) | real SDK stdio | `git_fixture.*` initializes a disposable local repository and calls all six tools; staged/unstaged/untracked/rename/deletion/binary/local branch cases are asserted with no remote. |
 | clangd (27 tools) | real SDK stdio | `clangd_fixture.*` selects a ready standalone LLVM kit, configures Ninja, validates the database, and calls every published `clangd__*` tool. |
 | debugger (16 tools) | real SDK stdio | `debugger_fixture.*` qualifies LLDB-DAP, uses the public `debugger__step_over` name, and covers paused/running stop paths. MSVC/PDB is not claimed. |
 | Existing build trees | real SDK stdio and hostile unit matrix | An IDE-like external Ninja/Clang tree with CRLF cache, File API, and compilation database is created before the ForgeMCP session. Listing is hash-proved read-only; targets, build, CTest, and status follow without configure. Unit cases reject mismatch, stale/malformed/oversized metadata, source mismatch, and workspace escape. |
@@ -23,8 +24,9 @@ success assertion, setup condition, and cleanup assertion. The scenario call
 collector records every official `ClientSession.call_tool` invocation; a listed
 clangd tool cannot be counted merely because `tools/list` advertised it.
 
-The machine-readable manifest is exactly **66 tools**: 23 Core/workspace/CMake/
-Quality, 27 clangd, and 16 debugger. The unified runner wraps official SDK
+The machine-readable manifest is dynamic from the declared tool inventory
+(currently **72 tools**): 23 Core/workspace/CMake/Quality, 6 Git, 27 clangd,
+and 16 debugger. The unified runner wraps official SDK
 `call_tool` (never handlers/services), emits one bounded host-local record per
 tool/scenario with call count, meaningful-success state, and
 success/expected-error category, and rejects duplicates/orphans. `tools/list`,

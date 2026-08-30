@@ -115,7 +115,7 @@ CMake/Quality work, debugger execution/start/termination, or clangd startup is
 active; otherwise `IDLE`. Health and activity do not imply one another.
 
 Builtin provider IDs are `core`, `workspace`, `process_runtime`,
-`plugin_manager`, `cmake`, `clangd`, `debugger`, and `quality`.
+`plugin_manager`, `cmake`, `clangd`, `debugger`, `quality`, and `git`.
 
 ## Consequences
 
@@ -128,9 +128,12 @@ bounded. The result remains a partial, non-transactional collection of
 independently observed cached states, never a cross-service transaction.
 
 The view can be slightly inconsistent and cached observations can be unknown or
-stale; those conditions are explicit. Phase 1 deliberately has no Git status or
-history, aggregated diagnostic messages, refresh operation, raw output/logs,
-background polling, file watchers, multi-workspace state, or persistence across
-restarts. Git requires its own freshness, ignore, nesting, and trust decision.
+stale; those conditions are explicit. Git Intelligence Phase 1 adds only a
+cache-only scalar provider: it never runs Git from `project__status`; dirty
+worktrees/conflicts are warnings; and unconfigured unavailable Git is neutral
+while an explicit unavailable Git/provider failure is degraded. Git history,
+raw Git output/config/path data, background polling, file watchers,
+multi-workspace state, and persistence remain absent. Its separate trust
+decision is ADR 0017.
 The Phase C resource is only another read adapter over this view; it does not
 change those exclusions or cause resource-change notifications.

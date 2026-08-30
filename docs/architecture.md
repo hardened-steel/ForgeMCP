@@ -403,6 +403,44 @@ Long CMake operations consume only their invocation's execution context. Configu
 
 Running configure, build, or tests is not sandboxing: CMake project scripts, custom commands, generators, build tools, and test executables may execute project-controlled code. The configured workspace is therefore a trust boundary, not an untrusted-input boundary. See ADR 0006.
 
+## Git Intelligence Phase 1
+
+`forgemcp.git` is a builtin transport-neutral feature plugin. `GitService`
+owns the fixed read-only Git grammar and immutable Pydantic response models;
+`GitPlugin` contributes six tools, `forgemcp://git/status`, the
+`forgemcp_review_changes` prompt, and cached legacy prompt completions. No
+FastMCP type, public `Path`, Git config value, gitdir path, raw argv, or raw
+process output crosses this boundary.
+
+Configuration follows CLI `--git`, then `FORGEMCP_GIT`, then qualified Git for
+Windows/known host discovery. An explicit invalid path is terminal for that
+selection and does not fall back. Discovery approves a canonical absolute,
+regular, non-link/reparse executable outside the workspace; ProcessPolicy
+captures file metadata and rejects later replacement. Git version qualification
+is bounded through ProcessRuntime. All commands use the exact qualified file,
+`shell=False`, a workspace CWD, bounded timeout/output, process-tree cleanup,
+and a scrubbed environment with disabled global/system configuration, prompts,
+and optional locks. Fixed `-c` controls disable fsmonitor, credential helper,
+external diff, and submodule recursion; diff/show additionally use
+`--no-ext-diff` and `--no-textconv`. Network and mutation grammars are absent.
+
+The service first proves `rev-parse --show-toplevel` equals the configured
+workspace. It accepts a normal `.git` directory or a linked-worktree `.git`
+file, but internal metadata outside the workspace remains private. Git-reported
+paths are revalidated through WorkspaceService before publication. No nested
+repository/submodule traversal occurs. Porcelain v2 `-z` and NUL-delimited
+formats are strictly parsed; malformed, non-UTF, contradictory, oversized, or
+truncated protocol data becomes an incomplete/error result. Patch and commit
+metadata are intentional but untrusted tool data and are never logged.
+
+Git status is cached at application scope. A successful Workspace mutation
+batch invalidates that cache; failed/no-op changes publish no batch. Git tools
+explicitly refresh their own bounded data, whereas the Git ProjectStatus
+provider returns cached scalar counts only and never launches Git. Dirty trees
+and conflicts are warnings, not Core failures; explicit unavailable Git or a
+malformed/provider failure is degraded, while an unconfigured unavailable Git
+does not worsen health. There is no filesystem watcher.
+
 ## Error and logging policy
 
 Expected operational errors inherit from `ForgeMCPError` and are converted with `to_mcp_error_response`. The response includes only a stable code and an intentional public message.
@@ -438,7 +476,8 @@ SDK 1.x legacy `2025-11-25` stdio.
 
 The versioned JSON resources are `forgemcp://about`,
 `forgemcp://project/status`, `forgemcp://workspace/files`,
-`forgemcp://cmake/targets`, and `forgemcp://logs/recent`. Workspace manifests
+`forgemcp://cmake/targets`, `forgemcp://git/status`, and `forgemcp://logs/recent`. Git status
+is explicitly cached/no-process; Git log remains a tool-only bounded read. Workspace manifests
 retain at most 1,000 metadata entries and page 50 at a time. Opaque random
 cursors are application-local, stored in a 32-entry TTL cache, bound to the
 Workspace mutation generation, and reveal no offset, path, or generation.
@@ -448,7 +487,7 @@ IDs for cached already-validated File API models; reads never configure, create
 a query, or run a process. Target resources expose only bounded name/type and
 validated workspace-relative artifact data.
 
-The five prompts are fixed ForgeMCP-authored workflows. Handlers only render
+The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
 messages and never invoke tools. Bounded project identifiers occupy a separate
 JSON-labeled data message and unknown arguments fail. Completion exists only
 for prompt and resource-template references because that is the legacy MCP

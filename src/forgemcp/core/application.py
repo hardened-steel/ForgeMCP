@@ -13,6 +13,7 @@ from forgemcp.cmake import CMakePlugin, CompilationDatabaseRegistry
 from forgemcp.clangd import ClangdPlugin
 from forgemcp.debugger import DebuggerPlugin
 from forgemcp.discovery import DiscoveryPlugin
+from forgemcp.git import GitPlugin
 from forgemcp.quality import QualityPlugin
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.errors import LifecycleError
@@ -106,7 +107,7 @@ class ForgeApplication:
         services.register("plugins", plugins)
         for plugin in (
             WorkspacePlugin(), CMakePlugin(), ClangdPlugin(), DebuggerPlugin(), DiscoveryPlugin(),
-            ProjectPlugin(), QualityPlugin(),
+            ProjectPlugin(), QualityPlugin(), GitPlugin(),
             *tuple(builtin_plugins),
         ):
             plugins.register_builtin(plugin)

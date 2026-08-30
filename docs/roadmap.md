@@ -81,14 +81,15 @@ irreversible choices belong in [adr/](adr/).
   aware compilation-database policy/validation, and clangd document/database
   coherence. The workspace/CMake/clangd coherence audit and opt-in real
   Windows gate passed on 2026-08-22. See ADR 0014. That phase did not include
-  an external watcher, Git, or an MCP discovery surface.
+  an external watcher or an MCP discovery surface; Git arrived separately in Phase 1.
 - UX Stabilization Phase C: bounded server instructions, Resources, Prompts,
   legacy prompt/resource-template Completion, application-scoped structured
   logging fan-out, a sanitized recent-log ring, and connection-scoped MCP
   Logging. The official SDK stdio gate covers initialization, discovery,
   reads, pagination, prompts, completion context, log filtering, cancellation,
   and clean shutdown. See ADR 0015. Tasks, Experimental features, resource
-  subscriptions, Git, and an external watcher remain absent.
+  subscriptions, and an external watcher remain absent; Git is now a separate
+  read-only feature with its own ADR.
 - ForgeMCP Stabilization Phase D1: cached path-free CMake kits derived from
   central discovery; application-local CAS selection; deterministic per-kit
   build-directory suggestions; bounded existing-tree inspection/adoption;
@@ -96,8 +97,12 @@ irreversible choices belong in [adr/](adr/).
   configuration, and operator doctor matrix. CMake Tools state/scripts remain
   intentionally unsupported; see ADR 0016.
 - ForgeMCP Stabilization Phase D2.4: one-switch production-discovery live
-  acceptance, host-local 66-tool SDK evidence, external build-tree adoption,
+  acceptance, host-local dynamic SDK evidence, external build-tree adoption,
   and Phase C discovery/progress/disclosure gates on a disposable C++ fixture.
+- Git Intelligence Phase 1: builtin read-only Git plugin with qualified exact
+  discovery, porcelain/protocol parsing, bounded patches/history/blame/local
+  branches, cached ProjectStatus integration, Workspace mutation invalidation,
+  and disposable real SDK fixture coverage. No Git write or network operation.
 
 ### In progress
 
@@ -119,7 +124,7 @@ irreversible choices belong in [adr/](adr/).
 | UX Stabilization Phase C | Accepted Phase A, Phase B, and Workspace/CMake/clangd coherence baselines | Complete: bounded MCP discovery surface and connection logging pass the SDK protocol and adversarial gates. |
 | Stabilization Phase D1 | Phase B accepted, Workspace/CMake/clangd coherence accepted, Phase C implemented | CMake kit selection, safe compiler/generator propagation, and compatible existing-tree adoption work without cache deletion. |
 | Stabilization Phase D2 | D1 baseline and permanent C++ fixture | Full real-MCP surface is recorded against disposable fixture copies; Phase C+D share the final audit. |
-| Git intelligence | Separate Git freshness, ignored-file, nesting, and trust design | Not started; intentionally absent from `project__status` Phase 1. |
+| Git intelligence Phase 1 | Audited ProcessRuntime, Workspace path policy, plugins, ProjectStatus and discovery | Complete when all six read-only tools have real SDK coverage, fixed process controls hold, and the Git fixture gate is capability-qualified. |
 
 ## Completed milestone: clangd phase 1
 

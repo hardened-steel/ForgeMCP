@@ -376,6 +376,37 @@ def test_trusted_adapter_environment_is_scrubbed_and_path_is_explicit(tmp_path, 
     asyncio.run(exercise())
 
 
+def test_git_wrapper_scrubs_credentials_and_forces_read_only_environment(tmp_path, monkeypatch):
+    async def exercise() -> None:
+        monkeypatch.setenv("FORGEMCP_TEST_SECRET", "must-not-reach-git")
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", "must-not-reach-git")
+        service = runtime(
+            tmp_path,
+            allowed_environment_overrides=frozenset({
+                "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT",
+            }),
+        )
+        code = (
+            "import json, os; print(json.dumps({key: os.getenv(key) for key in "
+            "('FORGEMCP_TEST_SECRET', 'GIT_EXTERNAL_DIFF', 'GIT_CONFIG_GLOBAL', "
+            "'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT')}))"
+        )
+        result = await service.run_git([sys.executable, "-c", code])
+        observed = json.loads(result.stdout.text)
+        assert observed == {
+            "FORGEMCP_TEST_SECRET": None,
+            "GIT_EXTERNAL_DIFF": None,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        assert service.cached_status().active_processes == 0
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_normal_process_callers_do_not_inherit_forgemcp_settings(tmp_path, monkeypatch):
     async def exercise() -> None:
         monkeypatch.setenv("FORGEMCP_TEST_NORMAL", "still-inherited")

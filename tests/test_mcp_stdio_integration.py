@@ -117,7 +117,7 @@ def test_stdio_mcp_end_to_end_registers_tools_serializes_responses_and_closes_li
                     assert project_status["partial"] is False
                     assert project_status["health"] in {"healthy", "degraded", "failed"}
                     assert project_status["activity"] in {"idle", "busy", "paused"}
-                    assert len(project_status["components"]) == 8
+                    assert len(project_status["components"]) == 9
                     assert len(json.dumps(project_status)) < 100_000
                     invalid_project_status = await session.call_tool(
                         "project__status", {"refresh": True}

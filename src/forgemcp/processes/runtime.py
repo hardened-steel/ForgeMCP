@@ -81,6 +81,10 @@ def _known_llvm_quality_tools(environment: Mapping[str, str]) -> tuple[Path, ...
 
 
 _FIXED_QUALITY_EXECUTABLES = ("clang-format", "clang-tidy")
+_GIT_ENVIRONMENT_KEYS = frozenset({
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS",
+    "GIT_TERMINAL_PROMPT",
+})
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -614,7 +618,10 @@ class ProcessRuntime:
         )
         self._policy = (
             ProcessPolicy(
-                allowed_executable_paths=frozenset(configured_exact_paths)
+                allowed_executable_paths=frozenset(configured_exact_paths),
+                # These are consumed only by the narrow private Git wrapper;
+                # they never create a generic process-environment API.
+                allowed_environment_overrides=_GIT_ENVIRONMENT_KEYS,
             )
             if policy is None
             else policy
@@ -832,6 +839,38 @@ class ProcessRuntime:
             stderr_truncated=result.stderr.truncated,
         )
         return result
+
+    async def run_git(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float | None = None,
+    ) -> ProcessResult:
+        """Run one exact approved Git invocation in a scrubbed environment.
+
+        Git callers cannot select environment values, a shell, or an
+        executable by name.  Host global/system Git configuration is excluded
+        before the feature adds its fixed, read-only argv controls.
+        """
+        if isinstance(argv, str) or not isinstance(argv, Sequence) or not argv:
+            raise ProcessArgumentError("Git commands must be a non-empty argv sequence.")
+        executable = Path(argv[0]) if isinstance(argv[0], str) else Path()
+        if not executable.is_absolute() or not self._policy.approves_exact_executable(executable):
+            raise ProcessExecutableError("Git commands require an exact approved executable path.")
+        return await self.run(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            environment={
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+            environment_mode=ProcessEnvironmentMode.SCRUBBED,
+            require_exact_executable=True,
+        )
 
     async def start(
         self,

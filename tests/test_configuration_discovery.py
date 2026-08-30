@@ -256,6 +256,21 @@ def test_invalid_explicit_cmake_path_cannot_fallback_to_a_bare_path_tool(tmp_pat
     assert runtime.calls == []
 
 
+def test_invalid_explicit_git_path_cannot_fallback_to_path_discovery(tmp_path: Path) -> None:
+    """An operator-selected Git executable is authoritative even when host Git exists."""
+    missing = tmp_path.parent / "missing-explicit-git.exe"
+    config = _config(
+        tmp_path,
+        {"FORGEMCP_WORKSPACE": str(tmp_path), "PATH": os.environ.get("PATH", "")},
+        git_path=str(missing),
+    )
+    discovery = ToolchainDiscoveryService(config)
+    git = next(item for item in discovery.snapshot().tools if item.tool == "git")
+    assert git.available is False
+    assert git.source is ConfigurationSource.CLI
+    assert any(reason.startswith("git:") for reason in discovery.snapshot().rejections)
+
+
 def test_filtered_developer_environment_failure_is_nonfatal_and_multi_app_state_isolated(tmp_path: Path) -> None:
     first = _config(tmp_path, {"FORGEMCP_WORKSPACE": str(tmp_path), "FORGEMCP_BUILD_DIR": "one"})
     second = _config(tmp_path, {"FORGEMCP_WORKSPACE": str(tmp_path), "FORGEMCP_BUILD_DIR": "two"})
@@ -321,7 +336,7 @@ def test_doctor_json_and_print_config_are_sanitized(tmp_path: Path, capsys: pyte
     assert set(payload["discovery"]) == {
         "toolchain", "host_arch", "target_arch", "visual_studio", "tools", "rejections",
     }
-    assert len(payload["discovery"]["tools"]) == 13
+    assert len(payload["discovery"]["tools"]) == 14
     assert all(set(item) == {"tool", "available", "source", "rejection"} for item in payload["discovery"]["tools"])
     assert len(payload["discovery"]["rejections"]) <= 64
     assert set(payload["kits"]) == {"kits", "discovery_state", "complete"}

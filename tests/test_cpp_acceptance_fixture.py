@@ -268,7 +268,7 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     server_status = await call("server_status")
                     assert server_status["workspace_root"] == "configured"
                     project_status = await call("project__status")
-                    assert project_status["partial"] is False and len(project_status["components"]) == 8
+                    assert project_status["partial"] is False and len(project_status["components"]) == 9
                     listed_files = await call("workspace__list_files", {"path": ".", "recursive": True})
                     assert "CMakeLists.txt" in {item["path"] for item in listed_files["files"]}
                     before = await call("workspace__read_text", {"path": "analysis/format_me.cpp"})

@@ -62,6 +62,7 @@ def pytest_configure(config: pytest.Config) -> None:
             item.get("origin") == "standalone" and item.get("compiler_family") == "clang"
             and item.get("debugger_compatibility") == "compatible" for item in ready
         ),
+        "git": tools.get("git", False),
     }
     # Only booleans and public metadata enter the report.  Paths, PATH and
     # discovery rejection details deliberately remain absent.
@@ -112,6 +113,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             group = "clangd"
         elif item.get_closest_marker("debugger_fixture_mcp"):
             group = "debugger"
+        elif item.get_closest_marker("git_fixture_mcp"):
+            group = "git"
         elif item.name == "test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flow":
             group = "cmake_quality"
         if group is not None:
@@ -170,6 +173,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "standalone_clang": "clangd",
         "clangd": "clangd",
         "qualified_lldb_dap": "debugger",
+        "git": "git",
         "msvc": "msvc",
     }
     qualification: dict[str, str] = {}
@@ -204,7 +208,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         # host capabilities are available.  A skipped live scenario is valid
         # only if the production discovery report proves its capability absent.
         available = config._forgemcp_live_capabilities  # type: ignore[attr-defined]
-        aliases = {"mcp_stdio": True, "cmake": available["cmake_ctest_ninja"], "ninja": available["cmake_ctest_ninja"], "clangd": available["clangd"], "compile_commands": available["standalone_clang"], "standalone_llvm": available["standalone_clang"], "lldb_dap": available["qualified_lldb_dap"], "dwarf_debuggee": available["qualified_lldb_dap"]}
+        aliases = {"mcp_stdio": True, "cmake": available["cmake_ctest_ninja"], "ninja": available["cmake_ctest_ninja"], "git": available["git"], "clangd": available["clangd"], "compile_commands": available["standalone_clang"], "standalone_llvm": available["standalone_clang"], "lldb_dap": available["qualified_lldb_dap"], "dwarf_debuggee": available["qualified_lldb_dap"]}
         missing = []
         for entry in TOOL_ACCEPTANCE:
             required = all(aliases.get(capability, False) for capability in entry.required_host_capabilities)
@@ -220,7 +224,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         if actual != expected or incomplete:
             absent = sorted(tool for tool, _ in expected - actual)
             raise AssertionError(
-                "66-tool SDK coverage is incomplete: " + ", ".join((absent + incomplete)[:66])
+                f"{len(TOOL_ACCEPTANCE)}-tool SDK coverage is incomplete: " + ", ".join((absent + incomplete)[:len(TOOL_ACCEPTANCE)])
             )
         temporary_report = root / "coverage.json.tmp"
         write_coverage_report(temporary_report)

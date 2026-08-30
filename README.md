@@ -43,18 +43,21 @@ The server exposes a Core diagnostic tool and the built-in CMake feature plugin:
 - `clang_format__check`, `clang_format__apply`
 - `clang_tidy__list_checks`, `clang_tidy__run`
 - `sanitizer__parse_report`
+- `git__status`, `git__diff`, `git__log`, `git__show_commit`, `git__blame`, and
+  `git__list_branches` (Git Intelligence Phase 1, read-only only)
 
 UX Stabilization Phase C also exposes application-scoped discovery data:
 
 - resources: `forgemcp://about`, `forgemcp://project/status`,
-  `forgemcp://workspace/files`, `forgemcp://cmake/targets`, and
+  `forgemcp://workspace/files`, `forgemcp://cmake/targets`,
+  `forgemcp://git/status`, and
   `forgemcp://logs/recent`;
 - resource templates: `forgemcp://workspace/files/{cursor}`,
   `forgemcp://cmake/targets/{profile}`, and
   `forgemcp://logs/recent/{level}/{limit}`; and
 - prompts: `forgemcp_build_report`, `forgemcp_test_report`,
   `forgemcp_diagnose_build`, `forgemcp_analyze_file`, and
-  `forgemcp_debug_target`.
+  `forgemcp_debug_target`, plus `forgemcp_review_changes`.
 
 Every resource is versioned bounded `application/json`. Project-controlled
 filenames, targets, test names, and safe log metadata are untrusted JSON data,
@@ -68,16 +71,18 @@ Feature integrations use the public `forgemcp.plugins` contract. Workspace, CMak
 
 `project__status {}` is the sole Project Intelligence Phase 1 operation. It
 concurrently aggregates bounded cached snapshots for Core, Workspace, Process
-Runtime, Plugin Manager, CMake, clangd, debugger, and Quality. It never refreshes
+Runtime, Plugin Manager, CMake, clangd, debugger, Quality, and cached Git. It never refreshes
 tools, reads source, starts a process/session, runs a build/test/analysis, or
 changes lifecycle. Provider failure yields an explicit partial response without
 raw exceptions. Overlapping calls share one in-flight snapshot, cancellation
 cleanup is bounded, and the UTF-8 JSON response is capped at 100,000 bytes with
 deterministic omission metadata. Provider models are strictly revalidated at
 the registry boundary, including timestamp freshness. Health is separate from activity and the per-component
-timestamps make the result intentionally non-transactional. Git, diagnostic
-messages, raw output, persistent history, and multi-workspace aggregation are
-not part of Phase 1; see [ADR 0011](docs/adr/0011-project-status-provider-and-health-model.md).
+timestamps make the result intentionally non-transactional. Git contributes
+only cached scalar availability/count data and never probes from project status;
+diagnostic messages, raw output, persistent history, and multi-workspace
+aggregation remain absent. See [ADR 0011](docs/adr/0011-project-status-provider-and-health-model.md)
+and [ADR 0017](docs/adr/0017-git-read-only-trust-and-repository-boundary.md).
 
 Debugger Phase 1 is launch-only source debugging through a separately installed
 exact `--lldb-dap` / `FORGEMCP_LLDB_DAP` path or one exact discovered LLVM candidate. It supports workspace-contained PE/COFF + DWARF launch, source
@@ -165,7 +170,7 @@ Run the complete host-qualified acceptance tier with one switch:
 ```
 
 It uses production-equivalent Toolchain Discovery and writes path-free,
-host-local capability and bounded 66-tool SDK-coverage JSON reports under the
+host-local capability and bounded dynamic SDK-coverage JSON reports under the
 temporary directory (never the repository). It runs MSVC gates for a ready
 MSVC kit and standalone LLVM/clangd/Quality/DAP gates for their qualified
 chain, failing if a discovered capability is skipped or has no meaningful SDK
@@ -229,6 +234,7 @@ forgemcp --workspace C:\src\demo --build-dir build
 | `--clang-format PATH` | `FORGEMCP_CLANG_FORMAT` | discovery | local absolute executable | clang-format executable | Same exact-file policy; `-i` remains unavailable. |
 | `--clang-tidy PATH` | `FORGEMCP_CLANG_TIDY` | discovery | local absolute executable | clang-tidy executable | Same exact-file policy; no arbitrary arguments/fixes. |
 | `--lldb-dap PATH` | `FORGEMCP_LLDB_DAP` | discovery | local absolute executable | LLVM DAP adapter | Exact-file qualification and strict adapter policy still apply. |
+| `--git PATH` | `FORGEMCP_GIT` | discovery | local absolute executable | Read-only Git Intelligence | Exact regular non-link/reparse file outside the workspace; an invalid explicit value never falls back. |
 | `--toolchain MODE` | `FORGEMCP_TOOLCHAIN` | `auto` | `auto`, `msvc`, `llvm` | Compiler-family preference | `llvm` prefers ready standalone `clang++`; exact provider remains path-free and is selected by CMake kit. |
 | `--host-arch ARCH` | `FORGEMCP_HOST_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | Tool process architecture | Incompatible PE candidates are rejected. |
 | `--target-arch ARCH` | `FORGEMCP_TARGET_ARCH` | `auto` | `auto`, `x64`, `x86`, `arm64` | MSVC compiler target | Used only in fixed VS developer-environment setup. |
@@ -522,6 +528,32 @@ tool_timeout_sec = 1800
 startup_timeout_sec = 30
 ```
 
+## Git Intelligence Phase 1
+
+Git Intelligence Phase 1 is intentionally read-only. `git__status` uses
+porcelain v2, `git__diff` exposes only staged or unstaged bounded patches, and
+`git__log`, `git__show_commit`, `git__blame`, and `git__list_branches` use
+fixed local-only grammars. There are no stage/unstage, commit, checkout,
+branch mutation, merge/rebase/reset/clean, fetch/pull/push, credential, or
+arbitrary-argv operations.
+
+Git is qualified as one exact canonical regular non-link executable, never a
+workspace executable. Every invocation uses `ProcessRuntime`, `shell=False`,
+an exact rechecked executable, bounded output/timeout/cancellation cleanup,
+`--no-optional-locks`, disabled pager/prompt, a scrubbed Git environment,
+disabled fsmonitor, and `--no-ext-diff`/`--no-textconv` where patches are
+generated. No Git config, host path, raw argv/output, patch, commit message,
+author, or filename reaches ForgeMCP logs or ProjectStatus.
+
+The workspace must itself be the Git worktree root. Normal `.git` directories
+and linked-worktree `.git` files are supported, including an internal gitdir
+outside the workspace, but that metadata path is never exposed. Git paths are
+revalidated through WorkspaceService; nested repositories and submodules are
+not traversed. Patch text and commit/branch/author/path metadata are untrusted
+project data, not instructions. Git is not a sandbox, and Phase 1 performs no
+network operation. `project__status` consumes only the cached scalar Git
+summary and never probes Git.
+
 ## Core structure
 
 - `core/config.py` — typed runtime configuration and workspace-root validation.
@@ -533,6 +565,7 @@ startup_timeout_sec = 30
 - `lsp/` — reusable transport-neutral JSON-RPC/LSP framing and request client.
 - `clangd/` — managed clangd feature plugin, normalized models, document synchronization, and safe WorkspaceEdit application.
 - `quality/` — clang-format CAS edits, read-only clang-tidy diagnostics, and sanitizer report parsing.
+- `git/` — bounded porcelain/protocol parsing, fixed read-only Git service, and GitPlugin MCP contributions.
 - `project/` — strict status models, provider registry, health/activity aggregation, and ProjectPlugin contribution.
 - `core/errors.py` — expected Core errors and safe MCP-facing responses.
 - `core/logging.py` — application-scoped sanitized fan-out, JSON stderr sink, and bounded recent-log ring.

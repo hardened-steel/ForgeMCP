@@ -592,6 +592,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--clang-format", dest="clang_format_path", metavar="PATH", help="Exact clang-format executable path.")
     parser.add_argument("--clang-tidy", dest="clang_tidy_path", metavar="PATH", help="Exact clang-tidy executable path.")
     parser.add_argument("--lldb-dap", dest="lldb_dap_path", metavar="PATH", help="Exact lldb-dap executable path.")
+    parser.add_argument("--git", dest="git_path", metavar="PATH", help="Exact Git executable path for read-only Git intelligence.")
     parser.add_argument("--toolchain", choices=("auto", "msvc", "llvm"), help="Toolchain preference.")
     parser.add_argument("--host-arch", choices=("auto", "x64", "x86", "arm64"), help="Tool host architecture.")
     parser.add_argument("--target-arch", choices=("auto", "x64", "x86", "arm64"), help="Compiler target architecture.")

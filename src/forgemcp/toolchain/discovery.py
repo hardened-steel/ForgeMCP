@@ -33,7 +33,7 @@ from forgemcp.toolchain.models import CMakeKit, CMakeKitList
 _TOOLS: Final = (
     "cmake", "ctest", "ninja", "msbuild", "cl", "clang", "clang++",
     "clangd", "clang-format", "clang-tidy", "lldb-dap", "cppvsdbg",
-    "opendebugad7",
+    "opendebugad7", "git",
 )
 _DISPLAY_NAMES: Final = {"clang++": "clang++", "lldb-dap": "lldb-dap"}
 _MAX_VSWHERE_BYTES = 512 * 1024
@@ -568,7 +568,7 @@ class ToolchainDiscoveryService:
         candidates = self._candidates(tool)
         explicit_field = {
             "cmake": "cmake_path", "ctest": "ctest_path", "clangd": "clangd_path",
-            "clang-format": "clang_format_path", "clang-tidy": "clang_tidy_path", "lldb-dap": "lldb_dap_path",
+            "clang-format": "clang_format_path", "clang-tidy": "clang_tidy_path", "lldb-dap": "lldb_dap_path", "git": "git_path",
         }.get(tool)
         explicit_required = explicit_field is not None and getattr(self._config, explicit_field) is not None
         for index, (path, source) in enumerate(candidates):
@@ -585,13 +585,16 @@ class ToolchainDiscoveryService:
                 break
         reason = rejected[0] if rejected else "not found"
         self._record_rejection(f"{tool}: {reason}")
-        return ToolSelection(tool, None, "discovery", False, reason)
+        source: ConfigurationSource | str = (
+            self._config.source_of(explicit_field) if explicit_required and explicit_field is not None else "discovery"
+        )
+        return ToolSelection(tool, None, source, False, reason)
 
     def _candidates(self, tool: str) -> Sequence[tuple[Path, ConfigurationSource | str]]:
         candidates: list[tuple[Path, ConfigurationSource | str]] = []
         configured_field = {
             "cmake": "cmake_path", "ctest": "ctest_path", "clangd": "clangd_path",
-            "clang-format": "clang_format_path", "clang-tidy": "clang_tidy_path", "lldb-dap": "lldb_dap_path",
+            "clang-format": "clang_format_path", "clang-tidy": "clang_tidy_path", "lldb-dap": "lldb_dap_path", "git": "git_path",
         }.get(tool)
         if configured_field is not None:
             configured = getattr(self._config, configured_field)
@@ -872,6 +875,14 @@ class ToolchainDiscoveryService:
         return tuple(paths)
 
     def _standalone_tool_paths(self, tool: str) -> tuple[Path, ...]:
+        if tool == "git":
+            if os.name == "nt":
+                roots = (*self._program_files_roots(), Path("C:/Program Files"), Path("C:/Program Files (x86)"))
+                return tuple(
+                    candidate for root in dict.fromkeys(roots)
+                    for candidate in (root / "Git" / "cmd" / "git.exe", root / "Git" / "bin" / "git.exe")
+                )
+            return tuple(Path(directory) / "git" for directory in ("/usr/bin", "/usr/local/bin", "/opt/git/bin"))
         suffix = ".exe" if os.name == "nt" else ""
         name = _DISPLAY_NAMES.get(tool, tool) + suffix
         paths: list[Path] = []
