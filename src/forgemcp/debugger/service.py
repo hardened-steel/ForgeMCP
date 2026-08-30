@@ -12,7 +12,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from forgemcp.dap import DapClient, DapConnectionClosedError, DapError, DapRequestError, DapRequestTimeoutError
+from forgemcp.dap import (
+    DapClient,
+    DapConnectionClosedError,
+    DapError,
+    DapRequestError,
+    DapRequestTimeoutError,
+)
+from forgemcp.dap.errors import DapRequestCompatibility
 from forgemcp.debugger.backends.lldb_dap import LldbDapBackend
 from forgemcp.debugger.errors import (
     DebuggerFailedError,
@@ -67,6 +74,10 @@ _STOPPED_REASONS = {
     "instruction breakpoint": DebugStoppedReason.INSTRUCTION_BREAKPOINT,
 }
 _CACHE_CAPACITY = {"thread": 256, "frame": 256, "scope": 512, "variables": 2048, "breakpoint": 1024}
+
+
+class _PauseThreadIdRequired(Exception):
+    """Private marker for one qualified LLDB-DAP compatibility response."""
 
 
 @dataclass(slots=True)
@@ -228,6 +239,7 @@ class DebuggerService:
         self._terminal_event_recorded = False
         self._exited_event_recorded = False
         self._launch_operation: asyncio.Task[object] | None = None
+        self._control_operation: asyncio.Task[object] | None = None
         self._last_stop_reason: DebugStoppedReason | None = None
         self._cached_thread_count: int | None = None
         self._last_read_event_sequence = 0
@@ -361,6 +373,12 @@ class DebuggerService:
             # the bounded pre-emption path that lets stop tear down a hung
             # STARTING/CONFIGURING adapter instead of waiting for its timeout.
             launch_operation.cancel()
+        control_operation = self._control_operation
+        if control_operation is not None and control_operation is not asyncio.current_task() and not control_operation.done():
+            # In particular, stop can pre-empt the bounded Windows pause
+            # compatibility retry instead of waiting for both DAP deadlines.
+            control_operation.cancel()
+            await asyncio.gather(control_operation, return_exceptions=True)
         async with self._session_lock, self._mutating_lock:
             await self._close_unlocked()
             return await self.status()
@@ -382,28 +400,47 @@ class DebuggerService:
         return await self._execution_request("continue", thread_id)
 
     async def pause(self, thread_id: str | None = None) -> DebugSessionStatus:
-        async with self._mutating_lock:
-            self._require_state(DebuggerState.RUNNING)
-            native = None if thread_id is None else self._resolve(thread_id, "thread")
-            try:
-                await self._request("pause", {} if native is None else {"threadId": native})
-            except DebuggerRequestError:
-                # LLDB-DAP 22 on Windows rejects a protocol-optional omitted
-                # threadId.  Keep that adapter quirk entirely behind the
-                # service boundary: obtain one native thread id and retry,
-                # never manufacture or expose an MCP handle while RUNNING.
-                if native is not None:
-                    raise
-                body = await self._request("threads", {})
-                threads = body.get("threads")
-                native = next(
-                    (int(item["id"]) for item in threads if isinstance(item, Mapping) and _positive_int(item.get("id"))),
-                    None,
-                ) if isinstance(threads, list) else None
-                if native is None:
-                    raise DebuggerRequestError("The debug adapter returned no pausable thread.") from None
-                await self._request("pause", {"threadId": native})
-            return await self.status()
+        operation = asyncio.current_task()
+        if operation is not None:
+            self._control_operation = operation
+        try:
+            async with self._mutating_lock:
+                self._require_state(DebuggerState.RUNNING)
+                session_generation = self._session_generation
+                native = None if thread_id is None else self._resolve(thread_id, "thread")
+                try:
+                    await self._request("pause", {} if native is None else {"threadId": native})
+                except _PauseThreadIdRequired:
+                    # LLDB-DAP on Windows requires a threadId despite the DAP
+                    # schema making it optional. Obtain the ID from this exact
+                    # live session, retry once, and never create/expose a handle.
+                    if native is not None:
+                        raise DebuggerRequestError(
+                            "The debug adapter rejected the requested operation."
+                        ) from None
+                    self._require_state(DebuggerState.RUNNING)
+                    body = await self._request("threads", {})
+                    if self._session_generation != session_generation:
+                        raise DebuggerRequestError(
+                            "The debug session changed before pause could be retried."
+                        )
+                    threads = body.get("threads")
+                    native = next(
+                        (
+                            int(item["id"])
+                            for item in threads[:256]
+                            if isinstance(item, Mapping) and _positive_int(item.get("id"))
+                        ),
+                        None,
+                    ) if isinstance(threads, list) else None
+                    if native is None:
+                        raise DebuggerRequestError("The debug adapter returned no pausable thread.") from None
+                    self._require_state(DebuggerState.RUNNING)
+                    await self._request("pause", {"threadId": native})
+                return await self.status()
+        finally:
+            if self._control_operation is operation:
+                self._control_operation = None
 
     async def step_over(self, thread_id: str) -> DebugSessionStatus:
         return await self._execution_request("next", thread_id)
@@ -551,10 +588,24 @@ class DebuggerService:
     async def _execution_request(self, command: str, thread_id: str | None) -> DebugSessionStatus:
         async with self._mutating_lock:
             self._require_state(DebuggerState.PAUSED)
+            stop_generation = self._stop_generation
             native = self._resolve(thread_id, "thread") if thread_id is not None else None
             await self._invalidate_stopped_data()
             await self._request(command, {} if native is None else {"threadId": native})
-            await self._set_state(DebuggerState.RUNNING)
+            async with self._state_lock:
+                # A fast adapter may deliver continued + stopped before its
+                # execution response. Never overwrite that newer stop (or a
+                # terminal/failure event) with a stale RUNNING transition.
+                if (
+                    self._stop_generation == stop_generation
+                    and self._state
+                    not in {
+                        DebuggerState.TERMINATING,
+                        DebuggerState.TERMINATED,
+                        DebuggerState.FAILED,
+                    }
+                ):
+                    self._state = DebuggerState.RUNNING
             return await self.status()
 
     async def _request(self, command: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
@@ -565,10 +616,25 @@ class DebuggerService:
         except DapRequestTimeoutError as error:
             raise DebuggerRequestError("The debug adapter request timed out.") from error
         except DapRequestError as error:
+            if self._pause_requires_thread_id(command, arguments, error):
+                raise _PauseThreadIdRequired from error
             raise DebuggerRequestError("The debug adapter rejected the requested operation.") from error
         except DapError as error:
             await self._mark_failed(error)
             raise DebuggerFailedError("The debug-adapter transport failed.") from error
+
+    def _pause_requires_thread_id(
+        self, command: str, arguments: Mapping[str, object], error: DapRequestError
+    ) -> bool:
+        """Recognize only the bounded known LLDB-DAP missing-thread response."""
+        if (
+            self._backend.backend_id != "lldb-dap"
+            or command != "pause"
+            or arguments
+            or error.command != "pause"
+        ):
+            return False
+        return error.compatibility is DapRequestCompatibility.PAUSE_THREAD_ID_REQUIRED
 
     async def _read_request(self, command: str, arguments: Mapping[str, object], generation: int) -> Mapping[str, object]:
         if self._client is None:

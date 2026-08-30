@@ -46,6 +46,7 @@ _WINDOWS_RESERVED_COMPONENT = re.compile(
 )
 MAX_WORKSPACE_LIST_FILES = 1_000
 MAX_WORKSPACE_MUTATION_EDITS = 1_000
+MAX_GENERATED_DIRECTORY_FILES = 4_096
 
 ExpectedSnapshot: TypeAlias = FileSnapshot | str | None
 
@@ -159,9 +160,13 @@ class GeneratedWorkspaceDirectory:
         """Return whether the generated directory contains no entries."""
         return self._service._generated_directory_is_empty(self.relative_path)
 
-    def list_files(self, path: str = ".") -> tuple[str, ...]:
+    def list_files(
+        self, path: str = ".", *, maximum: int = MAX_GENERATED_DIRECTORY_FILES
+    ) -> tuple[str, ...]:
         """List direct regular, non-symlink file names below one generated directory."""
-        return self._service._list_generated_files(self.relative_path, path)
+        return self._service._list_generated_files(
+            self.relative_path, path, maximum=maximum
+        )
 
     def get_snapshot(self, path: str) -> FileSnapshot:
         """Return metadata for one generated file without exposing its contents."""
@@ -810,19 +815,34 @@ class WorkspaceService:
         with os.scandir(target) as entries:
             return next(entries, None) is None
 
-    def _list_generated_files(self, directory: str, path: str) -> tuple[str, ...]:
+    def _list_generated_files(
+        self, directory: str, path: str, *, maximum: int
+    ) -> tuple[str, ...]:
         """List direct regular files in a generated directory without following links."""
+        if (
+            not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or not 1 <= maximum <= MAX_GENERATED_DIRECTORY_FILES
+        ):
+            raise WorkspaceFileTooLargeError(
+                "Generated-directory listing limit is outside the supported bound."
+            )
         target = self._resolve_generated_child(directory, path)
         if not target.exists():
             raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
         if not target.is_dir():
             raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
+        names: list[str] = []
         with os.scandir(target) as entries:
-            return tuple(
-                entry.name
-                for entry in sorted(entries, key=lambda entry: entry.name)
-                if not _is_link_or_reparse_point(Path(entry.path)) and entry.is_file(follow_symlinks=False)
-            )
+            for entry in entries:
+                if _is_link_or_reparse_point(Path(entry.path)) or not entry.is_file(follow_symlinks=False):
+                    continue
+                names.append(entry.name)
+                if len(names) > maximum:
+                    raise WorkspaceFileTooLargeError(
+                        "The generated directory contains more files than this operation permits."
+                    )
+        return tuple(sorted(names))
 
     def _get_generated_snapshot(self, directory: str, path: str) -> FileSnapshot:
         """Capture metadata for one generated regular file with normal boundary checks."""

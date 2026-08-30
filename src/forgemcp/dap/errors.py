@@ -5,6 +5,8 @@ These errors deliberately never contain adapter payload, stdout, or stderr.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 
 class DapError(Exception):
     """Base class for expected DAP-client failures."""
@@ -22,9 +24,22 @@ class DapRequestTimeoutError(DapError):
     """The adapter did not reply before a bounded request deadline."""
 
 
+class DapRequestCompatibility(StrEnum):
+    """Strict internal classifications for known adapter incompatibilities."""
+
+    PAUSE_THREAD_ID_REQUIRED = "pause_thread_id_required"
+
+
 class DapRequestError(DapError):
     """The adapter returned a structurally valid unsuccessful response."""
 
-    def __init__(self, command: str, message: str | None = None) -> None:
+    def __init__(
+        self,
+        command: str,
+        message: str | None = None,
+        *,
+        compatibility: DapRequestCompatibility | None = None,
+    ) -> None:
         self.command = command
+        self.compatibility = compatibility
         super().__init__(message or f"The debug adapter rejected '{command}'.")

@@ -89,7 +89,8 @@ _CMAKE_HOME_DIRECTORY_CACHE = re.compile(
     r"^CMAKE_HOME_DIRECTORY(?::[^=]+)?=(?P<value>[^\r\n]{1,4096})\r*$", re.MULTILINE
 )
 _CMAKE_COMPILER_CACHE = re.compile(
-    r"^CMAKE_(?:C|CXX)_COMPILER(?::[^=]+)?=(?P<value>[^\r\n]{1,4096})\r*$", re.MULTILINE
+    r"^CMAKE_(?P<language>C|CXX)_COMPILER(?::[^=]+)?=(?P<value>[^\r\n]{1,4096})\r*$",
+    re.MULTILINE,
 )
 _COMPILER_DIAGNOSTIC = re.compile(
     r"^(?P<path>.+?):(?P<line>[0-9]+):(?P<column>[0-9]+):\s*"
@@ -102,7 +103,7 @@ _MSVC_DIAGNOSTIC = re.compile(
     re.IGNORECASE,
 )
 _LINKER_DIAGNOSTIC = re.compile(
-    r"^(?P<tool>LINK|(?:[^:]+/)?ld(?:\.exe)?)\s*:?\s*(?P<severity>fatal error|error|warning)\s*"
+    r"^(?P<tool>LINK|lld-link(?:\.exe)?|(?:[^:]+/)?ld(?:\.exe)?)\s*:?\s*(?P<severity>fatal error|error|warning)\s*"
     r"(?P<code>(?:LNK)?[A-Za-z]*[0-9]+)?\s*:?\s*(?P<message>.*)$",
     re.IGNORECASE,
 )
@@ -114,6 +115,12 @@ MAX_COMPILATION_DATABASE_ENTRIES = 100_000
 MAX_COMPILATION_DATABASE_DEPTH = 16
 MAX_CACHED_DISCOVERY_PROFILES = 16
 CACHED_DISCOVERY_PROFILE_TTL_SECONDS = 600.0
+MAX_FILE_API_REPLY_FILES = 4_096
+MAX_FILE_API_INDEX_FILES = 16
+MAX_FILE_API_CONFIGURATIONS = 128
+MAX_FILE_API_TARGETS = 4_096
+MAX_FILE_API_COLLECTION_ITEMS = 4_096
+MAX_FILE_API_JSON_BYTES = 1_048_576
 
 CacheValue: TypeAlias = str | int | bool
 
@@ -374,9 +381,9 @@ class CMakeService:
                 continue
             kit = self._kit_by_id(candidate_id)
             if kit is None or kit.readiness == "rejected":
-                if source == "operation":
-                    raise CMakeKitError("The requested CMake kit is unavailable or not qualified.")
-                continue
+                raise CMakeKitError(
+                    "The explicitly selected CMake kit is unavailable or not qualified; automatic fallback is disabled."
+                )
             return kit, source, self._toolchain.kit_profile(kit.id) if self._toolchain else None
         if self._toolchain is not None:
             kit = next((item for item in self._toolchain.kits().kits if item.readiness == "ready"), None)
@@ -454,15 +461,12 @@ class CMakeService:
                 source_matches = False
         generator = self._cached_generator_from_text(cache)
         family = self._cached_compiler_family_from_text(cache)
-        kit, selection_source, _ = self._effective_kit()
+        kit, _, kit_profile = self._effective_kit()
         compatibility = "unknown"
-        if kit is not None and selection_source != "automatic":
-            compatibility = (
-                "compatible"
-                if family in {None, kit.compiler_family}
-                and (generator is None or generator in kit.compatible_generators)
-                else "incompatible"
-            )
+        if kit is not None:
+            compatibility = "compatible" if self._cache_matches_kit(
+                cache, generator, family, kit, kit_profile
+            ) else "incompatible"
         stale = self._configuration_stale and generated.relative_path == self._configured_binary_dir
         database = self._validate_compilation_database(generated)
         file_api_valid = source_matches and self._file_api_is_valid(generated)
@@ -509,6 +513,66 @@ class CMakeService:
         if name.startswith(("g++", "gcc")):
             return "gcc"
         return None
+
+    @classmethod
+    def _cache_matches_kit(
+        cls,
+        cache: str,
+        generator: str | None,
+        family: str | None,
+        kit: CMakeKit,
+        profile: ToolchainProfile | None,
+    ) -> bool:
+        """Require generator, family, and exact compiler identity for adoption."""
+        if (
+            generator is None
+            or generator not in kit.compatible_generators
+            or family != kit.compiler_family
+            or profile is None
+            or profile.c_compiler_path is None
+            or profile.cxx_compiler_path is None
+        ):
+            return False
+        compilers = {
+            match.group("language"): match.group("value")
+            for match in _CMAKE_COMPILER_CACHE.finditer(cache)
+        }
+        if set(compilers) != {"C", "CXX"}:
+            return False
+
+        def identity(value: str | Path) -> str:
+            return os.path.normcase(os.path.abspath(str(value))).replace("\\", "/")
+
+        return (
+            identity(compilers["C"]) == identity(profile.c_compiler_path)
+            and identity(compilers["CXX"]) == identity(profile.cxx_compiler_path)
+        )
+
+    def _require_existing_tree_compatible(
+        self,
+        generated: GeneratedWorkspaceDirectory,
+        kit: CMakeKit | None,
+        profile: ToolchainProfile | None,
+    ) -> None:
+        """Reject selected-kit adoption unless cache identity matches exactly."""
+        if kit is None:
+            return
+        try:
+            cache = generated.read_text("CMakeCache.txt")
+        except WorkspaceError:
+            return
+        generator = self._cached_generator_from_text(cache)
+        family = self._cached_compiler_family_from_text(cache)
+        if not self._cache_matches_kit(cache, generator, family, kit, profile):
+            raise CMakeBuildTreeIncompatibleError(
+                self._build_tree_incompatibility_message(
+                    generator,
+                    kit.preferred_generator,
+                    family,
+                    kit.compiler_family,
+                    kit.id,
+                )
+            )
 
     def _safe_diagnostics(
         self, result: ProcessResult, *, category: str
@@ -866,11 +930,12 @@ class CMakeService:
 
     def list_targets(self, *, binary_dir: str | None = None) -> CMakeTargetList:
         """Read target metadata solely from CMake File API codemodel v2."""
-        kit, _, _ = self._effective_kit()
+        kit, _, kit_profile = self._effective_kit()
         generated = self._workspace.open_generated_directory(self._resolve_profile(
             binary_dir=binary_dir, source_dir=None, preset=None,
             explicit_kit=kit if self._kit_is_explicit() else None,
         ).binary_dir)
+        self._require_existing_tree_compatible(generated, kit, kit_profile)
         codemodel = self._load_codemodel(generated)
         configurations = self._parse_target_configurations(codemodel, generated)
         result = CMakeTargetList(binary_dir=generated.relative_path, configurations=configurations)
@@ -902,6 +967,9 @@ class CMakeService:
                 explicit_kit=kit if self._kit_is_explicit() else None,
             )
             generated = self._workspace.open_generated_directory(profile.binary_dir)
+            self._require_existing_tree_compatible(
+                generated, kit, kit_profile or self._configured_kit_profile
+            )
             normalised_binary = generated.relative_path
             target_names = self._validate_names(targets, label="target")
             selected_configuration = self._selected_configuration(configuration)
@@ -968,6 +1036,9 @@ class CMakeService:
             binary_dir=binary_dir, source_dir=None, preset=None,
             explicit_kit=kit if self._kit_is_explicit() else None,
         ).binary_dir)
+        self._require_existing_tree_compatible(
+            generated, kit, kit_profile or self._configured_kit_profile
+        )
         result = await self._run_required(
             "ctest", [self._tool_executable("ctest"), "--test-dir", generated.relative_path, "--show-only=json-v1"],
             timeout_seconds=self._default_timeout("test"),
@@ -1005,17 +1076,26 @@ class CMakeService:
                 explicit_kit=kit if self._kit_is_explicit() else None,
             )
             generated = self._workspace.open_generated_directory(profile.binary_dir)
+            self._require_existing_tree_compatible(
+                generated, kit, kit_profile or self._configured_kit_profile
+            )
             normalised_binary = generated.relative_path
             names = self._validate_names(test_names, label="test name")
             selected_configuration = self._selected_configuration(configuration)
             await context.report_progress(
                 ProgressUpdate(0, None, "Preparing selected tests" if names else "Preparing discovered tests")
             )
-            argv = [self._tool_executable("ctest"), "--test-dir", generated.relative_path, "--output-on-failure"]
+            argv = [
+                self._tool_executable("ctest"), "--test-dir", generated.relative_path,
+                "--output-on-failure", "--no-tests=error",
+            ]
             if selected_configuration is not None:
                 argv.extend(["--build-config", selected_configuration])
             if names:
-                argv.extend(["-R", "^(?:" + "|".join(re.escape(name) for name in names) + ")$"])
+                # CTest uses CMake's regex dialect, which does not implement
+                # PCRE non-capturing groups.  A plain group plus no-tests=error
+                # prevents a malformed/no-match filter from reporting success.
+                argv.extend(["-R", "^(" + "|".join(re.escape(name) for name in names) + ")$"])
             await context.report_progress(ProgressUpdate(0, None, "Test run started"))
             result, progress_observer = await self._run_with_progress(
                 "ctest",
@@ -1517,16 +1597,6 @@ class CMakeService:
                 raise CMakePresetKitConflictError(
                     "An explicit configure generator and a CMake preset are alternative generator workflows; choose one."
                 )
-                profile_id = self._profile_by_binary_dir.get(generated.relative_path)
-                if profile_id is not None and profile_id in self._target_profiles:
-                    profile = self._target_profiles[profile_id]
-                    self._target_profiles[profile_id] = CachedCMakeTargetProfile(
-                        profile_id=profile.profile_id,
-                        targets=profile.targets,
-                        observed_at=profile.observed_at,
-                        expires_at=profile.expires_at,
-                        kit_id=None if effective_kit is None else effective_kit.id,
-                    )
             return requested
         if preset is not None:
             return None
@@ -1785,11 +1855,13 @@ class CMakeService:
         self._expire_target_profiles()
         existing = self._profile_by_binary_dir.get(targets.binary_dir)
         profile_id = existing if existing in self._target_profiles else secrets.token_urlsafe(18)
+        effective_kit, _, _ = self._effective_kit()
         profile = CachedCMakeTargetProfile(
             profile_id=profile_id,
             targets=targets,
             observed_at=datetime.now(UTC),
             expires_at=monotonic() + CACHED_DISCOVERY_PROFILE_TTL_SECONDS,
+            kit_id=None if effective_kit is None else effective_kit.id,
         )
         self._target_profiles[profile_id] = profile
         self._target_profiles.move_to_end(profile_id)
@@ -1942,14 +2014,24 @@ class CMakeService:
     def _load_codemodel(self, generated: GeneratedWorkspaceDirectory) -> Mapping[str, object]:
         reply_directory = ".cmake/api/v1/reply"
         try:
-            names = generated.list_files(reply_directory)
+            names = generated.list_files(
+                reply_directory, maximum=MAX_FILE_API_REPLY_FILES
+            )
         except WorkspaceError as error:
             raise CMakeFileApiError("CMake File API reply directory is missing; configure this build tree first.") from error
         indexes = [name for name in names if name.startswith("index-") and name.endswith(".json")]
         if not indexes:
             raise CMakeFileApiError("CMake File API reply is missing; configure this build tree after requesting codemodel-v2.")
+        if len(indexes) > MAX_FILE_API_INDEX_FILES:
+            raise CMakeFileApiError("CMake File API contains too many index replies.")
         snapshots = [
-            (generated.get_snapshot(f"{reply_directory}/{name}"), name)
+            (
+                generated.read_text_with_snapshot(
+                    f"{reply_directory}/{name}",
+                    maximum_bytes=MAX_FILE_API_JSON_BYTES,
+                )[1],
+                name,
+            )
             for name in indexes
         ]
         index_name = max(
@@ -1957,7 +2039,14 @@ class CMakeService:
             key=lambda item: (item[0].modified_at or item[0].captured_at, item[1]),
         )[1]
         index_snapshot = next(snapshot for snapshot, name in snapshots if name == index_name)
-        query_snapshot = generated.get_snapshot(".cmake/api/v1/query/codemodel-v2")
+        try:
+            _, query_snapshot = generated.read_text_with_snapshot(
+                ".cmake/api/v1/query/codemodel-v2", maximum_bytes=4_096
+            )
+        except WorkspaceError as error:
+            raise CMakeFileApiError(
+                "CMake File API codemodel-v2 query is missing or oversized."
+            ) from error
         if (
             query_snapshot.exists
             and query_snapshot.modified_at is not None
@@ -1989,12 +2078,19 @@ class CMakeService:
         self, generated: GeneratedWorkspaceDirectory, path: str
     ) -> Mapping[str, object]:
         try:
-            content = generated.read_text(path)
+            content, _ = generated.read_text_with_snapshot(
+                path, maximum_bytes=MAX_FILE_API_JSON_BYTES
+            )
             value = json.loads(content)
         except (WorkspaceError, json.JSONDecodeError) as error:
             raise CMakeFileApiError("CMake File API contains a missing or malformed JSON reply.") from error
         if not isinstance(value, dict):
             raise CMakeFileApiError("CMake File API JSON replies must contain objects.")
+        if (
+            self._json_depth(value) > MAX_COMPILATION_DATABASE_DEPTH
+            or not self._json_strings_within_limits(value)
+        ):
+            raise CMakeFileApiError("CMake File API JSON reply exceeds structural limits.")
         return value
 
     def _parse_target_configurations(
@@ -2002,21 +2098,29 @@ class CMakeService:
     ) -> tuple[CMakeConfigurationTargets, ...]:
         configurations = codemodel["configurations"]
         assert isinstance(configurations, list)  # Checked by _load_codemodel.
+        if len(configurations) > MAX_FILE_API_CONFIGURATIONS:
+            raise CMakeFileApiError("CMake File API contains too many configurations.")
         paths = codemodel.get("paths")
         if not isinstance(paths, Mapping):
             raise CMakeFileApiError("CMake File API codemodel reply has no top-level paths object.")
         source_base = self._safe_file_api_path(paths.get("source"), base=".")
         build_base = self._safe_file_api_path(paths.get("build"), base=generated.relative_path)
         parsed: list[CMakeConfigurationTargets] = []
+        total_targets = 0
         for configuration in configurations:
             if not isinstance(configuration, Mapping):
                 raise CMakeFileApiError("CMake File API configuration entries must be objects.")
             name = configuration.get("name")
             if not isinstance(name, str):
                 raise CMakeFileApiError("CMake File API configuration names must be strings.")
+            if len(name) > 256 or "\x00" in name:
+                raise CMakeFileApiError("CMake File API configuration name is outside the supported bound.")
             references = configuration.get("targets")
             if not isinstance(references, list):
                 raise CMakeFileApiError("CMake File API configuration targets must be an array.")
+            total_targets += len(references)
+            if total_targets > MAX_FILE_API_TARGETS:
+                raise CMakeFileApiError("CMake File API contains too many targets.")
             entries: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
             identifiers: dict[str, str] = {}
             for reference in references:
@@ -2061,6 +2165,13 @@ class CMakeService:
             or not isinstance(paths, Mapping)
         ):
             raise CMakeFileApiError("A CMake File API target is malformed.")
+        if (
+            len(name) > 256
+            or len(target_id) > 1024
+            or len(target_type) > 128
+            or any("\x00" in value for value in (name, target_id, target_type))
+        ):
+            raise CMakeFileApiError("A CMake File API target exceeds string limits.")
         target_source = self._safe_file_api_path(paths.get("source"), base=source_base)
         target_build = self._safe_file_api_path(paths.get("build"), base=build_base)
         artifacts = self._file_api_paths(target.get("artifacts"), base=target_build, key="path")
@@ -2068,6 +2179,8 @@ class CMakeService:
         raw_dependencies = target.get("dependencies", [])
         if not isinstance(raw_dependencies, list):
             raise CMakeFileApiError("CMake File API target dependencies must be an array.")
+        if len(raw_dependencies) > MAX_FILE_API_COLLECTION_ITEMS:
+            raise CMakeFileApiError("CMake File API dependency collection exceeds its fixed bound.")
         dependencies: list[str] = []
         for dependency in raw_dependencies:
             if not isinstance(dependency, Mapping) or not isinstance(dependency.get("id"), str):
@@ -2089,6 +2202,8 @@ class CMakeService:
             return ()
         if not isinstance(value, list):
             raise CMakeFileApiError("A CMake File API target path collection must be an array.")
+        if len(value) > MAX_FILE_API_COLLECTION_ITEMS:
+            raise CMakeFileApiError("CMake File API target path collection exceeds its fixed bound.")
         paths: list[str] = []
         for item in value:
             if not isinstance(item, Mapping):

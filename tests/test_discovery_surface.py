@@ -511,7 +511,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
 
                     listed = await session.list_resources()
                     uris = {str(resource.uri) for resource in listed.resources}
-                    assert {
+                    assert uris == {
                         "forgemcp://about",
                         "forgemcp://project/status",
                         "forgemcp://workspace/files",
@@ -521,7 +521,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                     } <= uris
                     templates = await session.list_resource_templates()
                     template_uris = {template.uriTemplate for template in templates.resourceTemplates}
-                    assert {
+                    assert template_uris == {
                         "forgemcp://workspace/files/{cursor}",
                         "forgemcp://cmake/targets/{profile}",
                         "forgemcp://cmake/kits/{kit}",
@@ -543,6 +543,25 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         await session.read_resource(AnyUrl("forgemcp://cmake/kits"))
                     )
                     assert {"schema_version", "resource", "state", "kits", "complete"} <= kits.keys()
+                    kit_values = kits["kits"]
+                    assert isinstance(kit_values, list)
+                    selected_kit = kit_values[0]["id"] if kit_values else "kit-unavailable"
+                    kit_resource = _resource_json(
+                        await session.read_resource(AnyUrl(f"forgemcp://cmake/kits/{selected_kit}"))
+                    )
+                    assert kit_resource["state"] == ("available" if kit_values else "unavailable")
+                    target_profile = _resource_json(
+                        await session.read_resource(AnyUrl("forgemcp://cmake/targets/unavailable-profile"))
+                    )
+                    assert target_profile["error"]["code"] == "profile_unavailable"
+                    initial_logs = _resource_json(
+                        await session.read_resource(AnyUrl("forgemcp://logs/recent"))
+                    )
+                    assert isinstance(initial_logs["events"], list)
+                    filtered_logs = _resource_json(
+                        await session.read_resource(AnyUrl("forgemcp://logs/recent/info/10"))
+                    )
+                    assert filtered_logs["limit"] == 10
                     with pytest.raises(McpError):
                         await session.read_resource(AnyUrl("forgemcp://unknown"))
 
@@ -618,6 +637,69 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                     assert log_completion.completion.values == ["warning"]
                     assert log_completion.completion.total == 1
                     assert log_completion.completion.hasMore is False
+                    completion_cases: list[tuple[object, str, str, dict[str, str]]] = [
+                        (
+                            mcp_types.ResourceTemplateReference(
+                                type="ref/resource", uri="forgemcp://logs/recent/{level}/{limit}"
+                            ),
+                            "limit", "", {},
+                        ),
+                        (
+                            mcp_types.ResourceTemplateReference(
+                                type="ref/resource", uri="forgemcp://workspace/files/{cursor}"
+                            ),
+                            "cursor", "", {},
+                        ),
+                        (
+                            mcp_types.ResourceTemplateReference(
+                                type="ref/resource", uri="forgemcp://cmake/kits/{kit}"
+                            ),
+                            "kit", "", {},
+                        ),
+                        (
+                            mcp_types.ResourceTemplateReference(
+                                type="ref/resource", uri="forgemcp://cmake/targets/{profile}"
+                            ),
+                            "profile", "", {},
+                        ),
+                    ]
+                    profile_prompts = (
+                        "forgemcp_build_report", "forgemcp_test_report",
+                        "forgemcp_diagnose_build", "forgemcp_debug_target",
+                    )
+                    for reference in profile_prompts:
+                        for argument in ("profile", "configuration", "generator", "kit"):
+                            completion_cases.append((
+                                mcp_types.PromptReference(type="ref/prompt", name=reference),
+                                argument, "", {},
+                            ))
+                    for reference in (
+                        "forgemcp_build_report", "forgemcp_test_report", "forgemcp_diagnose_build"
+                    ):
+                        completion_cases.append((
+                            mcp_types.PromptReference(type="ref/prompt", name=reference),
+                            "preset", "", {},
+                        ))
+                    for reference in (
+                        "forgemcp_build_report", "forgemcp_diagnose_build", "forgemcp_debug_target"
+                    ):
+                        completion_cases.append((
+                            mcp_types.PromptReference(type="ref/prompt", name=reference),
+                            "target", "", {},
+                        ))
+                    completion_cases.append((
+                        mcp_types.PromptReference(type="ref/prompt", name="forgemcp_test_report"),
+                        "test", "", {},
+                    ))
+                    for reference, argument, value, context in completion_cases:
+                        first_result = await session.complete(
+                            reference, {"name": argument, "value": value}, context_arguments=context  # type: ignore[arg-type]
+                        )
+                        second_result = await session.complete(
+                            reference, {"name": argument, "value": value}, context_arguments=context  # type: ignore[arg-type]
+                        )
+                        assert first_result.completion == second_result.completion
+                        assert len(first_result.completion.values) <= 100
                     with pytest.raises(McpError):
                         await session.complete(
                             mcp_types.PromptReference(
@@ -681,6 +763,7 @@ def test_phase_c_stdio_sdk_gate(tmp_path: Path) -> None:
                         if notifications:
                             break
                         await asyncio.sleep(0.05)
+                    assert len(notifications) == 1
                     assert notifications[-1].level == "info"
                     assert notifications[-1].data["category"] == "workspace_text_edits_applied"
                     logs = _resource_json(

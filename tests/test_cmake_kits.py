@@ -42,8 +42,8 @@ class _Toolchain:
         self._profiles = {
             item.id: ToolchainProfile(
                 item,
-                Path("C:/safe/compiler.exe"),
-                Path("C:/safe/compiler++.exe"),
+                Path(f"C:/safe/{item.c_compiler}.exe"),
+                Path(f"C:/safe/{item.cxx_compiler}.exe"),
                 None,
             )
             for item in kits
@@ -101,6 +101,22 @@ def test_selection_is_cas_guarded_and_invalid_selection_does_not_change_state(tm
     assert getattr(stale.value, "code", None) == "kit_selection_conflict"
 
 
+def test_invalid_initial_kit_never_falls_back_to_an_automatic_kit(tmp_path: Path) -> None:
+    available = _kit("kit-clang-000000000001")
+    config = ForgeConfig(workspace_root=tmp_path, cmake_kit="kit-missing-00000000000")
+    runtime = _Runtime()
+    service = CMakeService(
+        WorkspaceService(config, create_logger("CRITICAL")),
+        runtime,
+        config,
+        _Toolchain(available),
+    )
+
+    with pytest.raises(CMakeKitError, match="automatic fallback is disabled"):
+        asyncio.run(service.configure(binary_dir="build"))
+    assert runtime.calls == []
+
+
 def test_explicit_kit_uses_private_compilers_and_per_kit_directory_without_output_leak(tmp_path: Path) -> None:
     kit = _kit("kit-clang-000000000001")
     service, runtime = _service(tmp_path, kit)
@@ -111,7 +127,7 @@ def test_explicit_kit_uses_private_compilers_and_per_kit_directory_without_outpu
     assert result.effective_kit == kit
     assert any(argument.startswith("-DCMAKE_C_COMPILER:FILEPATH=C:") for argument in runtime.calls[0])
     serialized = json.dumps(result.model_dump(mode="json"))
-    assert "C:/safe/compiler" not in serialized
+    assert "C:/safe/clang" not in serialized
     assert "C:/host/secret/output" not in serialized
 
 
@@ -136,7 +152,8 @@ def test_existing_cache_is_read_only_adoptable_or_rejected_by_explicit_kit(tmp_p
     (build / "CMakeCache.txt").write_text(
         f"CMAKE_HOME_DIRECTORY:INTERNAL={tmp_path}\r\n"
         "CMAKE_GENERATOR:INTERNAL=Ninja\r\n"
-        "CMAKE_CXX_COMPILER:FILEPATH=C:/tool/clang++.exe\r\n",
+        "CMAKE_C_COMPILER:FILEPATH=C:/safe/clang.exe\r\n"
+        "CMAKE_CXX_COMPILER:FILEPATH=C:/safe/clang++.exe\r\n",
         encoding="utf-8",
     )
 
@@ -150,6 +167,24 @@ def test_existing_cache_is_read_only_adoptable_or_rejected_by_explicit_kit(tmp_p
     incompatible, _ = _service(tmp_path, msvc)
     with pytest.raises(CMakeBuildTreeIncompatibleError):
         asyncio.run(incompatible.configure(binary_dir="build", kit=msvc.id))
+    assert runtime.calls == []
+
+
+def test_existing_tree_with_same_family_but_different_compiler_is_not_executed(tmp_path: Path) -> None:
+    kit = _kit("kit-clang-000000000001")
+    service, runtime = _service(tmp_path, kit)
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "CMakeCache.txt").write_text(
+        f"CMAKE_HOME_DIRECTORY:INTERNAL={tmp_path}\r\n"
+        "CMAKE_GENERATOR:INTERNAL=Ninja\r\n"
+        "CMAKE_C_COMPILER:FILEPATH=C:/other/clang.exe\r\n"
+        "CMAKE_CXX_COMPILER:FILEPATH=C:/other/clang++.exe\r\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CMakeBuildTreeIncompatibleError):
+        asyncio.run(service.build(binary_dir="build"))
     assert runtime.calls == []
 
 
@@ -169,4 +204,25 @@ def test_msvc_and_linker_diagnostics_are_path_safe_and_structured(tmp_path: Path
     assert [item.category for item in diagnostics] == ["compiler", "linker"]
     assert diagnostics[0].file == "main.cpp" and diagnostics[0].line == 0 and diagnostics[0].column == 4
     assert diagnostics[1].code == "LNK1104" and "C:/secret" not in diagnostics[1].message
+    assert (omitted, invalid, complete) == (0, 0, True)
+
+
+def test_lld_link_failure_is_classified_without_disclosing_its_absolute_path(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, _kit("kit-clang-000000000001"))
+    now = datetime.now(UTC)
+    result = ProcessResult(
+        exit_code=1,
+        started_at=now,
+        finished_at=now,
+        stdout=ProcessOutput(text=""),
+        stderr=ProcessOutput(
+            text="lld-link: error: undefined symbol: C:/host/canary/intentionally_undefined_symbol\n"
+        ),
+    )
+
+    diagnostics, omitted, invalid, complete = service._safe_diagnostics(result, category="build")
+
+    assert len(diagnostics) == 1 and diagnostics[0].category == "linker"
+    assert "C:/host/canary" not in diagnostics[0].message
+    assert service._build_outcome(result, diagnostics) == "linker_failure"
     assert (omitted, invalid, complete) == (0, 0, True)

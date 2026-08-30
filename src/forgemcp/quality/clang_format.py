@@ -123,7 +123,7 @@ class ClangFormatService:
         except QualityToolUnavailableError as error:
             self._cached_status = QualityToolInfo(available=False, error=error.message)
             return self._cached_status
-        self._cached_status = QualityToolInfo(executable=selected.canonical, available=True, version=selected.version)
+        self._cached_status = QualityToolInfo(executable="clang-format", available=True, version=selected.version)
         return self._cached_status
 
     async def check(self, paths: Iterable[str]) -> FormatCheckResult:
@@ -221,7 +221,7 @@ class ClangFormatService:
                 continue
             selection = _ToolSelection(canonical, version)
             self._cached_status = QualityToolInfo(
-                executable=selection.canonical, available=True, version=selection.version
+                executable="clang-format", available=True, version=selection.version
             )
             return selection
         self._cached_status = QualityToolInfo(

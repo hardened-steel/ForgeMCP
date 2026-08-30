@@ -186,6 +186,15 @@ def test_generated_directory_capability_creates_and_guards_file_api_style_files(
     assert service.validate_reported_path(str(tmp_path / "build")) == "build"
 
 
+def test_generated_directory_listing_fails_closed_above_caller_bound(tmp_path):
+    generated = workspace(tmp_path).open_generated_directory("build", create=True)
+    for index in range(3):
+        generated.write_text(f"reply/{index}.json", "{}")
+
+    with pytest.raises(WorkspaceFileTooLargeError, match="more files"):
+        generated.list_files("reply", maximum=2)
+
+
 def test_execution_paths_allow_existing_ignored_build_tree_without_exposing_pathlib(tmp_path):
     build = tmp_path / "build"
     build.mkdir()

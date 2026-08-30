@@ -22,7 +22,7 @@ class ClangdSessionState(StrEnum):
 class ClangdStatus(ForgeModel):
     """Safe availability and lifecycle status for the clangd feature."""
 
-    executable: str = Field(min_length=1, description="Configured clangd executable selector, never its argv.")
+    executable: str = Field(min_length=1, description="Stable public tool identity, never its resolved executable path or argv.")
     available: bool = Field(description="Whether clangd is available through the Process Runtime.")
     state: ClangdSessionState = Field(description="Current managed-session lifecycle state.")
     version: str | None = Field(default=None, max_length=256, description="Parsed clangd version when available.")

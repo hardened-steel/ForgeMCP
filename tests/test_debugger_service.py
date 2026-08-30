@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from forgemcp.dap import DapRequestError
+from forgemcp.dap.errors import DapRequestCompatibility
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
 from forgemcp.debugger.errors import DebuggerHandleExpiredError, DebuggerRequestError, DebuggerStaleDataError, DebuggerUnsupportedError
@@ -109,6 +111,10 @@ class _FakeBackend:
         return {"program": program, "cwd": cwd, "args": list(args), "env": dict(environment), "stopOnEntry": stop_on_entry, "console": "internalConsole"}
 
 
+class _LldbFakeBackend(_FakeBackend):
+    backend_id = "lldb-dap"
+
+
 def test_fake_adapter_drives_configuration_handles_events_and_stop_generation(tmp_path: Path):
     async def exercise() -> None:
         source = tmp_path / "source.cpp"
@@ -150,6 +156,133 @@ def test_fake_adapter_drives_configuration_handles_events_and_stop_generation(tm
         await runtime.aclose()
 
     asyncio.run(exercise())
+
+
+def test_step_response_cannot_overwrite_a_newer_stopped_event(tmp_path: Path) -> None:
+    event_before_response = _FAKE_ADAPTER.replace(
+        'elif command in {"continue", "next", "stepIn", "stepOut"}:\n        send("response", request_seq=sequence_id, command=command, success=True, body={})\n        send("event", event="continued", body={})',
+        'elif command in {"continue", "next", "stepIn", "stepOut"}:\n        if command == "next":\n            send("event", event="continued", body={})\n            send("event", event="stopped", body={"reason": "step", "threadId": 7})\n            send("response", request_seq=sequence_id, command=command, success=True, body={})\n        else:\n            send("response", request_seq=sequence_id, command=command, success=True, body={})\n            send("event", event="continued", body={})',
+    )
+
+    async def exercise() -> None:
+        source = tmp_path / "source.cpp"
+        source.write_text("int main() { return 0; }\n", encoding="utf-8")
+        build = tmp_path / "build"
+        build.mkdir()
+        (build / "demo.exe").write_bytes(b"placeholder")
+        config = ForgeConfig(workspace_root=tmp_path)
+        runtime = ProcessRuntime(
+            config,
+            create_logger("CRITICAL"),
+            policy=ProcessPolicy(
+                allowed_executables=frozenset(),
+                allowed_executable_paths=frozenset({Path(sys.executable).resolve()}),
+            ),
+        )
+        service = DebuggerService(
+            WorkspaceService(config, create_logger("CRITICAL")),
+            runtime,
+            _FakeBackend(runtime, event_before_response),  # type: ignore[arg-type]
+        )
+        await service.launch(DebugLaunchRequest(program="build/demo.exe", cwd="build"))
+        await asyncio.sleep(0.02)
+        thread = (await service.threads())[0]
+        status = await service.step_over(thread.thread_id)
+        assert status.state is DebuggerState.PAUSED
+        assert (await service.threads())[0].thread_id != thread.thread_id
+        await service.stop()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_pause_thread_retry_is_exact_single_session_and_stop_preemptible(tmp_path: Path) -> None:
+    required_thread = _FAKE_ADAPTER.replace(
+        'elif command == "pause":\n        send("response", request_seq=sequence_id, command=command, success=True, body={})\n        send("event", event="stopped", body={"reason": "pause", "threadId": 7})',
+        'elif command == "pause":\n        if arguments.get("threadId") != 7:\n            send("response", request_seq=sequence_id, command=command, success=False, body={"error": {"format": "Request \'pause\': missing value at arguments.threadId", "id": 3, "showUser": True}})\n        else:\n            send("response", request_seq=sequence_id, command=command, success=True, body={})\n            send("event", event="stopped", body={"reason": "pause", "threadId": 7})',
+    )
+
+    async def make_service(script: str) -> tuple[DebuggerService, ProcessRuntime]:
+        source = tmp_path / "source.cpp"
+        source.write_text("int main() { return 0; }\n", encoding="utf-8")
+        build = tmp_path / "build"
+        build.mkdir(exist_ok=True)
+        (build / "demo.exe").write_bytes(b"placeholder")
+        config = ForgeConfig(workspace_root=tmp_path)
+        runtime = ProcessRuntime(
+            config,
+            create_logger("CRITICAL"),
+            policy=ProcessPolicy(
+                allowed_executables=frozenset(),
+                allowed_executable_paths=frozenset({Path(sys.executable).resolve()}),
+            ),
+        )
+        service = DebuggerService(
+            WorkspaceService(config, create_logger("CRITICAL")),
+            runtime,
+            _LldbFakeBackend(runtime, script),  # type: ignore[arg-type]
+        )
+        await service.launch(DebugLaunchRequest(program="build/demo.exe", cwd="build"))
+        await asyncio.sleep(0.02)
+        thread = (await service.threads())[0]
+        await service.continue_execution(thread.thread_id)
+        await asyncio.sleep(0.02)
+        assert (await service.status()).state is DebuggerState.RUNNING
+        return service, runtime
+
+    async def exercise() -> None:
+        service, runtime = await make_service(required_thread)
+        await service.pause()
+        await asyncio.sleep(0.02)
+        assert (await service.status()).state is DebuggerState.PAUSED
+        await service.stop()
+        await runtime.aclose()
+
+        hanging_threads = required_thread.replace(
+            "launch_sequence = None",
+            "launch_sequence = None\nthread_queries = 0",
+        ).replace(
+            'elif command == "threads":\n        send("response", request_seq=sequence_id, command=command, success=True, body={"threads": [{"id": 7, "name": "main"}]})',
+            'elif command == "threads":\n        thread_queries += 1\n        if thread_queries == 1:\n            send("response", request_seq=sequence_id, command=command, success=True, body={"threads": [{"id": 7, "name": "main"}]})',
+        )
+        # Keep the initial paused inspection functional, then suppress the
+        # retry-time threads response after configuration/launch completed.
+        service, runtime = await make_service(hanging_threads)
+        operation = asyncio.create_task(service.pause())
+        await asyncio.sleep(0.05)
+        stopped = await asyncio.wait_for(service.stop(), timeout=2.0)
+        assert stopped.state is DebuggerState.TERMINATED
+        assert operation.cancelled()
+        await runtime.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_pause_retry_does_not_mask_arbitrary_adapter_or_protocol_failures(tmp_path: Path) -> None:
+    config = ForgeConfig(workspace_root=tmp_path)
+    runtime = ProcessRuntime(
+        config,
+        create_logger("CRITICAL"),
+        policy=ProcessPolicy(
+            allowed_executables=frozenset(),
+            allowed_executable_paths=frozenset({Path(sys.executable).resolve()}),
+        ),
+    )
+    service = DebuggerService(
+        WorkspaceService(config, create_logger("CRITICAL")),
+        runtime,
+        _LldbFakeBackend(runtime),  # type: ignore[arg-type]
+    )
+    assert service._pause_requires_thread_id(
+        "pause", {}, DapRequestError("pause", compatibility=DapRequestCompatibility.PAUSE_THREAD_ID_REQUIRED)
+    )
+    assert not service._pause_requires_thread_id(
+        "pause", {}, DapRequestError("pause", "adapter exploded with threadId data")
+    )
+    assert not service._pause_requires_thread_id(
+        "pause", {"threadId": 7}, DapRequestError("pause", compatibility=DapRequestCompatibility.PAUSE_THREAD_ID_REQUIRED)
+    )
+    asyncio.run(runtime.aclose())
 
 
 def test_debugger_launch_schema_preserves_empty_default_factories_for_mcp_clients():

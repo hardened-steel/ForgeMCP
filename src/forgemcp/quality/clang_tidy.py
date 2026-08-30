@@ -91,7 +91,7 @@ class ClangTidyService:
         except QualityToolUnavailableError as error:
             self._cached_status = QualityToolInfo(available=False, error=error.message)
             return self._cached_status
-        self._cached_status = QualityToolInfo(executable=tool.canonical, available=True, version=tool.version)
+        self._cached_status = QualityToolInfo(executable="clang-tidy", available=True, version=tool.version)
         return self._cached_status
 
     async def list_checks(self, checks: str | None = None) -> TidyCheckList:
@@ -202,7 +202,7 @@ class ClangTidyService:
                 continue
             selection = _ToolSelection(canonical, version)
             self._cached_status = QualityToolInfo(
-                executable=selection.canonical, available=True, version=selection.version
+                executable="clang-tidy", available=True, version=selection.version
             )
             return selection
         self._cached_status = QualityToolInfo(

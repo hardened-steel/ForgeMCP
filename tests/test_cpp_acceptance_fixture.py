@@ -68,6 +68,20 @@ def _snapshot_sha(payload: dict[str, object]) -> str:
     return value
 
 
+def test_acceptance_collector_rejects_handler_or_service_call_tool_lookalikes() -> None:
+    class _DirectHandlerLookalike:
+        async def call_tool(self, tool_name: str, arguments: object) -> object:
+            raise AssertionError("a direct handler must never be invoked")
+
+    async def exercise() -> None:
+        collector = McpToolCallCollector("core_fixture")
+        with pytest.raises(AssertionError, match="official SDK ClientSession"):
+            await collector.call(_DirectHandlerLookalike(), "server_status")
+        assert collector.called_tools == set()
+
+    asyncio.run(exercise())
+
+
 def test_cpp_acceptance_fixture_is_complete_and_has_no_generated_artifacts() -> None:
     required = {
         "CMakeLists.txt", "CMakePresets.json", "README.md", "include/fixture/math.hpp",
@@ -170,7 +184,14 @@ def test_cpp_acceptance_fixture_adopts_an_external_build_tree_over_mcp(tmp_path:
     async def exercise() -> None:
         parameters = StdioServerParameters(
             command=sys.executable, args=["-m", "forgemcp.server"], cwd=Path.cwd(),
-            env={**os.environ, "FORGEMCP_WORKSPACE": str(root), "FORGEMCP_LOG_LEVEL": "INFO"},
+            env={
+                **os.environ,
+                "FORGEMCP_WORKSPACE": str(root),
+                "FORGEMCP_LOG_LEVEL": "INFO",
+                # Bind discovery to the exact compiler pair that created the
+                # external tree; family-only adoption is intentionally denied.
+                "FORGEMCP_CMAKE_KIT": profile.kit.id,
+            },
         )
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as session:
@@ -224,19 +245,37 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     names = [tool.name for tool in (await session.list_tools()).tools]
                     assert len(names) == len(set(names))
                     assert set(names) == {entry.tool_name for entry in TOOL_ACCEPTANCE}
-                    collector = McpToolCallCollector("core_fixture")
+                    collector = McpToolCallCollector(("core_fixture", "cmake_fixture", "quality_fixture"))
                     visited: set[str] = set()
+                    progress: dict[str, list[tuple[float, float | None, str | None]]] = {}
 
-                    async def call(name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
+                    async def call(
+                        name: str,
+                        arguments: dict[str, object] | None = None,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
                         visited.add(name)
-                        return _json(await collector.call(session, name, arguments or {}))
+                        return _json(await collector.call(session, name, arguments or {}, **kwargs))
 
-                    await call("server_status")
-                    await call("project__status")
-                    await call("workspace__list_files", {"path": ".", "recursive": True})
+                    def observe(key: str):
+                        progress[key] = []
+
+                        async def callback(value: float, total: float | None, message: str | None) -> None:
+                            progress[key].append((value, total, message))
+
+                        return callback
+
+                    server_status = await call("server_status")
+                    assert server_status["workspace_root"] == "configured"
+                    project_status = await call("project__status")
+                    assert project_status["partial"] is False and len(project_status["components"]) == 8
+                    listed_files = await call("workspace__list_files", {"path": ".", "recursive": True})
+                    assert "CMakeLists.txt" in {item["path"] for item in listed_files["files"]}
                     before = await call("workspace__read_text", {"path": "analysis/format_me.cpp"})
+                    assert "int" in before["text"] and before["path"] == "analysis/format_me.cpp"
                     snapshot = before["snapshot"]["sha256"]  # type: ignore[index]
-                    await call("workspace__get_snapshot", {"path": "analysis/format_me.cpp"})
+                    snap = await call("workspace__get_snapshot", {"path": "analysis/format_me.cpp"})
+                    assert snap["snapshot"]["sha256"] == snapshot and snap["snapshot"]["exists"] is True  # type: ignore[index]
                     created = await call("workspace__apply_unified_patch", {
                         "patch": "--- /dev/null\n+++ b/analysis/created.cpp\n@@ -0,0 +1 @@\n+int created = 1;\n",
                         "expected_snapshots": {"analysis/created.cpp": None},
@@ -253,7 +292,8 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     })
                     assert stale["applied"] is False
 
-                    await call("cmake__status")
+                    cmake_status = await call("cmake__status")
+                    assert cmake_status["available"] is True
                     kits = await call("cmake__list_kits")
                     ready_kits = [item for item in kits["kits"] if item["readiness"] == "ready"]  # type: ignore[index]
                     assert ready_kits
@@ -262,30 +302,53 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     # its dedicated Windows gate rather than conflating the
                     # two qualified workflows.
                     preferred_kit = next((item for item in ready_kits if item["compiler_family"] == "clang"), ready_kits[0])
-                    await call("cmake__select_kit", {
+                    selected = await call("cmake__select_kit", {
                         "kit": preferred_kit["id"], "expected_selection_generation": 0,
                     })
-                    await call("cmake__list_build_trees")
-                    await call("cmake__list_presets")
+                    assert selected["selection_generation"] == 1
+                    trees_before = await call("cmake__list_build_trees")
+                    assert isinstance(trees_before["build_trees"], list)
+                    presets = await call("cmake__list_presets")
+                    assert "ninja-debug" in {item["name"] for item in presets["configure_presets"]}  # type: ignore[index]
                     configured = await call("cmake__configure", {
                         "binary_dir": "build", "generator": "Ninja",
                         "cache_variables": {"CMAKE_BUILD_TYPE": "Debug"},
-                    })
+                    }, progress_callback=observe("configure"))
                     assert configured["process"]["exit_code"] == 0  # type: ignore[index]
-                    await call("cmake__list_targets", {"binary_dir": "build"})
-                    warning = await call("cmake__build", {"binary_dir": "build", "targets": ["fixture_warning"]})
+                    assert configured["compilation_database"]["availability"] == "available"  # type: ignore[index]
+                    targets = await call("cmake__list_targets", {"binary_dir": "build"})
+                    target_names = {
+                        target["name"] for configuration in targets["configurations"]  # type: ignore[index]
+                        for target in configuration["targets"]
+                    }
+                    assert {"fixture_good", "fixture_warning", "fixture_compile_error", "fixture_link_error"} <= target_names
+                    warning = await call(
+                        "cmake__build", {"binary_dir": "build", "targets": ["fixture_warning"]},
+                        progress_callback=observe("warning"),
+                    )
                     assert warning["process"]["exit_code"] == 0  # type: ignore[index]
-                    built = await call("cmake__build", {"binary_dir": "build"})
+                    assert warning["outcome"] in {"success", "success_with_warnings"}
+                    built = await call("cmake__build", {"binary_dir": "build"}, progress_callback=observe("build"))
                     assert built["process"]["exit_code"] == 0, json.dumps(built["process"], indent=2)  # type: ignore[index]
-                    compile_failure = await call("cmake__build", {"binary_dir": "build", "targets": ["fixture_compile_error"]})
+                    assert built["outcome"] == "success"
+                    compile_failure = await call(
+                        "cmake__build", {"binary_dir": "build", "targets": ["fixture_compile_error"]},
+                        progress_callback=observe("compile_failure"),
+                    )
                     assert compile_failure["process"]["exit_code"] != 0  # type: ignore[index]
                     assert compile_failure["diagnostics"]  # type: ignore[index]
-                    link_failure = await call("cmake__build", {"binary_dir": "build", "targets": ["fixture_link_error"]})
+                    assert compile_failure["outcome"] == "compile_failure"
+                    link_failure = await call(
+                        "cmake__build", {"binary_dir": "build", "targets": ["fixture_link_error"]},
+                        progress_callback=observe("link_failure"),
+                    )
                     assert link_failure["process"]["exit_code"] != 0  # type: ignore[index]
+                    assert link_failure["outcome"] == "linker_failure"
                     tests = await call("cmake__ctest_list_tests", {"binary_dir": "build"})
                     assert {item["name"] for item in tests["tests"]} == {"fixture_pass", "fixture_expected_failure"}  # type: ignore[index]
-                    passed = await call("cmake__ctest_run", {"binary_dir": "build"})
+                    passed = await call("cmake__ctest_run", {"binary_dir": "build"}, progress_callback=observe("test_success"))
                     assert passed["process"]["exit_code"] == 0  # type: ignore[index]
+                    assert passed["failed_tests"] == []
                     negative_configure = await call("cmake__configure", {
                         "binary_dir": "build-negative", "generator": "Ninja",
                         "cache_variables": {"CMAKE_BUILD_TYPE": "Debug", "FIXTURE_ENABLE_NEGATIVE_TESTS": True},
@@ -295,23 +358,47 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                     assert negative_build["process"]["exit_code"] == 0  # type: ignore[index]
                     negative_tests = await call("cmake__ctest_list_tests", {"binary_dir": "build-negative"})
                     assert {item["name"] for item in negative_tests["tests"]} >= {"fixture_intentional_failure", "fixture_timeout"}  # type: ignore[index]
-                    failing_test = await call("cmake__ctest_run", {"binary_dir": "build-negative", "test_names": ["fixture_intentional_failure"]})
+                    failing_test = await call(
+                        "cmake__ctest_run", {"binary_dir": "build-negative", "test_names": ["fixture_intentional_failure"]},
+                        progress_callback=observe("test_failure"),
+                    )
                     assert failing_test["test_names"] == ["fixture_intentional_failure"]
-                    timeout_test = await call("cmake__ctest_run", {"binary_dir": "build-negative", "test_names": ["fixture_timeout"], "timeout_seconds": 3})
+                    assert failing_test["process"]["exit_code"] != 0 and failing_test["failed_tests"] == ["fixture_intentional_failure"]  # type: ignore[index]
+                    timeout_test = await call(
+                        "cmake__ctest_run", {"binary_dir": "build-negative", "test_names": ["fixture_timeout"], "timeout_seconds": 3},
+                        progress_callback=observe("test_timeout"),
+                    )
                     assert timeout_test["test_names"] == ["fixture_timeout"]
+                    assert timeout_test["process"]["exit_code"] != 0 and timeout_test["failed_tests"] == ["fixture_timeout"]  # type: ignore[index]
                     conflict = await call("cmake__configure", {"binary_dir": "build-conflict", "preset": "ninja-debug"})
                     assert conflict["error"]["code"] == "preset_kit_conflict"  # type: ignore[index]
 
-                    await call("quality__status")
+                    quality = await call("quality__status")
+                    assert quality["clang_format"]["available"] is True and quality["clang_format"]["executable"] == "clang-format"  # type: ignore[index]
+                    assert quality["clang_tidy"]["available"] is True and quality["clang_tidy"]["executable"] == "clang-tidy"  # type: ignore[index]
                     checked = await call("clang_format__check", {"paths": ["analysis/format_me.cpp"]})
                     item = checked["files"][0]  # type: ignore[index]
                     assert item["would_change"] is True
                     applied = await call("clang_format__apply", {"files": [{"path": item["path"], "expected_sha256": item["snapshot_sha256"]}]})
                     assert applied["applied"] is True
-                    await call("clang_tidy__list_checks", {"checks": "modernize-use-nullptr"})
-                    await call("clang_tidy__run", {"paths": ["analysis/tidy_me.cpp"], "compile_commands_dir": "build", "checks": "-*,modernize-use-nullptr"})
+                    tidy_checks = await call("clang_tidy__list_checks", {"checks": "modernize-use-nullptr"})
+                    assert "modernize-use-nullptr" in tidy_checks["checks"]
+                    tidy = await call("clang_tidy__run", {"paths": ["analysis/tidy_me.cpp"], "compile_commands_dir": "build", "checks": "-*,modernize-use-nullptr"})
+                    assert tidy["execution_state"] == "completed"
+                    assert any(item.get("code") == "modernize-use-nullptr" for item in tidy["diagnostics"])
                     report = (root / "reports" / "asan.txt").read_text(encoding="utf-8")
-                    await call("sanitizer__parse_report", {"output": report})
+                    sanitizer = await call("sanitizer__parse_report", {"output": report})
+                    assert sanitizer["findings"][0]["kind"] == "address_sanitizer"  # type: ignore[index]
+                    for key, updates in progress.items():
+                        assert updates, key
+                        values = [value for value, _, _ in updates]
+                        assert values == sorted(values), (key, updates)
+                    for key in ("configure", "warning", "build", "test_success"):
+                        assert progress[key][-1][2] in {"Configure completed", "Build completed", "Test run completed"}
+                    for key in ("compile_failure", "link_failure", "test_failure", "test_timeout"):
+                        updates = progress[key]
+                        assert updates[-1][2] in {"Build failed", "Test run failed", "Test run timed out"}
+                        assert not any(total is not None and value == total for value, total, _ in updates)
                     mandatory = {
                         entry.tool_name for entry in TOOL_ACCEPTANCE
                         if entry.subsystem in {"core", "cmake", "quality"}
@@ -327,6 +414,7 @@ def test_cpp_acceptance_fixture_mcp_surface_and_real_cmake_workspace_quality_flo
                         available_capabilities=frozenset({"mcp_stdio", "cmake", "ninja"}),
                         subsystems=frozenset({"core", "cmake", "quality"}),
                     )
+                    collector.complete_assertions(mandatory)
         text = errors.read_text(encoding="utf-8")
         assert str(root) not in text
 
@@ -440,7 +528,7 @@ def test_cpp_acceptance_fixture_real_clangd_all_tools_mcp_gate(tmp_path: Path) -
                         "new_name": "renamed_shared_value", "expected_sha256": _snapshot_sha(prepared),
                     })
                     rename_edit = renamed.get("edit")
-                    assert isinstance(rename_edit, dict) and rename_edit.get("applied") is True
+                    assert isinstance(rename_edit, dict) and rename_edit.get("applied") is True, renamed
                     assert rename_edit.get("affected_files") == 2
                     assert "renamed_shared_value" in (root / "app/good_main.cpp").read_text(encoding="utf-8")
                     assert "renamed_shared_value" in (root / "shared.hpp").read_text(encoding="utf-8")
@@ -567,6 +655,7 @@ def test_cpp_acceptance_fixture_real_clangd_all_tools_mcp_gate(tmp_path: Path) -
                         available_capabilities=frozenset({"mcp_stdio", "clangd", "compile_commands"}),
                         subsystems=frozenset({"clangd"}),
                     )
+                    collector.complete_assertions(clangd_tools)
         return errors.read_text(encoding="utf-8")
 
     server_errors = asyncio.run(exercise())
@@ -787,6 +876,7 @@ def test_cpp_acceptance_fixture_real_debugger_all_tools_mcp_gate(tmp_path: Path)
                         available_capabilities=frozenset({"mcp_stdio", "standalone_llvm", "lldb_dap", "dwarf_debuggee"}),
                         subsystems=frozenset({"debugger"}),
                     )
+                    collector.complete_assertions(debugger_tools)
         return errors.read_text(encoding="utf-8")
 
     server_errors = asyncio.run(exercise())

@@ -12,6 +12,7 @@ from forgemcp.dap.errors import (
     DapConnectionClosedError,
     DapError,
     DapProtocolError,
+    DapRequestCompatibility,
     DapRequestError,
     DapRequestTimeoutError,
 )
@@ -21,6 +22,26 @@ from forgemcp.dap.protocol import DapEvent, DapResponse, DapReverseRequest, pars
 DapEventHandler = Callable[[str, Mapping[str, object]], object | Awaitable[object]]
 _MAX_QUEUED_EVENTS = 16
 _MAX_QUEUED_REVERSE_REQUESTS = 8
+
+
+def _response_compatibility(
+    command: str, body: Mapping[str, object]
+) -> DapRequestCompatibility | None:
+    """Classify one known LLDB-DAP schema mismatch without retaining payload."""
+    if command != "pause":
+        return None
+    error = body.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    error_id = error.get("id")
+    error_format = error.get("format")
+    show_user = error.get("showUser")
+    if error_id != 3 or show_user is not True or not isinstance(error_format, str) or len(error_format) > 512:
+        return None
+    normalized = " ".join(error_format.casefold().split())
+    if "request 'pause': missing value at arguments.threadid" in normalized:
+        return DapRequestCompatibility.PAUSE_THREAD_ID_REQUIRED
+    return None
 
 
 class DapClientState(StrEnum):
@@ -146,7 +167,11 @@ class DapClient:
                     await asyncio.shield(cleanup)
                 raise
             if not response.success:
-                raise DapRequestError(command, response.message)
+                raise DapRequestError(
+                    command,
+                    response.message,
+                    compatibility=_response_compatibility(command, response.body),
+                )
             if command == "initialize":
                 self._supports_cancel_request = response.body.get("supportsCancelRequest") is True
             return response.body

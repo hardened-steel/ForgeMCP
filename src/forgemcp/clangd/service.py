@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from itertools import islice
 import json
+import os
 import re
 import secrets
 import time
@@ -658,38 +659,55 @@ class ClangdService:
         # the same semantic request at that definition *without didOpen* and
         # merge only non-overlapping file contributions.  This keeps closed
         # headers closed while restoring the atomic cross-file WorkspaceEdit.
-        definition_target = self._rename_definition_target(definition_response, document.uri)
-        if definition_target is not None and self._workspace_edit_paths(response) <= {document.path}:
-            target_uri, target_range = definition_target
-            target_path = self._path_from_uri(target_uri)
-            if target_path is not None:
+        pinned_snapshots: dict[str, FileSnapshot] = {}
+        definition_target = self._rename_definition_target(definition_response, document.path)
+        old_identifier = self._identifier_at_position(text, position)
+        primary_paths = self._workspace_edit_paths(response)
+        if (
+            definition_target is not None
+            and old_identifier is not None
+            and self._primary_rename_matches_request(
+                response, document.path, text, position, old_identifier, new_name
+            )
+        ):
+            target_uri, target_range, target_path = definition_target
+            if self._path_identity(target_path) not in {
+                self._path_identity(path) for path in primary_paths
+            }:
                 try:
-                    target_text, _ = self._workspace.read_text(target_path)
-                    target_position = self._from_lsp_range(target_text, target_range).start
-                    header_response = await self._request(
-                        "textDocument/rename",
-                        {
-                            "textDocument": {"uri": target_uri},
-                            "position": self._to_lsp_position(target_text, target_position),
-                            "newName": new_name,
-                        },
-                    )
+                    target_text, target_snapshot = self._workspace.read_text(target_path)
+                    parsed_target_range = self._from_lsp_range(target_text, target_range)
                 except (WorkspaceError, ClangdProtocolError):
-                    header_response = None
-                # clangd may still answer an empty/header-incomplete edit for
-                # a closed include even after resolving its definition.  The
-                # definition's target-selection range is already a validated
-                # semantic spelling of the same symbol, so it is the safe,
-                # bounded final contribution to the one atomic edit.
-                if target_path not in self._workspace_edit_paths(header_response):
+                    parsed_target_range = None
+                if (
+                    parsed_target_range is not None
+                    and self._definition_range_is_safe_identifier(
+                        target_text, parsed_target_range, old_identifier
+                    )
+                ):
+                    # The primary rename has already succeeded at the exact
+                    # request position.  Do not issue a second rename against
+                    # a closed document: real clangd versions can reject that
+                    # request merely because the document is not open.  The
+                    # unique same-symbol definition, pinned snapshot, exact
+                    # spelling/boundary check, and common WorkspaceEdit/CAS
+                    # engine are the complete fallback proof.
                     header_response = {
                         "changes": {
-                            target_uri: [{"range": target_range, "newText": new_name}],
+                            target_uri: [
+                                {"range": target_range, "newText": new_name}
+                            ],
                         }
                     }
-                response = self._merge_rename_workspace_edits(response, header_response)
+                    response = self._merge_rename_workspace_edits(response, header_response)
+                    pinned_snapshots[target_path] = target_snapshot
         return RenameResult(
-            edit=await self._apply_workspace_edit_for_snapshot(response, document, request_snapshot)
+            edit=await self._apply_workspace_edit_for_snapshot(
+                response,
+                document,
+                request_snapshot,
+                pinned_snapshots=pinned_snapshots,
+            )
         )
 
     async def code_actions(
@@ -943,13 +961,20 @@ class ClangdService:
         )
 
     async def _apply_workspace_edit_for_snapshot(
-        self, raw_edit: object, document: _DocumentState, request_snapshot: FileSnapshot
+        self,
+        raw_edit: object,
+        document: _DocumentState,
+        request_snapshot: FileSnapshot,
+        *,
+        pinned_snapshots: Mapping[str, FileSnapshot] | None = None,
     ) -> WorkspaceEditSummary:
         """Commit only if the LSP request's anchor snapshot is still current."""
         async with self._mutation_lock:
             self._require_mutation_session()
             self._require_unchanged_document(document, request_snapshot)
-            return await self._apply_workspace_edit_locked(raw_edit, anchor=document)
+            return await self._apply_workspace_edit_locked(
+                raw_edit, anchor=document, pinned_snapshots=pinned_snapshots
+            )
 
     async def _apply_workspace_edit(
         self, raw_edit: object, *, anchor: _DocumentState
@@ -960,7 +985,11 @@ class ClangdService:
             return await self._apply_workspace_edit_locked(raw_edit, anchor=anchor)
 
     async def _apply_workspace_edit_locked(
-        self, raw_edit: object, *, anchor: _DocumentState
+        self,
+        raw_edit: object,
+        *,
+        anchor: _DocumentState,
+        pinned_snapshots: Mapping[str, FileSnapshot] | None = None,
     ) -> WorkspaceEditSummary:
         """Apply one WorkspaceEdit while the mutation and lifecycle boundaries are stable."""
         if raw_edit is None:
@@ -998,6 +1027,11 @@ class ClangdService:
                 text, snapshot = self._workspace.read_text(path)
             except WorkspaceError as error:
                 raise ClangdEditConflictError("A WorkspaceEdit target is no longer readable in the workspace.") from error
+            pinned = None if pinned_snapshots is None else pinned_snapshots.get(path)
+            if pinned is not None and snapshot.sha256 != pinned.sha256:
+                raise ClangdEditConflictError(
+                    "A rename definition changed after clangd identified its spelling."
+                )
             open_document = self._document_for_path(path)
             if open_document is not None:
                 if snapshot.sha256 != open_document.snapshot.sha256:
@@ -1115,9 +1149,13 @@ class ClangdService:
         return tuple(entries)
 
     def _rename_definition_target(
-        self, response: object, current_uri: str
-    ) -> tuple[str, Mapping[str, object]] | None:
-        """Extract one workspace-contained closed definition target safely."""
+        self, response: object, current_path: str
+    ) -> tuple[str, Mapping[str, object], str] | None:
+        """Extract exactly one distinct workspace-contained definition.
+
+        Multiple/overload results, an external URI, malformed locations, and
+        Windows case aliases are deliberately ineligible for manual fallback.
+        """
         values: Sequence[object]
         if isinstance(response, list):
             values = response
@@ -1125,16 +1163,136 @@ class ClangdService:
             values = (response,)
         else:
             return None
-        for value in values:
-            if not isinstance(value, Mapping):
+        if len(values) != 1 or not isinstance(values[0], Mapping):
+            return None
+        value = values[0]
+        uri = value.get("targetUri", value.get("uri"))
+        source_range = value.get(
+            "targetSelectionRange", value.get("targetRange", value.get("range"))
+        )
+        if not isinstance(uri, str) or not isinstance(source_range, Mapping):
+            return None
+        path = self._path_from_uri(uri)
+        if path is None or self._path_identity(path) == self._path_identity(current_path):
+            return None
+        return uri, source_range, path
+
+    def _primary_rename_matches_request(
+        self,
+        raw_edit: object,
+        current_path: str,
+        current_text: str,
+        request_position: Position,
+        old_identifier: str,
+        new_name: str,
+    ) -> bool:
+        """Require a successful primary edit for the exact requested spelling."""
+        if not isinstance(raw_edit, Mapping):
+            return False
+        try:
+            entries = self._workspace_edit_entries(raw_edit)
+        except ClangdProtocolError:
+            return False
+        for uri, edits, _ in entries:
+            path = self._path_from_uri(uri)
+            if path is None or self._path_identity(path) != self._path_identity(current_path):
                 continue
-            uri = value.get("targetUri", value.get("uri"))
-            source_range = value.get("targetSelectionRange", value.get("targetRange", value.get("range")))
-            if not isinstance(uri, str) or uri == current_uri or not isinstance(source_range, Mapping):
-                continue
-            if self._path_from_uri(uri) is not None:
-                return uri, source_range
-        return None
+            for raw_edit_value in edits:
+                if not isinstance(raw_edit_value, Mapping):
+                    continue
+                raw_range = raw_edit_value.get("range")
+                if (
+                    not isinstance(raw_range, Mapping)
+                    or raw_edit_value.get("newText") != new_name
+                ):
+                    continue
+                try:
+                    parsed = self._from_lsp_range(current_text, raw_range)
+                except ClangdProtocolError:
+                    continue
+                if (
+                    self._range_text(current_text, parsed) == old_identifier
+                    and (parsed.start.line, parsed.start.column)
+                    <= (request_position.line, request_position.column)
+                    <= (parsed.end.line, parsed.end.column)
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _definition_range_is_safe_identifier(
+        cls, text: str, source_range: Range, identifier: str
+    ) -> bool:
+        """Validate exact spelling, token boundaries, and reject macros."""
+        if source_range.start.line != source_range.end.line:
+            return False
+        offsets = cls._range_offsets(text, source_range)
+        if offsets is None:
+            return False
+        start, end = offsets
+        if text[start:end] != identifier or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier) is None:
+            return False
+        if start > 0 and re.match(r"[A-Za-z0-9_]", text[start - 1]):
+            return False
+        if end < len(text) and re.match(r"[A-Za-z0-9_]", text[end]):
+            return False
+        lines = text.splitlines()
+        if source_range.start.line >= len(lines):
+            return False
+        prefix = lines[source_range.start.line][: source_range.start.column]
+        return not prefix.lstrip().startswith("#")
+
+    @classmethod
+    def _identifier_at_position(cls, text: str, position: Position) -> str | None:
+        offset = cls._position_offset(text, position)
+        if offset is None:
+            return None
+        is_identifier = lambda character: bool(re.fullmatch(r"[A-Za-z0-9_]", character))
+        probe = offset
+        if probe >= len(text) or not is_identifier(text[probe]):
+            if probe == 0 or not is_identifier(text[probe - 1]):
+                return None
+            probe -= 1
+        start = probe
+        end = probe + 1
+        while start > 0 and is_identifier(text[start - 1]):
+            start -= 1
+        while end < len(text) and is_identifier(text[end]):
+            end += 1
+        value = text[start:end]
+        return value if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) else None
+
+    @classmethod
+    def _range_text(cls, text: str, source_range: Range) -> str | None:
+        offsets = cls._range_offsets(text, source_range)
+        return None if offsets is None else text[offsets[0] : offsets[1]]
+
+    @classmethod
+    def _range_offsets(cls, text: str, source_range: Range) -> tuple[int, int] | None:
+        start = cls._position_offset(text, source_range.start)
+        end = cls._position_offset(text, source_range.end)
+        if start is None or end is None or end < start:
+            return None
+        return start, end
+
+    @staticmethod
+    def _position_offset(text: str, position: Position) -> int | None:
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            lines = [""]
+        elif text.endswith(("\n", "\r")):
+            lines.append("")
+        if position.line >= len(lines):
+            return None
+        line = lines[position.line]
+        visible = line[:-2] if line.endswith("\r\n") else line[:-1] if line.endswith(("\n", "\r")) else line
+        if position.column > len(visible):
+            return None
+        return sum(len(item) for item in lines[: position.line]) + position.column
+
+    @staticmethod
+    def _path_identity(path: str) -> str:
+        return os.path.normcase(path.replace("\\", "/"))
 
     def _workspace_edit_paths(self, raw_edit: object) -> set[str]:
         """Best-effort safe path view used only to decide rename fallback."""
@@ -1628,7 +1786,10 @@ class ClangdService:
         self, *, available: bool, version: str | None = None, error: str | None = None
     ) -> ClangdStatus:
         return ClangdStatus(
-            executable=self._executable,
+            # The resolved executable is an application-private launch
+            # capability.  Status exposes only the fixed public tool identity,
+            # including when an explicit absolute selector was configured.
+            executable="clangd",
             available=available,
             state=self._state,
             version=version,

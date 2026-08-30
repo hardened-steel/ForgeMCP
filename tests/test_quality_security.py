@@ -212,6 +212,23 @@ def test_tidy_qualification_rejects_a_different_llvm_tool_under_the_right_name(t
     assert status.available is False
 
 
+def test_quality_status_never_discloses_resolved_executable_paths(tmp_path: Path):
+    runtime = RoutingRuntime()
+    workspace = service_workspace(tmp_path)
+
+    async def exercise() -> None:
+        formatter = await ClangFormatService(
+            ForgeConfig(workspace_root=tmp_path), workspace, runtime
+        ).status()
+        tidy = await ClangTidyService(
+            ForgeConfig(workspace_root=tmp_path), workspace, runtime
+        ).status()
+        assert formatter.executable == "clang-format"
+        assert tidy.executable == "clang-tidy"
+        serialized = formatter.model_dump_json() + tidy.model_dump_json()
+        assert "C:/trusted" not in serialized and "C:\\\\trusted" not in serialized
+
+
 @pytest.mark.parametrize(
     "xml",
     [

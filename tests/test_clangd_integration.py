@@ -911,6 +911,181 @@ def test_rename_definition_barrier_recovers_a_closed_header_omitted_by_clangd(tm
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "case",
+    ("different_spelling", "macro", "multiple", "external", "malformed", "empty_primary", "primary_error"),
+)
+def test_rename_definition_fallback_rejects_unsafe_or_unaccepted_locations(
+    tmp_path: Path, case: str
+) -> None:
+    """Definition fallback is unavailable unless every semantic proof holds."""
+
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        main = tmp_path / "main.cpp"
+        header = tmp_path / "shared.hpp"
+        main.write_text('#include "shared.hpp"\nint main() { return value; }\n', encoding="utf-8")
+        header_text = "#define value 1\n" if case == "macro" else (
+            "inline int other = 1;\n" if case == "different_spelling" else "inline int value = 1;\n"
+        )
+        header.write_text(header_text, encoding="utf-8")
+        other = tmp_path / "other.hpp"
+        other.write_text("inline int value = 2;\n", encoding="utf-8")
+        external = tmp_path.parent / "external-rename.hpp"
+        external.write_text("inline int value = 3;\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        original_request = service._request
+        header_rename_calls = 0
+        normal_range = {
+            "start": {"line": 0, "character": 8 if case == "macro" else 11},
+            "end": {"line": 0, "character": 13 if case == "macro" else 16},
+        }
+
+        async def adversarial(method: str, params: dict[str, object]) -> object:
+            nonlocal header_rename_calls
+            if method == "textDocument/definition":
+                location = {"uri": header.as_uri(), "range": normal_range}
+                if case == "multiple":
+                    return [location, {"uri": other.as_uri(), "range": {
+                        "start": {"line": 0, "character": 11},
+                        "end": {"line": 0, "character": 16},
+                    }}]
+                if case == "external":
+                    return [{"uri": external.as_uri(), "range": normal_range}]
+                if case == "malformed":
+                    return [{"uri": header.as_uri(), "range": {
+                        "start": {"line": 0, "character": 999},
+                        "end": {"line": 0, "character": 1004},
+                    }}]
+                return [location]
+            if method == "textDocument/rename":
+                text_document = params["textDocument"]
+                assert isinstance(text_document, dict)
+                if text_document["uri"] != document.uri:
+                    header_rename_calls += 1
+                    return None
+                if case == "primary_error":
+                    raise ClangdProtocolError("synthetic primary rejection")
+                if case == "empty_primary":
+                    return None
+                return {"changes": {document.uri: [{
+                    "range": {
+                        "start": {"line": 1, "character": 20},
+                        "end": {"line": 1, "character": 25},
+                    },
+                    "newText": "renamed_value",
+                }]}}
+            return await original_request(method, params)
+
+        service._request = adversarial  # type: ignore[method-assign]
+        if case == "primary_error":
+            with pytest.raises(ClangdProtocolError):
+                await service.rename(
+                    "main.cpp", Position(line=1, column=20), "renamed_value",
+                    expected_sha256=document.snapshot.sha256,
+                )
+        else:
+            result = await service.rename(
+                "main.cpp", Position(line=1, column=20), "renamed_value",
+                expected_sha256=document.snapshot.sha256,
+            )
+            assert result.edit.affected_files == (0 if case == "empty_primary" else 1)
+        assert "renamed_value" not in header.read_text(encoding="utf-8")
+        assert header_rename_calls == 0
+        if case in {"empty_primary", "primary_error"}:
+            assert "renamed_value" not in main.read_text(encoding="utf-8")
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_rename_definition_fallback_pins_header_snapshot_and_avoids_overlap(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        (tmp_path / "db").mkdir()
+        (tmp_path / "db" / "compile_commands.json").write_text("[]", encoding="utf-8")
+        main = tmp_path / "main.cpp"
+        header = tmp_path / "shared.hpp"
+        main.write_text('#include "shared.hpp"\nint main() { return value; }\n', encoding="utf-8")
+        header.write_text("inline int value = 1;\n", encoding="utf-8")
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        original_request = service._request
+        definition_range = {
+            "start": {"line": 0, "character": 11},
+            "end": {"line": 0, "character": 16},
+        }
+        case_variant_uri = (
+            Path(str(header).replace("shared.hpp", "SHARED.HPP")).as_uri()
+            if os.name == "nt" else header.as_uri()
+        )
+
+        async def complete_primary(method: str, params: dict[str, object]) -> object:
+            if method == "textDocument/definition":
+                return [{"uri": case_variant_uri, "range": definition_range}]
+            if method == "textDocument/rename":
+                return {"changes": {
+                    document.uri: [{
+                        "range": {"start": {"line": 1, "character": 20}, "end": {"line": 1, "character": 25}},
+                        "newText": "renamed_value",
+                    }],
+                    header.as_uri(): [{"range": definition_range, "newText": "renamed_value"}],
+                }}
+            return await original_request(method, params)
+
+        service._request = complete_primary  # type: ignore[method-assign]
+        result = await service.rename(
+            "main.cpp", Position(line=1, column=20), "renamed_value",
+            expected_sha256=document.snapshot.sha256,
+        )
+        assert result.edit.affected_files == 2
+        assert header.read_text(encoding="utf-8").count("renamed_value") == 1
+
+        # Reset and force a stale closed-header snapshot after the semantic
+        # fallback has been computed but before the common atomic commit.
+        main.write_text('#include "shared.hpp"\nint main() { return value; }\n', encoding="utf-8")
+        header.write_text("inline int value = 1;\n", encoding="utf-8")
+        await service.aclose()
+        service, _ = _service(tmp_path)
+        await service.start("db")
+        document, _ = await service._synchronize_document("main.cpp")
+        original_apply = service._apply_workspace_edit_for_snapshot
+
+        async def partial(method: str, params: dict[str, object]) -> object:
+            if method == "textDocument/definition":
+                return [{"uri": header.as_uri(), "range": definition_range}]
+            if method == "textDocument/rename":
+                text_document = params["textDocument"]
+                assert isinstance(text_document, dict)
+                if text_document["uri"] == document.uri:
+                    return {"changes": {document.uri: [{
+                        "range": {"start": {"line": 1, "character": 20}, "end": {"line": 1, "character": 25}},
+                        "newText": "renamed_value",
+                    }]}}
+                return None
+            raise AssertionError(method)
+
+        async def stale_before_commit(*args: object, **kwargs: object):
+            header.write_text("inline int value = 2;\n", encoding="utf-8")
+            return await original_apply(*args, **kwargs)
+
+        service._request = partial  # type: ignore[method-assign]
+        service._apply_workspace_edit_for_snapshot = stale_before_commit  # type: ignore[method-assign]
+        with pytest.raises(ClangdEditConflictError):
+            await service.rename(
+                "main.cpp", Position(line=1, column=20), "renamed_value",
+                expected_sha256=document.snapshot.sha256,
+            )
+        assert "renamed_value" not in main.read_text(encoding="utf-8")
+        assert "renamed_value" not in header.read_text(encoding="utf-8")
+        await service.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_builtin_clangd_plugin_registers_every_phase_one_tool_with_flat_schemas(tmp_path: Path):
     async def exercise() -> None:
         application = ForgeApplication.create(ForgeConfig(workspace_root=tmp_path))
@@ -1016,6 +1191,27 @@ def test_explicit_clangd_path_is_allowed_by_the_default_process_policy(tmp_path:
 
     assert config.clangd_path == executable
     assert executable in runtime.policy.allowed_executable_paths
+
+
+def test_clangd_status_never_discloses_an_explicit_executable_path(tmp_path: Path):
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "compile_commands.json").write_text("[]", encoding="utf-8")
+    canary = tmp_path / "HOST_PATH_CANARY" / "clangd.exe"
+    config = ForgeConfig(workspace_root=tmp_path, clangd_path=canary)
+    runtime = _FakeProcessRuntime()
+    service = ClangdService(
+        config,
+        WorkspaceService(config, create_logger("CRITICAL")),
+        runtime,
+    )  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        status = (await service.start("build")).status
+        assert status.executable == "clangd"
+        assert "HOST_PATH_CANARY" not in status.model_dump_json()
+        await service.aclose()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.skipif(

@@ -13,6 +13,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from mcp import ClientSession
+
 LIVE_MCP = "live_mcp"
 FAKE_MCP = "fake_mcp"
 UNAVAILABLE = "unavailable"
@@ -36,20 +38,43 @@ class ToolAcceptance:
 class McpToolCallCollector:
     """Runtime proof that a scenario crossed the official SDK boundary."""
 
-    def __init__(self, scenario_id: str) -> None:
-        self.scenario_id = scenario_id
+    def __init__(self, scenario_id: str | Iterable[str]) -> None:
+        roots = (scenario_id,) if isinstance(scenario_id, str) else tuple(scenario_id)
+        if not roots or any(not root for root in roots):
+            raise ValueError("At least one non-empty scenario root is required")
+        self.scenario_roots = frozenset(roots)
         self.called_tools: set[str] = set()
 
     async def call(self, session: object, tool_name: str, arguments: Mapping[str, object] | None = None, **kwargs: object) -> object:
+        if not isinstance(session, ClientSession):
+            raise AssertionError("MCP coverage requires the official SDK ClientSession")
         call_tool = getattr(session, "call_tool", None)
         if call_tool is None:
             raise AssertionError("MCP scenario has no SDK ClientSession.call_tool boundary")
         # This deliberately wraps the SDK boundary, rather than a ForgeMCP
         # handler or service.  ``tools/list`` is not a coverage event.
         result = await call_tool(tool_name, arguments or {}, **kwargs)
-        self.called_tools.add(tool_name)
-        _record_sdk_call(self.scenario_id, tool_name, result)
+        entry = _manifest_entry(tool_name)
+        # Fixture setup is also performed through the public SDK.  Such calls
+        # are real integration traffic, but must not manufacture coverage for
+        # a different owning scenario (for example CMake setup in clangd).
+        if _scenario_root(entry) in self.scenario_roots:
+            self.called_tools.add(tool_name)
+            _record_sdk_call(self.scenario_roots, tool_name, result, assertion_completed=False)
         return result
+
+    def complete_assertions(self, tool_names: Iterable[str]) -> None:
+        """Mark calls only after their scenario's response assertions passed.
+
+        Scenarios invoke this at their successful end.  A parsing or semantic
+        assertion failure therefore leaves every affected record incomplete,
+        and a manifest declaration alone can never manufacture coverage.
+        """
+        names = set(tool_names)
+        if not names <= self.called_tools:
+            raise AssertionError("Cannot complete an assertion for an uncalled MCP tool")
+        for tool_name in names:
+            _complete_sdk_assertion(self.scenario_roots, tool_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +110,28 @@ def _result_category(result: object) -> tuple[bool, str]:
     return True, "success"
 
 
-def _record_sdk_call(scenario_root: str, tool_name: str, result: object) -> None:
+def _manifest_entry(tool_name: str) -> ToolAcceptance:
     entry = next((item for item in TOOL_ACCEPTANCE if item.tool_name == tool_name), None)
     if entry is None:
         raise AssertionError(f"SDK acceptance call has no manifest tool: {tool_name}")
+    return entry
+
+
+def _scenario_root(entry: ToolAcceptance) -> str:
+    return entry.scenario_id.split(".", 1)[0]
+
+
+def _owned_manifest_entry(scenario_roots: frozenset[str], tool_name: str) -> ToolAcceptance:
+    entry = _manifest_entry(tool_name)
+    if _scenario_root(entry) not in scenario_roots:
+        raise AssertionError(f"SDK acceptance call crossed the wrong scenario boundary: {tool_name}")
+    return entry
+
+
+def _record_sdk_call(
+    scenario_roots: frozenset[str], tool_name: str, result: object, *, assertion_completed: bool
+) -> None:
+    entry = _owned_manifest_entry(scenario_roots, tool_name)
     meaningful, category = _result_category(result)
     key = (entry.tool_name, entry.scenario_id)
     with _coverage_lock:
@@ -98,8 +141,25 @@ def _record_sdk_call(scenario_root: str, tool_name: str, result: object) -> None
             scenario_id=entry.scenario_id,
             capability_group=entry.subsystem,
             calls=1 if previous is None else previous.calls + 1,
-            meaningful_assertion_completed=meaningful or bool(previous and previous.meaningful_assertion_completed),
+            meaningful_assertion_completed=assertion_completed or bool(previous and previous.meaningful_assertion_completed),
             category="success" if meaningful or (previous and previous.category == "success") else category,
+        )
+
+
+def _complete_sdk_assertion(scenario_roots: frozenset[str], tool_name: str) -> None:
+    entry = _owned_manifest_entry(scenario_roots, tool_name)
+    key = (entry.tool_name, entry.scenario_id)
+    with _coverage_lock:
+        previous = _coverage.get(key)
+        if previous is None or previous.calls <= 0:
+            raise AssertionError(f"Meaningful assertion has no preceding SDK call: {tool_name}")
+        _coverage[key] = CoverageRecord(
+            tool_name=previous.tool_name,
+            scenario_id=previous.scenario_id,
+            capability_group=previous.capability_group,
+            calls=previous.calls,
+            meaningful_assertion_completed=True,
+            category=previous.category,
         )
 
 

@@ -22,7 +22,7 @@ class QualityProcessSummary(ForgeModel):
 class QualityToolInfo(ForgeModel):
     """Qualified availability information for a fixed local quality executable."""
 
-    executable: str | None = Field(default=None, max_length=4096, description="Canonical approved executable path when qualification succeeded.")
+    executable: str | None = Field(default=None, max_length=64, description="Stable public tool identity when qualification succeeded, never its resolved path.")
     available: bool = Field(description="Whether the fixed executable produced a parseable version banner.")
     version: str | None = Field(default=None, min_length=1, max_length=256, description="Parsed local tool version when available.")
     error: str | None = Field(default=None, min_length=1, max_length=512, description="Intentional safe reason when qualification is unavailable.")

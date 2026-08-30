@@ -203,6 +203,7 @@ def prepare_project(root: Path, *, build: str = "build") -> None:
 def install_file_api(root: Path, *, multi_config: bool = False) -> None:
     workspace = WorkspaceService(ForgeConfig(workspace_root=root), create_logger("CRITICAL"))
     generated = workspace.open_generated_directory("build", create=True)
+    generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
     index = json.loads((FIXTURES / "index-v2.json").read_text(encoding="utf-8"))
     codemodel = "codemodel-multi-v2.json" if multi_config else "codemodel-v2.json"
     index["reply"]["codemodel-v2"]["jsonFile"] = codemodel
@@ -563,6 +564,7 @@ def test_file_api_rejects_missing_stale_malformed_and_outside_paths(tmp_path):
 
     workspace = WorkspaceService(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL"))
     generated = workspace.open_generated_directory("build")
+    generated.write_text(".cmake/api/v1/query/codemodel-v2", "")
     generated.write_text(".cmake/api/v1/reply/index-stale.json", '{"reply": {}}')
     with pytest.raises(CMakeFileApiError, match="stale"):
         service.list_targets(binary_dir="build")
@@ -644,7 +646,7 @@ def test_ctest_json_listing_and_failed_exact_name_run(tmp_path):
     assert run.process.exit_code == 8
     assert run.failed_tests == ("unit[b]",)
     assert runtime.calls[1] == (
-        ("ctest", "--test-dir", "build", "--output-on-failure", "--build-config", "Debug", "-R", r"^(?:unit\.a|unit\[b\])$"),
+        ("ctest", "--test-dir", "build", "--output-on-failure", "--no-tests=error", "--build-config", "Debug", "-R", r"^(unit\.a|unit\[b\])$"),
         ".",
         12.0,
     )

@@ -61,6 +61,7 @@ add_library(fixture_clangd_anchors OBJECT EXCLUDE_FROM_ALL
     analysis/clangd_anchors.cpp
     analysis/code_action.cpp
     analysis/format_me.cpp
+    analysis/tidy_me.cpp
 )
 target_include_directories(fixture_clangd_anchors PRIVATE include)
 

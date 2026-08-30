@@ -14,8 +14,10 @@ from forgemcp.dap import (
     DapClientState,
     DapConnectionClosedError,
     DapProtocolError,
+    DapRequestError,
     DapRequestTimeoutError,
 )
+from forgemcp.dap.errors import DapRequestCompatibility
 from forgemcp.core.config import ForgeConfig
 from forgemcp.core.logging import create_logger
 from forgemcp.processes import ProcessPolicy, ProcessRuntime
@@ -88,6 +90,29 @@ def test_client_handles_partial_frames_out_of_order_responses_and_interleaved_ev
         await client.aclose()
 
     asyncio.run(exercise())
+
+
+def test_client_classifies_only_exact_bounded_pause_thread_compatibility_response():
+    async def rejected(body: object) -> DapRequestError:
+        reader = asyncio.StreamReader()
+        writer = _Writer()
+        client = DapClient(reader, writer)  # type: ignore[arg-type]
+        await client.start()
+        request = asyncio.create_task(client.request("pause"))
+        await asyncio.sleep(0)
+        reader.feed_data(
+            _frame({"seq": 2, "type": "response", "request_seq": 1, "command": "pause", "success": False, "body": body})
+        )
+        with pytest.raises(DapRequestError) as caught:
+            await request
+        await client.aclose()
+        return caught.value
+
+    exact = asyncio.run(rejected({"error": {"format": "Request 'pause': missing value at arguments.threadId", "id": 3, "showUser": True}}))
+    assert exact.compatibility is DapRequestCompatibility.PAUSE_THREAD_ID_REQUIRED
+    assert "missing value" not in str(exact)
+    arbitrary = asyncio.run(rejected({"error": {"format": "threadId missing after adapter failure", "id": 3, "showUser": True}}))
+    assert arbitrary.compatibility is None
 
 
 def test_reverse_requests_are_denied_and_writes_remain_sequential():
