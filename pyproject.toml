@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "ForgeMCP contributors" }]
 dependencies = [
-    "mcp[cli]>=1.0,<2.0",
+    "mcp[cli]>=1.29,<2.0",
     "pydantic>=2.0,<3.0",
 ]
 

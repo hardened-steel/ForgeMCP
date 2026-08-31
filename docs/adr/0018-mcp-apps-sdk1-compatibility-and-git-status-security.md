@@ -37,14 +37,23 @@ and clears during normal shutdown. GitPlugin registers only:
 
 `server.py` is the sole SDK 1.x compatibility boundary. It passes public
 generic `meta` arguments to FastMCP for the nested Tool and Resource metadata.
+The supported floor is `mcp>=1.29,<2`: this is the first ForgeMCP-tested 1.x
+floor with those public decorators and generic `_meta` models. A regression
+also pins the deliberately narrow SDK 1.x `ServerCapabilities` extra-field
+contract used only for the missing typed extensions field.
+
 One documented, bounded initialization adapter injects the wire-only server
 capability `{ "extensions": { "io.modelcontextprotocol/ui": {} } }` and
 continues to omit empty `experimental`. A second read-only SDK 1.x helper reads
 the current connection's initialize parameters only while handling `tools/list`;
 it attaches App metadata solely when the client declares the exact App MIME
-type. It retains no cross-connection mutable capability state. Remove both
-helpers when a future SDK 2.x provides stable typed Apps registration and
-extensions fields.
+type. It retains no cross-connection mutable capability state. On SDK 2.x
+migration, remove `_install_sdk1_apps_compatibility_adapter`,
+`_connection_supports_mcp_apps`, and the `model_extra` fallback in
+`client_supports_mcp_apps`; replace them with typed server-extension and
+current-connection client-capability APIs. Keep the public
+`FastMCP.tool(..., meta=...)` and `FastMCP.resource(..., meta=...)`
+projections: those are ordinary wire metadata, not the temporary shim.
 
 All clients retain the same `git__status` name, schema, annotations,
 read-only behavior, structured content, and JSON-text fallback. Apps-capable

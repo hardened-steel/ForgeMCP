@@ -7,6 +7,7 @@ configuration precedence or installs test-only executable paths.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from datetime import UTC, datetime
@@ -15,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from forgemcp.core.config import ForgeConfig
+from forgemcp.core.logging import create_logger
+from forgemcp.processes import LldbDapQualifier, ProcessError, ProcessPolicy, ProcessRuntime
 from forgemcp.toolchain import ToolchainDiscoveryService
 from tests.acceptance_manifest import TOOL_ACCEPTANCE, coverage_records, reset_coverage_records, write_coverage_report
 
@@ -26,6 +29,107 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run the unified production-discovery real-MCP C++ acceptance tier",
     )
+
+
+async def _read_lldb_dap_message(reader: asyncio.StreamReader) -> dict[str, object]:
+    """Read one bounded DAP response for the live-acceptance eligibility gate."""
+    header_block = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5.0)
+    if len(header_block) > 8_192:
+        raise ValueError("oversized DAP header")
+    headers: dict[str, str] = {}
+    for line in header_block[:-4].split(b"\r\n"):
+        name, separator, value = line.partition(b":")
+        if not separator:
+            raise ValueError("malformed DAP header")
+        headers[name.decode("ascii").casefold()] = value.decode("ascii").strip()
+    length = int(headers["content-length"])
+    if not 0 <= length <= 1_048_576:
+        raise ValueError("oversized DAP message")
+    payload = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
+    message = json.loads(payload.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise ValueError("non-object DAP message")
+    return message
+
+
+async def _request_lldb_dap(
+    handle: object, *, sequence: int, command: str, arguments: dict[str, object]
+) -> dict[str, object]:
+    """Send one fixed acceptance-only request and return its matching response."""
+    stdin = getattr(handle, "stdin")
+    stdout = getattr(handle, "stdout")
+    payload = json.dumps(
+        {"seq": sequence, "type": "request", "command": command, "arguments": arguments},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    stdin.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload)
+    await stdin.drain()
+    while True:
+        message = await _read_lldb_dap_message(stdout)
+        if message.get("type") == "response" and message.get("request_seq") == sequence:
+            return message
+
+
+async def _qualify_lldb_dap_for_live_acceptance(
+    config: ForgeConfig, discovery: ToolchainDiscoveryService
+) -> tuple[bool, str]:
+    """Qualify production's exact adapter selection before debugger collection.
+
+    This deliberately consumes the same ToolchainDiscoveryService selection
+    that a production ForgeApplication gives to LldbDapBackend.  The probe
+    remains a test-harness gate: it establishes a strict scrubbed launch and
+    minimal DAP initialize/disconnect without retaining paths or a stale
+    result in the application.
+    """
+    executable = discovery.executable("lldb-dap")
+    if executable is None:
+        return False, "candidate_absent"
+    qualifier = LldbDapQualifier(config, create_logger("CRITICAL"))
+    candidate = qualifier.candidate_for_path(executable, discovery.source("lldb-dap"))
+    qualification = await qualifier.qualify(candidate)
+    if not qualification.available:
+        return False, "candidate_detected_unqualified"
+    policy = ProcessPolicy(
+        allowed_executables=frozenset(),
+        allowed_executable_paths=frozenset({candidate.path}),
+        allow_environment_inheritance=False,
+        default_timeout_seconds=10.0,
+        maximum_timeout_seconds=10.0,
+    )
+    runtime = ProcessRuntime(config, create_logger("CRITICAL"), policy=policy)
+    handle = None
+    try:
+        handle = await runtime.start_trusted_adapter(
+            [str(candidate.path)], approved_path_directories=candidate.companion_directories
+        )
+        initialize = await _request_lldb_dap(
+            handle,
+            sequence=1,
+            command="initialize",
+            arguments={
+                "clientID": "forgemcp-live-acceptance",
+                "adapterID": "lldb",
+                "pathFormat": "path",
+                "linesStartAt1": True,
+                "columnsStartAt1": True,
+                "supportsRunInTerminalRequest": False,
+            },
+        )
+        if initialize.get("success") is not True:
+            return False, "candidate_detected_unqualified"
+        disconnect = await _request_lldb_dap(
+            handle,
+            sequence=2,
+            command="disconnect",
+            arguments={"terminateDebuggee": False},
+        )
+        return (disconnect.get("success") is True, "qualified" if disconnect.get("success") is True else "candidate_detected_unqualified")
+    except (asyncio.TimeoutError, UnicodeError, ValueError, KeyError, json.JSONDecodeError, OSError, ProcessError):
+        return False, "candidate_detected_unqualified"
+    finally:
+        if handle is not None:
+            await handle.aclose()
+        await runtime.aclose()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -43,6 +147,16 @@ def pytest_configure(config: pytest.Config) -> None:
     kits = discovery.kits().model_dump(mode="json").get("kits", [])
     tools = {str(item["tool"]): bool(item["available"]) for item in snapshot["tools"]}  # type: ignore[index]
     ready = [item for item in kits if item.get("readiness") == "ready"]
+    lldb_candidate = bool(tools.get("lldb-dap", False)) and any(
+        item.get("origin") == "standalone" and item.get("compiler_family") == "clang"
+        and item.get("debugger_compatibility") == "compatible" for item in ready
+    )
+    lldb_qualification = "candidate_absent"
+    qualified_lldb_dap = False
+    if lldb_candidate:
+        qualified_lldb_dap, lldb_qualification = asyncio.run(
+            _qualify_lldb_dap_for_live_acceptance(ForgeConfig(workspace_root=Path.cwd()), discovery)
+        )
     capabilities = {
         "cmake_ctest_ninja": all(tools.get(name, False) for name in ("cmake", "ctest", "ninja")),
         "msvc": any(item.get("compiler_family") == "msvc" for item in ready),
@@ -58,10 +172,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "clangd": tools.get("clangd", False),
         "clang_format": tools.get("clang-format", False),
         "clang_tidy": tools.get("clang-tidy", False),
-        "qualified_lldb_dap": bool(tools.get("lldb-dap", False)) and any(
-            item.get("origin") == "standalone" and item.get("compiler_family") == "clang"
-            and item.get("debugger_compatibility") == "compatible" for item in ready
-        ),
+        "qualified_lldb_dap": qualified_lldb_dap,
         "git": tools.get("git", False),
     }
     # Only booleans and public metadata enter the report.  Paths, PATH and
@@ -70,10 +181,14 @@ def pytest_configure(config: pytest.Config) -> None:
     config._forgemcp_live_discovery = {  # type: ignore[attr-defined]
         "schema_version": 1,
         "started_at_utc": datetime.now(UTC).isoformat(),
-        "discovery_candidates": capabilities,
-        "capabilities": {name: False for name in capabilities},
+        "discovery_candidates": {**capabilities, "qualified_lldb_dap": lldb_candidate},
+        "capabilities": capabilities,
         "qualification": {
-            name: "candidate_detected_unqualified" if present else "candidate_absent"
+            name: (
+                lldb_qualification
+                if name == "qualified_lldb_dap"
+                else "candidate_detected_unqualified" if present else "candidate_absent"
+            )
             for name, present in capabilities.items()
         },
         "tool_sources": {
@@ -121,6 +236,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             config._forgemcp_live_node_groups[item.nodeid] = group  # type: ignore[attr-defined]
         if item.get_closest_marker("msvc_live_mcp") and not capabilities["msvc"]:
             item.add_marker(pytest.mark.skip(reason="capability_absent: production discovery found no ready MSVC kit"))
+        if item.get_closest_marker("debugger_fixture_mcp") and not capabilities["qualified_lldb_dap"]:
+            item.add_marker(pytest.mark.skip(reason="capability_absent: strict production-candidate LLDB-DAP qualification did not pass"))
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -172,13 +289,24 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "clang_tidy": "cmake_quality",
         "standalone_clang": "clangd",
         "clangd": "clangd",
-        "qualified_lldb_dap": "debugger",
         "git": "git",
         "msvc": "msvc",
     }
     qualification: dict[str, str] = {}
     qualified: dict[str, bool] = {}
+    initial_qualification = discovery_report["qualification"]
     for name, candidate in candidates.items():
+        if name == "qualified_lldb_dap":
+            # This capability was qualified before collection by strict launch
+            # plus initialize/disconnect. A later fixture failure must fail the
+            # unified command, not rewrite that independent evidence to false.
+            qualified[name] = candidate
+            qualification[name] = (
+                initial_qualification[name]
+                if isinstance(initial_qualification, dict) and isinstance(initial_qualification.get(name), str)
+                else "candidate_detected_unqualified"
+            )
+            continue
         statuses = by_group.get(qualification_nodes.get(name, ""), [])
         is_qualified = bool(candidate and statuses and all(status == "passed" for status in statuses))
         qualified[name] = is_qualified
@@ -209,6 +337,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         # only if the production discovery report proves its capability absent.
         available = config._forgemcp_live_capabilities  # type: ignore[attr-defined]
         aliases = {"mcp_stdio": True, "cmake": available["cmake_ctest_ninja"], "ninja": available["cmake_ctest_ninja"], "git": available["git"], "clangd": available["clangd"], "compile_commands": available["standalone_clang"], "standalone_llvm": available["standalone_clang"], "lldb_dap": available["qualified_lldb_dap"], "dwarf_debuggee": available["qualified_lldb_dap"]}
+        required_expected = {
+            (entry.tool_name, entry.scenario_id)
+            for entry in TOOL_ACCEPTANCE
+            if all(aliases.get(capability, False) for capability in entry.required_host_capabilities)
+        }
         missing = []
         for entry in TOOL_ACCEPTANCE:
             required = all(aliases.get(capability, False) for capability in entry.required_host_capabilities)
@@ -219,12 +352,14 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             raise AssertionError("available live capability was skipped or lacked a successful SDK call: " + ", ".join(missing))
         incomplete = [
             record.tool_name for record in records
-            if record.calls <= 0 or not record.meaningful_assertion_completed or record.category != "success"
+            if (record.tool_name, record.scenario_id) in required_expected
+            and (record.calls <= 0 or not record.meaningful_assertion_completed or record.category != "success")
         ]
-        if actual != expected or incomplete:
-            absent = sorted(tool for tool, _ in expected - actual)
+        if actual != required_expected or incomplete:
+            absent = sorted(tool for tool, _ in required_expected - actual)
             raise AssertionError(
-                f"{len(TOOL_ACCEPTANCE)}-tool SDK coverage is incomplete: " + ", ".join((absent + incomplete)[:len(TOOL_ACCEPTANCE)])
+                f"required SDK coverage is incomplete ({len(actual)}/{len(required_expected)} live tools): "
+                + ", ".join((absent + incomplete)[:len(TOOL_ACCEPTANCE)])
             )
         temporary_report = root / "coverage.json.tmp"
         write_coverage_report(temporary_report)

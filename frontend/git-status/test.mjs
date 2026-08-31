@@ -27,6 +27,9 @@ test("source has a stable built asset digest and no network or unsafe DOM sinks"
   assert.match(javascript, /ui\/resource-teardown/);
   assert.match(javascript, /textContent/);
   assert.match(javascript, /state\.refreshing/);
+  assert.match(javascript, /MAX_PENDING_REQUESTS = 2/);
+  assert.match(javascript, /status\.files\.length > MAX_FILES/);
+  assert.match(javascript, /boundedString\(file\.path, MAX_PATH_LENGTH\)/);
   assert.match(javascript, /name: TOOL_NAME/);
   for (const forbidden of ["innerHTML", "insertAdjacentHTML", "document.write", "localStorage", "fetch(", "XMLHttpRequest", "WebSocket", "eval(", "Function(", "ui/open-link", "clipboard", "<iframe"]) assert.equal(html.includes(forbidden), false, forbidden);
 });

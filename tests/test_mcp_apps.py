@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import subprocess
 import sys
 import zipfile
+from importlib.metadata import version as installed_version
 from importlib.util import find_spec
 from importlib.resources import files
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from mcp import ClientSession, types as mcp_types
@@ -28,7 +31,7 @@ from forgemcp.plugins import (
     MissingAppResourceError,
     ToolAppBinding,
 )
-from forgemcp.server import client_supports_mcp_apps
+from forgemcp.server import _install_sdk1_apps_compatibility_adapter, client_supports_mcp_apps
 from tests.acceptance_manifest import MCP_APP_RESOURCE_INVENTORY
 
 
@@ -115,6 +118,43 @@ def test_client_capability_negotiation_requires_the_exact_html_mime_type() -> No
     )
 
 
+def test_minimum_supported_sdk_exposes_the_public_meta_apis_and_extra_capability_storage() -> None:
+    """Pin the SDK floor used by the temporary Apps 1.x compatibility adapter."""
+    installed = tuple(int(part) for part in installed_version("mcp").split(".")[:2])
+    assert installed >= (1, 29)
+    assert "_meta" in inspect.signature(mcp_types.Tool).parameters
+    assert "_meta" in inspect.signature(mcp_types.Resource).parameters
+    from mcp.server.fastmcp import FastMCP
+
+    assert "meta" in inspect.signature(FastMCP.tool).parameters
+    assert "meta" in inspect.signature(FastMCP.resource).parameters
+    # SDK 1.x lacks a typed extensions member. The adapter's only controlled
+    # extra-field compatibility dependency is therefore explicitly pinned.
+    assert mcp_types.ServerCapabilities.model_config.get("extra") == "allow"
+
+
+def test_sdk1_apps_compatibility_adapter_merges_extensions_without_rewriting_capabilities() -> None:
+    class _Server:
+        def get_capabilities(self, _notifications: object, _experimental: object) -> mcp_types.ServerCapabilities:
+            return mcp_types.ServerCapabilities.model_validate(
+                {"experimental": {"existing": {}}, "extensions": {"example/extension": {"value": True}}}
+            )
+
+    holder = SimpleNamespace(_mcp_server=_Server())
+    original_config = dict(mcp_types.ServerCapabilities.model_config)
+    _install_sdk1_apps_compatibility_adapter(holder)  # type: ignore[arg-type]
+    capabilities = holder._mcp_server.get_capabilities(None, None)
+
+    assert capabilities.experimental == {"existing": {}}
+    assert capabilities.model_extra == {
+        "extensions": {
+            "example/extension": {"value": True},
+            "io.modelcontextprotocol/ui": {},
+        }
+    }
+    assert mcp_types.ServerCapabilities.model_config == original_config
+
+
 def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     html = files("forgemcp.apps.assets").joinpath("git-status.html").read_text(encoding="utf-8")
     source = (_ROOT / "frontend" / "git-status" / "git-status-app.js").read_text(encoding="utf-8")
@@ -127,7 +167,7 @@ def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     assert "localStorage" not in html and "ui/open-link" not in html and "ui/update-model-context" not in html
     assert "resources/read" not in html
     assert "textContent" in source
-    assert "display(status.branch)" in source and "display(file.path)" in source
+    assert "display(status.branch, MAX_BRANCH_LENGTH)" in source and "display(file.path)" in source
     assert "TOOL_NAME = \"git__status\"" in source and "tools/call" in source
 
 
@@ -166,6 +206,7 @@ def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
             async with session_type(*streams) as session:
                 initialized = await session.initialize()
                 assert initialized.serverInfo == mcp_types.Implementation(name="ForgeMCP", version=__version__)
+                assert initialized.protocolVersion == "2025-11-25"
                 assert initialized.capabilities.experimental is None
                 extensions = getattr(initialized.capabilities, "extensions", None)
                 assert extensions == {"io.modelcontextprotocol/ui": {}}

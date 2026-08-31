@@ -90,6 +90,19 @@ def test_discovery_orders_explicit_configuration_before_path(tmp_path: Path):
     assert discovered[0].canonical_path == explicit.resolve()
 
 
+def test_exact_toolchain_selection_uses_the_same_companion_policy_as_qualification(tmp_path: Path):
+    executable = tmp_path / ("lldb-dap.exe" if os.name == "nt" else "lldb-dap")
+    executable.write_bytes(b"candidate")
+    executable.chmod(0o755)
+    qualifier = LldbDapQualifier(ForgeConfig(workspace_root=tmp_path), create_logger("CRITICAL"))
+
+    candidate = qualifier.candidate_for_path(executable, "standalone")
+
+    assert candidate.path == executable
+    assert candidate.source == "standalone"
+    assert executable.parent.resolve() in candidate.companion_directories
+
+
 def test_qualification_uses_exact_strict_runtime_and_closes_a_runnable_candidate(tmp_path: Path):
     async def exercise() -> None:
         executable = tmp_path / ("lldb-dap.exe" if os.name == "nt" else "lldb-dap")

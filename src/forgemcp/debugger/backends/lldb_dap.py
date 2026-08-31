@@ -82,7 +82,9 @@ class LldbDapBackend:
         if self._toolchain is not None:
             path = self._toolchain.executable("lldb-dap")
             if path is not None and self._runtime.policy.approves_exact_executable(path):
-                self._candidate = LldbDapCandidate(path=path, source=self._toolchain.source("lldb-dap"))
+                self._candidate = LldbDapQualifier(self._config, self._logger).candidate_for_path(
+                    path, self._toolchain.source("lldb-dap")
+                )
                 return DebugAdapterInfo(
                     backend_id=self.backend_id,
                     display_name="LLVM LLDB-DAP",

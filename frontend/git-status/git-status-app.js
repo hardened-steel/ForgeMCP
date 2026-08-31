@@ -5,19 +5,28 @@
   const APP_VERSION = "1.0.0";
   const TOOL_NAME = "git__status";
   const TABS = ["All", "Staged", "Modified", "Untracked", "Conflicted"];
+  const MAX_PENDING_REQUESTS = 2;
+  const MAX_FILES = 512;
+  const MAX_PATH_LENGTH = 4096;
+  const MAX_BRANCH_LENGTH = 1024;
+  const MAX_ERROR_LENGTH = 512;
   const app = document.getElementById("app");
-  const state = { active: true, initialized: false, refreshing: false, tab: "All", lastSuccess: null, error: null, hostContext: {} };
+  const state = { active: true, initialized: false, refreshing: false, tab: "All", lastSuccess: null, error: null };
   const pending = new Map();
   let nextId = 1;
   let resizeTimer = null;
   let resizeObserver = null;
 
   function isObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
-  function display(value) {
+  function display(value, maximum = MAX_PATH_LENGTH) {
     if (typeof value !== "string") return "";
-    return value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`);
+    const bounded = value.slice(0, maximum);
+    return bounded.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`) + (value.length > maximum ? "…" : "");
   }
   function integer(value, fallback = 0) { return Number.isInteger(value) && value >= 0 ? value : fallback; }
+  function boundedString(value, maximum, nullable = false) {
+    return (nullable && value === null) || (typeof value === "string" && value.length <= maximum);
+  }
   function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -28,6 +37,7 @@
     if (state.active) window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
   }
   function sendRequest(method, params) {
+    if (!state.active || pending.size >= MAX_PENDING_REQUESTS) return Promise.reject(new Error("Too many pending App requests."));
     const id = nextId++;
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
@@ -36,7 +46,6 @@
   }
   function applyHostContext(update) {
     if (!isObject(update)) return;
-    state.hostContext = { ...state.hostContext, ...update };
     if (update.theme === "light" || update.theme === "dark") document.documentElement.dataset.theme = update.theme;
     const variables = update.styles && isObject(update.styles) && isObject(update.styles.variables) ? update.styles.variables : null;
     if (variables) {
@@ -48,7 +57,20 @@
   function statusFromResult(result) {
     if (!isObject(result) || result.isError === true || !isObject(result.structuredContent)) return null;
     const status = result.structuredContent;
-    if (typeof status.repository !== "string" || !Array.isArray(status.files)) return null;
+    if (![
+      "available", "unavailable", "error",
+    ].includes(status.repository) || typeof status.git_available !== "boolean" || typeof status.git_configured !== "boolean"
+      || !boundedString(status.branch, MAX_BRANCH_LENGTH, true) || !boundedString(status.head_oid, 64, true)
+      || !boundedString(status.error, MAX_ERROR_LENGTH, true) || !Array.isArray(status.files) || status.files.length > MAX_FILES
+      || !["detached", "unborn", "incomplete", "truncated"].every((key) => typeof status[key] === "boolean")
+      || !["ahead", "behind"].every((key) => status[key] === null || integer(status[key]) === status[key])
+      || !["staged_count", "unstaged_count", "untracked_count", "conflicted_count"].every((key) => integer(status[key]) === status[key])) return null;
+    if (!status.files.every((file) => isObject(file)
+      && boundedString(file.path, MAX_PATH_LENGTH)
+      && boundedString(file.original_path, MAX_PATH_LENGTH, true)
+      && boundedString(file.staged_status, 1)
+      && boundedString(file.unstaged_status, 1)
+      && typeof file.untracked === "boolean" && typeof file.conflicted === "boolean")) return null;
     return status;
   }
   function selectedRows(status) {
@@ -119,13 +141,13 @@
     }
     const repository = display(status.repository);
     if (repository !== "available") {
-      shell.append(element("p", "notice error", `Repository ${repository || "unavailable"}${status.error ? `: ${display(status.error)}` : ""}`));
+      shell.append(element("p", "notice error", `Repository ${repository || "unavailable"}${status.error ? `: ${display(status.error, MAX_ERROR_LENGTH)}` : ""}`));
       app.append(shell);
       announceSize();
       return;
     }
     const summary = element("section", "summary");
-    const branch = status.unborn === true ? "unborn" : status.detached === true ? "detached" : display(status.branch) || "unknown";
+    const branch = status.unborn === true ? "unborn" : status.detached === true ? "detached" : display(status.branch, MAX_BRANCH_LENGTH) || "unknown";
     addMetric(summary, "Branch", branch);
     addMetric(summary, "HEAD", display(status.head_oid).slice(0, 12) || "none");
     addMetric(summary, "Ahead / Behind", `${integer(status.ahead, 0)} / ${integer(status.behind, 0)}`);

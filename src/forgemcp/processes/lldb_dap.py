@@ -119,6 +119,20 @@ class LldbDapQualifier:
             )
         return tuple(candidates)
 
+    def candidate_for_path(self, path: Path, source: str) -> LldbDapCandidate:
+        """Describe one already-selected candidate with the normal loader policy.
+
+        The application Toolchain Discovery service owns executable selection.
+        Callers that already hold that exact private selection must not repeat
+        broad discovery just to reconstruct the companion-DLL policy used by
+        strict qualification and launch.
+        """
+        return LldbDapCandidate(
+            path=path,
+            source=source,
+            companion_directories=self._companion_directories(path),
+        )
+
     async def discover_and_qualify(self) -> tuple[AdapterQualification, ...]:
         """Discover then run each local candidate through the strict adapter policy."""
         qualifications: list[AdapterQualification] = []

@@ -405,8 +405,16 @@ def _install_sdk1_apps_compatibility_adapter(mcp: FastMCP[ForgeApplication]) -> 
 
     def get_capabilities(self, notification_options, experimental_capabilities):
         capabilities = original(notification_options, experimental_capabilities)
+        existing_extensions = getattr(capabilities, "extensions", None)
+        if existing_extensions is None:
+            model_extra = getattr(capabilities, "model_extra", None)
+            existing_extensions = (
+                model_extra.get("extensions") if isinstance(model_extra, Mapping) else None
+            )
+        extensions = dict(existing_extensions) if isinstance(existing_extensions, Mapping) else {}
+        extensions[MCP_APPS_EXTENSION_ID] = {}
         updates: dict[str, object] = {
-            "extensions": {MCP_APPS_EXTENSION_ID: {}},
+            "extensions": extensions,
         }
         if not capabilities.experimental:
             updates["experimental"] = None
