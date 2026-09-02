@@ -31,6 +31,7 @@ from forgemcp.plugins import (
     MissingAppResourceError,
     ToolAppBinding,
 )
+from forgemcp.plugins.apps import MAX_APP_HTML_BYTES
 from forgemcp.server import _install_sdk1_apps_compatibility_adapter, client_supports_mcp_apps
 from tests.acceptance_manifest import MCP_APP_RESOURCE_INVENTORY
 
@@ -105,7 +106,7 @@ def test_app_resource_rejects_non_html_or_oversized_static_assets() -> None:
     with pytest.raises(ValueError, match="HTML5"):
         _app_resource("<html><body>not a full document</body></html>")
     with pytest.raises(ValueError, match="byte limit"):
-        _app_resource("<!doctype html>" + "x" * (256 * 1024))
+        _app_resource("<!doctype html>" + "x" * MAX_APP_HTML_BYTES)
 
 
 def test_client_capability_negotiation_requires_the_exact_html_mime_type() -> None:
@@ -158,17 +159,27 @@ def test_sdk1_apps_compatibility_adapter_merges_extensions_without_rewriting_cap
 def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     html = files("forgemcp.apps.assets").joinpath("git-status.html").read_text(encoding="utf-8")
     source = (_ROOT / "frontend" / "git-status" / "git-status-app.js").read_text(encoding="utf-8")
+    helper = (_ROOT / "frontend" / "common" / "mcp-app.js").read_text(encoding="utf-8")
+    lockfile = (_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8")
     assert html.startswith("<!doctype html>")
-    assert len(html.encode("utf-8")) <= 256 * 1024
+    assert len(html.encode("utf-8")) <= MAX_APP_HTML_BYTES
     assert "source-sha256:" in html
     assert "C:\\" not in html and "/Users/" not in html
-    assert "fetch(" not in html and "XMLHttpRequest" not in html and "WebSocket" not in html
-    assert "innerHTML" not in html and "insertAdjacentHTML" not in html and "document.write" not in html
-    assert "localStorage" not in html and "ui/open-link" not in html and "ui/update-model-context" not in html
-    assert "resources/read" not in html
+    # The official runtime is bundled, so protocol method strings may occur in
+    # dependency code. ForgeMCP-authored frontend source must not use them.
+    authored = source + helper
+    assert "fetch(" not in authored and "XMLHttpRequest" not in authored and "WebSocket" not in authored
+    assert "innerHTML" not in authored and "insertAdjacentHTML" not in authored and "document.write" not in authored
+    assert "localStorage" not in authored and "ui/open-link" not in authored and "ui/update-model-context" not in authored
+    assert "resources/read" not in authored
     assert "textContent" in source
-    assert "display(status.branch, MAX_BRANCH_LENGTH)" in source and "display(file.path)" in source
-    assert "TOOL_NAME = \"git__status\"" in source and "tools/call" in source
+    assert "safeText(status.branch, MAX_BRANCH_LENGTH)" in source and "safeText(file.path)" in source
+    assert 'from "@modelcontextprotocol/ext-apps"' in helper
+    assert "new App(" in helper and "new PostMessageTransport(" in helper
+    assert '"@modelcontextprotocol/ext-apps"' in lockfile
+    for forbidden in ("Refresh", "callServerTool", "tools/call", "sendFollowUpMessage", "resources/read", "requestDisplayMode", "ui/open-link", "window.parent.postMessage"):
+        assert forbidden not in authored
+    assert "height: 258px" in html and "height: 269px" in html
 
 
 def test_git_status_canaries_are_model_data_not_html_templates() -> None:
@@ -185,8 +196,8 @@ def test_git_status_canaries_are_model_data_not_html_templates() -> None:
     for canary in canaries:
         assert canary not in source
         assert isinstance(canary, str)
-    assert "row.append(element" in source
-    assert "textContent = text" in source
+    assert "row.append(el" in source
+    assert "node.textContent = text" in source
     assert "replace(/[" in source
 
 

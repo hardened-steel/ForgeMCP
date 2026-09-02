@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+# Bootstrap installs this complete development set so the wheel smoke test does
+# not depend on whichever build backend happens to be installed globally.
+dev = ["pytest>=8.0", "hatchling>=1.27"]
 
 [project.scripts]
 forgemcp = "forgemcp.server:main"
@@ -31,4 +34,7 @@ markers = [
     "clangd_fixture_mcp: complete real-MCP clangd acceptance gate on the disposable C++ fixture",
     "debugger_fixture_mcp: complete real-MCP standalone LLVM LLDB-DAP gate on the disposable C++ fixture",
     "git_fixture_mcp: complete disposable read-only Git service/MCP acceptance gate",
+]
+filterwarnings = [
+    "ignore:Field 'lifespan' has an incomplete definition:pydantic_settings.exceptions.IncompleteFieldDefinitionWarning:pydantic_settings.sources.utils",
 ]

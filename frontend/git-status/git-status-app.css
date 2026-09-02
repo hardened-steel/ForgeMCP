@@ -1,53 +1,12 @@
-:root {
-  color-scheme: light dark;
-  --surface: var(--color-background-primary, #f8fafc);
-  --surface-muted: var(--color-background-secondary, #eef2f7);
-  --text: var(--color-text-primary, #172033);
-  --muted: var(--color-text-secondary, #526077);
-  --line: var(--color-border-primary, #cbd5e1);
-  --accent: #176b87;
-  --good: #0e7a49;
-  --warn: #a05a00;
-  --danger: #b42318;
-  --radius: 8px;
-  font-family: var(--font-sans, Arial, sans-serif);
-}
-
-:root[data-theme="dark"] {
-  --surface: var(--color-background-primary, #151b25);
-  --surface-muted: var(--color-background-secondary, #202a38);
-  --text: var(--color-text-primary, #edf3fb);
-  --muted: var(--color-text-secondary, #b8c4d4);
-  --line: var(--color-border-primary, #3b485a);
-}
-
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--surface); color: var(--text); font-size: 14px; line-height: 1.45; }
+body { margin: 0; padding: var(--forge-safe-top) var(--forge-safe-right) var(--forge-safe-bottom) var(--forge-safe-left); background: var(--forge-term-bg); color: var(--forge-term-text); font: 11px/1.25 var(--font-mono, ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace); min-width: 0; }
 button { font: inherit; }
-.shell { display: grid; gap: 16px; max-width: 1040px; margin: 0 auto; padding: 18px; }
-.header { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
-.title { margin: 0; font-size: 18px; font-weight: 700; }
-.refresh { min-width: 38px; min-height: 34px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-muted); color: var(--text); cursor: pointer; }
-.refresh:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.refresh:disabled { cursor: wait; opacity: .62; }
-.summary { display: grid; gap: 10px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.metric { min-height: 74px; border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; background: var(--surface-muted); }
-.metric-label { color: var(--muted); font-size: 12px; }
-.metric-value { display: block; margin-top: 4px; font-family: var(--font-mono, Consolas, monospace); font-size: 18px; font-weight: 700; overflow-wrap: anywhere; }
-.details, .warning, .notice { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; background: var(--surface-muted); overflow-wrap: anywhere; }
-.warning { border-color: var(--warn); color: var(--warn); }
-.error { border-color: var(--danger); color: var(--danger); }
-.clean { border-color: var(--good); color: var(--good); }
-.tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
-.tab { min-width: 72px; min-height: 32px; border: 1px solid var(--line); border-radius: var(--radius); padding: 5px 10px; background: var(--surface); color: var(--text); cursor: pointer; }
-.tab[aria-selected="true"] { border-color: var(--accent); background: var(--accent); color: #ffffff; }
-.groups { display: grid; gap: 16px; }
-.group { display: grid; gap: 6px; }
-.group-title { margin: 0; color: var(--muted); font-size: 13px; font-weight: 700; }
-.rows { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-.row { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 10px; padding: 8px 10px; border-top: 1px solid var(--line); }
-.row:first-child { border-top: 0; }
-.code { color: var(--muted); font-family: var(--font-mono, Consolas, monospace); font-size: 12px; }
-.path { font-family: var(--font-mono, Consolas, monospace); overflow-wrap: anywhere; white-space: pre-wrap; }
-.empty { color: var(--muted); }
-@media (max-width: 620px) { .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .shell { padding: 12px; } }
+.forge-term { height: 258px; min-width: 0; overflow: hidden; display: grid; grid-template-rows: 27px 29px 31px 115px 35px 19px; background: var(--forge-term-bg); border: 1px solid var(--forge-term-border); border-radius: 4px; }
+.forge-command, .forge-branch, .forge-filters, .forge-detail, .forge-footer { min-width: 0; display: flex; align-items: center; border-bottom: 1px solid var(--forge-term-border); }
+.forge-command { gap: 7px; padding: 0 8px; background: var(--forge-term-row); }.forge-prompt, .forge-complete { color: var(--forge-term-green); }.forge-command-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.forge-branch { gap: 7px; padding: 0 8px; white-space: nowrap; }.forge-branch-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--forge-term-pink); }.forge-sync, .forge-filter-state, .forge-detail-label, .forge-detail-states, .forge-total { color: var(--forge-term-muted); }
+.forge-strip { margin-left: auto; display: flex; gap: 2px; flex: 0 0 auto; outline-offset: 2px; }.forge-strip i { width: 7px; height: 7px; background: color-mix(in srgb, var(--forge-term-muted) 23%, transparent); }.forge-strip .staged, .forge-file.staged .forge-code { color: var(--forge-term-blue); background-color: var(--forge-term-blue); }.forge-strip .modified, .forge-file.modified .forge-code { color: var(--forge-term-purple); background-color: var(--forge-term-purple); }.forge-strip .untracked, .forge-file.untracked .forge-code { color: var(--forge-term-orange); background-color: var(--forge-term-orange); }.forge-strip .conflicted, .forge-file.conflicted .forge-code { color: var(--forge-term-red); background-color: var(--forge-term-red); }
+.forge-filters { gap: 4px; padding: 3px 6px; }.forge-filter { height: 23px; min-width: 0; border: 1px solid transparent; border-radius: 2px; padding: 0 5px; background: transparent; cursor: pointer; white-space: nowrap; }.forge-filter:hover, .forge-filter:focus-visible, .forge-filter[aria-pressed="true"] { background: var(--forge-term-row); border-color: currentColor; outline: 0; }.forge-filter.staged { color: var(--forge-term-blue); }.forge-filter.modified { color: var(--forge-term-purple); }.forge-filter.untracked { color: var(--forge-term-orange); }.forge-filter.conflicted, .forge-error { color: var(--forge-term-red); }.forge-filter-state { margin-left: auto; white-space: nowrap; }
+.forge-files { list-style: none; min-width: 0; margin: 0; padding: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scroll-snap-type: y mandatory; }.forge-files li { height: 23px; scroll-snap-align: start; }.forge-file { width: 100%; height: 23px; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 6px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--forge-term-border) 28%, transparent); padding: 0 8px; background: transparent; color: var(--forge-term-text); text-align: left; cursor: pointer; }.forge-file:hover, .forge-file:focus-visible, .forge-file[aria-selected="true"] { background: var(--forge-term-row); outline: 0; }.forge-code { font-weight: 600; background: transparent !important; }.forge-path, .forge-detail-path, .forge-detail-states { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.forge-empty { display: flex; align-items: center; padding: 0 8px; color: var(--forge-term-muted); }
+.forge-detail { gap: 7px; padding: 0 8px; background: var(--forge-term-row); }.forge-detail-path { color: var(--forge-term-pink); }.forge-detail-states { margin-left: auto; }.forge-footer { justify-content: space-between; padding: 0 8px; border-bottom: 0; }.forge-incomplete { color: var(--forge-term-orange); }.forge-truncated, .forge-error { color: var(--forge-term-red); }
+@media (max-width: 520px) { .forge-term { height: 269px; grid-template-rows: 27px 29px 42px 115px 37px 19px; }.forge-filters { flex-wrap: wrap; align-content: center; }.forge-filter { height: 17px; padding: 0 4px; }.forge-filter-state { width: 100%; margin-left: 4px; }.forge-strip { display: none; }.forge-detail { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: 17px 17px; gap: 0 7px; align-content: center; }.forge-detail-states { grid-column: 2; margin-left: 0; }.forge-sync { overflow: hidden; text-overflow: ellipsis; }.forge-footer { min-width: 0; }.forge-total { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } }

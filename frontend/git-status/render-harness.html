@@ -7,7 +7,7 @@
     <style>html,body,iframe{border:0;height:100%;margin:0;width:100%;}</style>
   </head>
   <body>
-    <iframe id="app" src="/src/forgemcp/apps/assets/git-status.html" title="Git Status App"></iframe>
+    <iframe id="app" src="/git-status.html" title="Git Status App"></iframe>
     <script>
       (() => {
         "use strict";
@@ -36,16 +36,30 @@
           ]
         };
         const result = { content: [{ type: "text", text: "Git repository status." }], structuredContent: status };
+        const lifecycle = [];
+        window.__forgemcpHarness = {
+          phase: "connecting",
+          requestTeardown() {
+            frame.contentWindow.postMessage({ jsonrpc: "2.0", id: "teardown", method: "ui/resource-teardown", params: {} }, "*");
+          },
+        };
         window.addEventListener("message", (event) => {
           if (event.source !== frame.contentWindow || !event.data || typeof event.data !== "object") return;
           const message = event.data;
+          window.__forgemcpHarness.lastMessage = { method: message.method || null, id: message.id || null };
           if (message.method === "ui/initialize") {
-            frame.contentWindow.postMessage({ jsonrpc: "2.0", id: message.id, result: { hostContext: { theme: "light" } } }, "*");
+            lifecycle.push("initialize");
+            frame.contentWindow.postMessage({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2026-01-26", hostInfo: { name: "ForgeMCP harness", version: "1.0.0" }, hostCapabilities: {}, hostContext: { theme: "light" } } }, "*");
           } else if (message.method === "ui/notifications/initialized") {
+            lifecycle.push("initialized");
             frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: {} } }, "*");
             frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: result }, "*");
-          } else if (message.method === "tools/call") {
-            frame.contentWindow.postMessage({ jsonrpc: "2.0", id: message.id, result }, "*");
+            window.__forgemcpHarness.phase = "rendered";
+          } else if (message.method === "ui/resource-teardown") {
+            lifecycle.push("teardown");
+            frame.contentWindow.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
+          } else if (message.id === "teardown" && message.result && typeof message.result === "object") {
+            window.__forgemcpHarness.phase = "tornDown";
           }
         });
       })();

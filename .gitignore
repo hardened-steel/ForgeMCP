@@ -221,3 +221,13 @@ examples/cpp-acceptance-project/**/compile_commands.json
 examples/cpp-acceptance-project/**/*.pdb
 examples/cpp-acceptance-project/**/*.exe
 examples/cpp-acceptance-project/.cache/
+
+# ForgeMCP frontend and verification artifacts.  Keep sources, lockfiles and
+# checked-in packaged App HTML visible to Git.
+/frontend/**/node_modules/
+/frontend/**/dist/
+/frontend/**/.cache/
+/.tmp-pytest*/
+/.pytest-tmp/
+/playwright-report/
+/test-results/

@@ -118,6 +118,42 @@ See [ADR 0010](docs/adr/0010-quality-tools-formatting-analysis-and-trust-boundar
 
 Requires Python 3.11 or later.
 
+### Reproducible developer workflow
+
+From a clean PowerShell checkout, use the repository entrypoints rather than a
+root-level virtual environment:
+
+```powershell
+git clone <repository-url>
+cd ForgeMCP
+.\scripts\bootstrap.ps1
+.\scripts\verify.ps1 -Mode Portable
+```
+
+`bootstrap.ps1` requires Python 3.11+ and Node.js 22+, creates `.venv/` only
+when it is absent, installs `.[dev]` (including the wheel build backend), and
+runs the one networked frontend installation. Python packages remain in
+`.venv/`; frontend packages remain in `frontend/node_modules/`; neither global
+environment is modified. After bootstrap, `npm run build --prefix frontend`
+uses only the canonical lockfile and local modules, so it makes no network
+request.
+
+`Portable` runs the App build/browser checks, the full portable Python suite,
+`compileall`, and diff/artifact hygiene. `Live` runs the same prerequisite App
+checks plus production-discovery acceptance and reports capability/coverage
+evidence:
+
+```powershell
+.\scripts\verify.ps1 -Mode Live
+```
+
+Every pytest command uses `-ra`: platform and host-dependent skips therefore
+show their reason. A changing numeric skip count is acceptable when the same
+mandatory tests pass and each missing capability is explicitly classified as
+`platform_absent`, `privilege_absent`, `capability_absent`, or
+`live_gate_not_requested`. A capability reported available by the Live
+discovery gate must run and cannot silently skip.
+
 ### C++ acceptance fixture and D2 gates
 
 `examples/cpp-acceptance-project` is the permanent, dependency-free C++
@@ -580,23 +616,27 @@ receive nested metadata on `git__status`:
 
 The resource uses the exact App MIME, explicit empty CSP domain lists, omitted
 permissions/domain, and `prefersBorder=true`. It renders repository state,
-bounded HEAD, divergence/counts, warnings, and grouped safe-text file rows with
-All/Staged/Modified/Untracked/Conflicted filters. Refresh calls only
-`git__status`; there are no App-only writes. Hosts without the extension retain
+bounded HEAD, divergence/counts, warnings, and compact safe-text file rows with
+local All/Staged/Modified/Untracked/Conflicted filters and file selection. The
+view never calls `git__status` or any other tool. Hosts without the extension retain
 the unmodified plain tool schema, structured content, and textual fallback.
 
-The checked-in source and offline build are under `frontend/git-status`. Node
-is not a ForgeMCP runtime dependency:
+The checked-in App sources live under `frontend/git-status`, shared code lives
+under `frontend/common`, and one canonical toolchain/lockfile lives under
+`frontend`. Node is not a ForgeMCP runtime dependency:
 
 ```powershell
-Push-Location frontend\git-status
-npm run build
-npm test
-Pop-Location
+npm ci --prefix frontend
+npm run build --prefix frontend
+npm test --prefix frontend
 ```
 
 `npm run build` regenerates `src/forgemcp/apps/assets/git-status.html`; the
-embedded source SHA-256 makes drift fail the frontend test. See
+embedded source SHA-256 makes drift fail the frontend test. The production
+asset is a checked-in package resource: rebuild and commit it with every
+frontend change. The frontend test loads that exact HTML in Chromium, completes
+the official ext-apps handshake, sends a tool result, exercises filters and
+selection, and tears down. See
 [ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md).
 
 ## Core structure

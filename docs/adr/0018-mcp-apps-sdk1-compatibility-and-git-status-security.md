@@ -66,20 +66,21 @@ at plugin startup. It is static, HTML5, UTF-8 and byte-bounded; missing or
 corrupt assets stop Git plugin composition rather than falling back to a
 workspace path. Node is development-only. `frontend/git-status` has source,
 lock file, an offline `npm run build`, and source-digest verification. The
-single-file view uses direct JSON-RPC over `postMessage`, a deliberately narrow
-implementation of `ui/initialize`, initialized, tool input/result/cancel,
-host-context, size, and teardown lifecycle messages. The direct implementation
-is safer for this no-dependency App than adding an unbundled runtime or CDN:
-its protocol surface is small, static, protocol-tested, and contains no
-network, host-resource read, arbitrary tool, or browser permission API.
+single-file view bundles the official `@modelcontextprotocol/ext-apps` runtime
+from the frontend lockfile. It registers `ontoolinput`, `ontoolresult`,
+`onhostcontextchanged`, and `onteardown` before `connect()` with the official
+`PostMessageTransport`; no ForgeMCP code implements the wire protocol. A small
+shared frontend helper applies the official document-theme, host-style,
+host-font, and safe-area helpers. The view still has no network,
+host-resource read, arbitrary tool, or browser permission API.
 
 The Git Status App has restrictive CSP metadata with all four domain lists
 explicitly empty, no permissions, no dedicated domain, and `prefersBorder=true`.
-It calls only `git__status` for Refresh, allows one active request, keeps the
-last successful state after failure, and never updates model context. Project
-strings are rendered through DOM construction and `textContent`; unsafe HTML
-sinks, template concatenation, external assets, browser storage, eval,
-networking, nested frames, clipboard, and host DOM access are absent.
+It renders only the attached `git__status` result; filters and file selection
+are local and it neither calls tools nor updates model context. Project strings
+are rendered through DOM construction and `textContent`; unsafe HTML sinks,
+template concatenation, external assets, browser storage, eval, networking,
+nested frames, clipboard, and host DOM access are absent.
 
 ## Consequences
 

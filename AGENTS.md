@@ -42,6 +42,21 @@ Before designing or changing a module, read:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+Agents may run the following local, non-destructive workspace commands without
+additional confirmation:
+
+```powershell
+npm run build --prefix frontend
+npm test --prefix frontend
+.\.venv\Scripts\python.exe -m pytest ...
+.\.venv\Scripts\python.exe -m compileall ...
+git diff --check
+```
+
+`npm ci --prefix frontend` may need network access when dependencies are first
+installed or the lockfile changes; any Codex sandbox approval for that command
+is a host-policy decision, not something this repository can disable.
+
 ## Documentation ownership
 Stable onboarding and rules: AGENTS.md
 Current system design: docs/architecture.md

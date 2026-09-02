@@ -29,6 +29,28 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run the unified production-discovery real-MCP C++ acceptance tier",
     )
+    parser.addoption(
+        "--forgemcp-live-report-dir",
+        action="store",
+        default=None,
+        help="system-temp directory for ephemeral live acceptance capability and coverage reports",
+    )
+
+
+def _live_report_root(config: pytest.Config) -> Path:
+    configured = config.getoption("--forgemcp-live-report-dir")
+    if configured is None:
+        root = Path(tempfile.mkdtemp(prefix="forgemcp-live-acceptance-"))
+    else:
+        root = Path(str(configured)).resolve()
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        try:
+            root.relative_to(temporary_root)
+        except ValueError as error:
+            raise pytest.UsageError("--forgemcp-live-report-dir must be inside the system temporary directory") from error
+        root.mkdir(parents=True, exist_ok=True)
+    config._forgemcp_live_report_root = root  # type: ignore[attr-defined]
+    return root
 
 
 async def _read_lldb_dap_message(reader: asyncio.StreamReader) -> dict[str, object]:
@@ -136,8 +158,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "msvc_live_mcp: MSVC real-MCP gate controlled by the unified runner")
     if not config.getoption("--run-forgemcp-live-acceptance"):
         return
-    report_root = Path(tempfile.gettempdir()) / "forgemcp-live-acceptance"
-    report_root.mkdir(parents=True, exist_ok=True)
+    report_root = _live_report_root(config)
     # A failed, interrupted, or capability-incomplete run must not leave an
     # earlier successful artifact looking current.
     for name in ("coverage.json", "coverage.json.tmp", "capabilities.json"):
@@ -240,11 +261,30 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="capability_absent: strict production-candidate LLDB-DAP qualification did not pass"))
 
 
+def _skip_category(reason: str) -> str:
+    """Normalize portable skip evidence without turning absent host tools into failures."""
+    if reason.startswith(("platform_absent:", "privilege_absent:", "capability_absent:", "live_gate_not_requested:")):
+        return reason
+    folded = reason.casefold()
+    if "run only by --run-forgemcp-live-acceptance" in folded:
+        return f"live_gate_not_requested: {reason}"
+    if any(token in folded for token in ("windows-only", "windows path", "windows uses", "windows closes", "posix")):
+        return f"platform_absent: {reason}"
+    if any(token in folded for token in ("does not permit", "symlink creation", "symbolic links are unavailable", "access is denied", "privilege")):
+        return f"privilege_absent: {reason}"
+    return f"capability_absent: {reason}"
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
     outcome = yield
     report = outcome.get_result()
     config = item.config
+    if report.skipped and isinstance(report.longrepr, tuple) and len(report.longrepr) == 3:
+        path, line, reason = report.longrepr
+        if isinstance(reason, str):
+            prefix = "Skipped: "
+            report.longrepr = (path, line, prefix + _skip_category(reason.removeprefix(prefix)))
     if not config.getoption("--run-forgemcp-live-acceptance"):
         return
     groups: dict[str, str] = config._forgemcp_live_node_groups  # type: ignore[attr-defined]
@@ -265,7 +305,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     config = session.config
     if not config.getoption("--run-forgemcp-live-acceptance"):
         return
-    root = Path(tempfile.gettempdir()) / "forgemcp-live-acceptance"
+    root: Path = config._forgemcp_live_report_root  # type: ignore[attr-defined]
     root.mkdir(parents=True, exist_ok=True)
     report_path = root / "coverage.json"
     discovery_path = root / "capabilities.json"

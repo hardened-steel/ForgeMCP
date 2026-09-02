@@ -1,0 +1,32 @@
+:root {
+  color-scheme: light dark;
+  --forge-safe-top: 0px;
+  --forge-safe-right: 0px;
+  --forge-safe-bottom: 0px;
+  --forge-safe-left: 0px;
+  --forge-term-bg: var(--color-background-primary, #0b0f14);
+  --forge-term-row: var(--color-background-secondary, #11171e);
+  --forge-term-text: var(--color-text-primary, #c7d0da);
+  --forge-term-muted: var(--color-text-secondary, #737e8a);
+  --forge-term-border: var(--color-border-primary, #434b55);
+  --forge-term-pink: #f044a1;
+  --forge-term-blue: #5794f8;
+  --forge-term-purple: #aa72f2;
+  --forge-term-orange: #ff733c;
+  --forge-term-red: #f05252;
+  --forge-term-green: #57ad47;
+}
+
+:root[data-theme="light"] {
+  --forge-term-bg: var(--color-background-primary, #f7f8fa);
+  --forge-term-row: var(--color-background-secondary, #eceff3);
+  --forge-term-text: var(--color-text-primary, #252a31);
+  --forge-term-muted: var(--color-text-secondary, #6f7782);
+  --forge-term-border: var(--color-border-primary, #aeb5bf);
+  --forge-term-pink: #ba2573;
+  --forge-term-blue: #2768c8;
+  --forge-term-purple: #7543c4;
+  --forge-term-orange: #bd4b1c;
+  --forge-term-red: #b72d35;
+  --forge-term-green: #377b30;
+}

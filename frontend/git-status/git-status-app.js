@@ -1,252 +1,131 @@
-(() => {
-  "use strict";
+import { connectMcpApp } from "../common/mcp-app.js";
 
-  const APP_NAME = "forgemcp-git-status";
-  const APP_VERSION = "1.0.0";
-  const TOOL_NAME = "git__status";
-  const TABS = ["All", "Staged", "Modified", "Untracked", "Conflicted"];
-  const MAX_PENDING_REQUESTS = 2;
-  const MAX_FILES = 512;
-  const MAX_PATH_LENGTH = 4096;
-  const MAX_BRANCH_LENGTH = 1024;
-  const MAX_ERROR_LENGTH = 512;
-  const app = document.getElementById("app");
-  const state = { active: true, initialized: false, refreshing: false, tab: "All", lastSuccess: null, error: null };
-  const pending = new Map();
-  let nextId = 1;
-  let resizeTimer = null;
-  let resizeObserver = null;
+const MAX_FILES = 512;
+const MAX_PATH_LENGTH = 4096;
+const MAX_BRANCH_LENGTH = 1024;
+const root = document.getElementById("app");
+const state = { filter: null, selected: null, status: null, tornDown: false };
 
-  function isObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
-  function display(value, maximum = MAX_PATH_LENGTH) {
-    if (typeof value !== "string") return "";
-    const bounded = value.slice(0, maximum);
-    return bounded.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`) + (value.length > maximum ? "…" : "");
+function isObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function safeText(value, maximum = MAX_PATH_LENGTH) {
+  if (typeof value !== "string") return "";
+  const text = value.slice(0, maximum).replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, (item) => `\\u${item.codePointAt(0).toString(16).padStart(4, "0")}`);
+  return text + (value.length > maximum ? "…" : "");
+}
+function count(value) { return Number.isInteger(value) && value >= 0 ? value : 0; }
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function validStatus(result) {
+  const status = isObject(result) && result.isError !== true && isObject(result.structuredContent) ? result.structuredContent : null;
+  if (!status || !["available", "unavailable", "error"].includes(status.repository) || !Array.isArray(status.files) || status.files.length > MAX_FILES) return null;
+  return status;
+}
+function kind(file) {
+  if (file.conflicted === true) return "conflicted";
+  if (file.untracked === true) return "untracked";
+  if (typeof file.staged_status === "string" && file.staged_status !== ".") return "staged";
+  return "modified";
+}
+function matches(file, filter) { return !filter || kind(file) === filter; }
+function statusCode(file) {
+  if (file.untracked === true) return "??";
+  return `${safeText(file.staged_status, 1) || "."}${safeText(file.unstaged_status, 1) || "."}`.replaceAll(".", "·");
+}
+function files() { return Array.isArray(state.status?.files) ? state.status.files.filter(isObject) : []; }
+function select(file) { state.selected = file || null; renderDetail(); renderRows(); }
+function filterCount(name) {
+  const fields = { staged: "staged_count", modified: "unstaged_count", untracked: "untracked_count", conflicted: "conflicted_count" };
+  return count(state.status?.[fields[name]]);
+}
+function detailText(file) {
+  if (!file) return ["selected:", "none", ""];
+  const original = safeText(file.original_path);
+  const states = `index=${safeText(file.staged_status, 1) || "."} · worktree=${safeText(file.unstaged_status, 1) || "."}`;
+  return ["selected:", safeText(file.path), `${states}${original ? ` · original=${original}` : ""}`];
+}
+function renderDetail() {
+  const target = root.querySelector(".forge-detail");
+  if (!target) return;
+  const [label, path, states] = detailText(state.selected);
+  target.replaceChildren(el("span", "forge-detail-label", label), el("span", "forge-detail-path", path), el("span", "forge-detail-states", states));
+}
+function renderRows() {
+  const target = root.querySelector(".forge-files");
+  if (!target) return;
+  const visible = files().filter((file) => matches(file, state.filter));
+  target.replaceChildren();
+  if (!visible.length) target.append(el("li", "forge-empty", "No matching paths."));
+  for (const file of visible) {
+    const item = el("li");
+    const row = el("button", `forge-file ${kind(file)}`);
+    row.type = "button";
+    row.setAttribute("aria-selected", String(file === state.selected));
+    row.append(el("span", "forge-code", statusCode(file)), el("span", "forge-path", safeText(file.path)));
+    row.addEventListener("click", () => select(file));
+    item.append(row);
+    target.append(item);
   }
-  function integer(value, fallback = 0) { return Number.isInteger(value) && value >= 0 ? value : fallback; }
-  function boundedString(value, maximum, nullable = false) {
-    return (nullable && value === null) || (typeof value === "string" && value.length <= maximum);
-  }
-  function element(tag, className, text) {
-    const node = document.createElement(tag);
-    if (className) node.className = className;
-    if (text !== undefined) node.textContent = text;
-    return node;
-  }
-  function sendNotification(method, params) {
-    if (state.active) window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
-  }
-  function sendRequest(method, params) {
-    if (!state.active || pending.size >= MAX_PENDING_REQUESTS) return Promise.reject(new Error("Too many pending App requests."));
-    const id = nextId++;
-    return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
-    });
-  }
-  function applyHostContext(update) {
-    if (!isObject(update)) return;
-    if (update.theme === "light" || update.theme === "dark") document.documentElement.dataset.theme = update.theme;
-    const variables = update.styles && isObject(update.styles) && isObject(update.styles.variables) ? update.styles.variables : null;
-    if (variables) {
-      for (const [key, value] of Object.entries(variables)) {
-        if (key.startsWith("--") && key.length <= 96 && typeof value === "string" && value.length <= 512) document.documentElement.style.setProperty(key, value);
-      }
-    }
-  }
-  function statusFromResult(result) {
-    if (!isObject(result) || result.isError === true || !isObject(result.structuredContent)) return null;
-    const status = result.structuredContent;
-    if (![
-      "available", "unavailable", "error",
-    ].includes(status.repository) || typeof status.git_available !== "boolean" || typeof status.git_configured !== "boolean"
-      || !boundedString(status.branch, MAX_BRANCH_LENGTH, true) || !boundedString(status.head_oid, 64, true)
-      || !boundedString(status.error, MAX_ERROR_LENGTH, true) || !Array.isArray(status.files) || status.files.length > MAX_FILES
-      || !["detached", "unborn", "incomplete", "truncated"].every((key) => typeof status[key] === "boolean")
-      || !["ahead", "behind"].every((key) => status[key] === null || integer(status[key]) === status[key])
-      || !["staged_count", "unstaged_count", "untracked_count", "conflicted_count"].every((key) => integer(status[key]) === status[key])) return null;
-    if (!status.files.every((file) => isObject(file)
-      && boundedString(file.path, MAX_PATH_LENGTH)
-      && boundedString(file.original_path, MAX_PATH_LENGTH, true)
-      && boundedString(file.staged_status, 1)
-      && boundedString(file.unstaged_status, 1)
-      && typeof file.untracked === "boolean" && typeof file.conflicted === "boolean")) return null;
-    return status;
-  }
-  function selectedRows(status) {
-    const files = status.files.filter(isObject);
-    const match = (file) => {
-      if (state.tab === "Staged") return file.untracked !== true && file.conflicted !== true && file.staged_status && file.staged_status !== ".";
-      if (state.tab === "Modified") return file.untracked !== true && file.conflicted !== true && file.unstaged_status && file.unstaged_status !== ".";
-      if (state.tab === "Untracked") return file.untracked === true;
-      if (state.tab === "Conflicted") return file.conflicted === true;
-      return true;
-    };
-    return files.filter(match);
-  }
-  function groupFor(file) {
-    if (file.conflicted === true) return "Conflicted";
-    if (file.untracked === true) return "Untracked";
-    if (file.staged_status && file.staged_status !== ".") return "Staged";
-    if (file.unstaged_status && file.unstaged_status !== ".") return "Modified";
-    return "Other";
-  }
-  function addMetric(container, label, value) {
-    const metric = element("section", "metric");
-    metric.append(element("div", "metric-label", label), element("output", "metric-value", value));
-    container.append(metric);
-  }
-  function addRows(container, rows) {
-    if (!rows.length) { container.append(element("p", "empty", "No matching files.")); return; }
-    const groups = new Map();
-    for (const file of rows) {
-      const group = state.tab === "All" ? groupFor(file) : state.tab;
-      if (!groups.has(group)) groups.set(group, []);
-      groups.get(group).push(file);
-    }
-    for (const [group, files] of groups) {
-      const section = element("section", "group");
-      section.append(element("h2", "group-title", group));
-      const list = element("div", "rows");
-      for (const file of files) {
-        const code = `${display(file.staged_status || ".")}${display(file.unstaged_status || ".")}`;
-        const row = element("div", "row");
-        const path = display(file.path);
-        const original = display(file.original_path);
-        row.append(element("span", "code", code), element("span", "path", original ? `${path} <- ${original}` : path));
-        list.append(row);
-      }
-      section.append(list);
-      container.append(section);
-    }
-  }
-  function render() {
-    app.replaceChildren();
-    const shell = element("div", "shell");
-    const header = element("header", "header");
-    header.append(element("h1", "title", "Git Status"));
-    const refresh = element("button", "refresh", state.refreshing ? "Refreshing" : "Refresh");
-    refresh.type = "button";
-    refresh.disabled = state.refreshing || !state.active;
-    refresh.addEventListener("click", refreshStatus);
-    header.append(refresh);
-    shell.append(header);
-    if (state.error) shell.append(element("div", "warning error", state.error));
-    const status = state.lastSuccess;
-    if (!status) {
-      shell.append(element("p", "notice", state.error ? "The last result could not be displayed." : "Loading repository status..."));
-      app.append(shell);
-      announceSize();
-      return;
-    }
-    const repository = display(status.repository);
-    if (repository !== "available") {
-      shell.append(element("p", "notice error", `Repository ${repository || "unavailable"}${status.error ? `: ${display(status.error, MAX_ERROR_LENGTH)}` : ""}`));
-      app.append(shell);
-      announceSize();
-      return;
-    }
-    const summary = element("section", "summary");
-    const branch = status.unborn === true ? "unborn" : status.detached === true ? "detached" : display(status.branch, MAX_BRANCH_LENGTH) || "unknown";
-    addMetric(summary, "Branch", branch);
-    addMetric(summary, "HEAD", display(status.head_oid).slice(0, 12) || "none");
-    addMetric(summary, "Ahead / Behind", `${integer(status.ahead, 0)} / ${integer(status.behind, 0)}`);
-    addMetric(summary, "Changes", `${integer(status.staged_count)} staged, ${integer(status.unstaged_count)} modified`);
-    shell.append(summary);
-    const details = element("section", "details");
-    details.textContent = `${integer(status.untracked_count)} untracked | ${integer(status.conflicted_count)} conflicted`;
-    shell.append(details);
-    if (status.incomplete === true || status.truncated === true) shell.append(element("div", "warning", "Status is incomplete or truncated; file rows and counts may be partial."));
-    if (integer(status.staged_count) + integer(status.unstaged_count) + integer(status.untracked_count) + integer(status.conflicted_count) === 0 && status.files.length === 0) shell.append(element("p", "notice clean", "Working tree clean."));
-    const tabs = element("nav", "tabs");
-    for (const label of TABS) {
-      const tab = element("button", "tab", label);
-      tab.type = "button";
-      tab.setAttribute("role", "tab");
-      tab.setAttribute("aria-selected", String(state.tab === label));
-      tab.addEventListener("click", () => { state.tab = label; render(); });
-      tabs.append(tab);
-    }
-    shell.append(tabs);
-    const groups = element("section", "groups");
-    addRows(groups, selectedRows(status));
-    shell.append(groups);
-    app.append(shell);
-    announceSize();
-  }
-  function applyToolResult(result) {
-    const status = statusFromResult(result);
-    state.refreshing = false;
-    if (status) { state.lastSuccess = status; state.error = null; }
-    else state.error = "Git status result was unavailable or malformed.";
-    render();
-  }
-  function refreshStatus() {
-    if (state.refreshing || !state.active) return;
-    state.refreshing = true;
-    state.error = null;
-    render();
-    sendRequest("tools/call", { name: TOOL_NAME, arguments: {} }).then(applyToolResult).catch(() => {
-      state.refreshing = false;
-      state.error = "Refresh failed; the last successful status is still shown.";
-      render();
-    });
-  }
-  function announceSize() {
-    if (!state.active) return;
-    if (resizeTimer !== null) window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => {
-      const box = document.body.getBoundingClientRect();
-      sendNotification("ui/notifications/size-changed", { width: Math.ceil(box.width), height: Math.ceil(box.height) });
-    }, 80);
-  }
-  function teardown(id) {
-    state.active = false;
-    if (resizeTimer !== null) window.clearTimeout(resizeTimer);
-    if (resizeObserver) resizeObserver.disconnect();
-    window.removeEventListener("message", onMessage);
-    for (const pendingRequest of pending.values()) pendingRequest.reject(new Error("Resource torn down."));
-    pending.clear();
-    if (id !== undefined && id !== null) window.parent.postMessage({ jsonrpc: "2.0", id, result: {} }, "*");
-  }
-  function onMessage(event) {
-    if (!state.active || event.source !== window.parent || !isObject(event.data)) return;
-    const message = event.data;
-    if (message.id !== undefined && pending.has(message.id) && !message.method) {
-      const request = pending.get(message.id);
-      pending.delete(message.id);
-      if (message.error) request.reject(new Error("Host request failed.")); else request.resolve(message.result);
-      return;
-    }
-    if (message.method === "ui/notifications/tool-input" || message.method === "ui/notifications/tool-input-partial") { return; }
-    if (message.method === "ui/notifications/tool-result") { applyToolResult(message.params); return; }
-    if (message.method === "ui/notifications/tool-cancelled") {
-      state.refreshing = false;
-      state.error = "Tool request was cancelled; the last successful status is still shown.";
-      render();
-      return;
-    }
-    if (message.method === "ui/notifications/host-context-changed") { applyHostContext(message.params); render(); return; }
-    if (message.method === "ui/resource-teardown") { teardown(message.id); }
-  }
-  window.addEventListener("message", onMessage);
-  if (typeof ResizeObserver === "function") {
-    resizeObserver = new ResizeObserver(announceSize);
-    resizeObserver.observe(document.body);
-  }
-  render();
-  sendRequest("ui/initialize", {
-    protocolVersion: "2026-01-26",
-    appInfo: { name: APP_NAME, version: APP_VERSION },
-    appCapabilities: {},
-  }).then((result) => {
-    if (!isObject(result)) throw new Error("Malformed initialization result.");
-    applyHostContext(result.hostContext);
-    state.initialized = true;
-    sendNotification("ui/notifications/initialized", {});
-    render();
-  }).catch(() => {
-    state.error = "Host initialization failed.";
+  const shown = root.querySelector(".forge-filter-state");
+  if (shown) shown.textContent = `${state.filter || "all"} · ${visible.length} shown`;
+}
+function filterButton(name, code, label, tip) {
+  const button = el("button", `forge-filter ${name}`, `[${code} ${filterCount(name)} ${label}]`);
+  button.type = "button";
+  button.title = tip;
+  button.setAttribute("aria-pressed", String(state.filter === name));
+  button.addEventListener("click", () => {
+    state.filter = state.filter === name ? null : name;
+    const visible = files().filter((file) => matches(file, state.filter));
+    if (!visible.includes(state.selected)) state.selected = visible[0] || null;
     render();
   });
-})();
+  return button;
+}
+function branchLabel(status) {
+  if (status.unborn === true) return "unborn";
+  if (status.detached === true) return "detached";
+  return safeText(status.branch, MAX_BRANCH_LENGTH) || "unknown";
+}
+function render() {
+  root.replaceChildren();
+  const panel = el("section", "forge-term");
+  panel.setAttribute("aria-label", "Compact terminal-style Git status");
+  const command = el("header", "forge-command");
+  command.append(el("span", "forge-prompt", "$"), el("span", "forge-command-text", "git status --short --branch"));
+  panel.append(command);
+  const status = state.status;
+  if (!status) {
+    panel.append(el("div", "forge-branch forge-error", "Git status result unavailable."), el("div", "forge-filters"), el("ul", "forge-files"), el("div", "forge-detail"), el("footer", "forge-footer", "● error"));
+    root.append(panel); return;
+  }
+  const sync = `↑${count(status.ahead)} ↓${count(status.behind)}`;
+  const branch = el("div", "forge-branch");
+  branch.append(el("span", "forge-branch-prefix", "##"), el("span", "forge-branch-name", branchLabel(status)), el("span", "forge-sync", sync));
+  const strip = el("span", "forge-strip");
+  strip.title = "One cell per changed path; color matches status.";
+  strip.setAttribute("tabindex", "0");
+  for (const file of files().slice(0, 16)) strip.append(el("i", kind(file)));
+  branch.append(strip); panel.append(branch);
+  const filters = el("div", "forge-filters");
+  filters.setAttribute("aria-label", "Local status filters");
+  filters.append(filterButton("staged", "S", "staged", "Show staged paths"), filterButton("modified", "M", "modified", "Show modified worktree paths"), filterButton("untracked", "?", "untracked", "Show untracked paths"), filterButton("conflicted", "!", "conflict", "Show merge conflicts"), el("span", "forge-filter-state"));
+  panel.append(filters, el("ul", "forge-files"));
+  const detail = el("div", "forge-detail"); detail.setAttribute("aria-live", "polite"); panel.append(detail);
+  const footer = el("footer", "forge-footer");
+  const total = count(status.staged_count) + count(status.unstaged_count) + count(status.untracked_count) + count(status.conflicted_count);
+  const mode = status.repository !== "available" ? "error" : status.truncated === true ? "truncated" : status.incomplete === true ? "incomplete" : "complete";
+  footer.append(el("span", "forge-total", total ? `${total} changed · ${sync}` : "working tree clean"), el("span", `forge-${mode}`, `● ${mode}`));
+  panel.append(footer); root.append(panel); renderRows(); renderDetail();
+}
+
+connectMcpApp({
+  ontoolinput: () => {},
+  ontoolresult: (result) => { state.status = validStatus(result); state.filter = null; state.selected = files()[0] || null; render(); },
+  onhostcontextchanged: () => {},
+  onteardown: () => { state.tornDown = true; },
+}).catch(() => { if (!state.tornDown) render(); });
+render();

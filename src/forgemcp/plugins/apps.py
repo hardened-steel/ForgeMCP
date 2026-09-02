@@ -22,7 +22,9 @@ from forgemcp.plugins.errors import (
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APP_HTML_MIME_TYPE = "text/html;profile=mcp-app"
 MAX_APP_CONTRIBUTIONS = 32
-MAX_APP_HTML_BYTES = 256 * 1024
+# The official ext-apps runtime is bundled into each static, CSP-isolated App.
+# Keep a finite resource cap while allowing the verified runtime itself.
+MAX_APP_HTML_BYTES = 768 * 1024
 MAX_APP_URI_CHARACTERS = 512
 MAX_APP_DESCRIPTION_CHARACTERS = 1024
 _VALID_VISIBILITY = frozenset(("model", "app"))

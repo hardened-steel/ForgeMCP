@@ -509,7 +509,7 @@ directory or workspace. Resource metadata has empty `connectDomains`,
 `resourceDomains`, `frameDomains`, and `baseUriDomains`, omits permissions and
 domain, and requests a border. The static view receives only ordinary
 `git__status` tool results, renders untrusted branch/path values with
-`textContent`, and Refresh calls only `git__status` through the host bridge.
+`textContent`, and uses only local filters/file selection without host bridge calls.
 
 The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
 messages and never invoke tools. Bounded project identifiers occupy a separate

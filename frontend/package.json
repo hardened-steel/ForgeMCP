@@ -1,0 +1,16 @@
+{
+  "name": "forgemcp-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Shared offline frontend toolchain for ForgeMCP MCP Apps.",
+  "scripts": {
+    "build": "node git-status/build.mjs",
+    "test": "node --test git-status/test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
