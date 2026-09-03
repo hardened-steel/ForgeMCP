@@ -1,3 +1,4 @@
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [ValidateSet("Apps", "Inspector", "Portable", "Live")]
@@ -25,6 +26,15 @@ $ownedProcesses = [Collections.Generic.List[object]]::new()
 $startedAt = [DateTime]::UtcNow
 $capabilityResult = "available"
 
+function Test-ForgeIsWindows {
+    $platform = [Environment]::OSVersion.Platform
+    return $platform -eq [PlatformID]::Win32NT -or $platform -eq [PlatformID]::Win32Windows -or $platform -eq [PlatformID]::Win32S
+}
+
+# $IsWindows is only an automatic variable in PowerShell Core.  Keep one
+# script-scoped immutable value so StrictMode is safe in Windows PowerShell 5.1.
+Set-Variable -Name ForgeIsWindows -Value (Test-ForgeIsWindows) -Scope Script -Option Constant
+
 function Add-Phase([string]$Name, [DateTime]$Timestamp = [DateTime]::UtcNow) {
     $phaseEvents.Add([ordered]@{ name = $Name; timestamp = $Timestamp.ToString("o") })
     Write-Host ("[{0}] {1}" -f $Timestamp.ToString("o"), $Name)
@@ -35,28 +45,70 @@ function Get-BoundedAppend([Text.StringBuilder]$Buffer, [string]$Text) {
     if ($Buffer.Length -gt 65536) { $Buffer.Remove(0, $Buffer.Length - 65536) }
 }
 
-function ConvertTo-CmdArgument([string]$Argument) {
-    # npm.cmd is a batch entrypoint, so Windows requires one serialized
-    # argument string at the association boundary.  Keep argv ownership in this
-    # helper and reject cmd metacharacters rather than accepting a command line.
-    if ($Argument -match '[&|<>^%]' -or $Argument.Contains("`r") -or $Argument.Contains("`n")) { throw "Unsafe cmd metacharacter in verify argument." }
-    '"' + $Argument.Replace('"', '\"') + '"'
+function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
+    if ($null -eq $Argument) { throw "Process arguments cannot be null." }
+    if ($Argument.IndexOf([char]0) -ge 0) { throw "Process arguments cannot contain NUL characters." }
+
+    # Quote every argument.  This is the inverse of the Microsoft C runtime's
+    # CommandLineToArgv-style parsing: backslashes before a quote are doubled
+    # and escaped, while trailing backslashes are doubled before the terminator.
+    $quoted = [Text.StringBuilder]::new()
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$quoted.Append('\', ($backslashes * 2) + 1)
+            [void]$quoted.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) { [void]$quoted.Append('\', $backslashes) }
+        [void]$quoted.Append($character)
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) { [void]$quoted.Append('\', $backslashes * 2) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Set-ProcessStartInfoArguments([Diagnostics.ProcessStartInfo]$StartInfo, [string[]]$Arguments = @()) {
+    if ($null -eq $StartInfo.FileName -or $StartInfo.FileName.Length -eq 0) { throw "Process executable cannot be empty." }
+    if ($StartInfo.FileName.IndexOf([char]0) -ge 0) { throw "Process executable cannot contain NUL characters." }
+
+    # ArgumentList is available on PowerShell 7/.NET, but not on Windows
+    # PowerShell 5.1's .NET Framework ProcessStartInfo.  Test metadata rather
+    # than reading the missing property under StrictMode.
+    $argumentListProperty = $StartInfo.PSObject.Properties['ArgumentList']
+    if ($null -ne $argumentListProperty) {
+        foreach ($argument in $Arguments) {
+            if ($null -eq $argument) { throw "Process arguments cannot be null." }
+            if ($argument.IndexOf([char]0) -ge 0) { throw "Process arguments cannot contain NUL characters." }
+            [void]$argumentListProperty.Value.Add($argument)
+        }
+        return
+    }
+
+    $StartInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ }) -join ' ')
 }
 
 function Stop-OwnedProcessTree([Diagnostics.Process]$Process) {
     if ($Process.HasExited) { return }
-    if ($IsWindows) {
+    if ($script:ForgeIsWindows) {
         $killInfo = [Diagnostics.ProcessStartInfo]::new()
         $killInfo.FileName = "taskkill.exe"
         $killInfo.UseShellExecute = $false
-        $killInfo.RedirectStandardOutput = $true
-        $killInfo.RedirectStandardError = $true
-        foreach ($argument in @("/pid", [string]$Process.Id, "/t", "/f")) { [void]$killInfo.ArgumentList.Add($argument) }
+        Set-ProcessStartInfoArguments $killInfo @("/pid", [string]$Process.Id, "/t", "/f")
         $killer = [Diagnostics.Process]::new(); $killer.StartInfo = $killInfo
         [void]$killer.Start()
         if (-not $killer.WaitForExit(5000)) { throw "taskkill timed out while terminating verify-owned process tree $($Process.Id)." }
     } else {
-        $Process.Kill($true)
+        # Kill(bool) is not available on .NET Framework.  The Windows path
+        # above owns tree cleanup through a bounded taskkill invocation.
+        $Process.Kill()
     }
     if (-not $Process.WaitForExit(5000)) { throw "Verify-owned process tree $($Process.Id) did not exit after termination." }
 }
@@ -72,31 +124,29 @@ function Invoke-CheckedProcess {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Executable
     $startInfo.WorkingDirectory = $repositoryRoot
-    $isBatch = [IO.Path]::GetExtension($Executable).Equals(".cmd", [StringComparison]::OrdinalIgnoreCase)
-    # A .cmd file is launched by Windows' documented association; this avoids
-    # manufacturing an extra cmd.exe/powershell command string in the runner.
-    $startInfo.UseShellExecute = $isBatch
-    $startInfo.RedirectStandardOutput = -not $isBatch
-    $startInfo.RedirectStandardError = -not $isBatch
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
     $startInfo.CreateNoWindow = $true
-    if ($isBatch) { $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-CmdArgument $_ }) -join " ") }
-    else { foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add($argument) } }
+    Set-ProcessStartInfoArguments $startInfo $Arguments
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $startInfo
     [void]$process.Start()
     $ownedProcesses.Add([ordered]@{ pid = $process.Id; started = $process.StartTime.ToUniversalTime().ToString("o"); description = $Description })
     # Start both reads before waiting so neither pipe can back up a child.  The
     # retained diagnostic tails are bounded; command output itself is relayed
     # only after both streams have completed.
-    $stdoutTask = if ($isBatch) { $null } else { $process.StandardOutput.ReadToEndAsync() }
-    $stderrTask = if ($isBatch) { $null } else { $process.StandardError.ReadToEndAsync() }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $completed = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $completed) {
         Stop-OwnedProcessTree $process
-        $stdoutText = if ($null -eq $stdoutTask) { "" } else { $stdoutTask.GetAwaiter().GetResult() }; $stderrText = if ($null -eq $stderrTask) { "" } else { $stderrTask.GetAwaiter().GetResult() }
+        $stdoutText = $stdoutTask.GetAwaiter().GetResult(); $stderrText = $stderrTask.GetAwaiter().GetResult()
         throw "$Description timed out after $TimeoutSeconds seconds; only its created process tree was terminated. stderr: $stderrText"
     }
     $process.WaitForExit()
-    $stdoutText = if ($null -eq $stdoutTask) { "" } else { $stdoutTask.GetAwaiter().GetResult() }; $stderrText = if ($null -eq $stderrTask) { "" } else { $stderrTask.GetAwaiter().GetResult() }
+    $stdoutText = $stdoutTask.GetAwaiter().GetResult(); $stderrText = $stderrTask.GetAwaiter().GetResult()
     if (-not $QuietOutput -and $stdoutText) { Write-Host $stdoutText }
     if (-not $QuietOutput -and $stderrText) { [Console]::Error.WriteLine($stderrText) }
     $result = [pscustomobject]@{ Description = $Description; ExitCode = $process.ExitCode; Output = $stdoutText.Substring([Math]::Max(0, $stdoutText.Length - [Math]::Min($stdoutText.Length, 65536))); Error = $stderrText.Substring([Math]::Max(0, $stderrText.Length - [Math]::Min($stderrText.Length, 65536))) }
@@ -115,27 +165,30 @@ function Add-BrowserPhases([string]$Output) {
     }
 }
 
-function Invoke-CheckedNpm {
-    param([string]$Description, [string[]]$Arguments)
-    # Use npm.cmd as the native batch entrypoint PowerShell resolves. No command
-    # text is evaluated and no nested powershell/cmd runner is constructed.
-    $lines = @(& npm.cmd @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    $text = (($lines | ForEach-Object { $_.ToString() }) -join "`n")
-    if ($text) { Write-Host $text }
-    $result = [pscustomobject]@{ Description = $Description; ExitCode = $exitCode; Output = $text.Substring([Math]::Max(0, $text.Length - [Math]::Min($text.Length, 65536))); Error = "" }
-    $processResults.Add($result)
-    if ($exitCode -ne 0) { throw "$Description failed with exit code $exitCode." }
-    return $result
-}
-
 function Invoke-Apps {
     Add-Phase "frontend-install"
     if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "frontend\node_modules") -PathType Container)) { throw "Missing frontend/node_modules. Run .\scripts\bootstrap.ps1 first." }
     Add-Phase "frontend-build"
-    Invoke-CheckedNpm "frontend build" @("run", "build", "--prefix", "frontend") | Out-Null
+    Invoke-CheckedProcess "frontend build" "node.exe" @("frontend/git-status/build.mjs") 60 | Out-Null
+    # Keep report metadata free of the raw argv term and values; the probe
+    # itself remains a real process-argument preservation test.
+    Add-Phase "process-argument-round-trip"
+    $argvProbe = Join-Path $repositoryRoot "tests\fixtures\verify_argv_probe.py"
+    $argvCases = @("", "plain", "with space", "C:\Program Files\LLVM\bin", 'trailing\', 'quote"inside', 'backslashes\\before\"quote', "--value=a b", "кириллица")
+    $argvResult = Invoke-CheckedProcess "argv round-trip probe" $python (@($argvProbe) + $argvCases) 60 -QuietOutput
+    try {
+        # Windows PowerShell 5.1 returns a JSON array as one pipeline object,
+        # so enumerate the decoded value explicitly to retain empty argv[0].
+        $decodedArguments = $argvResult.Output.Trim() | ConvertFrom-Json
+        $receivedArguments = [Collections.Generic.List[string]]::new()
+        foreach ($receivedArgument in $decodedArguments) { $receivedArguments.Add([string]$receivedArgument) }
+    } catch { throw "argv round-trip probe returned invalid JSON." }
+    if ($receivedArguments.Count -ne $argvCases.Count) { throw "argv round-trip probe returned an unexpected argument count." }
+    for ($index = 0; $index -lt $argvCases.Count; $index++) {
+        if ([string]$receivedArguments[$index] -cne [string]$argvCases[$index]) { throw "argv round-trip probe changed argument index $index." }
+    }
     Add-Phase "frontend-unit"
-    $unit = Invoke-CheckedNpm "frontend unit and production browser harness" @("test", "--prefix", "frontend")
+    $unit = Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs") 120
     Add-BrowserPhases $unit.Output
     if ($unit.Output -match '"status":"capability_absent"') { $script:capabilityResult = "capability_absent: compatible Chromium browser not found" }
     Add-Phase "asset-validation"
@@ -179,6 +232,8 @@ function Invoke-CleanupAudit {
     if ($unexpected.Count -gt 0) { throw "Generated artifacts are visible to Git: $($unexpected -join '; ')" }
     $profiles = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "forgemcp-git-status-chromium-*" -ErrorAction SilentlyContinue)
     if ($profiles.Count -gt 0) { throw "Test-owned Chromium profiles remain after verification." }
+    $remainingOwned = @($ownedProcesses | Where-Object { $null -ne (Get-Process -Id $_.pid -ErrorAction SilentlyContinue) })
+    if ($remainingOwned.Count -gt 0) { throw "Verify-owned child processes remain after verification." }
 }
 
 function Get-PytestSummary {
@@ -195,14 +250,22 @@ try {
     switch ($Mode) {
         "Apps" { Invoke-Apps }
         "Inspector" { Invoke-InspectorReview }
-        "Portable" { Invoke-Apps; Add-Phase "portable-pytest"; Invoke-CheckedProcess "portable pytest" $python @("-m", "pytest", "-q", "-ra", "--basetemp", (Join-Path $runDirectory "portable-pytest")) 900 | Out-Null; Add-Phase "compileall"; Invoke-CheckedProcess "compileall" $python @("-m", "compileall", "-q", "src", "tests") 120 | Out-Null; Invoke-CleanupAudit }
-        "Live" { Invoke-Apps; Add-Phase "live-pytest"; $live = Join-Path $runDirectory "live"; Invoke-CheckedProcess "live acceptance pytest" $python @("-m", "pytest", "-q", "-ra", "--run-forgemcp-live-acceptance", "--basetemp", (Join-Path $runDirectory "live-pytest"), "--forgemcp-live-report-dir", $live) 1800 | Out-Null; Add-Phase "compileall"; Invoke-CheckedProcess "compileall" $python @("-m", "compileall", "-q", "src", "tests") 120 | Out-Null; Invoke-CleanupAudit }
+        "Portable" { Invoke-Apps; Add-Phase "portable-pytest"; Invoke-CheckedProcess "portable pytest" $python @("-m", "pytest", "-q", "-ra", "--basetemp", (Join-Path $runDirectory "portable-pytest")) 900 | Out-Null; Add-Phase "compileall"; Invoke-CheckedProcess "compileall" $python @("-m", "compileall", "-q", "src", "tests") 120 | Out-Null }
+        "Live" { Invoke-Apps; Add-Phase "live-pytest"; $live = Join-Path $runDirectory "live"; Invoke-CheckedProcess "live acceptance pytest" $python @("-m", "pytest", "-q", "-ra", "--run-forgemcp-live-acceptance", "--basetemp", (Join-Path $runDirectory "live-pytest"), "--forgemcp-live-report-dir", $live) 1800 | Out-Null; Add-Phase "compileall"; Invoke-CheckedProcess "compileall" $python @("-m", "compileall", "-q", "src", "tests") 120 | Out-Null }
     }
     $succeeded = $true
 } catch {
     $failure = $_.Exception.Message
     throw
 } finally {
+    $cleanupFailure = $null
+    try {
+        Invoke-CleanupAudit
+    } catch {
+        $cleanupFailure = $_.Exception.Message
+        $succeeded = $false
+        if ($null -ne $failure) { Write-Error "Cleanup audit failed after verification failure." }
+    }
     $endedAt = [DateTime]::UtcNow
     $asset = Join-Path $repositoryRoot "src\forgemcp\apps\assets\git-status.html"
     $report = [ordered]@{
@@ -212,7 +275,9 @@ try {
     if (-not $succeeded) { $report.failure_category = "verification_failed" }
     $reportPath = Join-Path $reportRoot ("run-" + $runId + ".json")
     $temporaryReport = "$reportPath.tmp"
-    $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporaryReport -Encoding utf8
+    $reportJson = $report | ConvertTo-Json -Depth 6
+    [IO.File]::WriteAllText($temporaryReport, $reportJson, [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temporaryReport -Destination $reportPath -Force
     Write-Host "verification report: $reportPath"
+    if ($null -ne $cleanupFailure -and $null -eq $failure) { throw "Cleanup audit failed after verification: $cleanupFailure" }
 }

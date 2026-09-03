@@ -1,5 +1,8 @@
+#requires -Version 5.1
 [CmdletBinding()]
-param()
+param(
+    [switch]$ValidateOnly
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -15,6 +18,11 @@ $pythonVersion = & $pythonCommand.Source -c "import sys; print(f'{sys.version_in
 if ([version]$pythonVersion -lt [version]"3.11") { throw "Python 3.11 or later is required (found $pythonVersion)." }
 $nodeVersion = (& node --version).Trim().TrimStart("v")
 if ([version]$nodeVersion -lt [version]"22.0") { throw "Node.js 22 or later is required for the Chromium browser harness (found v$nodeVersion)." }
+
+if ($ValidateOnly) {
+    Write-Host "Bootstrap prerequisites validated; no files were changed."
+    return
+}
 
 $venvPython = Join-Path $repositoryRoot ".venv\Scripts\python.exe"
 function Invoke-Checked([string]$Description, [scriptblock]$Action) {

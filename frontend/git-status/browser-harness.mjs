@@ -17,7 +17,8 @@ const repositoryRoot = resolve(sourceDirectory, "..", "..");
 const assetPath = join(repositoryRoot, "src", "forgemcp", "apps", "assets", "git-status.html");
 const harnessPath = join(sourceDirectory, "render-harness.html");
 
-function phase(name) { console.log(JSON.stringify({ phase: name, timestamp: new Date().toISOString() })); }
+let currentPhase = "not-started";
+function phase(name) { currentPhase = name; console.log(JSON.stringify({ phase: name, timestamp: new Date().toISOString() })); }
 function delay(ms) { return new Promise((resolveDelay) => setTimeout(resolveDelay, ms)); }
 function browserExecutable() {
   const candidates = [process.env.FORGEMCP_CHROMIUM, join(process.env.PROGRAMFILES || "", "Google", "Chrome", "Application", "chrome.exe"), join(process.env["PROGRAMFILES(X86)"] || "", "Google", "Chrome", "Application", "chrome.exe"), "/usr/bin/google-chrome", "/usr/bin/chromium"].filter(Boolean);
@@ -41,6 +42,17 @@ async function waitForBrowserExit(browser) {
 }
 function boundedOutput(stream) {
   let text = ""; stream.setEncoding("utf8"); stream.on("data", (chunk) => { text = `${text}${chunk}`.slice(-MAX_BROWSER_OUTPUT_BYTES); }); return () => text;
+}
+function browserFailureCategory(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/CDP WebSocket/u.test(message)) return "cdp_websocket_error";
+  if (/timed out/u.test(message)) return "timeout";
+  return "browser_harness_error";
+}
+function chromiumStderrCategory(text) {
+  if (/GPU process isn't usable|gpu_process_host\.cc.*exited unexpectedly/iu.test(text)) return "gpu_process_unusable";
+  if (/DevToolsActivePort|DevTools listening/iu.test(text)) return "devtools_startup";
+  return text ? "chromium_stderr_present" : "none";
 }
 async function terminateCreatedBrowser(browser) {
   if (!browser || browser.exitCode !== null) return;
@@ -70,11 +82,11 @@ async function main() {
   const [asset, harness] = await Promise.all([readFile(assetPath), readFile(harnessPath)]);
   const server = createServer((request, response) => { const body = request.url === "/git-status.html" ? asset : request.url === "/harness.html" ? harness : null; response.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" }); response.end(body || "not found"); });
   const profile = boundedTempPath(await mkdtemp(join(tmpdir(), "forgemcp-git-status-chromium-")));
-  let browser; let browserClosed = false; let stderr = () => ""; let browserExit = "not observed";
+  let browser; let browserClosed = false; let stderr = () => ""; let browserExit = "not observed"; let failureCategory;
   try {
     await Promise.race([new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(0, "127.0.0.1", resolveListen); }), delay(REQUEST_TIMEOUT_MS).then(() => { throw new Error("timed out starting harness HTTP server"); })]);
     const port = server.address().port;
-    browser = spawn(executable, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    browser = spawn(executable, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     boundedOutput(browser.stdout); stderr = boundedOutput(browser.stderr); browser.once("exit", (code, signal) => { browserExit = `code=${code}; signal=${signal}`; }); await onceEvent(browser, "spawn");
     phase("cdp-connect");
     const portFile = join(profile, "DevToolsActivePort");
@@ -104,12 +116,13 @@ async function main() {
     phase("browser-exit"); await cdp.command("Browser.close"); await waitForBrowserExit(browser); browserClosed = browser.exitCode !== null; cdp.close(); socket.close();
     console.log(JSON.stringify({ status: "passed", browser: "Chromium", lifecycle: ["connect", "tool-result", "filters", "selection", "teardown"] }));
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)}; Chromium exit: ${browserExit}; Chromium stderr: ${stderr()}`);
+    failureCategory = browserFailureCategory(error);
   } finally {
     if (browser && !browserClosed) await terminateCreatedBrowser(browser);
     await new Promise((resolveClose) => server.close(resolveClose));
-    for (let attempt = 0; attempt < 10; attempt += 1) { try { await rm(profile, { recursive: true, force: true, maxRetries: 1, retryDelay: 100 }); break; } catch (error) { if (attempt === 9) throw new Error(`failed to remove test-owned Chromium profile: ${error.message}; browser stderr: ${stderr()}`); await delay(250); } }
+    for (let attempt = 0; attempt < 10; attempt += 1) { try { await rm(profile, { recursive: true, force: true, maxRetries: 1, retryDelay: 100 }); break; } catch (error) { if (attempt === 9) throw new Error(`failed to remove test-owned Chromium profile; chromium_stderr_category=${chromiumStderrCategory(stderr())}`); await delay(250); } }
   }
+  if (failureCategory) throw new Error(`browser_harness_failure; category=${failureCategory}; phase=${currentPhase}; chromium_exit=${browserExit}; chromium_stderr_category=${chromiumStderrCategory(stderr())}`);
 }
 try {
   await main();
