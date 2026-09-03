@@ -7,7 +7,7 @@
     <style>html,body,iframe{border:0;height:100%;margin:0;width:100%;}</style>
   </head>
   <body>
-    <iframe id="app" src="/git-status.html" title="Git Status App"></iframe>
+    <iframe id="app" src="git-status.html" title="Git Status App"></iframe>
     <script>
       (() => {
         "use strict";
@@ -39,6 +39,9 @@
         const lifecycle = [];
         window.__forgemcpHarness = {
           phase: "connecting",
+          publishResult(result) {
+            frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: result }, "*");
+          },
           requestTeardown() {
             frame.contentWindow.postMessage({ jsonrpc: "2.0", id: "teardown", method: "ui/resource-teardown", params: {} }, "*");
           },
@@ -53,7 +56,7 @@
           } else if (message.method === "ui/notifications/initialized") {
             lifecycle.push("initialized");
             frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: {} } }, "*");
-            frame.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: result }, "*");
+            window.__forgemcpHarness.publishResult(result);
             window.__forgemcpHarness.phase = "rendered";
           } else if (message.method === "ui/resource-teardown") {
             lifecycle.push("teardown");

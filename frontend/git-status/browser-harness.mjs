@@ -1,17 +1,13 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Cdp } from "./cdp-client.mjs";
+import puppeteer from "puppeteer";
+import { resolvePinnedBrowser } from "./browser-dependency.mjs";
 
-const REQUEST_TIMEOUT_MS = 15_000;
-const HTTP_TIMEOUT_MS = 5_000;
-const EXIT_TIMEOUT_MS = 5_000;
-const MAX_BROWSER_OUTPUT_BYTES = 64 * 1024;
+const TIMEOUT_MS = 30_000;
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(sourceDirectory, "..", "..");
 const assetPath = join(repositoryRoot, "src", "forgemcp", "apps", "assets", "git-status.html");
@@ -19,113 +15,158 @@ const harnessPath = join(sourceDirectory, "render-harness.html");
 
 let currentPhase = "not-started";
 function phase(name) { currentPhase = name; console.log(JSON.stringify({ phase: name, timestamp: new Date().toISOString() })); }
-function delay(ms) { return new Promise((resolveDelay) => setTimeout(resolveDelay, ms)); }
-function browserExecutable() {
-  const candidates = [process.env.FORGEMCP_CHROMIUM, join(process.env.PROGRAMFILES || "", "Google", "Chrome", "Application", "chrome.exe"), join(process.env["PROGRAMFILES(X86)"] || "", "Google", "Chrome", "Application", "chrome.exe"), "/usr/bin/google-chrome", "/usr/bin/chromium"].filter(Boolean);
-  return candidates.find((candidate) => isAbsolute(candidate) && existsSync(candidate));
-}
 function boundedTempPath(path) {
   const root = resolve(tmpdir()); const candidate = resolve(path);
-  assert.notEqual(relative(root, candidate).startsWith(".."), true, `temporary path outside system temp: ${candidate}`);
+  assert.equal(relative(root, candidate).startsWith(".."), false, `temporary path outside system temp: ${candidate}`);
   return candidate;
 }
-function onceEvent(target, name, timeoutMs = REQUEST_TIMEOUT_MS) {
-  return new Promise((resolveEvent, rejectEvent) => {
-    const timeout = setTimeout(() => rejectEvent(new Error(`timed out waiting for ${name}`)), timeoutMs);
-    const done = (event) => { clearTimeout(timeout); resolveEvent(event); };
-    if (typeof target.addEventListener === "function") target.addEventListener(name, done, { once: true });
-    else target.once(name, done);
-  });
+function withTimeout(action, description) {
+  let timer;
+  return Promise.race([
+    action,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout: ${description}`)), TIMEOUT_MS); }),
+  ]).finally(() => clearTimeout(timer));
 }
-async function waitForBrowserExit(browser) {
-  await Promise.race([new Promise((resolveExit) => browser.once("exit", resolveExit)), delay(EXIT_TIMEOUT_MS)]);
-}
-function boundedOutput(stream) {
-  let text = ""; stream.setEncoding("utf8"); stream.on("data", (chunk) => { text = `${text}${chunk}`.slice(-MAX_BROWSER_OUTPUT_BYTES); }); return () => text;
+async function waitForMainFrame(page) {
+  const deadline = Date.now() + TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      if (page.mainFrame()) return;
+    } catch { /* Chrome has not dispatched the initial target yet. */ }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  throw new Error("timeout: waiting for Puppeteer main-frame lifecycle");
 }
 function browserFailureCategory(error) {
   const message = error instanceof Error ? error.message : String(error);
-  if (/CDP WebSocket/u.test(message)) return "cdp_websocket_error";
-  if (/timed out/u.test(message)) return "timeout";
+  if (message.includes("browser_dependency_missing")) return "browser_dependency_missing";
+  if (message.includes("timeout:")) return "timeout";
   return "browser_harness_error";
 }
-function chromiumStderrCategory(text) {
-  if (/GPU process isn't usable|gpu_process_host\.cc.*exited unexpectedly/iu.test(text)) return "gpu_process_unusable";
-  if (/DevToolsActivePort|DevTools listening/iu.test(text)) return "devtools_startup";
-  return text ? "chromium_stderr_present" : "none";
+const forbiddenSandboxArgs = ["--no" + "-sandbox", "--disable" + "-setuid-sandbox"];
+function stateResult(kind) {
+  const base = {
+    repository: "available", git_available: true, git_configured: true, branch: "main", detached: false, unborn: false,
+    ahead: 0, behind: 0, staged_count: 0, unstaged_count: 0, untracked_count: 0, conflicted_count: 0,
+    incomplete: false, truncated: false, files: [],
+  };
+  if (kind === "error") base.repository = "error";
+  if (kind === "incomplete") base.incomplete = true;
+  if (kind === "truncated") base.truncated = true;
+  return { structuredContent: base };
 }
-async function terminateCreatedBrowser(browser) {
-  if (!browser || browser.exitCode !== null) return;
-  browser.kill(); await waitForBrowserExit(browser);
-  if (browser.exitCode !== null || process.platform !== "win32" || !browser.pid) return;
-  await Promise.race([new Promise((resolveExit) => { const killer = spawn("taskkill.exe", ["/pid", String(browser.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true }); killer.once("exit", resolveExit); }), delay(EXIT_TIMEOUT_MS)]);
-  await waitForBrowserExit(browser);
+async function panelMetrics(frame) {
+  return await frame.evaluate(() => {
+    const panel = document.querySelector(".forge-term");
+    if (!panel) return null;
+    const bounds = panel.getBoundingClientRect();
+    return { height: bounds.height, scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth };
+  });
 }
-async function waitFor(check, description) {
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
-  while (Date.now() < deadline) { if (await check()) return; await delay(50); }
-  throw new Error(`timed out waiting for ${description}`);
-}
-async function fetchJson(url) {
-  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
-  try { const response = await fetch(url, { signal: controller.signal }); if (!response.ok) throw new Error(`CDP endpoint returned HTTP ${response.status}`); return await response.json(); }
-  finally { clearTimeout(timer); }
+async function assertStableViewport(page, frame, width, expectedHeight) {
+  await page.setViewport({ width, height: 400, deviceScaleFactor: 1 });
+  await frame.waitForFunction(() => document.querySelector(".forge-term"));
+  const metrics = await panelMetrics(frame);
+  assert.ok(metrics);
+  assert.equal(metrics.height, expectedHeight, `unexpected panel height at ${width}px`);
+  assert.ok(metrics.scrollWidth <= metrics.clientWidth, `horizontal overflow at ${width}px`);
 }
 
-async function main() {
-  phase("chromium-launch");
-  const executable = browserExecutable();
-  if (!executable) {
-    console.log(JSON.stringify({ status: "capability_absent", reason: "compatible Chromium browser not found" }));
-    return;
-  }
+export async function runBrowserHarness() {
+  phase("browser-dependency");
+  const pinned = await resolvePinnedBrowser();
   const [asset, harness] = await Promise.all([readFile(assetPath), readFile(harnessPath)]);
-  const server = createServer((request, response) => { const body = request.url === "/git-status.html" ? asset : request.url === "/harness.html" ? harness : null; response.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" }); response.end(body || "not found"); });
-  const profile = boundedTempPath(await mkdtemp(join(tmpdir(), "forgemcp-git-status-chromium-")));
-  let browser; let browserClosed = false; let stderr = () => ""; let browserExit = "not observed"; let failureCategory;
+  const server = createServer((request, response) => {
+    const body = request.url === "/git-status.html" ? asset : request.url === "/harness.html" ? harness : null;
+    response.writeHead(body ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
+    response.end(body || "not found");
+  });
+  const profile = boundedTempPath(await mkdtemp(join(tmpdir(), "forgemcp-git-status-puppeteer-")));
+  const failures = [];
+  let browser;
+  let expectedDisconnect = false;
   try {
-    await Promise.race([new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(0, "127.0.0.1", resolveListen); }), delay(REQUEST_TIMEOUT_MS).then(() => { throw new Error("timed out starting harness HTTP server"); })]);
+    await withTimeout(new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(0, "127.0.0.1", resolveListen); }), "starting local harness HTTP server");
     const port = server.address().port;
-    browser = spawn(executable, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    boundedOutput(browser.stdout); stderr = boundedOutput(browser.stderr); browser.once("exit", (code, signal) => { browserExit = `code=${code}; signal=${signal}`; }); await onceEvent(browser, "spawn");
-    phase("cdp-connect");
-    const portFile = join(profile, "DevToolsActivePort");
-    await waitFor(async () => { try { return (await readFile(portFile, "utf8")).length > 0; } catch { return false; } }, "Chromium DevTools endpoint");
-    const [debugPort] = (await readFile(portFile, "utf8")).trim().split(/\r?\n/);
-    const version = await fetchJson(`http://127.0.0.1:${debugPort}/json/version`);
-    const socket = new WebSocket(version.webSocketDebuggerUrl); await onceEvent(socket, "open"); const cdp = new Cdp(socket);
-    phase("target-create");
-    const { targetId } = await cdp.command("Target.createTarget", { url: "about:blank" });
-    const { sessionId } = await cdp.command("Target.attachToTarget", { targetId, flatten: true });
-    const exceptions = [];
-    socket.addEventListener("message", (event) => { try { const message = JSON.parse(String(event.data)); if (message.sessionId === sessionId && message.method === "Runtime.exceptionThrown") { const detail = message.params.exceptionDetails; exceptions.push(detail.exception?.description || detail.text); } } catch { /* Cdp reports malformed protocol data. */ } });
-    // Runtime.evaluate and Page.navigate are request/response commands; no
-    // event-domain subscription is needed for this deterministic harness.
-    phase("page-load"); await cdp.command("Page.navigate", { url: `http://127.0.0.1:${port}/harness.html` }, sessionId);
-    async function evaluate(expression) { const result = await cdp.command("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId); if (result.exceptionDetails) throw new Error(result.exceptionDetails.text); return result.result.value; }
+    const localOrigin = `http://127.0.0.1:${port}`;
+    const allowed = new Set([`${localOrigin}/git-status.html`]);
+    phase("puppeteer-launch");
+    browser = await puppeteer.launch({
+      headless: "shell", pipe: true, userDataDir: profile, timeout: TIMEOUT_MS,
+      args: ["--disable-gpu", "--mute-audio", "--hide-scrollbars", "--window-size=736,400", "--disable-background-networking"],
+    });
+    const launchArgs = browser.process()?.spawnargs || [];
+    for (const forbiddenArg of forbiddenSandboxArgs) assert.equal(launchArgs.includes(forbiddenArg), false, "browser sandbox must remain enabled");
+    assert.ok(launchArgs.some((argument) => argument.includes("remote-debugging-pipe")), "Puppeteer must use its pipe transport");
+    browser.on("disconnected", () => { if (!expectedDisconnect) failures.push("browser disconnected unexpectedly"); });
+    const pages = await browser.pages();
+    const page = pages[0] || await browser.newPage();
+    // Puppeteer resolves the page handle before Chrome's initial about:blank
+    // target is necessarily dispatched to the FrameManager. This is a bounded
+    // lifecycle wait, not a fixed delay or test retry.
+    await waitForMainFrame(page);
+    page.setDefaultTimeout(TIMEOUT_MS);
+    page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
+    page.on("console", (message) => { if (message.type() === "error") failures.push(`console error: ${message.text()}`); });
+    page.on("request", (request) => { if (!allowed.has(request.url())) failures.push(`unexpected network request: ${request.url()}`); });
+    page.on("requestfailed", (request) => failures.push(`failed local resource: ${request.url()}`));
+    page.on("framenavigated", (navigatedFrame) => {
+      if (navigatedFrame.parentFrame() === null) failures.push(`unexpected navigation: ${navigatedFrame.url()}`);
+      else if (!allowed.has(navigatedFrame.url())) failures.push(`unexpected frame navigation: ${navigatedFrame.url()}`);
+    });
+    phase("page-load");
+    await page.setContent(harness.toString("utf8").replace("<head>", `<head><base href="${localOrigin}/">`), { waitUntil: "load", timeout: TIMEOUT_MS });
+    const iframe = await page.waitForSelector("#app");
+    const frame = await iframe.contentFrame();
+    assert.ok(frame, "App iframe must be present");
     phase("app-initialize");
-    await waitFor(async () => await evaluate("window.__forgemcpHarness?.phase === 'rendered' && document.querySelector('#app').contentDocument?.querySelectorAll('.forge-file').length === 4"), "initial tool result render");
-    phase("tool-result");
-    const initial = await evaluate(`(() => { const doc = document.querySelector('#app').contentDocument; return { rows: doc.querySelectorAll('.forge-file').length, branch: doc.querySelector('.forge-branch-name')?.textContent, selected: doc.querySelector('.forge-file[aria-selected=\\"true\\"]')?.textContent, pwned: doc.defaultView.__xss_canary }; })()`);
-    assert.equal(initial.rows, 4); assert.match(initial.branch, /<img src=x/); assert.match(initial.selected, /<script>window/); assert.equal(initial.pwned, undefined);
+    await frame.waitForFunction(() => document.querySelectorAll(".forge-file").length === 4);
+    const initial = await frame.evaluate(() => ({
+      rows: document.querySelectorAll(".forge-file").length,
+      branch: document.querySelector(".forge-branch-name")?.textContent,
+      selected: document.querySelector(".forge-file[aria-selected='true']")?.textContent,
+      pwned: globalThis.__xss_canary,
+    }));
+    assert.equal(initial.rows, 4); assert.match(initial.branch || "", /<img src=x/); assert.match(initial.selected || "", /<script>window/); assert.equal(initial.pwned, undefined);
+    phase("dimensions");
+    await assertStableViewport(page, frame, 736, 258);
+    await assertStableViewport(page, frame, 360, 269);
+    await assertStableViewport(page, frame, 320, 269);
     phase("interaction");
-    const interaction = await evaluate(`(() => { const doc = document.querySelector('#app').contentDocument; doc.querySelector('.forge-filter.untracked').click(); const filterRows = doc.querySelectorAll('.forge-file').length; doc.querySelector('.forge-file').click(); return { filterRows, detail: doc.querySelector('.forge-detail').textContent, pressed: doc.querySelector('.forge-filter.untracked').getAttribute('aria-pressed') }; })()`);
-    assert.equal(interaction.filterRows, 1); assert.equal(interaction.pressed, "true"); assert.match(interaction.detail, /untracked/);
-    phase("teardown"); await evaluate("window.__forgemcpHarness.requestTeardown()"); await waitFor(async () => await evaluate("window.__forgemcpHarness?.phase === 'tornDown'"), "official teardown acknowledgement");
-    assert.deepEqual(exceptions, []);
-    phase("browser-exit"); await cdp.command("Browser.close"); await waitForBrowserExit(browser); browserClosed = browser.exitCode !== null; cdp.close(); socket.close();
-    console.log(JSON.stringify({ status: "passed", browser: "Chromium", lifecycle: ["connect", "tool-result", "filters", "selection", "teardown"] }));
+    await frame.click(".forge-filter.untracked");
+    assert.equal((await frame.$$(".forge-file")).length, 1);
+    assert.equal(await frame.$eval(".forge-filter.untracked", (node) => node.getAttribute("aria-pressed")), "true");
+    await frame.click(".forge-file");
+    assert.match(await frame.$eval(".forge-detail", (node) => node.textContent || ""), /untracked/);
+    await assertStableViewport(page, frame, 320, 269);
+    await frame.click(".forge-filter.untracked");
+    assert.equal((await frame.$$(".forge-file")).length, 4, "removing a filter restores all rows");
+    await assertStableViewport(page, frame, 736, 258);
+    for (const kind of ["clean", "error", "incomplete", "truncated"]) {
+      phase(`state-${kind}`);
+      await page.evaluate((result) => window.__forgemcpHarness.publishResult(result), stateResult(kind));
+      const selector = kind === "error" ? ".forge-error" : `.forge-${kind === "clean" ? "complete" : kind}`;
+      await frame.waitForSelector(selector);
+      await assertStableViewport(page, frame, 736, 258);
+      await assertStableViewport(page, frame, 320, 269);
+    }
+    assert.deepEqual(failures, [], failures.join("\n"));
+    phase("teardown");
+    await page.evaluate(() => window.__forgemcpHarness.requestTeardown());
+    await page.waitForFunction(() => window.__forgemcpHarness?.phase === "tornDown");
+    assert.deepEqual(failures, [], failures.join("\n"));
+    phase("browser-close");
+    expectedDisconnect = true;
+    await browser.close();
+    browser = undefined;
+    console.log(JSON.stringify({ status: "passed", browser: pinned, lifecycle: ["connect", "tool-result", "filters", "selection", "teardown"] }));
   } catch (error) {
-    failureCategory = browserFailureCategory(error);
+    throw new Error(`browser_harness_failure; category=${browserFailureCategory(error)}; phase=${currentPhase}; ${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    if (browser && !browserClosed) await terminateCreatedBrowser(browser);
-    await new Promise((resolveClose) => server.close(resolveClose));
-    for (let attempt = 0; attempt < 10; attempt += 1) { try { await rm(profile, { recursive: true, force: true, maxRetries: 1, retryDelay: 100 }); break; } catch (error) { if (attempt === 9) throw new Error(`failed to remove test-owned Chromium profile; chromium_stderr_category=${chromiumStderrCategory(stderr())}`); await delay(250); } }
+    if (browser) { expectedDisconnect = true; await browser.close().catch(() => {}); }
+    if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-  if (failureCategory) throw new Error(`browser_harness_failure; category=${failureCategory}; phase=${currentPhase}; chromium_exit=${browserExit}; chromium_stderr_category=${chromiumStderrCategory(stderr())}`);
 }
-try {
-  await main();
-} catch (error) {
-  throw error instanceof Error ? error : new Error(String(error));
-}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runBrowserHarness();

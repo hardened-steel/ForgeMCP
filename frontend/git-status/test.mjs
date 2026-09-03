@@ -1,37 +1,16 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import vm from "node:vm";
-import { Cdp } from "./cdp-client.mjs";
+import { runBrowserHarness } from "./browser-harness.mjs";
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = join(sourceDirectory, "..", "..");
 const commonDirectory = join(sourceDirectory, "..", "common");
 const asset = join(repositoryRoot, "src", "forgemcp", "apps", "assets", "git-status.html");
-
-class FakeSocket extends EventTarget {
-  constructor() { super(); this.sent = []; }
-  send(value) { this.sent.push(JSON.parse(value)); }
-  message(value) { this.dispatchEvent(new MessageEvent("message", { data: value })); }
-}
-
-test("CDP routes out-of-order replies and ignores late request IDs", async () => {
-  const socket = new FakeSocket(); const cdp = new Cdp(socket, { requestTimeoutMs: 50 });
-  const first = cdp.command("first"); const second = cdp.command("second");
-  socket.message(JSON.stringify({ id: 2, result: { order: 2 } })); socket.message(JSON.stringify({ id: 1, result: { order: 1 } }));
-  assert.deepEqual(await first, { order: 1 }); assert.deepEqual(await second, { order: 2 });
-  const late = cdp.command("late", {}, undefined, { timeoutMs: 5 }); await assert.rejects(late, /timed out/);
-  const current = cdp.command("current"); socket.message(JSON.stringify({ id: 3, result: { stale: true } })); socket.message(JSON.stringify({ id: 4, result: { current: true } }));
-  assert.deepEqual(await current, { current: true });
-});
-
-test("CDP rejects malformed responses and browser disconnects", async () => {
-  const malformedSocket = new FakeSocket(); const malformed = new Cdp(malformedSocket, { requestTimeoutMs: 50 }); const pending = malformed.command("malformed"); malformedSocket.message("not-json"); await assert.rejects(pending, /malformed JSON/);
-  const closedSocket = new FakeSocket(); const closed = new Cdp(closedSocket, { requestTimeoutMs: 50 }); const disconnected = closed.command("disconnect"); closedSocket.dispatchEvent(new Event("close")); await assert.rejects(disconnected, /disconnected/);
-});
 
 test("production asset bundles official ext-apps and has no refresh or privileged UI action", async () => {
   execFileSync(process.execPath, [join(sourceDirectory, "build.mjs"), "--check"], { cwd: sourceDirectory });
@@ -67,17 +46,35 @@ test("production asset bundles official ext-apps and has no refresh or privilege
   for (const forbidden of ["Refresh", "callServerTool", "tools/call", "sendFollowUpMessage", "resources/read", "requestDisplayMode", "ui/open-link", "fetch(", "XMLHttpRequest", "WebSocket", "innerHTML", "insertAdjacentHTML", "document.write", "localStorage", "<iframe", "window.parent.postMessage"]) assert.equal(`${javascript}\n${helper}`.includes(forbidden), false, forbidden);
 });
 
-test("checked-in production asset completes the official App lifecycle in Chromium", (t) => {
-  const harness = join(sourceDirectory, "browser-harness.mjs");
-  const result = execFileSync(process.execPath, [harness], {
+test("Puppeteer is locked and the harness has no system-browser fallback", async () => {
+  const [packageJson, lockfile, harness, dependency] = await Promise.all([
+    readFile(join(sourceDirectory, "..", "package.json"), "utf8"),
+    readFile(join(sourceDirectory, "..", "package-lock.json"), "utf8"),
+    readFile(join(sourceDirectory, "browser-harness.mjs"), "utf8"),
+    readFile(join(sourceDirectory, "browser-dependency.mjs"), "utf8"),
+  ]);
+  assert.match(packageJson, /"puppeteer": "\^25\.10\.0"/);
+  assert.match(lockfile, /"node_modules\/puppeteer"/);
+  assert.match(harness, /headless: "shell"/);
+  assert.match(harness, /pipe: true/);
+  assert.doesNotMatch(harness, /FORGEMCP_CHROMIUM|PROGRAMFILES|google-chrome|remote-debugging-port|WebSocket|DevToolsActivePort/);
+  assert.match(harness, /forbiddenSandboxArgs/);
+  assert.match(dependency, /browser_dependency_missing/);
+});
+
+test("a missing Puppeteer cache is a bounded configuration failure", () => {
+  const dependency = join(sourceDirectory, "browser-dependency.mjs");
+  const result = spawnSync(process.execPath, [dependency], {
     cwd: repositoryRoot,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-  process.stdout.write(`${result}\n`);
-  if (result.includes('"status":"capability_absent"')) {
-    t.skip("capability_absent: compatible Chromium browser not found");
-    return;
-  }
-  assert.match(result, /"status":"passed"/, result);
+    env: { ...process.env, PUPPETEER_CACHE_DIR: join(repositoryRoot, "frontend", ".missing-puppeteer-cache") },
+    timeout: 5_000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /browser_dependency_missing/);
+});
+
+test("checked-in production asset completes the official App lifecycle in pinned Chrome Headless Shell", async () => {
+  await runBrowserHarness();
 });

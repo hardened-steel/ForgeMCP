@@ -49,14 +49,25 @@ def test_bootstrap_has_a_non_mutating_prerequisite_validation_mode() -> None:
     assert "Bootstrap prerequisites validated; no files were changed." in script
 
 
-def test_chromium_harness_uses_headless_software_compositing_without_weakening_security() -> None:
+def test_puppeteer_harness_uses_pinned_headless_shell_without_weakening_security() -> None:
     harness = (_ROOT / "frontend" / "git-status" / "browser-harness.mjs").read_text(encoding="utf-8")
+    dependency = (_ROOT / "frontend" / "git-status" / "browser-dependency.mjs").read_text(encoding="utf-8")
 
-    assert '"--headless=new"' in harness
+    assert 'headless: "shell"' in harness
+    assert "pipe: true" in harness
     assert '"--disable-gpu"' in harness
-    assert '"--no-sandbox"' not in harness
-    assert '"--disable-setuid-sandbox"' not in harness
-    assert "--user-data-dir=${profile}" in harness
+    assert '"--disable-background-networking"' in harness
+    assert "forbiddenSandboxArgs" in harness
+    assert "userDataDir: profile" in harness
     assert 'readFile(assetPath)' in harness
-    assert "chromium_stderr_category" in harness
-    assert "Chromium stderr:" not in harness
+    assert "remote-debugging-port" not in harness
+    assert "FORGEMCP_CHROMIUM" not in harness
+    assert "browser_dependency_missing" in dependency
+
+
+def test_bootstrap_installs_and_verifies_the_locked_puppeteer_browser_without_npx() -> None:
+    script = (_ROOT / "scripts" / "bootstrap.ps1").read_text(encoding="utf-8")
+
+    assert '"browsers" "install" "chrome-headless-shell"' in script
+    assert "frontend\\git-status\\browser-dependency.mjs" in script
+    assert "npx" not in script.lower()

@@ -138,6 +138,14 @@ environment is modified. After bootstrap, `npm run build --prefix frontend`
 uses only the canonical lockfile and local modules, so it makes no network
 request.
 
+The frontend acceptance test uses the lockfile-pinned Puppeteer browser, Chrome
+Headless Shell, rather than an installed system browser. Its shared cache is
+`%USERPROFILE%\.cache\puppeteer` (outside the repository and Python wheel).
+The initial browser download is roughly 200 MB and needs network access only
+during bootstrap or when that cache is missing; normal build and verification
+runs are offline. `Apps` reports `browser_dependency_missing` if the pinned
+binary is unavailable.
+
 `Portable` runs the App build/browser checks, the full portable Python suite,
 `compileall`, and diff/artifact hygiene. `Live` runs the same prerequisite App
 checks plus production-discovery acceptance and reports capability/coverage

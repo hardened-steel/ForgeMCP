@@ -170,6 +170,8 @@ function Invoke-Apps {
     if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "frontend\node_modules") -PathType Container)) { throw "Missing frontend/node_modules. Run .\scripts\bootstrap.ps1 first." }
     Add-Phase "frontend-build"
     Invoke-CheckedProcess "frontend build" "node.exe" @("frontend/git-status/build.mjs") 60 | Out-Null
+    Add-Phase "browser-dependency"
+    Invoke-CheckedProcess "pinned browser dependency" "node.exe" @("frontend/git-status/browser-dependency.mjs") 60 | Out-Null
     # Keep report metadata free of the raw argv term and values; the probe
     # itself remains a real process-argument preservation test.
     Add-Phase "process-argument-round-trip"
@@ -190,7 +192,6 @@ function Invoke-Apps {
     Add-Phase "frontend-unit"
     $unit = Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs") 120
     Add-BrowserPhases $unit.Output
-    if ($unit.Output -match '"status":"capability_absent"') { $script:capabilityResult = "capability_absent: compatible Chromium browser not found" }
     Add-Phase "asset-validation"
     Invoke-CheckedProcess "production asset freshness" "node.exe" @("frontend/git-status/build.mjs", "--check") 60 | Out-Null
     Add-Phase "asset-validation"
@@ -230,8 +231,8 @@ function Invoke-CleanupAudit {
     $status = Invoke-CheckedProcess "git status" "git.exe" @("status", "--short") 60
     $unexpected = @($status.Output -split "`r?`n" | Where-Object { $_ -match $artifactPattern })
     if ($unexpected.Count -gt 0) { throw "Generated artifacts are visible to Git: $($unexpected -join '; ')" }
-    $profiles = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "forgemcp-git-status-chromium-*" -ErrorAction SilentlyContinue)
-    if ($profiles.Count -gt 0) { throw "Test-owned Chromium profiles remain after verification." }
+    $profiles = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "forgemcp-git-status-puppeteer-*" -ErrorAction SilentlyContinue)
+    if ($profiles.Count -gt 0) { throw "Test-owned Puppeteer profiles remain after verification." }
     $remainingOwned = @($ownedProcesses | Where-Object { $null -ne (Get-Process -Id $_.pid -ErrorAction SilentlyContinue) })
     if ($remainingOwned.Count -gt 0) { throw "Verify-owned child processes remain after verification." }
 }

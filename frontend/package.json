@@ -12,6 +12,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/inspector": "2.4.0",
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "puppeteer": "^25.10.0"
   }
 }
