@@ -5,11 +5,33 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import vm from "node:vm";
+import { Cdp } from "./cdp-client.mjs";
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = join(sourceDirectory, "..", "..");
 const commonDirectory = join(sourceDirectory, "..", "common");
 const asset = join(repositoryRoot, "src", "forgemcp", "apps", "assets", "git-status.html");
+
+class FakeSocket extends EventTarget {
+  constructor() { super(); this.sent = []; }
+  send(value) { this.sent.push(JSON.parse(value)); }
+  message(value) { this.dispatchEvent(new MessageEvent("message", { data: value })); }
+}
+
+test("CDP routes out-of-order replies and ignores late request IDs", async () => {
+  const socket = new FakeSocket(); const cdp = new Cdp(socket, { requestTimeoutMs: 50 });
+  const first = cdp.command("first"); const second = cdp.command("second");
+  socket.message(JSON.stringify({ id: 2, result: { order: 2 } })); socket.message(JSON.stringify({ id: 1, result: { order: 1 } }));
+  assert.deepEqual(await first, { order: 1 }); assert.deepEqual(await second, { order: 2 });
+  const late = cdp.command("late", {}, undefined, { timeoutMs: 5 }); await assert.rejects(late, /timed out/);
+  const current = cdp.command("current"); socket.message(JSON.stringify({ id: 3, result: { stale: true } })); socket.message(JSON.stringify({ id: 4, result: { current: true } }));
+  assert.deepEqual(await current, { current: true });
+});
+
+test("CDP rejects malformed responses and browser disconnects", async () => {
+  const malformedSocket = new FakeSocket(); const malformed = new Cdp(malformedSocket, { requestTimeoutMs: 50 }); const pending = malformed.command("malformed"); malformedSocket.message("not-json"); await assert.rejects(pending, /malformed JSON/);
+  const closedSocket = new FakeSocket(); const closed = new Cdp(closedSocket, { requestTimeoutMs: 50 }); const disconnected = closed.command("disconnect"); closedSocket.dispatchEvent(new Event("close")); await assert.rejects(disconnected, /disconnected/);
+});
 
 test("production asset bundles official ext-apps and has no refresh or privileged UI action", async () => {
   execFileSync(process.execPath, [join(sourceDirectory, "build.mjs"), "--check"], { cwd: sourceDirectory });
@@ -45,12 +67,17 @@ test("production asset bundles official ext-apps and has no refresh or privilege
   for (const forbidden of ["Refresh", "callServerTool", "tools/call", "sendFollowUpMessage", "resources/read", "requestDisplayMode", "ui/open-link", "fetch(", "XMLHttpRequest", "WebSocket", "innerHTML", "insertAdjacentHTML", "document.write", "localStorage", "<iframe", "window.parent.postMessage"]) assert.equal(`${javascript}\n${helper}`.includes(forbidden), false, forbidden);
 });
 
-test("checked-in production asset completes the official App lifecycle in Chromium", () => {
+test("checked-in production asset completes the official App lifecycle in Chromium", (t) => {
   const harness = join(sourceDirectory, "browser-harness.mjs");
   const result = execFileSync(process.execPath, [harness], {
     cwd: repositoryRoot,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+  process.stdout.write(`${result}\n`);
+  if (result.includes('"status":"capability_absent"')) {
+    t.skip("capability_absent: compatible Chromium browser not found");
+    return;
+  }
   assert.match(result, /"status":"passed"/, result);
 });

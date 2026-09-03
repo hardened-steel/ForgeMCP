@@ -11,6 +11,7 @@
     "@modelcontextprotocol/ext-apps": "^1.7.5"
   },
   "devDependencies": {
+    "@modelcontextprotocol/inspector": "2.4.0",
     "esbuild": "^0.28.2"
   }
 }
