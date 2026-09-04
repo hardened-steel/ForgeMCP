@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from importlib.resources import files
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -14,12 +15,15 @@ from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import Diagnostic, Position, Range
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     ForgePlugin,
     NoOpProgressReporter,
     PluginContext,
     PluginMetadata,
     ProgressUpdate,
     ToolContribution,
+    ToolAppBinding,
     ToolExecutionContext,
 )
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
@@ -32,6 +36,32 @@ from forgemcp.workspace import (
     WorkspaceService,
 )
 from forgemcp.toolchain import ToolchainDiscoveryService
+
+
+CLANGD_SESSION_APP_URI = "ui://forgemcp/clangd/session"
+CLANGD_INSIGHT_APP_URI = "ui://forgemcp/clangd/insight"
+CLANGD_NAVIGATION_APP_URI = "ui://forgemcp/clangd/navigation"
+CLANGD_CHANGE_HIERARCHY_APP_URI = "ui://forgemcp/clangd/change-hierarchy"
+
+_CLANGD_APP_RESOURCES = (
+    (CLANGD_SESSION_APP_URI, "forgemcp_clangd_session_app", "clangd-session.html", "Read-only clangd lifecycle and availability panel."),
+    (CLANGD_INSIGHT_APP_URI, "forgemcp_clangd_insight_app", "clangd-insight.html", "Read-only clangd diagnostics and editor insight panel."),
+    (CLANGD_NAVIGATION_APP_URI, "forgemcp_clangd_navigation_app", "clangd-navigation.html", "Read-only clangd navigation results panel."),
+    (CLANGD_CHANGE_HIERARCHY_APP_URI, "forgemcp_clangd_change_hierarchy_app", "clangd-change-hierarchy.html", "Read-only clangd change and hierarchy results panel."),
+)
+
+_CLANGD_APP_BINDINGS = {
+    CLANGD_SESSION_APP_URI: ("status", "start", "stop"),
+    CLANGD_INSIGHT_APP_URI: ("diagnostics", "hover", "completion", "signature_help"),
+    CLANGD_NAVIGATION_APP_URI: (
+        "definition", "references", "declaration", "type_definition", "implementation", "document_symbols",
+        "workspace_symbols", "switch_source_header",
+    ),
+    CLANGD_CHANGE_HIERARCHY_APP_URI: (
+        "prepare_rename", "rename", "code_actions", "apply_code_action", "format_document", "format_range",
+        "prepare_call_hierarchy", "incoming_calls", "outgoing_calls", "prepare_type_hierarchy", "supertypes", "subtypes",
+    ),
+}
 
 
 async def _run_lifecycle_progress(
@@ -276,6 +306,7 @@ class ClangdPlugin(ForgePlugin):
         self._status_registry = status_registry
         status_registry.register(_ClangdStatusProvider(self._service))
         self._register_tools(context)
+        self._register_apps(context)
 
     async def stop(self) -> None:
         """Stop the managed server before Process Runtime closes its child handles."""
@@ -339,6 +370,26 @@ class ClangdPlugin(ForgePlugin):
                     handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context),
                 )
             )
+
+    @staticmethod
+    def _register_apps(context: PluginContext) -> None:
+        """Register static read-only result views without changing tool behavior."""
+        csp = AppCsp(connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=())
+        for uri, name, asset_name, description in _CLANGD_APP_RESOURCES:
+            try:
+                html = files("forgemcp.apps.assets").joinpath(asset_name).read_text(encoding="utf-8")
+            except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+                raise RuntimeError("clangd App asset is unavailable.") from error
+            context.apps.register_resource(
+                AppResourceContribution(
+                    uri=uri, name=name, description=description, html=html, csp=csp, prefers_border=True
+                )
+            )
+        for uri, tool_names in _CLANGD_APP_BINDINGS.items():
+            for name in tool_names:
+                context.apps.bind_tool(
+                    ToolAppBinding(tool_name=f"clangd__{name}", resource_uri=uri, visibility=("model", "app"))
+                )
 
     async def _dispatch(
         self,
