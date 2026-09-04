@@ -21,6 +21,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from forgemcp import __version__
 from forgemcp.git.plugin import GIT_STATUS_APP_URI
+from forgemcp.project.plugin import PROJECT_STATUS_APP_URI
 from forgemcp.plugins import (
     AppCsp,
     AppRegistry,
@@ -115,6 +116,7 @@ def test_client_capability_negotiation_requires_the_exact_html_mime_type() -> No
     assert client_supports_mcp_apps({"experimental": {"io.modelcontextprotocol/ui": {}}}) is False
     assert client_supports_mcp_apps(mcp_types.ClientCapabilities.model_validate(_APPS_CAPABILITY)) is True
     assert MCP_APP_RESOURCE_INVENTORY == (
+        {"tool_name": "project__status", "uri": PROJECT_STATUS_APP_URI, "mime_type": MCP_APP_HTML_MIME_TYPE},
         {"tool_name": "git__status", "uri": GIT_STATUS_APP_URI, "mime_type": MCP_APP_HTML_MIME_TYPE},
     )
 
@@ -182,6 +184,30 @@ def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     assert "height: 258px" in html and "height: 269px" in html
 
 
+def test_project_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
+    html = files("forgemcp.apps.assets").joinpath("project-status.html").read_text(encoding="utf-8")
+    source = (_ROOT / "frontend" / "project-status" / "project-status-app.js").read_text(encoding="utf-8")
+    helper = (_ROOT / "frontend" / "common" / "mcp-app.js").read_text(encoding="utf-8")
+    assert html.startswith("<!doctype html>")
+    assert len(html.encode("utf-8")) <= MAX_APP_HTML_BYTES
+    assert "source-sha256:" in html
+    assert "C:\\" not in html and "/Users/" not in html
+    authored = source + helper
+    for forbidden in (
+        "fetch(", "XMLHttpRequest", "WebSocket", "innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+        "localStorage", "callServerTool", "tools/call", "resources/read", "requestDisplayMode", "ui/open-link",
+        "window.parent.postMessage", "eval(", "Function(",
+    ):
+        assert forbidden not in authored
+    assert "textContent" in source
+    assert "validStatus" in source and "validComponent" in source
+    assert "MAX_COMPONENTS = 64" in source and "MAX_CAPABILITIES = 128" in source and "MAX_WARNINGS = 32" in source
+    assert "ArrowLeft" in source and "mouseenter" in source and "aria-label" in source
+    assert 'from "@modelcontextprotocol/ext-apps"' in helper
+    assert "new App(" in helper and "new PostMessageTransport(" in helper
+    assert "height: 226px" in html and "height: 250px" in html
+
+
 def test_git_status_canaries_are_model_data_not_html_templates() -> None:
     canaries = (
         "<img src=x onerror=globalThis.pwned=1>",
@@ -202,6 +228,17 @@ def test_git_status_canaries_are_model_data_not_html_templates() -> None:
 
 
 def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
+    def normalize_result(value: object) -> object:
+        """Ignore independently observed timestamps, not wire content or shape."""
+        if isinstance(value, dict):
+            return {
+                key: "<timestamp>" if key in {"generated_at", "observed_at"} else normalize_result(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [normalize_result(item) for item in value]
+        return value
+
     async def exercise(session_type: type[ClientSession], apps_capable: bool) -> dict[str, object]:
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -224,42 +261,54 @@ def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
 
                 tools = await session.list_tools()
                 assert len(tools.tools) == 72
-                status_tool = next(tool for tool in tools.tools if tool.name == "git__status")
+                git_tool = next(tool for tool in tools.tools if tool.name == "git__status")
+                project_tool = next(tool for tool in tools.tools if tool.name == "project__status")
                 if apps_capable:
-                    assert status_tool.meta == {
+                    assert git_tool.meta == {
                         "ui": {"resourceUri": GIT_STATUS_APP_URI, "visibility": ["model", "app"]}
                     }
-                    resources = await session.list_resources()
-                    resource = next(item for item in resources.resources if str(item.uri) == GIT_STATUS_APP_URI)
-                    assert resource.mimeType == MCP_APP_HTML_MIME_TYPE
-                    assert resource.meta == {
-                        "ui": {
-                            "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": [], "baseUriDomains": []},
-                            "prefersBorder": True,
-                        }
+                    assert project_tool.meta == {
+                        "ui": {"resourceUri": PROJECT_STATUS_APP_URI, "visibility": ["model", "app"]}
                     }
-                    content = await session.read_resource(mcp_types.AnyUrl(GIT_STATUS_APP_URI))
-                    assert len(content.contents) == 1
-                    item = content.contents[0]
-                    assert str(item.uri) == GIT_STATUS_APP_URI
-                    assert item.mimeType == MCP_APP_HTML_MIME_TYPE
-                    assert item.meta == resource.meta
-                    assert item.text.startswith("<!doctype html>")
+                    resources = await session.list_resources()
+                    for uri in (GIT_STATUS_APP_URI, PROJECT_STATUS_APP_URI):
+                        resource = next(item for item in resources.resources if str(item.uri) == uri)
+                        assert resource.mimeType == MCP_APP_HTML_MIME_TYPE
+                        assert resource.meta == {
+                            "ui": {
+                                "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": [], "baseUriDomains": []},
+                                "prefersBorder": True,
+                            }
+                        }
+                        content = await session.read_resource(mcp_types.AnyUrl(uri))
+                        assert len(content.contents) == 1
+                        item = content.contents[0]
+                        assert str(item.uri) == uri
+                        assert item.mimeType == MCP_APP_HTML_MIME_TYPE
+                        assert item.meta == resource.meta
+                        assert item.text.startswith("<!doctype html>")
                 else:
-                    assert status_tool.meta is None
+                    assert git_tool.meta is None and project_tool.meta is None
                     assert (await session.list_resources()).resources
 
-                result = await session.call_tool("git__status", {})
-                assert result.isError is False
-                assert len(result.content) == 1
-                payload = json.loads(result.content[0].text)
-                assert isinstance(payload, dict)
-                assert result.structuredContent == payload
+                results = {}
+                for tool in (git_tool, project_tool):
+                    result = await session.call_tool(tool.name, {})
+                    assert result.isError is False
+                    assert len(result.content) == 1
+                    payload = json.loads(result.content[0].text)
+                    assert isinstance(payload, dict)
+                    if tool.name == "git__status":
+                        assert result.structuredContent == payload
+                    else:
+                        # Project Status has no declared typed output schema;
+                        # its historical textual fallback remains unchanged.
+                        assert result.structuredContent is None
+                    results[tool.name] = normalize_result(payload)
                 return {
-                    "input_schema": status_tool.inputSchema,
-                    "output_schema": status_tool.outputSchema,
-                    "annotations": status_tool.annotations,
-                    "result": result.model_dump(by_alias=True),
+                    "git": {"input_schema": git_tool.inputSchema, "output_schema": git_tool.outputSchema, "annotations": git_tool.annotations},
+                    "project": {"input_schema": project_tool.inputSchema, "output_schema": project_tool.outputSchema, "annotations": project_tool.annotations},
+                    "results": results,
                 }
 
     apps_contract = asyncio.run(exercise(_AppsClientSession, True))
@@ -283,6 +332,7 @@ def test_wheel_contains_and_installs_the_static_git_status_asset(tmp_path: Path)
     wheel = next(wheels.glob("forgemcp-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         assert "forgemcp/apps/assets/git-status.html" in archive.namelist()
+        assert "forgemcp/apps/assets/project-status.html" in archive.namelist()
     target = tmp_path / "installed"
     install = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(target), str(wheel)],
@@ -298,8 +348,8 @@ def test_wheel_contains_and_installs_the_static_git_status_asset(tmp_path: Path)
             "-I",
             "-c",
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "from importlib.resources import files; value=files('forgemcp.apps.assets').joinpath('git-status.html').read_text(encoding='utf-8'); "
-            "assert value.startswith('<!doctype html>'); print(len(value))",
+            "from importlib.resources import files; values=[files('forgemcp.apps.assets').joinpath(name).read_text(encoding='utf-8') for name in ('git-status.html','project-status.html')]; "
+            "assert all(value.startswith('<!doctype html>') for value in values); print(sum(map(len, values)))",
             str(target),
         ],
         cwd=tmp_path,

@@ -60,9 +60,10 @@ UX Stabilization Phase C also exposes application-scoped discovery data:
   `forgemcp_debug_target`, plus `forgemcp_review_changes`.
 
 Every discovery resource is versioned bounded `application/json`. The Git
-Status App separately exposes the static `ui://forgemcp/git/status` resource as
-`text/html;profile=mcp-app`; it carries no project data and is rendered only by
-clients that negotiate the stable MCP Apps extension. Project-controlled
+Status App and Project Status App separately expose static
+`ui://forgemcp/git/status` and `ui://forgemcp/project/status` resources as
+`text/html;profile=mcp-app`; they are rendered only by clients that negotiate
+the stable MCP Apps extension. Project-controlled
 filenames, targets, test names, and safe log metadata are untrusted JSON data,
 not instructions. Resources never return source text, patch text, raw process
 output, diagnostic messages, argv/environment, absolute paths, PIDs, handles,
@@ -545,6 +546,8 @@ npx @modelcontextprotocol/inspector --cli forgemcp -- --method resources/list
 npx @modelcontextprotocol/inspector --cli forgemcp -- --method prompts/list
 npx @modelcontextprotocol/inspector --cli forgemcp -- --method tools/call --tool-name git__status --app-info
 npx @modelcontextprotocol/inspector --cli forgemcp -- --method resources/read --uri ui://forgemcp/git/status --format json
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method tools/call --tool-name project__status --app-info
+npx @modelcontextprotocol/inspector --cli forgemcp -- --method resources/read --uri ui://forgemcp/project/status --format json
 npx @modelcontextprotocol/inspector --cli forgemcp -- --method tools/call --tool-name git__status --format json
 ```
 
@@ -605,11 +608,11 @@ project data, not instructions. Git is not a sandbox, and Phase 1 performs no
 network operation. `project__status` consumes only the cached scalar Git
 summary and never probes Git.
 
-### Git Status MCP App
+### Status MCP Apps
 
 Apps-capable hosts which declare
 `extensions.io.modelcontextprotocol/ui.mimeTypes=["text/html;profile=mcp-app"]`
-receive nested metadata on `git__status`:
+receive nested metadata on `git__status` and `project__status`:
 
 ```json
 {
@@ -622,24 +625,29 @@ receive nested metadata on `git__status`:
 }
 ```
 
-The resource uses the exact App MIME, explicit empty CSP domain lists, omitted
-permissions/domain, and `prefersBorder=true`. It renders repository state,
+Both resources use the exact App MIME, explicit empty CSP domain lists, omitted
+permissions/domain, and `prefersBorder=true`. The Git App renders repository state,
 bounded HEAD, divergence/counts, warnings, and compact safe-text file rows with
 local All/Staged/Modified/Untracked/Conflicted filters and file selection. The
-view never calls `git__status` or any other tool. Hosts without the extension retain
-the unmodified plain tool schema, structured content, and textual fallback.
+Project Status App renders a compact cached component overview with local
+selection only; it never calls `project__status` or any other tool. Hosts without
+the extension retain the unmodified plain tool schema, structured content, and
+textual fallback.
 
-The checked-in App sources live under `frontend/git-status`, shared code lives
-under `frontend/common`, and one canonical toolchain/lockfile lives under
+The checked-in App sources live under `frontend/git-status` and
+`frontend/project-status`, shared code lives under `frontend/common`, and one canonical toolchain/lockfile lives under
 `frontend`. Node is not a ForgeMCP runtime dependency:
 
 ```powershell
 npm ci --prefix frontend
+npm run write:asset --prefix frontend
 npm run build --prefix frontend
 npm test --prefix frontend
 ```
 
-`npm run build` regenerates `src/forgemcp/apps/assets/git-status.html`; the
+`npm run write:asset` regenerates `src/forgemcp/apps/assets/git-status.html`
+and `src/forgemcp/apps/assets/project-status.html`; `npm run build` verifies
+their freshness. The
 embedded source SHA-256 makes drift fail the frontend test. The production
 asset is a checked-in package resource: rebuild and commit it with every
 frontend change. The frontend test loads that exact HTML in Chromium, completes

@@ -18,8 +18,10 @@ def test_apps_mode_uses_direct_node_entrypoints_and_no_command_wrappers() -> Non
     script = (_ROOT / "scripts" / "verify.ps1").read_text(encoding="utf-8")
     apps = _function_body(script, "Invoke-Apps")
 
-    assert 'Invoke-CheckedProcess "frontend build" "node.exe" @("frontend/git-status/build.mjs") 60' in apps
-    assert 'Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs") 120' in apps
+    assert 'Invoke-CheckedProcess "frontend build Git Status" "node.exe" @("frontend/git-status/build.mjs") 60' in apps
+    assert 'Invoke-CheckedProcess "frontend build Project Status" "node.exe" @("frontend/project-status/build.mjs") 60' in apps
+    assert 'Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs", "frontend/project-status/test.mjs") 120' in apps
+    assert 'Invoke-CheckedProcess "Project Status asset freshness" "node.exe" @("frontend/project-status/build.mjs", "--check") 60' in apps
     assert 'Invoke-CheckedProcess "MCP App packaging/protocol tests" $python' in apps
     assert "tests/test_mcp_apps.py" in apps
     for forbidden in ("npm", ".cmd", "powershell.exe", "cmd.exe", "npx", "invoke-expression", "invoke-webrequest", "curl", "wget"):

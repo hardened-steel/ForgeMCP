@@ -1,4 +1,4 @@
-# ADR 0018: MCP Apps SDK 1.x compatibility and Git Status App security
+# ADR 0018: MCP Apps SDK 1.x compatibility and read-only Status App security
 
 ## Context
 
@@ -24,15 +24,13 @@ permission/preferred-border metadata, and plugin ownership. Bindings have one
 existing public tool, one registered App URI, and explicit `model`/`app`
 visibility. The application registry validates missing/duplicate tool and
 resource references after plugin startup, participates in failed-start rollback,
-and clears during normal shutdown. GitPlugin registers only:
+and clears during normal shutdown. The Git and Project plugins register only:
 
 ```json
-{
-  "tool": "git__status",
-  "resource": "ui://forgemcp/git/status",
-  "mimeType": "text/html;profile=mcp-app",
-  "visibility": ["model", "app"]
-}
+[
+  {"tool": "git__status", "resource": "ui://forgemcp/git/status", "mimeType": "text/html;profile=mcp-app", "visibility": ["model", "app"]},
+  {"tool": "project__status", "resource": "ui://forgemcp/project/status", "mimeType": "text/html;profile=mcp-app", "visibility": ["model", "app"]}
+]
 ```
 
 `server.py` is the sole SDK 1.x compatibility boundary. It passes public
@@ -55,17 +53,18 @@ current-connection client-capability APIs. Keep the public
 `FastMCP.tool(..., meta=...)` and `FastMCP.resource(..., meta=...)`
 projections: those are ordinary wire metadata, not the temporary shim.
 
-All clients retain the same `git__status` name, schema, annotations,
-read-only behavior, structured content, and JSON-text fallback. Apps-capable
-clients receive the binding; clients without the exact MIME receive the plain
-tool definition and never need to act on UI resources. The `ui://` resource is
-still statically registered so a capable host can inspect/fetch it normally.
+All clients retain the same `git__status` and `project__status` names, schemas,
+annotations, ordinary results, and fallbacks. Apps-capable clients receive the
+bindings; clients without the exact MIME receive the plain tool definitions and
+never need to act on UI resources. The `ui://` resources are still statically
+registered so a capable host can inspect/fetch them normally.
 
-The production asset is a package resource loaded through `importlib.resources`
-at plugin startup. It is static, HTML5, UTF-8 and byte-bounded; missing or
-corrupt assets stop Git plugin composition rather than falling back to a
-workspace path. Node is development-only. `frontend/git-status` has source,
-lock file, an offline `npm run build`, and source-digest verification. The
+Production assets are package resources loaded through `importlib.resources`
+at plugin startup. They are static, HTML5, UTF-8 and byte-bounded; missing or
+corrupt assets stop their plugin composition rather than falling back to a
+workspace path. Node is development-only. `frontend/git-status` and
+`frontend/project-status` share a lock file, offline build, and source-digest
+verification. The
 single-file view bundles the official `@modelcontextprotocol/ext-apps` runtime
 from the frontend lockfile. It registers `ontoolinput`, `ontoolresult`,
 `onhostcontextchanged`, and `onteardown` before `connect()` with the official
@@ -74,11 +73,11 @@ shared frontend helper applies the official document-theme, host-style,
 host-font, and safe-area helpers. The view still has no network,
 host-resource read, arbitrary tool, or browser permission API.
 
-The Git Status App has restrictive CSP metadata with all four domain lists
+The Git Status App and Project Status App have restrictive CSP metadata with all four domain lists
 explicitly empty, no permissions, no dedicated domain, and `prefersBorder=true`.
-It renders only the attached `git__status` result; filters and file selection
-are local and it neither calls tools nor updates model context. Project strings
-are rendered through DOM construction and `textContent`; unsafe HTML sinks,
+They render only their attached results; Git filters/file selection and Project
+component selection are local, and neither calls tools nor updates model context.
+Project strings are rendered through DOM construction and `textContent`; unsafe HTML sinks,
 template concatenation, external assets, browser storage, eval, networking,
 nested frames, clipboard, and host DOM access are absent.
 
@@ -87,6 +86,9 @@ nested frames, clipboard, and host DOM access are absent.
 The 72-tool model surface remains stable while Apps-capable hosts can render a
 safe interactive Git dashboard. The same result remains meaningful in every
 non-Apps host. The UI cannot stage, commit, checkout, read arbitrary resources,
-or call arbitrary tools. Maintaining the narrow SDK boundary is temporary
+or call arbitrary tools. Project Status is similarly a local presentation of
+the attached cached `project__status` result: it shows only bounded public
+health/activity, aggregate counts, and component name/state/summary or warning
+data, and does not refresh or invoke tools. Maintaining the narrow SDK boundary is temporary
 technical debt, protected by live SDK stdio Apps/no-Apps regression tests and
 Inspector App-info validation.

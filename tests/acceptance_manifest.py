@@ -259,6 +259,11 @@ _QUALITY = ("quality__status", "clang_format__check", "clang_format__apply", "cl
 _GIT = ("git__status", "git__diff", "git__log", "git__show_commit", "git__blame", "git__list_branches")
 MCP_APP_RESOURCE_INVENTORY = (
     {
+        "tool_name": "project__status",
+        "uri": "ui://forgemcp/project/status",
+        "mime_type": "text/html;profile=mcp-app",
+    },
+    {
         "tool_name": "git__status",
         "uri": "ui://forgemcp/git/status",
         "mime_type": "text/html;profile=mcp-app",

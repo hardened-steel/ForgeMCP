@@ -85,7 +85,8 @@ border metadata, and plugin ownership; one binding links an existing qualified
 tool name to one registered App resource and declares `model`/`app` visibility.
 The registry validates every reference after startup, removes contributions on
 failed-start rollback and reverse shutdown, and has no connection state. Git
-uses this only to bind `git__status` to `ui://forgemcp/git/status`.
+binds `git__status` to `ui://forgemcp/git/status`; Project binds
+`project__status` to `ui://forgemcp/project/status`.
 
 The discovery registry admits at most 128 static resources, 128 templates, 128
 prompts, and 256 completion providers. Resource reads share an eight-slot gate,
@@ -502,14 +503,16 @@ IDs for cached already-validated File API models; reads never configure, create
 a query, or run a process. Target resources expose only bounded name/type and
 validated workspace-relative artifact data.
 
-The sole App resource is `ui://forgemcp/git/status` with exact MIME
-`text/html;profile=mcp-app`. It is a package asset read with
-`importlib.resources` during Git plugin composition, never from the current
-directory or workspace. Resource metadata has empty `connectDomains`,
+The App resources are `ui://forgemcp/git/status` and
+`ui://forgemcp/project/status`, each with exact MIME
+`text/html;profile=mcp-app`. They are package assets read with
+`importlib.resources` during Git and Project plugin composition, never from the
+current directory or workspace. Resource metadata has empty `connectDomains`,
 `resourceDomains`, `frameDomains`, and `baseUriDomains`, omits permissions and
-domain, and requests a border. The static view receives only ordinary
-`git__status` tool results, renders untrusted branch/path values with
-`textContent`, and uses only local filters/file selection without host bridge calls.
+domain, and requests a border. The static views receive only ordinary tool
+results: Git renders untrusted branch/path values with `textContent`, and
+Project Status renders bounded safe component fields with `textContent` and
+local selection. Neither view makes host bridge calls.
 
 The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
 messages and never invoke tools. Bounded project identifiers occupy a separate

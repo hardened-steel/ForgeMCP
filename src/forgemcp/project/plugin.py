@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from importlib.resources import files
 
 from pydantic import ValidationError
 
@@ -10,12 +11,15 @@ from forgemcp import __version__
 from forgemcp.core.errors import to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     ForgePlugin,
     PluginContext,
     PluginManager,
     PluginMetadata,
     ResourceContribution,
     ToolContribution,
+    ToolAppBinding,
 )
 from forgemcp.processes import ProcessRuntime
 from forgemcp.project.errors import ProjectStatusError, ProjectStatusRequestError
@@ -27,6 +31,9 @@ from forgemcp.workspace import WorkspaceMutationBus, WorkspaceService
 
 class _ProjectStatusArguments(ForgeModel):
     """Project Intelligence Phase 1 deliberately accepts no options."""
+
+
+PROJECT_STATUS_APP_URI = "ui://forgemcp/project/status"
 
 
 class CoreStatusProvider:
@@ -195,9 +202,33 @@ class ProjectPlugin(ForgePlugin):
                 handler=self._resource,
             )
         )
+        self._register_status_app(context)
 
     async def stop(self) -> None:
         self._service = None
+
+    @staticmethod
+    def _register_status_app(context: PluginContext) -> None:
+        """Register the static status view without replacing the JSON resource."""
+        try:
+            html = files("forgemcp.apps.assets").joinpath("project-status.html").read_text(encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+            raise RuntimeError("Project Status App asset is unavailable.") from error
+        context.apps.register_resource(
+            AppResourceContribution(
+                uri=PROJECT_STATUS_APP_URI,
+                name="forgemcp_project_status_app",
+                description="Interactive read-only cached project status overview.",
+                html=html,
+                csp=AppCsp(connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=()),
+                prefers_border=True,
+            )
+        )
+        context.apps.bind_tool(
+            ToolAppBinding(
+                tool_name="project__status", resource_uri=PROJECT_STATUS_APP_URI, visibility=("model", "app")
+            )
+        )
 
     async def _dispatch(self, arguments: Mapping[str, object]) -> dict[str, object]:
         try:

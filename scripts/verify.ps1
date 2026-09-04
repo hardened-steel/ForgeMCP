@@ -169,7 +169,8 @@ function Invoke-Apps {
     Add-Phase "frontend-install"
     if (-not (Test-Path -LiteralPath (Join-Path $repositoryRoot "frontend\node_modules") -PathType Container)) { throw "Missing frontend/node_modules. Run .\scripts\bootstrap.ps1 first." }
     Add-Phase "frontend-build"
-    Invoke-CheckedProcess "frontend build" "node.exe" @("frontend/git-status/build.mjs") 60 | Out-Null
+    Invoke-CheckedProcess "frontend build Git Status" "node.exe" @("frontend/git-status/build.mjs") 60 | Out-Null
+    Invoke-CheckedProcess "frontend build Project Status" "node.exe" @("frontend/project-status/build.mjs") 60 | Out-Null
     Add-Phase "browser-dependency"
     Invoke-CheckedProcess "pinned browser dependency" "node.exe" @("frontend/git-status/browser-dependency.mjs") 60 | Out-Null
     # Keep report metadata free of the raw argv term and values; the probe
@@ -190,10 +191,11 @@ function Invoke-Apps {
         if ([string]$receivedArguments[$index] -cne [string]$argvCases[$index]) { throw "argv round-trip probe changed argument index $index." }
     }
     Add-Phase "frontend-unit"
-    $unit = Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs") 120
+    $unit = Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs", "frontend/project-status/test.mjs") 120
     Add-BrowserPhases $unit.Output
     Add-Phase "asset-validation"
     Invoke-CheckedProcess "production asset freshness" "node.exe" @("frontend/git-status/build.mjs", "--check") 60 | Out-Null
+    Invoke-CheckedProcess "Project Status asset freshness" "node.exe" @("frontend/project-status/build.mjs", "--check") 60 | Out-Null
     Add-Phase "asset-validation"
     Invoke-CheckedProcess "MCP App packaging/protocol tests" $python @("-m", "pytest", "-q", "-ra", "--basetemp", (Join-Path $runDirectory "apps-pytest"), "tests/test_mcp_apps.py") 180 | Out-Null
 }
@@ -210,15 +212,18 @@ function Invoke-InspectorReview {
     $appList = Invoke-CheckedProcess "Inspector tools/list --app-info" $inspector ($target + @("--method", "tools/list", "--app-info") + $common) 120 -QuietOutput
     $appRows = @($appList.Output -split "`r?`n" | Where-Object { $_ -match '^\{' } | ForEach-Object { $_ | ConvertFrom-Json })
     $apps = @($appRows | Where-Object { $_.hasApp })
-    if ($apps.Count -ne 1 -or $apps[0].toolName -ne "git__status" -or $apps[0].resourceUri -ne "ui://forgemcp/git/status" -or $apps[0].resourceMimeType -ne "text/html;profile=mcp-app") { throw "Inspector App inventory is not exactly git__status -> ui://forgemcp/git/status." }
-    $csp = $apps[0].csp
-    if ($null -eq $csp -or @($csp.connectDomains, $csp.resourceDomains, $csp.frameDomains, $csp.baseUriDomains | ForEach-Object { @($_).Count }).Where({ $_ -ne 0 }).Count -ne 0) { throw "Inspector reported unexpected App CSP metadata." }
+    if ($apps.Count -ne 2 -or @($apps | Where-Object { ($_.toolName -eq "git__status" -and $_.resourceUri -eq "ui://forgemcp/git/status") -or ($_.toolName -eq "project__status" -and $_.resourceUri -eq "ui://forgemcp/project/status") }).Count -ne 2 -or @($apps | Where-Object { $_.resourceMimeType -ne "text/html;profile=mcp-app" }).Count -ne 0) { throw "Inspector App inventory is not exactly the Git and Project Status bindings." }
+    foreach ($app in $apps) { $csp = $app.csp; if ($null -eq $csp -or @($csp.connectDomains, $csp.resourceDomains, $csp.frameDomains, $csp.baseUriDomains | ForEach-Object { @($_).Count }).Where({ $_ -ne 0 }).Count -ne 0) { throw "Inspector reported unexpected App CSP metadata." } }
     Add-Phase "inspector-tool-call-app-info"
     $toolInfo = Invoke-CheckedProcess "Inspector tools/call git__status --app-info" $inspector ($target + @("--method", "tools/call", "--tool-name", "git__status", "--app-info") + $common) 120 -QuietOutput
     if ($toolInfo.Output -notmatch '"resourceUri":"ui://forgemcp/git/status"') { throw "Inspector tools/call --app-info did not report the exact Git Status App URI." }
+    $projectToolInfo = Invoke-CheckedProcess "Inspector tools/call project__status --app-info" $inspector ($target + @("--method", "tools/call", "--tool-name", "project__status", "--app-info") + $common) 120 -QuietOutput
+    if ($projectToolInfo.Output -notmatch '"resourceUri":"ui://forgemcp/project/status"') { throw "Inspector tools/call --app-info did not report the exact Project Status App URI." }
     Add-Phase "inspector-resource-read"
     $resource = Invoke-CheckedProcess "Inspector resources/read Git Status App" $inspector ($target + @("--method", "resources/read", "--uri", "ui://forgemcp/git/status") + $common) 120 -QuietOutput
     if ($resource.Output -notmatch 'text/html;profile=mcp-app') { throw "Inspector resource read did not return the Git Status App MIME type." }
+    $projectResource = Invoke-CheckedProcess "Inspector resources/read Project Status App" $inspector ($target + @("--method", "resources/read", "--uri", "ui://forgemcp/project/status") + $common) 120 -QuietOutput
+    if ($projectResource.Output -notmatch 'text/html;profile=mcp-app') { throw "Inspector resource read did not return the Project Status App MIME type." }
     Add-Phase "inspector-no-apps-fallback"
     $plain = Invoke-CheckedProcess "Inspector ordinary tools/list" $inspector ($target + @("--method", "tools/list") + $common) 120 -QuietOutput
     if ($plain.Output -notmatch '"name":"git__status"') { throw "Inspector ordinary tools/list did not return git__status." }
