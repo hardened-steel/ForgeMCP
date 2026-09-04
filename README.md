@@ -138,15 +138,11 @@ environment is modified. After bootstrap, `npm run build --prefix frontend`
 uses only the canonical lockfile and local modules, so it makes no network
 request.
 
-The frontend acceptance test uses the lockfile-pinned Puppeteer browser, Chrome
-Headless Shell, rather than an installed system browser. Its shared cache is
-`%USERPROFILE%\.cache\puppeteer` (outside the repository and Python wheel).
-The initial browser download is roughly 200 MB and needs network access only
-during bootstrap or when that cache is missing; normal build and verification
-runs are offline. `Apps` reports `browser_dependency_missing` if the pinned
-binary is unavailable.
+The frontend build and Apps verification have no browser runtime dependency.
+They use the canonical lockfile and local Node modules only; no Chrome,
+Chromium, or browser cache is downloaded, launched, or removed.
 
-`Portable` runs the App build/browser checks, the full portable Python suite,
+`Portable` runs the App build/static checks, the full portable Python suite,
 `compileall`, and diff/artifact hygiene. `Live` runs the same prerequisite App
 checks plus production-discovery acceptance and reports capability/coverage
 evidence:
@@ -639,13 +635,18 @@ npm run build --prefix frontend
 npm test --prefix frontend
 ```
 
-`npm run build` regenerates `src/forgemcp/apps/assets/git-status.html`; the
-embedded source SHA-256 makes drift fail the frontend test. The production
-asset is a checked-in package resource: rebuild and commit it with every
-frontend change. The frontend test loads that exact HTML in Chromium, completes
-the official ext-apps handshake, sends a tool result, exercises filters and
-selection, and tears down. See
+`npm run build` and `npm test` build the single-file HTML in memory and fail if
+the checked-in production asset is stale. When intentionally changing frontend
+source, regenerate the asset with `npm run write:asset --prefix frontend`, then
+run the three commands above. The build bundles the official
+`@modelcontextprotocol/ext-apps` runtime and does not start a browser. See
 [ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md).
+
+For a manual visual review, start MCP Inspector from the installed frontend
+dependencies with `npm exec --prefix frontend --no -- @modelcontextprotocol/inspector`,
+connect it to `.venv\Scripts\python.exe -m forgemcp.server`, and invoke
+`git__status` in an Apps-capable session. This Inspector review is manual; it
+is not a CI or `verify.ps1` gate.
 
 ## Core structure
 

@@ -1,4 +1,4 @@
-"""Regression coverage for the bounded, offline Apps verification wrapper."""
+"""Regression coverage for the small, browser-free Apps verification wrapper."""
 
 from __future__ import annotations
 
@@ -10,35 +10,32 @@ _ROOT = Path(__file__).parents[1]
 
 def _function_body(script: str, name: str) -> str:
     start = script.index(f"function {name}")
-    end = script.index("\nfunction ", start + 1)
+    end = script.find("\nfunction ", start + 1)
+    if end == -1:
+        end = script.index("\nswitch ", start + 1)
     return script[start:end]
 
 
-def test_apps_mode_uses_direct_node_entrypoints_and_no_command_wrappers() -> None:
+def test_apps_mode_runs_only_the_browser_free_apps_workflow() -> None:
     script = (_ROOT / "scripts" / "verify.ps1").read_text(encoding="utf-8")
     apps = _function_body(script, "Invoke-Apps")
 
-    assert 'Invoke-CheckedProcess "frontend build" "node.exe" @("frontend/git-status/build.mjs") 60' in apps
-    assert 'Invoke-CheckedProcess "frontend unit and production browser harness" "node.exe" @("--test", "frontend/git-status/test.mjs") 120' in apps
-    assert 'Invoke-CheckedProcess "MCP App packaging/protocol tests" $python' in apps
+    assert '& npm ci --prefix frontend' in apps
+    assert '& npm run build --prefix frontend' in apps
+    assert '& npm test --prefix frontend' in apps
+    assert 'MCP App packaging and protocol tests' in apps
     assert "tests/test_mcp_apps.py" in apps
-    for forbidden in ("npm", ".cmd", "powershell.exe", "cmd.exe", "npx", "invoke-expression", "invoke-webrequest", "curl", "wget"):
+    assert "tests/test_verify_workflow.py" in apps
+    for forbidden in ("puppeteer", "chrome", "chromium", "browser-harness", "playwright", "selenium", "jsdom", "inspector"):
         assert forbidden not in apps.lower()
 
 
-def test_verify_wrapper_has_a_windows_powershell_compatible_argv_round_trip_gate() -> None:
+def test_verify_wrapper_remains_windows_powershell_compatible() -> None:
     script = (_ROOT / "scripts" / "verify.ps1").read_text(encoding="utf-8")
-    probe = (_ROOT / "tests" / "fixtures" / "verify_argv_probe.py").read_text(encoding="utf-8")
 
     assert "#requires -Version 5.1" in script
-    assert "function ConvertTo-WindowsCommandLineArgument" in script
-    assert "function Set-ProcessStartInfoArguments" in script
-    assert "PSObject.Properties['ArgumentList']" in script
-    assert "Process arguments cannot contain NUL characters." in script
-    assert "argv round-trip probe" in script
-    for value in ("with space", "C:\\Program Files\\LLVM\\bin", "--value=a b", "кириллица"):
-        assert value in script
-    assert "json.dumps(sys.argv[1:], ensure_ascii=False)" in probe
+    assert "Set-StrictMode -Version Latest" in script
+    assert "Invoke-CheckedCommand" in script
 
 
 def test_bootstrap_has_a_non_mutating_prerequisite_validation_mode() -> None:
@@ -49,25 +46,9 @@ def test_bootstrap_has_a_non_mutating_prerequisite_validation_mode() -> None:
     assert "Bootstrap prerequisites validated; no files were changed." in script
 
 
-def test_puppeteer_harness_uses_pinned_headless_shell_without_weakening_security() -> None:
-    harness = (_ROOT / "frontend" / "git-status" / "browser-harness.mjs").read_text(encoding="utf-8")
-    dependency = (_ROOT / "frontend" / "git-status" / "browser-dependency.mjs").read_text(encoding="utf-8")
-
-    assert 'headless: "shell"' in harness
-    assert "pipe: true" in harness
-    assert '"--disable-gpu"' in harness
-    assert '"--disable-background-networking"' in harness
-    assert "forbiddenSandboxArgs" in harness
-    assert "userDataDir: profile" in harness
-    assert 'readFile(assetPath)' in harness
-    assert "remote-debugging-port" not in harness
-    assert "FORGEMCP_CHROMIUM" not in harness
-    assert "browser_dependency_missing" in dependency
-
-
-def test_bootstrap_installs_and_verifies_the_locked_puppeteer_browser_without_npx() -> None:
+def test_bootstrap_installs_only_frontend_dependencies() -> None:
     script = (_ROOT / "scripts" / "bootstrap.ps1").read_text(encoding="utf-8")
 
-    assert '"browsers" "install" "chrome-headless-shell"' in script
-    assert "frontend\\git-status\\browser-dependency.mjs" in script
-    assert "npx" not in script.lower()
+    assert "npm ci --prefix frontend" in script
+    for forbidden in ("puppeteer", "chrome", "chromium", "browser-dependency", "browsers install"):
+        assert forbidden not in script.lower()

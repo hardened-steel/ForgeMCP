@@ -4,15 +4,15 @@
   "version": "1.0.0",
   "description": "Shared offline frontend toolchain for ForgeMCP MCP Apps.",
   "scripts": {
-    "build": "node git-status/build.mjs",
-    "test": "node --test git-status/test.mjs"
+    "build": "node git-status/build.mjs --check",
+    "write:asset": "node git-status/build.mjs --write",
+    "test": "node git-status/build.mjs --check"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.5"
   },
   "devDependencies": {
     "@modelcontextprotocol/inspector": "2.4.0",
-    "esbuild": "^0.28.2",
-    "puppeteer": "^25.10.0"
+    "esbuild": "^0.28.2"
   }
 }

@@ -17,7 +17,7 @@ $pythonCommand = Get-Command python -ErrorAction Stop
 $pythonVersion = & $pythonCommand.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 if ([version]$pythonVersion -lt [version]"3.11") { throw "Python 3.11 or later is required (found $pythonVersion)." }
 $nodeVersion = (& node --version).Trim().TrimStart("v")
-if ([version]$nodeVersion -lt [version]"22.0") { throw "Node.js 22 or later is required for the Chromium browser harness (found v$nodeVersion)." }
+if ([version]$nodeVersion -lt [version]"22.0") { throw "Node.js 22 or later is required (found v$nodeVersion)." }
 
 if ($ValidateOnly) {
     Write-Host "Bootstrap prerequisites validated; no files were changed."
@@ -36,9 +36,3 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
 Invoke-Checked "pip upgrade" { & $venvPython -m pip install --upgrade pip }
 Invoke-Checked "development dependency installation" { & $venvPython -m pip install -e ".[dev]" }
 Invoke-Checked "frontend dependency installation" { & npm ci --prefix frontend }
-$puppeteerCli = Join-Path $repositoryRoot "frontend\node_modules\puppeteer\lib\puppeteer\node\cli.js"
-if (-not (Test-Path -LiteralPath $puppeteerCli -PathType Leaf)) { throw "Puppeteer CLI is missing after frontend dependency installation." }
-# npm may block dependency lifecycle scripts.  This calls only the just-installed
-# locked Puppeteer CLI, which verifies or populates its shared cache.
-Invoke-Checked "pinned Chrome Headless Shell installation" { & node.exe $puppeteerCli "browsers" "install" "chrome-headless-shell" }
-Invoke-Checked "pinned browser dependency verification" { & node.exe "frontend\git-status\browser-dependency.mjs" }

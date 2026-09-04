@@ -182,6 +182,16 @@ def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     assert "height: 258px" in html and "height: 269px" in html
 
 
+def test_frontend_has_no_browser_automation_dependency() -> None:
+    package = (_ROOT / "frontend" / "package.json").read_text(encoding="utf-8")
+    lockfile = (_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8")
+    assert "puppeteer" not in package.lower()
+    assert "puppeteer" not in lockfile.lower()
+    assert "chromium" not in lockfile.lower()
+    for name in ("browser-harness.mjs", "browser-dependency.mjs", "render-harness.html"):
+        assert not (_ROOT / "frontend" / "git-status" / name).exists()
+
+
 def test_git_status_canaries_are_model_data_not_html_templates() -> None:
     canaries = (
         "<img src=x onerror=globalThis.pwned=1>",

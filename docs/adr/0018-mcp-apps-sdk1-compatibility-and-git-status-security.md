@@ -88,5 +88,6 @@ The 72-tool model surface remains stable while Apps-capable hosts can render a
 safe interactive Git dashboard. The same result remains meaningful in every
 non-Apps host. The UI cannot stage, commit, checkout, read arbitrary resources,
 or call arbitrary tools. Maintaining the narrow SDK boundary is temporary
-technical debt, protected by live SDK stdio Apps/no-Apps regression tests and
-Inspector App-info validation.
+technical debt, protected by SDK stdio Apps/no-Apps regression tests, static
+frontend safety checks, and wheel asset smoke tests. Visual rendering is
+reviewed manually in MCP Inspector rather than by automated browser acceptance.
