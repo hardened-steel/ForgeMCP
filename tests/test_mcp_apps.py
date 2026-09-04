@@ -178,6 +178,7 @@ def test_git_status_asset_is_static_safe_and_loaded_from_the_package() -> None:
     assert "safeText(status.branch, MAX_BRANCH_LENGTH)" in source and "safeText(file.path)" in source
     assert 'from "@modelcontextprotocol/ext-apps"' in helper
     assert "new App(" in helper and "new PostMessageTransport(" in helper
+    assert "forgemcp-git-status" in html
     assert '"@modelcontextprotocol/ext-apps"' in lockfile
     for forbidden in ("Refresh", "callServerTool", "tools/call", "sendFollowUpMessage", "resources/read", "requestDisplayMode", "ui/open-link", "window.parent.postMessage"):
         assert forbidden not in authored
@@ -205,7 +206,18 @@ def test_project_status_asset_is_static_safe_and_loaded_from_the_package() -> No
     assert "ArrowLeft" in source and "mouseenter" in source and "aria-label" in source
     assert 'from "@modelcontextprotocol/ext-apps"' in helper
     assert "new App(" in helper and "new PostMessageTransport(" in helper
+    assert "forgemcp-project-status" in html
     assert "height: 226px" in html and "height: 250px" in html
+
+
+def test_frontend_has_no_browser_automation_dependency() -> None:
+    package = (_ROOT / "frontend" / "package.json").read_text(encoding="utf-8")
+    lockfile = (_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8")
+    assert "puppeteer" not in package.lower()
+    assert "puppeteer" not in lockfile.lower()
+    assert "chromium" not in lockfile.lower()
+    for name in ("browser-harness.mjs", "browser-dependency.mjs", "render-harness.html"):
+        assert not (_ROOT / "frontend" / "git-status" / name).exists()
 
 
 def test_git_status_canaries_are_model_data_not_html_templates() -> None:

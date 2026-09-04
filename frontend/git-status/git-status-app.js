@@ -123,6 +123,7 @@ function render() {
 }
 
 connectMcpApp({
+  name: "forgemcp-git-status",
   ontoolinput: () => {},
   ontoolresult: (result) => { state.status = validStatus(result); state.filter = null; state.selected = files()[0] || null; render(); },
   onhostcontextchanged: () => {},

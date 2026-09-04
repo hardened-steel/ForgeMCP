@@ -90,5 +90,6 @@ or call arbitrary tools. Project Status is similarly a local presentation of
 the attached cached `project__status` result: it shows only bounded public
 health/activity, aggregate counts, and component name/state/summary or warning
 data, and does not refresh or invoke tools. Maintaining the narrow SDK boundary is temporary
-technical debt, protected by live SDK stdio Apps/no-Apps regression tests and
-Inspector App-info validation.
+technical debt, protected by SDK stdio Apps/no-Apps regression tests, static
+frontend safety checks, and wheel asset smoke tests. Visual rendering is
+reviewed manually in MCP Inspector rather than by automated browser acceptance.

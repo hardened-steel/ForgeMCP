@@ -647,12 +647,11 @@ npm test --prefix frontend
 
 `npm run write:asset` regenerates `src/forgemcp/apps/assets/git-status.html`
 and `src/forgemcp/apps/assets/project-status.html`; `npm run build` verifies
-their freshness. The
-embedded source SHA-256 makes drift fail the frontend test. The production
-asset is a checked-in package resource: rebuild and commit it with every
-frontend change. The frontend test loads that exact HTML in Chromium, completes
-the official ext-apps handshake, sends a tool result, exercises filters and
-selection, and tears down. See
+their freshness. The embedded source SHA-256 makes drift fail the frontend
+test. The production assets are checked-in package resources: rebuild and
+commit them with every frontend change. The build bundles the official
+`@modelcontextprotocol/ext-apps` runtime and does not start a browser. Visual
+rendering is reviewed manually in MCP Inspector. See
 [ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md).
 
 ## Core structure

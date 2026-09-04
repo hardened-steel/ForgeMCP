@@ -16,8 +16,8 @@ export function applyHostPresentation(context = {}) {
   }
 }
 
-export function connectMcpApp(handlers) {
-  const app = new App({ name: "forgemcp-git-status", version: "1.0.0" }, {}, { autoResize: false });
+export function connectMcpApp({ name, ...handlers }) {
+  const app = new App({ name, version: "1.0.0" }, {}, { autoResize: false });
   app.ontoolinput = handlers.ontoolinput;
   app.ontoolresult = handlers.ontoolresult;
   app.onhostcontextchanged = (context) => {

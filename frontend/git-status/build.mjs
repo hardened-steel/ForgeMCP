@@ -60,9 +60,9 @@ const html = template
   .replace("/* APP_CSS */", () => `${theme}\n${css}`)
   .replace("/* APP_JS */", () => javascript)
   .replace("<!doctype html>", `<!doctype html><!-- source-sha256:${digest} -->`);
-if (process.argv.includes("--check")) {
-  const existing = await readFile(output, "utf8");
-  if (existing !== html) throw new Error("git-status.html is stale; run npm run build --prefix frontend and commit the regenerated asset");
-} else {
+if (process.argv.includes("--write")) {
   await writeFile(output, html, "utf8");
+} else {
+  const existing = await readFile(output, "utf8");
+  if (normalizeText(existing) !== html) throw new Error("git-status.html is stale; run npm run write:asset --prefix frontend and commit the regenerated asset");
 }

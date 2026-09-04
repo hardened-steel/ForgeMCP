@@ -1,4 +1,4 @@
-<!doctype html><!-- source-sha256:9cf48591014c5aa3fe8f3d67ca816fa04028580d755b761cd0de608f333d20fc -->
+<!doctype html><!-- source-sha256:3e2b30b1008bee4aca77a07cbf74adba2f9d99078130d65dbcb78467dcb28313 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -143,8 +143,8 @@ function applyHostPresentation(context = {}) {
   }
 }
 
-function connectMcpApp(handlers) {
-  const app = new App({ name: "forgemcp-git-status", version: "1.0.0" }, {}, { autoResize: false });
+function connectMcpApp({ name, ...handlers }) {
+  const app = new App({ name, version: "1.0.0" }, {}, { autoResize: false });
   app.ontoolinput = handlers.ontoolinput;
   app.ontoolresult = handlers.ontoolresult;
   app.onhostcontextchanged = (context) => {
@@ -283,6 +283,7 @@ function render() {
 }
 
 connectMcpApp({
+  name: "forgemcp-git-status",
   ontoolinput: () => {},
   ontoolresult: (result) => { state.status = validStatus(result); state.filter = null; state.selected = files()[0] || null; render(); },
   onhostcontextchanged: () => {},
