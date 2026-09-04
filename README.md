@@ -59,9 +59,9 @@ UX Stabilization Phase C also exposes application-scoped discovery data:
   `forgemcp_diagnose_build`, `forgemcp_analyze_file`, and
   `forgemcp_debug_target`, plus `forgemcp_review_changes`.
 
-Every discovery resource is versioned bounded `application/json`. The Git
-Status App and Project Status App separately expose static
-`ui://forgemcp/git/status` and `ui://forgemcp/project/status` resources as
+Every discovery resource is versioned bounded `application/json`. The 72
+public tools each have one static read-only MCP App binding across 18 shared
+result-family `ui://forgemcp/...` resources, all with
 `text/html;profile=mcp-app`; they are rendered only by clients that negotiate
 the stable MCP Apps extension. Project-controlled
 filenames, targets, test names, and safe log metadata are untrusted JSON data,
@@ -139,15 +139,11 @@ environment is modified. After bootstrap, `npm run build --prefix frontend`
 uses only the canonical lockfile and local modules, so it makes no network
 request.
 
-The frontend acceptance test uses the lockfile-pinned Puppeteer browser, Chrome
-Headless Shell, rather than an installed system browser. Its shared cache is
-`%USERPROFILE%\.cache\puppeteer` (outside the repository and Python wheel).
-The initial browser download is roughly 200 MB and needs network access only
-during bootstrap or when that cache is missing; normal build and verification
-runs are offline. `Apps` reports `browser_dependency_missing` if the pinned
-binary is unavailable.
+The frontend workflow is browser-free: it builds source-digest-checked static
+HTML, runs Node source/shape checks, and runs Python package/protocol checks.
+Visual rendering remains a manual MCP Inspector review.
 
-`Portable` runs the App build/browser checks, the full portable Python suite,
+`Portable` runs the App build/static checks, the full portable Python suite,
 `compileall`, and diff/artifact hygiene. `Live` runs the same prerequisite App
 checks plus production-discovery acceptance and reports capability/coverage
 evidence:
@@ -608,11 +604,14 @@ project data, not instructions. Git is not a sandbox, and Phase 1 performs no
 network operation. `project__status` consumes only the cached scalar Git
 summary and never probes Git.
 
-### Status MCP Apps
+### MCP Apps
 
 Apps-capable hosts which declare
 `extensions.io.modelcontextprotocol/ui.mimeTypes=["text/html;profile=mcp-app"]`
-receive nested metadata on `git__status` and `project__status`:
+receive nested metadata on every one of the 72 public tools. Shared resources
+group compatible result families: server/workspace, CMake catalog/operations,
+Quality overview/findings, Git status/diff/history/source history, clangd
+session/insight/navigation/change-hierarchy, and debugger session/stack/data.
 
 ```json
 {
@@ -625,18 +624,17 @@ receive nested metadata on `git__status` and `project__status`:
 }
 ```
 
-Both resources use the exact App MIME, explicit empty CSP domain lists, omitted
-permissions/domain, and `prefersBorder=true`. The Git App renders repository state,
-bounded HEAD, divergence/counts, warnings, and compact safe-text file rows with
-local All/Staged/Modified/Untracked/Conflicted filters and file selection. The
-Project Status App renders a compact cached component overview with local
-selection only; it never calls `project__status` or any other tool. Hosts without
-the extension retain the unmodified plain tool schema, structured content, and
-textual fallback.
+Every resource uses the exact App MIME, explicit empty CSP domain lists, omitted
+permissions/domain, and `prefersBorder=true`. Views render only their attached,
+bounded public result with local filter/selection/detail controls. They never
+call a tool, read a resource, navigate, store data, or update model context.
+Hosts without the extension retain unmodified tool schemas, annotations,
+structured content, and textual fallbacks.
 
-The checked-in App sources live under `frontend/git-status` and
-`frontend/project-status`, shared code lives under `frontend/common`, and one canonical toolchain/lockfile lives under
-`frontend`. Node is not a ForgeMCP runtime dependency:
+Checked-in App sources live in their subsystem `frontend/*-apps` directories
+(with the established Git/Project status sources); `frontend/common` is
+read-only shared lifecycle/theme code and one canonical toolchain/lockfile
+lives under `frontend`. Node is not a ForgeMCP runtime dependency:
 
 ```powershell
 npm ci --prefix frontend
@@ -645,14 +643,14 @@ npm run build --prefix frontend
 npm test --prefix frontend
 ```
 
-`npm run write:asset` regenerates `src/forgemcp/apps/assets/git-status.html`
-and `src/forgemcp/apps/assets/project-status.html`; `npm run build` verifies
-their freshness. The embedded source SHA-256 makes drift fail the frontend
-test. The production assets are checked-in package resources: rebuild and
-commit them with every frontend change. The build bundles the official
+`npm run write:asset` regenerates all 18 package HTML assets; `npm run build`
+verifies their freshness. The embedded source SHA-256 makes drift fail the
+frontend test. The production assets are checked-in package resources: rebuild
+and commit them with every frontend change. The build bundles the official
 `@modelcontextprotocol/ext-apps` runtime and does not start a browser. Visual
 rendering is reviewed manually in MCP Inspector. See
-[ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md).
+[ADR 0018](docs/adr/0018-mcp-apps-sdk1-compatibility-and-git-status-security.md)
+and [ADR 0019](docs/adr/0019-all-tool-mcp-app-result-families.md).
 
 ## Core structure
 

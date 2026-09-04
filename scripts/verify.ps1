@@ -27,7 +27,7 @@ function Invoke-Apps {
     Invoke-CheckedCommand "frontend static tests" { & npm test --prefix frontend }
     $appsPytestTemp = Join-Path ([IO.Path]::GetTempPath()) ("forgemcp-apps-pytest-" + [Guid]::NewGuid().ToString("N"))
     try {
-        Invoke-CheckedCommand "MCP App packaging and protocol tests" { & $python -m pytest -q -ra -p no:cacheprovider --basetemp $appsPytestTemp tests/test_mcp_apps.py tests/test_verify_workflow.py }
+        Invoke-CheckedCommand "MCP App packaging and protocol tests" { & $python -m pytest -q -ra -p no:cacheprovider --basetemp $appsPytestTemp tests/test_mcp_apps.py tests/test_mcp_apps_core_workspace.py tests/test_mcp_apps_cmake.py tests/test_mcp_apps_quality.py tests/test_mcp_apps_git_inspection.py tests/test_mcp_apps_clangd.py tests/test_mcp_apps_debugger.py tests/test_verify_workflow.py }
     } finally {
         if (Test-Path -LiteralPath $appsPytestTemp) {
             $resolvedTemp = [IO.Path]::GetFullPath($appsPytestTemp)

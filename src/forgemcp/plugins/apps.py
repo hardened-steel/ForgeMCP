@@ -21,7 +21,11 @@ from forgemcp.plugins.errors import (
 
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APP_HTML_MIME_TYPE = "text/html;profile=mcp-app"
-MAX_APP_CONTRIBUTIONS = 32
+# Resources and bindings have independent bounded inventories.  A shared
+# result-family resource is deliberately reused by many public tools, so the
+# complete 72-tool surface needs more bindings than resources.
+MAX_APP_RESOURCES = 32
+MAX_APP_TOOL_BINDINGS = 128
 # The official ext-apps runtime is bundled into each static, CSP-isolated App.
 # Keep a finite resource cap while allowing the verified runtime itself.
 MAX_APP_HTML_BYTES = 768 * 1024
@@ -155,7 +159,13 @@ class ToolAppBinding:
 
     def __post_init__(self) -> None:
         tool_name = _bounded_text(self.tool_name, label="App binding tool name", maximum=128)
-        if "__" not in tool_name or not all(part.replace("_", "").isalnum() for part in tool_name.split("__")):
+        # ``server_status`` predates feature namespaces and is the one stable
+        # Core diagnostic tool retained for backwards compatibility.  Every
+        # other App-bound public tool remains namespace-qualified.
+        if tool_name != "server_status" and (
+            "__" not in tool_name
+            or not all(part.replace("_", "").isalnum() for part in tool_name.split("__"))
+        ):
             raise ValueError("App binding tool names must be qualified ForgeMCP tool names.")
         uri = _bounded_text(self.resource_uri, label="App binding resource URI", maximum=MAX_APP_URI_CHARACTERS)
         if not uri.startswith("ui://"):
@@ -191,7 +201,7 @@ class AppRegistry:
 
     def register_resource(self, plugin_id: str, contribution: AppResourceContribution) -> None:
         self._ensure_open()
-        if len(self._resources) >= MAX_APP_CONTRIBUTIONS:
+        if len(self._resources) >= MAX_APP_RESOURCES:
             raise ContributionLimitError("MCP App resource contribution limit exceeded.")
         if contribution.uri in self._resources:
             raise DuplicateAppResourceUriError(f"MCP App URI already registered: {contribution.uri}")
@@ -199,7 +209,7 @@ class AppRegistry:
 
     def register_tool_binding(self, plugin_id: str, binding: ToolAppBinding) -> None:
         self._ensure_open()
-        if len(self._bindings) >= MAX_APP_CONTRIBUTIONS:
+        if len(self._bindings) >= MAX_APP_TOOL_BINDINGS:
             raise ContributionLimitError("MCP App tool binding limit exceeded.")
         if binding.tool_name in self._bindings:
             raise DuplicateToolAppBindingError(f"MCP App binding already registered: {binding.tool_name}")

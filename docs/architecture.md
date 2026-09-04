@@ -78,15 +78,16 @@ all of that plugin's contribution kinds before reverse dependency rollback.
 Normal shutdown unregisters them in reverse lifecycle order and closes the
 application registry. There is no global mutable registry.
 
-MCP Apps Phase 1 adds a parallel transport-neutral App registry with
+MCP Apps adds a parallel transport-neutral App registry with
 `AppResourceContribution` and `ToolAppBinding`. Static App resources have
 unique `ui://` URIs, immutable bounded HTML, explicit CSP/permission/domain/
-border metadata, and plugin ownership; one binding links an existing qualified
+border metadata, and plugin ownership; one binding links an existing public
 tool name to one registered App resource and declares `model`/`app` visibility.
-The registry validates every reference after startup, removes contributions on
-failed-start rollback and reverse shutdown, and has no connection state. Git
-binds `git__status` to `ui://forgemcp/git/status`; Project binds
-`project__status` to `ui://forgemcp/project/status`.
+The historical Core `server_status` is the only non-namespaced binding; all
+others remain qualified. Resource and binding caps are separate (32 and 128),
+so the 18 shared resources can cover the complete 72-tool surface. The registry
+validates every reference after startup, removes contributions on failed-start
+rollback and reverse shutdown, and has no connection state. See ADR 0019.
 
 The discovery registry admits at most 128 static resources, 128 templates, 128
 prompts, and 256 completion providers. Resource reads share an eight-slot gate,
@@ -503,16 +504,16 @@ IDs for cached already-validated File API models; reads never configure, create
 a query, or run a process. Target resources expose only bounded name/type and
 validated workspace-relative artifact data.
 
-The App resources are `ui://forgemcp/git/status` and
-`ui://forgemcp/project/status`, each with exact MIME
-`text/html;profile=mcp-app`. They are package assets read with
-`importlib.resources` during Git and Project plugin composition, never from the
-current directory or workspace. Resource metadata has empty `connectDomains`,
-`resourceDomains`, `frameDomains`, and `baseUriDomains`, omits permissions and
-domain, and requests a border. The static views receive only ordinary tool
-results: Git renders untrusted branch/path values with `textContent`, and
-Project Status renders bounded safe component fields with `textContent` and
-local selection. Neither view makes host bridge calls.
+All 18 App resources are package assets read with `importlib.resources` during
+Core or feature-plugin composition, never from the current directory or
+workspace. Each uses exact MIME `text/html;profile=mcp-app`, empty
+`connectDomains`, `resourceDomains`, `frameDomains`, and `baseUriDomains`, no
+permissions/domain, and a requested border. Shared resources are assigned by
+public result family, not by tool: server/workspace, CMake, Quality, Git,
+clangd, and debugger each retain the mapping recorded in the acceptance
+manifest. Views receive only ordinary tool results, render untrusted fields by
+safe DOM construction with `textContent`, and provide local selection/filtering
+only. Neither views nor frontend sources make host bridge calls.
 
 The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
 messages and never invoke tools. Bounded project identifiers occupy a separate

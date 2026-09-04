@@ -52,6 +52,7 @@ from forgemcp.plugins import (
     ProgressUpdate,
     RegisteredToolContribution,
     ToolExecutionContext,
+    ToolAppBinding,
     ToolRegistry,
     invoke_tool_handler,
 )
@@ -59,7 +60,10 @@ from forgemcp.toolchain import ToolchainDiscoveryService
 
 
 SERVER_STATUS_APP_URI = "ui://forgemcp/server/status"
-_SERVER_STATUS_APP_META = {"ui": {"resourceUri": SERVER_STATUS_APP_URI, "visibility": ["model", "app"]}}
+_SERVER_STATUS_APP_BINDING = ToolAppBinding(
+    tool_name="server_status", resource_uri=SERVER_STATUS_APP_URI, visibility=("model", "app")
+)
+_SERVER_STATUS_APP_META = _SERVER_STATUS_APP_BINDING.tool_meta()
 
 
 # FastMCP derives a transient Pydantic arguments model from each Python
@@ -301,6 +305,7 @@ def create_server(
             plugins = application.services.get("plugins")
             if not surface_registered:
                 _register_server_status_app(plugins.apps)
+                plugins.apps.validate(("server_status", *(item.name for item in plugins.tools.contributions())))
             _register_contributed_tools(mcp, plugins.tools, plugins.apps)
             if not surface_registered:
                 _register_contributed_surface(mcp, plugins.surface)
@@ -564,6 +569,7 @@ def _register_server_status_app(registry: AppRegistry) -> None:
             prefers_border=True,
         ),
     )
+    registry.register_tool_binding("core", _SERVER_STATUS_APP_BINDING)
 
 
 def _app_resource_adapter(html: str):

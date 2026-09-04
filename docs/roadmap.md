@@ -103,11 +103,11 @@ irreversible choices belong in [adr/](adr/).
   discovery, porcelain/protocol parsing, bounded patches/history/blame/local
   branches, cached ProjectStatus integration, Workspace mutation invalidation,
   and disposable real SDK fixture coverage. No Git write or network operation.
-- MCP Apps Phase 1: read-only Git Status App and Project Status App bound to
-  existing `git__status` and `project__status`, static package HTML,
-  transport-neutral App registry, Apps/no-Apps SDK stdio coverage, restrictive
-  CSP/XSS gates, and wheel asset smoke. The 72
-  model-visible tools remain unchanged. See ADR 0018.
+- MCP Apps integration: all 72 existing public tools have exactly one
+  read-only binding to 18 shared static package resources, with deterministic
+  browser-free builds, Apps/no-Apps SDK inventory coverage, restrictive CSP/XSS
+  gates, and wheel asset smoke. The model-visible tools remain unchanged. See
+  ADR 0018 and ADR 0019.
 
 ### In progress
 

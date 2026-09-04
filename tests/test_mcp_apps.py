@@ -34,11 +34,38 @@ from forgemcp.plugins import (
 )
 from forgemcp.plugins.apps import MAX_APP_HTML_BYTES
 from forgemcp.server import _install_sdk1_apps_compatibility_adapter, client_supports_mcp_apps
-from tests.acceptance_manifest import MCP_APP_RESOURCE_INVENTORY
+from tests.acceptance_manifest import MCP_APP_RESOURCE_INVENTORY, TOOL_ACCEPTANCE
 
 
 _ROOT = Path(__file__).parents[1]
 _APPS_CAPABILITY = {"extensions": {"io.modelcontextprotocol/ui": {"mimeTypes": [MCP_APP_HTML_MIME_TYPE]}}}
+_APP_ASSETS = {
+    "ui://forgemcp/server/status": "server-status.html",
+    "ui://forgemcp/project/status": "project-status.html",
+    "ui://forgemcp/workspace/result": "workspace-result.html",
+    "ui://forgemcp/cmake/catalog": "cmake-catalog.html",
+    "ui://forgemcp/cmake/operation": "cmake-operation.html",
+    "ui://forgemcp/quality/overview": "quality-overview.html",
+    "ui://forgemcp/quality/findings": "quality-findings.html",
+    "ui://forgemcp/git/status": "git-status.html",
+    "ui://forgemcp/git/diff": "git-diff.html",
+    "ui://forgemcp/git/history": "git-history.html",
+    "ui://forgemcp/git/source-history": "git-source-history.html",
+    "ui://forgemcp/clangd/session": "clangd-session.html",
+    "ui://forgemcp/clangd/insight": "clangd-insight.html",
+    "ui://forgemcp/clangd/navigation": "clangd-navigation.html",
+    "ui://forgemcp/clangd/change-hierarchy": "clangd-change-hierarchy.html",
+    "ui://forgemcp/debugger/session": "debugger-session.html",
+    "ui://forgemcp/debugger/stack": "debugger-stack.html",
+    "ui://forgemcp/debugger/data": "debugger-data.html",
+}
+_EXPECTED_BINDINGS = {item["tool_name"]: item["uri"] for item in MCP_APP_RESOURCE_INVENTORY}
+_EMPTY_CSP_META = {
+    "ui": {
+        "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": [], "baseUriDomains": []},
+        "prefersBorder": True,
+    }
+}
 
 
 class _AppsClientSession(ClientSession):
@@ -115,10 +142,13 @@ def test_client_capability_negotiation_requires_the_exact_html_mime_type() -> No
     assert client_supports_mcp_apps({"extensions": {"io.modelcontextprotocol/ui": {"mimeTypes": ["text/plain"]}}}) is False
     assert client_supports_mcp_apps({"experimental": {"io.modelcontextprotocol/ui": {}}}) is False
     assert client_supports_mcp_apps(mcp_types.ClientCapabilities.model_validate(_APPS_CAPABILITY)) is True
-    assert MCP_APP_RESOURCE_INVENTORY == (
-        {"tool_name": "project__status", "uri": PROJECT_STATUS_APP_URI, "mime_type": MCP_APP_HTML_MIME_TYPE},
-        {"tool_name": "git__status", "uri": GIT_STATUS_APP_URI, "mime_type": MCP_APP_HTML_MIME_TYPE},
-    )
+    assert len(MCP_APP_RESOURCE_INVENTORY) == 72
+    assert len(_EXPECTED_BINDINGS) == 72
+    assert set(_EXPECTED_BINDINGS) == {item.tool_name for item in TOOL_ACCEPTANCE}
+    assert set(_EXPECTED_BINDINGS.values()) == set(_APP_ASSETS)
+    assert all(item["mime_type"] == MCP_APP_HTML_MIME_TYPE for item in MCP_APP_RESOURCE_INVENTORY)
+    assert _EXPECTED_BINDINGS["project__status"] == PROJECT_STATUS_APP_URI
+    assert _EXPECTED_BINDINGS["git__status"] == GIT_STATUS_APP_URI
 
 
 def test_minimum_supported_sdk_exposes_the_public_meta_apis_and_extra_capability_storage() -> None:
@@ -273,25 +303,23 @@ def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
 
                 tools = await session.list_tools()
                 assert len(tools.tools) == 72
-                git_tool = next(tool for tool in tools.tools if tool.name == "git__status")
-                project_tool = next(tool for tool in tools.tools if tool.name == "project__status")
+                by_name = {tool.name: tool for tool in tools.tools}
+                assert set(by_name) == set(_EXPECTED_BINDINGS)
+                git_tool = by_name["git__status"]
+                project_tool = by_name["project__status"]
                 if apps_capable:
-                    assert git_tool.meta == {
-                        "ui": {"resourceUri": GIT_STATUS_APP_URI, "visibility": ["model", "app"]}
-                    }
-                    assert project_tool.meta == {
-                        "ui": {"resourceUri": PROJECT_STATUS_APP_URI, "visibility": ["model", "app"]}
+                    assert {name: tool.meta for name, tool in by_name.items()} == {
+                        name: {"ui": {"resourceUri": uri, "visibility": ["model", "app"]}}
+                        for name, uri in _EXPECTED_BINDINGS.items()
                     }
                     resources = await session.list_resources()
-                    for uri in (GIT_STATUS_APP_URI, PROJECT_STATUS_APP_URI):
-                        resource = next(item for item in resources.resources if str(item.uri) == uri)
+                    app_resources = [item for item in resources.resources if str(item.uri).startswith("ui://")]
+                    assert len(app_resources) == len(_APP_ASSETS)
+                    assert {str(item.uri) for item in app_resources} == set(_APP_ASSETS)
+                    for uri in _APP_ASSETS:
+                        resource = next(item for item in app_resources if str(item.uri) == uri)
                         assert resource.mimeType == MCP_APP_HTML_MIME_TYPE
-                        assert resource.meta == {
-                            "ui": {
-                                "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": [], "baseUriDomains": []},
-                                "prefersBorder": True,
-                            }
-                        }
+                        assert resource.meta == _EMPTY_CSP_META
                         content = await session.read_resource(mcp_types.AnyUrl(uri))
                         assert len(content.contents) == 1
                         item = content.contents[0]
@@ -300,7 +328,7 @@ def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
                         assert item.meta == resource.meta
                         assert item.text.startswith("<!doctype html>")
                 else:
-                    assert git_tool.meta is None and project_tool.meta is None
+                    assert all(tool.meta is None for tool in by_name.values())
                     assert (await session.list_resources()).resources
 
                 results = {}
@@ -318,14 +346,49 @@ def test_sdk_stdio_apps_and_no_apps_contracts(tmp_path: Path) -> None:
                         assert result.structuredContent is None
                     results[tool.name] = normalize_result(payload)
                 return {
-                    "git": {"input_schema": git_tool.inputSchema, "output_schema": git_tool.outputSchema, "annotations": git_tool.annotations},
-                    "project": {"input_schema": project_tool.inputSchema, "output_schema": project_tool.outputSchema, "annotations": project_tool.annotations},
+                    "tools": {
+                        name: {"input_schema": tool.inputSchema, "output_schema": tool.outputSchema, "annotations": tool.annotations}
+                        for name, tool in sorted(by_name.items())
+                    },
                     "results": results,
                 }
 
     apps_contract = asyncio.run(exercise(_AppsClientSession, True))
     no_apps_contract = asyncio.run(exercise(ClientSession, False))
     assert apps_contract == no_apps_contract
+
+
+def test_all_authored_app_sources_and_packaged_assets_are_static_and_fail_closed() -> None:
+    """One integration gate for every result-family renderer, not its bundled runtime."""
+    source_directories = (
+        "common", "git-status", "project-status", "core-workspace-apps", "cmake-apps",
+        "quality-apps", "git-inspection-apps", "clangd-apps", "debugger-apps",
+    )
+    sources = [
+        path for directory in source_directories
+        for path in (_ROOT / "frontend" / directory).rglob("*.js")
+        if path.name != "test.mjs"
+    ]
+    authored = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+    forbidden = (
+        "callServerTool", "tools/call", "resources/read", "fetch(", "XMLHttpRequest", "WebSocket",
+        "innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "Function(",
+        "localStorage", "sessionStorage", "navigator.clipboard", "ui/open-link", "ui/update-model-context",
+        "requestDisplayMode", "window.parent.postMessage",
+    )
+    assert sources and all(token not in authored for token in forbidden)
+    assert "textContent" in authored
+    assert all("connectMcpApp(" in path.read_text(encoding="utf-8") for path in sources if path.name.endswith("-app.js"))
+    assert not any("<button" in path.read_text(encoding="utf-8").lower() for path in sources)
+
+    package_assets = files("forgemcp.apps.assets")
+    names = {item.name for item in package_assets.iterdir() if item.name.endswith(".html")}
+    assert names == set(_APP_ASSETS.values())
+    for asset_name in names:
+        html = package_assets.joinpath(asset_name).read_text(encoding="utf-8")
+        assert html.startswith("<!doctype html>")
+        assert "source-sha256:" in html
+        assert len(html.encode("utf-8")) <= MAX_APP_HTML_BYTES
 
 
 def test_wheel_contains_and_installs_the_static_git_status_asset(tmp_path: Path) -> None:
@@ -343,8 +406,7 @@ def test_wheel_contains_and_installs_the_static_git_status_asset(tmp_path: Path)
     assert build.returncode == 0, build.stderr
     wheel = next(wheels.glob("forgemcp-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
-        assert "forgemcp/apps/assets/git-status.html" in archive.namelist()
-        assert "forgemcp/apps/assets/project-status.html" in archive.namelist()
+        assert {f"forgemcp/apps/assets/{name}" for name in _APP_ASSETS.values()} <= set(archive.namelist())
     target = tmp_path / "installed"
     install = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(target), str(wheel)],
@@ -360,7 +422,7 @@ def test_wheel_contains_and_installs_the_static_git_status_asset(tmp_path: Path)
             "-I",
             "-c",
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
-            "from importlib.resources import files; values=[files('forgemcp.apps.assets').joinpath(name).read_text(encoding='utf-8') for name in ('git-status.html','project-status.html')]; "
+            f"from importlib.resources import files; values=[files('forgemcp.apps.assets').joinpath(name).read_text(encoding='utf-8') for name in {tuple(_APP_ASSETS.values())!r}]; "
             "assert all(value.startswith('<!doctype html>') for value in values); print(sum(map(len, values)))",
             str(target),
         ],

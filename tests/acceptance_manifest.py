@@ -257,20 +257,63 @@ _CORE = ("server_status", "project__status", "workspace__list_files", "workspace
 _CMAKE = ("cmake__status", "cmake__list_kits", "cmake__select_kit", "cmake__list_build_trees", "cmake__list_presets", "cmake__configure", "cmake__list_targets", "cmake__build", "cmake__ctest_list_tests", "cmake__ctest_run")
 _QUALITY = ("quality__status", "clang_format__check", "clang_format__apply", "clang_tidy__list_checks", "clang_tidy__run", "sanitizer__parse_report")
 _GIT = ("git__status", "git__diff", "git__log", "git__show_commit", "git__blame", "git__list_branches")
-MCP_APP_RESOURCE_INVENTORY = (
-    {
-        "tool_name": "project__status",
-        "uri": "ui://forgemcp/project/status",
-        "mime_type": "text/html;profile=mcp-app",
-    },
-    {
-        "tool_name": "git__status",
-        "uri": "ui://forgemcp/git/status",
-        "mime_type": "text/html;profile=mcp-app",
-    },
-)
 _CLANGD = ("clangd__status", "clangd__start", "clangd__stop", "clangd__diagnostics", "clangd__hover", "clangd__definition", "clangd__references", "clangd__document_symbols", "clangd__workspace_symbols", "clangd__completion", "clangd__signature_help", "clangd__declaration", "clangd__type_definition", "clangd__implementation", "clangd__prepare_rename", "clangd__rename", "clangd__code_actions", "clangd__apply_code_action", "clangd__format_document", "clangd__format_range", "clangd__prepare_call_hierarchy", "clangd__incoming_calls", "clangd__outgoing_calls", "clangd__prepare_type_hierarchy", "clangd__supertypes", "clangd__subtypes", "clangd__switch_source_header")
 _DEBUGGER = ("debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop", "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over", "debugger__step_in", "debugger__step_out", "debugger__threads", "debugger__stack_trace", "debugger__scopes", "debugger__variables", "debugger__evaluate", "debugger__events")
+
+
+# Integration-owned inventory: every public tool has exactly one static App
+# binding.  Repeated URIs intentionally identify shared result-family views.
+_APP_RESOURCE_BY_TOOL = (
+    *((name, "ui://forgemcp/server/status") for name in ("server_status",)),
+    *((name, "ui://forgemcp/project/status") for name in ("project__status",)),
+    *((name, "ui://forgemcp/workspace/result") for name in (
+        "workspace__list_files", "workspace__read_text", "workspace__get_snapshot",
+        "workspace__apply_unified_patch", "workspace__apply_text_edits",
+    )),
+    *((name, "ui://forgemcp/cmake/catalog") for name in (
+        "cmake__status", "cmake__list_kits", "cmake__list_build_trees", "cmake__list_presets",
+        "cmake__list_targets", "cmake__ctest_list_tests",
+    )),
+    *((name, "ui://forgemcp/cmake/operation") for name in (
+        "cmake__select_kit", "cmake__configure", "cmake__build", "cmake__ctest_run",
+    )),
+    *((name, "ui://forgemcp/quality/overview") for name in (
+        "quality__status", "clang_format__check", "clang_format__apply", "clang_tidy__list_checks",
+    )),
+    *((name, "ui://forgemcp/quality/findings") for name in ("clang_tidy__run", "sanitizer__parse_report")),
+    *((name, "ui://forgemcp/git/status") for name in ("git__status",)),
+    *((name, "ui://forgemcp/git/diff") for name in ("git__diff",)),
+    *((name, "ui://forgemcp/git/history") for name in ("git__log", "git__list_branches")),
+    *((name, "ui://forgemcp/git/source-history") for name in ("git__show_commit", "git__blame")),
+    *((name, "ui://forgemcp/clangd/session") for name in (
+        "clangd__status", "clangd__start", "clangd__stop",
+    )),
+    *((name, "ui://forgemcp/clangd/insight") for name in (
+        "clangd__diagnostics", "clangd__hover", "clangd__completion", "clangd__signature_help",
+    )),
+    *((name, "ui://forgemcp/clangd/navigation") for name in (
+        "clangd__definition", "clangd__references", "clangd__declaration", "clangd__type_definition",
+        "clangd__implementation", "clangd__document_symbols", "clangd__workspace_symbols", "clangd__switch_source_header",
+    )),
+    *((name, "ui://forgemcp/clangd/change-hierarchy") for name in (
+        "clangd__prepare_rename", "clangd__rename", "clangd__code_actions", "clangd__apply_code_action",
+        "clangd__format_document", "clangd__format_range", "clangd__prepare_call_hierarchy", "clangd__incoming_calls",
+        "clangd__outgoing_calls", "clangd__prepare_type_hierarchy", "clangd__supertypes", "clangd__subtypes",
+    )),
+    *((name, "ui://forgemcp/debugger/session") for name in (
+        "debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop",
+        "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over",
+        "debugger__step_in", "debugger__step_out", "debugger__events",
+    )),
+    *((name, "ui://forgemcp/debugger/stack") for name in ("debugger__threads", "debugger__stack_trace")),
+    *((name, "ui://forgemcp/debugger/data") for name in (
+        "debugger__scopes", "debugger__variables", "debugger__evaluate",
+    )),
+)
+MCP_APP_RESOURCE_INVENTORY = tuple(
+    {"tool_name": tool_name, "uri": uri, "mime_type": "text/html;profile=mcp-app"}
+    for tool_name, uri in _APP_RESOURCE_BY_TOOL
+)
 
 _DEBUGGER_DETAILS: dict[str, tuple[str, str, str, str]] = {
     "debugger__status": ("managed fixture session", "observes stopped/running/paused/terminated generations", "initialized SDK session", "application shutdown returns no active session"),

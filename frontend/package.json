@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "description": "Shared offline frontend toolchain for ForgeMCP MCP Apps.",
   "scripts": {
-    "write:asset": "node git-status/build.mjs --write && node project-status/build.mjs",
-    "build": "node git-status/build.mjs --check && node project-status/build.mjs --check",
-    "test": "node git-status/build.mjs --check && node --test project-status/test.mjs"
+    "write:asset": "node git-status/build.mjs --write && node project-status/build.mjs && node core-workspace-apps/build.mjs --write && node cmake-apps/build.mjs --write && node quality-apps/build.mjs --write && node git-inspection-apps/build.mjs --write && node clangd-apps/build.mjs --write && node debugger-apps/build.mjs --write",
+    "build": "node git-status/build.mjs --check && node project-status/build.mjs --check && node core-workspace-apps/build.mjs --check && node cmake-apps/build.mjs --check && node quality-apps/build.mjs --check && node git-inspection-apps/build.mjs --check && node clangd-apps/build.mjs --check && node debugger-apps/build.mjs --check",
+    "test": "npm run build && node --test project-status/test.mjs core-workspace-apps/test.mjs quality-apps/test.mjs clangd-apps/test.mjs debugger-apps/test.mjs && node cmake-apps/test.mjs && node git-inspection-apps/test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.5"
