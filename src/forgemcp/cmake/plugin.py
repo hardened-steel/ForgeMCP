@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from importlib.resources import files
 import json
 from pathlib import PurePosixPath, PureWindowsPath
 
@@ -16,6 +17,8 @@ from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
     CompletionContribution,
     CompletionReferenceKind,
+    AppCsp,
+    AppResourceContribution,
     CompletionRequest,
     ForgePlugin,
     NoOpProgressReporter,
@@ -26,6 +29,7 @@ from forgemcp.plugins import (
     ToolContribution,
     ToolHints,
     ToolExecutionContext,
+    ToolAppBinding,
 )
 from forgemcp.project import (
     ComponentState,
@@ -107,6 +111,8 @@ CMAKE_TARGETS_URI = "forgemcp://cmake/targets"
 CMAKE_TARGETS_TEMPLATE_URI = "forgemcp://cmake/targets/{profile}"
 CMAKE_KITS_URI = "forgemcp://cmake/kits"
 CMAKE_KITS_TEMPLATE_URI = "forgemcp://cmake/kits/{kit}"
+CMAKE_CATALOG_APP_URI = "ui://forgemcp/cmake/catalog"
+CMAKE_OPERATION_APP_URI = "ui://forgemcp/cmake/operation"
 MAX_RESOURCE_TARGETS = 512
 MAX_RESOURCE_TARGET_BYTES = 220 * 1024
 
@@ -250,6 +256,7 @@ class CMakePlugin(ForgePlugin):
         self._mutation_subscription = mutations.subscribe("cmake", self._on_workspace_mutation)
         self._status_registry = status_registry
         status_registry.register(_CMakeStatusProvider(self._service))
+        self._register_apps(context)
         context.tools.register(
             ToolContribution(
                 name="status",
@@ -384,6 +391,43 @@ class CMakePlugin(ForgePlugin):
         if self._service is not None:
             self._service.clear_selection()
         self._service = None
+
+    @staticmethod
+    def _register_apps(context: PluginContext) -> None:
+        """Register static CMake result views without changing tool behaviour."""
+        try:
+            catalog = files("forgemcp.apps.assets").joinpath("cmake-catalog.html").read_text(encoding="utf-8")
+            operation = files("forgemcp.apps.assets").joinpath("cmake-operation.html").read_text(encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+            raise RuntimeError("CMake App assets are unavailable.") from error
+        csp = AppCsp(connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=())
+        context.apps.register_resource(AppResourceContribution(
+            uri=CMAKE_CATALOG_APP_URI,
+            name="forgemcp_cmake_catalog_app",
+            description="Interactive read-only CMake catalog result view.",
+            html=catalog,
+            csp=csp,
+            prefers_border=True,
+        ))
+        context.apps.register_resource(AppResourceContribution(
+            uri=CMAKE_OPERATION_APP_URI,
+            name="forgemcp_cmake_operation_app",
+            description="Interactive read-only CMake operation result view.",
+            html=operation,
+            csp=csp,
+            prefers_border=True,
+        ))
+        for tool_name in (
+            "cmake__status", "cmake__list_kits", "cmake__list_build_trees", "cmake__list_presets",
+            "cmake__list_targets", "cmake__ctest_list_tests",
+        ):
+            context.apps.bind_tool(ToolAppBinding(
+                tool_name=tool_name, resource_uri=CMAKE_CATALOG_APP_URI, visibility=("model", "app")
+            ))
+        for tool_name in ("cmake__select_kit", "cmake__configure", "cmake__build", "cmake__ctest_run"):
+            context.apps.bind_tool(ToolAppBinding(
+                tool_name=tool_name, resource_uri=CMAKE_OPERATION_APP_URI, visibility=("model", "app")
+            ))
 
     def _targets_resource(self, profile_id: str | None) -> dict[str, object]:
         if self._service is None:
