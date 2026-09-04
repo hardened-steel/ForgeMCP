@@ -46,6 +46,9 @@ from forgemcp.workspace import WorkspaceMutationBatch, WorkspaceMutationBus, Wor
 
 GIT_STATUS_URI = "forgemcp://git/status"
 GIT_STATUS_APP_URI = "ui://forgemcp/git/status"
+GIT_DIFF_APP_URI = "ui://forgemcp/git/diff"
+GIT_HISTORY_APP_URI = "ui://forgemcp/git/history"
+GIT_SOURCE_HISTORY_APP_URI = "ui://forgemcp/git/source-history"
 GIT_REVIEW_PROMPT = "forgemcp_review_changes"
 
 
@@ -182,6 +185,7 @@ class GitPlugin(ForgePlugin):
         self._register_tools(context)
         self._register_surface(context)
         self._register_status_app(context)
+        self._register_inspection_apps(context)
 
     async def stop(self) -> None:
         if self._mutation_subscription is not None:
@@ -258,6 +262,52 @@ class GitPlugin(ForgePlugin):
         context.apps.bind_tool(ToolAppBinding(
             tool_name="git__status", resource_uri=GIT_STATUS_APP_URI, visibility=("model", "app"),
         ))
+
+    @staticmethod
+    def _register_inspection_apps(context: PluginContext) -> None:
+        """Register static views for the remaining bounded Git read operations."""
+        assets = (
+            (
+                GIT_DIFF_APP_URI,
+                "forgemcp_git_diff_app",
+                "Interactive read-only Git patch view.",
+                "git-diff.html",
+                ("git__diff",),
+            ),
+            (
+                GIT_HISTORY_APP_URI,
+                "forgemcp_git_history_app",
+                "Interactive read-only Git commit and branch history view.",
+                "git-history.html",
+                ("git__log", "git__list_branches"),
+            ),
+            (
+                GIT_SOURCE_HISTORY_APP_URI,
+                "forgemcp_git_source_history_app",
+                "Interactive read-only Git commit patch and file attribution view.",
+                "git-source-history.html",
+                ("git__show_commit", "git__blame"),
+            ),
+        )
+        for uri, name, description, asset_name, tool_names in assets:
+            try:
+                html = files("forgemcp.apps.assets").joinpath(asset_name).read_text(encoding="utf-8")
+            except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+                raise RuntimeError("Git inspection App asset is unavailable.") from error
+            context.apps.register_resource(AppResourceContribution(
+                uri=uri,
+                name=name,
+                description=description,
+                html=html,
+                csp=AppCsp(
+                    connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=(),
+                ),
+                prefers_border=True,
+            ))
+            for tool_name in tool_names:
+                context.apps.bind_tool(ToolAppBinding(
+                    tool_name=tool_name, resource_uri=uri, visibility=("model", "app"),
+                ))
 
     async def _dispatch(self, model: type[ForgeModel], arguments: Mapping[str, object], operation: object) -> object:
         try:
