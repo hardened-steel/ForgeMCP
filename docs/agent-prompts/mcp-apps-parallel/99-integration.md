@@ -17,6 +17,26 @@ Merge these branches one at a time:
 
 Read every worker report and `00-common-contract.md` before resolving conflicts.
 
+Worker reports are committed to their respective implementation branches under
+`docs/agent-reports/mcp-apps-parallel/`:
+
+- `codex/apps-core-workspace` → `01-core-workspace.md`
+- `codex/apps-cmake` → `02-cmake.md`
+- `codex/apps-quality` → `03-quality.md`
+- `codex/apps-git-inspection` → `04-git-inspection.md`
+- `codex/apps-clangd` → `05-clangd.md`
+- `codex/apps-debugger` → `06-debugger.md`
+
+Read each report from its branch before merging that branch. For example:
+
+```powershell
+git show codex/apps-cmake:docs/agent-reports/mcp-apps-parallel/02-cmake.md
+```
+
+Treat a missing report as an incomplete worker branch: do not merge it until
+the worker has created and committed the expected report. After all branches
+are merged, keep all six reports in the integration branch as audit evidence.
+
 ## Merge policy
 
 - Preserve the accepted Git Status and Project Status Apps.
@@ -106,4 +126,3 @@ asset count/total size, tests, unchanged tool inventory/contracts, absence of UI
 calls, package evidence, git status and any tools whose public result could only
 support a minimal confirmation view. Do not claim visual acceptance before the
 user samples the integrated widgets in MCP Inspector.
-
