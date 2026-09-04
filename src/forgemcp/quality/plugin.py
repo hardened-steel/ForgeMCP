@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.resources import files
 from time import monotonic
 
 from pydantic import Field, ValidationError
@@ -13,12 +14,15 @@ from pydantic import Field, ValidationError
 from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     ForgePlugin,
     NoOpProgressReporter,
     PluginContext,
     PluginMetadata,
     ProgressUpdate,
     ToolContribution,
+    ToolAppBinding,
     ToolExecutionContext,
 )
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
@@ -31,6 +35,10 @@ from forgemcp.quality.models import QualityStatus
 from forgemcp.quality.sanitizer import MAX_SANITIZER_INPUT_CHARACTERS, SanitizerReportParser
 from forgemcp.workspace import WorkspaceService
 from forgemcp.toolchain import ToolchainDiscoveryService
+
+
+QUALITY_OVERVIEW_APP_URI = "ui://forgemcp/quality/overview"
+QUALITY_FINDINGS_APP_URI = "ui://forgemcp/quality/findings"
 
 
 class _EmptyArguments(ForgeModel):
@@ -215,6 +223,7 @@ class QualityPlugin(ForgePlugin):
         self._status_registry = status_registry
         status_registry.register(_QualityStatusProvider(self))
         self._register_tools(context)
+        self._register_apps(context)
 
     async def stop(self) -> None:
         """Release only in-memory service references; no persistent process is owned."""
@@ -241,6 +250,49 @@ class QualityPlugin(ForgePlugin):
                 input_model=model,
                 namespace=namespace,
                 handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context),
+            ))
+
+    @staticmethod
+    def _register_apps(context: PluginContext) -> None:
+        """Register immutable Quality App assets without changing tool behavior."""
+        try:
+            overview = files("forgemcp.apps.assets").joinpath("quality-overview.html").read_text(encoding="utf-8")
+            findings = files("forgemcp.apps.assets").joinpath("quality-findings.html").read_text(encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+            raise RuntimeError("Quality App asset is unavailable.") from error
+        csp = AppCsp(connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=())
+        context.apps.register_resource(AppResourceContribution(
+            uri=QUALITY_OVERVIEW_APP_URI,
+            name="forgemcp_quality_overview_app",
+            description="Interactive read-only Quality tool and format overview.",
+            html=overview,
+            csp=csp,
+            prefers_border=True,
+        ))
+        context.apps.register_resource(AppResourceContribution(
+            uri=QUALITY_FINDINGS_APP_URI,
+            name="forgemcp_quality_findings_app",
+            description="Interactive read-only clang-tidy and sanitizer findings view.",
+            html=findings,
+            csp=csp,
+            prefers_border=True,
+        ))
+        for tool_name in (
+            "quality__status",
+            "clang_format__check",
+            "clang_format__apply",
+            "clang_tidy__list_checks",
+        ):
+            context.apps.bind_tool(ToolAppBinding(
+                tool_name=tool_name,
+                resource_uri=QUALITY_OVERVIEW_APP_URI,
+                visibility=("model", "app"),
+            ))
+        for tool_name in ("clang_tidy__run", "sanitizer__parse_report"):
+            context.apps.bind_tool(ToolAppBinding(
+                tool_name=tool_name,
+                resource_uri=QUALITY_FINDINGS_APP_URI,
+                visibility=("model", "app"),
             ))
 
     async def _dispatch(
