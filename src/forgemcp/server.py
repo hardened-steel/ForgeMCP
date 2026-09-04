@@ -10,6 +10,7 @@ import sys
 import warnings
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
+from importlib.resources import files
 from time import monotonic
 from types import MethodType
 from typing import Annotated
@@ -40,6 +41,8 @@ from forgemcp.core.logging import LOG_LEVELS, StructuredLogEvent, StructuredLogg
 from forgemcp.discovery import SERVER_INSTRUCTIONS
 from forgemcp.plugins import (
     AppRegistry,
+    AppCsp,
+    AppResourceContribution,
     CompletionReferenceKind,
     MCP_APPS_EXTENSION_ID,
     MCP_APP_HTML_MIME_TYPE,
@@ -53,6 +56,10 @@ from forgemcp.plugins import (
     invoke_tool_handler,
 )
 from forgemcp.toolchain import ToolchainDiscoveryService
+
+
+SERVER_STATUS_APP_URI = "ui://forgemcp/server/status"
+_SERVER_STATUS_APP_META = {"ui": {"resourceUri": SERVER_STATUS_APP_URI, "visibility": ["model", "app"]}}
 
 
 # FastMCP derives a transient Pydantic arguments model from each Python
@@ -292,6 +299,8 @@ def create_server(
         try:
             await application.start()
             plugins = application.services.get("plugins")
+            if not surface_registered:
+                _register_server_status_app(plugins.apps)
             _register_contributed_tools(mcp, plugins.tools, plugins.apps)
             if not surface_registered:
                 _register_contributed_surface(mcp, plugins.surface)
@@ -380,7 +389,7 @@ def create_server(
         logger.add_sink(sink)
         connection_sinks[key] = (logger, sink)
 
-    @mcp.tool(name="server_status")
+    @mcp.tool(name="server_status", meta=_SERVER_STATUS_APP_META)
     def server_status_tool(context: Context) -> dict[str, object]:
         """Return ForgeMCP version, workspace, lifecycle state, and Core services."""
         application = context.request_context.lifespan_context
@@ -534,6 +543,27 @@ def _register_contributed_apps(mcp: FastMCP[ForgeApplication], registry: AppRegi
             mime_type=MCP_APP_HTML_MIME_TYPE,
             meta=contribution.resource_meta(),
         )(_app_resource_adapter(contribution.html))
+
+
+def _register_server_status_app(registry: AppRegistry) -> None:
+    """Register Core's immutable App asset under the Core lifecycle owner."""
+    try:
+        html = files("forgemcp.apps.assets").joinpath("server-status.html").read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+        raise RuntimeError("Server Status App asset is unavailable.") from error
+    registry.register_resource(
+        "core",
+        AppResourceContribution(
+            uri=SERVER_STATUS_APP_URI,
+            name="forgemcp_server_status_app",
+            description="Interactive read-only ForgeMCP server status strip.",
+            html=html,
+            csp=AppCsp(
+                connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=(),
+            ),
+            prefers_border=True,
+        ),
+    )
 
 
 def _app_resource_adapter(html: str):

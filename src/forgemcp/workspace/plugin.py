@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from collections import OrderedDict
 from dataclasses import dataclass
+from importlib.resources import files
 import os
 import re
 import secrets
@@ -18,6 +19,8 @@ from forgemcp.core.errors import ForgeMCPError, to_mcp_error_response
 from forgemcp.models import FileSnapshot, Range
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     CompletionContribution,
     CompletionReferenceKind,
     CompletionRequest,
@@ -27,6 +30,7 @@ from forgemcp.plugins import (
     ResourceContribution,
     ResourceTemplateContribution,
     ToolContribution,
+    ToolAppBinding,
     ToolHints,
 )
 from forgemcp.workspace import (
@@ -43,6 +47,7 @@ MAX_TOOL_EDITS = 1_000
 MAX_TOOL_PATCH_CHARACTERS = 1_048_576
 WORKSPACE_FILES_URI = "forgemcp://workspace/files"
 WORKSPACE_FILES_TEMPLATE_URI = "forgemcp://workspace/files/{cursor}"
+WORKSPACE_RESULT_APP_URI = "ui://forgemcp/workspace/result"
 MAX_MANIFEST_ENTRIES = 1_000
 MANIFEST_PAGE_SIZE = 50
 MAX_MANIFEST_CURSORS = 32
@@ -259,6 +264,7 @@ class WorkspacePlugin(ForgePlugin):
         )
         for name, description, model, output_type, operation, hints in tools:
             context.tools.register(ToolContribution(name=name, description=description, input_model=model, output_type=output_type, handler=lambda arguments, m=model, op=operation: self._dispatch(m, arguments, op), hints=hints))
+        self._register_result_app(context)
         context.resources.register(
             ResourceContribution(
                 uri=WORKSPACE_FILES_URI,
@@ -292,6 +298,40 @@ class WorkspacePlugin(ForgePlugin):
                 provider=self._complete_manifest_cursors,
             )
         )
+
+    @staticmethod
+    def _register_result_app(context: PluginContext) -> None:
+        """Register the immutable result view without changing Workspace tools."""
+        try:
+            html = files("forgemcp.apps.assets").joinpath("workspace-result.html").read_text(encoding="utf-8")
+        except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+            raise RuntimeError("Workspace Result App asset is unavailable.") from error
+        context.apps.register_resource(
+            AppResourceContribution(
+                uri=WORKSPACE_RESULT_APP_URI,
+                name="forgemcp_workspace_result_app",
+                description="Interactive local view of one bounded Workspace tool result.",
+                html=html,
+                csp=AppCsp(
+                    connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=(),
+                ),
+                prefers_border=True,
+            )
+        )
+        for tool_name in (
+            "workspace__list_files",
+            "workspace__read_text",
+            "workspace__get_snapshot",
+            "workspace__apply_unified_patch",
+            "workspace__apply_text_edits",
+        ):
+            context.apps.bind_tool(
+                ToolAppBinding(
+                    tool_name=tool_name,
+                    resource_uri=WORKSPACE_RESULT_APP_URI,
+                    visibility=("model", "app"),
+                )
+            )
 
     async def stop(self) -> None:
         self._manifest_cursors.clear()
