@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from importlib.resources import files
 
 from pydantic import ConfigDict, Field, ValidationError
 
@@ -14,12 +15,15 @@ from forgemcp.debugger.models import DebugBreakpointSpec, DebugLaunchRequest
 from forgemcp.debugger.service import DebuggerService
 from forgemcp.models._base import ForgeModel
 from forgemcp.plugins import (
+    AppCsp,
+    AppResourceContribution,
     ForgePlugin,
     NoOpProgressReporter,
     PluginContext,
     PluginMetadata,
     ProgressUpdate,
     ToolContribution,
+    ToolAppBinding,
     ToolExecutionContext,
 )
 from forgemcp.project import ComponentState, ComponentStatus, ProjectStatusRegistry, StatusFact
@@ -27,6 +31,11 @@ from forgemcp.project.models import utc_now
 from forgemcp.processes import ProcessRuntime
 from forgemcp.toolchain import ToolchainDiscoveryService
 from forgemcp.workspace import WorkspaceService
+
+
+DEBUGGER_SESSION_APP_URI = "ui://forgemcp/debugger/session"
+DEBUGGER_STACK_APP_URI = "ui://forgemcp/debugger/stack"
+DEBUGGER_DATA_APP_URI = "ui://forgemcp/debugger/data"
 
 
 class _EmptyArguments(ForgeModel):
@@ -216,6 +225,7 @@ class DebuggerPlugin(ForgePlugin):
             )
         )
         self._register_tools(context)
+        self._register_apps(context)
 
     async def stop(self) -> None:
         if self._status_registry is not None:
@@ -246,6 +256,54 @@ class DebuggerPlugin(ForgePlugin):
         )
         for name, description, model, operation in contributions:
             context.tools.register(ToolContribution(name=name, description=description, input_model=model, handler=lambda arguments, m=model, op=operation, *, execution_context=None: self._dispatch(m, arguments, op, execution_context)))
+
+    @staticmethod
+    def _register_apps(context: PluginContext) -> None:
+        """Register static debugger result views without altering tool behavior."""
+        resources = (
+            (
+                DEBUGGER_SESSION_APP_URI,
+                "forgemcp_debugger_session_app",
+                "debugger-session.html",
+                "Compact read-only debugger session, breakpoint, and event view.",
+                (
+                    "debugger__status", "debugger__list_adapters", "debugger__launch", "debugger__stop",
+                    "debugger__set_breakpoints", "debugger__continue", "debugger__pause", "debugger__step_over",
+                    "debugger__step_in", "debugger__step_out", "debugger__events",
+                ),
+            ),
+            (
+                DEBUGGER_STACK_APP_URI,
+                "forgemcp_debugger_stack_app",
+                "debugger-stack.html",
+                "Compact read-only debugger thread and stack-frame view.",
+                ("debugger__threads", "debugger__stack_trace"),
+            ),
+            (
+                DEBUGGER_DATA_APP_URI,
+                "forgemcp_debugger_data_app",
+                "debugger-data.html",
+                "Compact read-only debugger scope, variable, and evaluation view.",
+                ("debugger__scopes", "debugger__variables", "debugger__evaluate"),
+            ),
+        )
+        for uri, name, asset_name, description, tool_names in resources:
+            try:
+                html = files("forgemcp.apps.assets").joinpath(asset_name).read_text(encoding="utf-8")
+            except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError) as error:
+                raise RuntimeError("Debugger App asset is unavailable.") from error
+            context.apps.register_resource(AppResourceContribution(
+                uri=uri,
+                name=name,
+                description=description,
+                html=html,
+                csp=AppCsp(connect_domains=(), resource_domains=(), frame_domains=(), base_uri_domains=()),
+                prefers_border=True,
+            ))
+            for tool_name in tool_names:
+                context.apps.bind_tool(ToolAppBinding(
+                    tool_name=tool_name, resource_uri=uri, visibility=("model", "app"),
+                ))
 
     async def _dispatch(
         self,
