@@ -32,15 +32,22 @@ Before designing or changing a module, read:
 
 ## Registration rules
 
-- MCP handlers are bound methods on a long-lived service object so intentional
-  in-memory state survives across calls.
-- Each module exposes `register(mcp)` for resources and prompts.
-- Each module with tools also exposes `register_apps(apps)`. MCP Python SDK 2.1
-  consumes Apps tools and UI resources while `MCPServer` is constructed, so this
-  phase must run first. Do not hide the ordering behind a plugin framework.
-- The protocol has one completion handler per server. Keep its explicit dispatcher
-  in `server.py`; feature services expose a `complete(...)` method when they own
-  completable prompt arguments or URI-template parameters.
+- Each module exposes one `register(mcp, apps, complete)` method. Define decorated MCP
+  tools, resources, and prompts as local entrypoint functions in that method; keep
+  reusable business operations as ordinary methods on the long-lived service object.
+- Let the SDK infer handler names, descriptions, input schemas, and structured output
+  from function names, docstrings, annotations, and return types. Supply registration
+  arguments only when they add metadata the SDK cannot infer. Do not repeat a title
+  in `ToolAnnotations`.
+- Put stable feature constants on the service class. Do not prefix public constants
+  or ordinary helper methods with an underscore.
+- The protocol has one completion handler per server. A feature registers its local
+  completion function with the `Complete` object passed to `register`.
+- MCP Python SDK 2.1 consumes Apps extensions while `MCPServer` is constructed. Keep
+  the small, explicit public-binding mount in `server.py`; do not add a plugin layer
+  to conceal that lifecycle.
+- Server instructions are the base instructions followed by the service class
+  docstrings. Write each service docstring as concise model-facing capability guidance.
 - Use stable, descriptive public names. Renaming a tool, resource URI, prompt, or
   result field is a public contract change.
 
@@ -53,9 +60,12 @@ Before designing or changing a module, read:
 - Resource-template parameters and prompt arguments should implement completions
   when the valid or useful values are enumerable. Plain static resources have no
   completion surface in MCP.
-- Widget source lives under `frontend/`; generated single-file HTML lives in the
-  owning Python feature's `assets/` directory and is committed. Never edit generated
-  HTML by hand.
+- Widget source lives under `frontend/`; generated single-file HTML lives under
+  `src/forgemcp/assets/` and is included by the wheel build. Never edit generated HTML
+  by hand.
+- Declare a widget with a package-relative `Widget("assets/<name>.html")`. Keep icons
+  as separate package files and load them through `IconFile`; never hardcode icon data
+  in Python modules.
 - Widgets register all event/request handlers before `app.connect()`, use host theme,
   font, style, and safe-area context, and load no undeclared external resources.
 - A tool's `content` must remain useful to the model and to text-only clients; a
@@ -88,13 +98,15 @@ Before designing or changing a module, read:
 ## Validation
 
 ```powershell
-npm run build --prefix frontend
+.\.venv\Scripts\python.exe -m build --wheel
 .\.venv\Scripts\python.exe -m pytest -q
 git diff --check
 ```
 
-Run the frontend build only when widget source or its dependencies changed. Ensure
-the generated HTML changed with the source and remains included in the Python wheel.
+The wheel build installs locked frontend dependencies and builds the widgets. For a
+faster frontend-only check while editing UI source, run `npm run build --prefix
+frontend`. Ensure every referenced generated HTML and icon file is present in the
+wheel.
 
 ## Documentation ownership
 

@@ -7,11 +7,7 @@ from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID
 from mcp.types import PromptReference, ResourceTemplateReference
 
 from forgemcp.server import create_server
-from forgemcp.workspace.service import (
-    INSPECT_WORKSPACE_PROMPT,
-    WORKSPACE_APP_URI,
-    WORKSPACE_FILES_URI,
-)
+from forgemcp.workspace.service import WorkspaceService
 
 
 @pytest.fixture
@@ -36,10 +32,16 @@ async def test_server_exposes_app_tool_progress_and_structured_output(tmp_path: 
         tools = await client.list_tools()
         tool = next(item for item in tools.tools if item.name == "workspace_overview")
         result = await client.call_tool("workspace_overview", {}, progress_callback=collect)
-        app = await client.read_resource(WORKSPACE_APP_URI)
+        app = await client.read_resource(WorkspaceService.WIDGET.uri)
+
+        assert WorkspaceService.__doc__ in client.instructions
 
     assert tool.meta is not None
-    assert tool.meta["ui"]["resourceUri"] == WORKSPACE_APP_URI
+    assert tool.meta["ui"]["resourceUri"] == WorkspaceService.WIDGET.uri
+    assert tool.description == "Summarize the configured C/C++ workspace without modifying it."
+    assert tool.output_schema is not None
+    assert tool.annotations is not None
+    assert tool.annotations.title is None
     assert tool.icons
     assert result.is_error is False
     assert result.structured_content is not None
@@ -57,17 +59,32 @@ async def test_server_exposes_resource_prompt_and_completions(tmp_path: Path) ->
         templates = await client.list_resource_templates()
         prompts = await client.list_prompts()
         resource_completion = await client.complete(
-            ResourceTemplateReference(uri=WORKSPACE_FILES_URI),
+            ResourceTemplateReference(uri=WorkspaceService.FILES_URI),
             {"name": "extension", "value": "cp"},
         )
         prompt_completion = await client.complete(
-            PromptReference(name=INSPECT_WORKSPACE_PROMPT),
+            PromptReference(name=WorkspaceService.PROMPT),
             {"name": "focus", "value": "to"},
         )
         resource = await client.read_resource("forgemcp://workspace/files/cpp")
 
-    assert any(item.uri_template == WORKSPACE_FILES_URI for item in templates.resource_templates)
-    assert any(item.name == INSPECT_WORKSPACE_PROMPT for item in prompts.prompts)
+    assert any(
+        item.uri_template == WorkspaceService.FILES_URI for item in templates.resource_templates
+    )
+    assert any(item.name == WorkspaceService.PROMPT for item in prompts.prompts)
     assert resource_completion.completion.values == ["cpp"]
     assert prompt_completion.completion.values == ["toolchain"]
     assert "main.cpp" in resource.contents[0].text
+
+
+@pytest.mark.anyio
+async def test_default_workspace_is_server_process_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "from-pwd.cpp").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    async with Client(create_server(), raise_exceptions=True) as client:
+        resource = await client.read_resource("forgemcp://workspace/files/cpp")
+
+    assert "from-pwd.cpp" in resource.contents[0].text

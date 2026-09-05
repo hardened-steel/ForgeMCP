@@ -7,7 +7,7 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
 ## Current MCP surface
 
 - Tool `workspace_overview` returns a typed, bounded summary of the configured
-  workspace, reports progress, carries an embedded icon, and opens an MCP App widget.
+  workspace, reports progress, carries a packaged icon, and opens an MCP App widget.
 - Resource template `forgemcp://workspace/files/{extension}` lists bounded,
   workspace-relative C/C++ file paths.
 - Prompt `inspect_cpp_workspace` starts a focused, read-only project inspection.
@@ -27,38 +27,45 @@ The server is built against MCP Python SDK `2.1.1`.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-The generated widget HTML is committed and included in the Python package. Rebuild it
-after changing files under `frontend/`:
+## Build
+
+One command installs the locked frontend dependencies, builds every widget, and
+creates the Python wheel with its HTML and icon assets:
 
 ```powershell
-npm ci --prefix frontend
-npm run build --prefix frontend
+.\.venv\Scripts\python.exe -m build --wheel
 ```
+
+The wheel is written to `dist/`. Generated HTML under `src/forgemcp/assets/` is build
+output; change its source under `frontend/`, never the HTML directly.
 
 ## Run
 
-Run against the included C++ acceptance project:
+Run against the current directory:
+
+```powershell
+.\.venv\Scripts\forgemcp.exe
+```
+
+Pass `--workspace` only when the target differs from the server process working
+directory:
 
 ```powershell
 .\.venv\Scripts\forgemcp.exe --workspace examples/cpp-acceptance-project
 ```
 
-For interactive development with MCP Inspector:
-
-```powershell
-$env:FORGEMCP_WORKSPACE = "examples/cpp-acceptance-project"
-.\.venv\Scripts\mcp.exe dev src/forgemcp/server.py
-```
+In VS Code, the `ForgeMCP: server` launch configuration is the one-button path: it
+builds the wheel first and then starts the server for this repository.
 
 All MCP traffic uses stdout. Operational logs must go to stderr.
 
 ## Verify
 
 ```powershell
-npm run build --prefix frontend
+.\.venv\Scripts\python.exe -m build --wheel
 .\.venv\Scripts\python.exe -m pytest -q
 git diff --check
 ```

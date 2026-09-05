@@ -201,7 +201,7 @@ cython_debug/
 #   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, you
 #   could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
@@ -221,6 +221,7 @@ __marimo__/
 
 # ForgeMCP development artifacts
 /frontend/node_modules/
+/src/forgemcp/assets/*.html
 /examples/cpp-acceptance-project/build*/
 /examples/cpp-acceptance-project/out/
 /examples/cpp-acceptance-project/**/compile_commands.json

@@ -15,11 +15,14 @@ adapter hierarchy. Add one only when concrete behavior makes it necessary.
 
 ```text
 src/forgemcp/
-  server.py                     # composition, CLI, MCPServer
+  server.py                     # composition root, CLI, MCPServer
+  assets.py                     # package-relative Widget and IconFile helpers
+  completion.py                 # one server-wide completion dispatcher
+  assets/*.html                 # generated single-file widgets
+  icons/*                       # source icon files packaged with the server
   <feature>/
     service.py                  # business logic, service class, MCP handlers
     errors.py                   # expected feature errors
-    assets/*.html               # generated single-file widgets
 tests/
   <feature>/test_service.py     # direct business behavior
   test_server.py                # MCP surface and protocol behavior
@@ -40,16 +43,21 @@ interfaces and factories for hypothetical parsers or kit providers.
 1. Resolve operator configuration such as the workspace root.
 2. Construct long-lived feature services and pass dependencies explicitly.
 3. Create one `Apps` instance.
-4. Call `register_apps(apps)` on every service that owns tools and widgets.
-5. Construct `MCPServer(extensions=[apps])`.
-6. Call `register(mcp)` for ordinary resources and prompts.
-7. Register the one server-wide completion dispatcher, delegating explicitly to the
-   services that own the referenced prompt or URI template.
-8. Run the selected transport; stdio is the default.
+4. Create one `Complete` completion collector.
+5. Construct `MCPServer(extensions=[apps])`, composing its instructions from the base
+   text and every service class docstring.
+6. Call each service's single `register(mcp, apps, complete)` method.
+7. Mount the validated Apps tools and resources through their public bindings and
+   register the one server-wide completion handler.
+8. Run the selected transport; stdio is the default and the workspace defaults to the
+   server process working directory.
 
-Steps 3-6 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
-construction and consumes the Apps tool/resource bindings at that point. A generic
-registrar would only conceal this lifecycle.
+Steps 3-7 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
+construction and consumes their bindings at that point. The empty `Apps` extension is
+therefore supplied to the constructor for capability negotiation, then the bindings
+collected by service registration are mounted through the SDK's public APIs. This
+keeps one feature registration method without a generic plugin framework or private
+SDK access.
 
 A service may depend on another service, but receives it in `__init__`. It never
 creates that dependency itself. This keeps tests local and makes application state
@@ -61,23 +69,28 @@ A typical feature has these methods:
 
 ```python
 class ExampleService:
+    """Describe this feature for the model-facing server instructions."""
+
+    WIDGET = Widget("assets/example.html")
+    ICON = IconFile("icons/example.svg")
+
     def __init__(self, dependency: DependencyService) -> None: ...
 
     def business_operation(self, ...) -> Result: ...
 
-    async def example_tool(self, ..., ctx: Context) -> Result: ...
-
-    def register_apps(self, apps: Apps) -> None: ...
-
-    def register(self, mcp: MCPServer) -> None: ...
-
-    async def complete(self, ref, argument, context) -> Completion | None: ...
+    def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
+        @apps.tool(resource_uri=self.WIDGET.uri, icons=[self.ICON.icon])
+        async def example_tool(value: str, ctx: Context) -> Result:
+            """Describe the tool; the SDK infers its public metadata and schema."""
+            ...
 ```
 
-Only methods that the feature actually needs are present. `register_apps` uses bound
-tool methods, preserving intentional service state between calls. `register` owns
-resources and prompts. `complete` only handles references owned by the feature and
-returns `None` for everything else.
+Only methods that the feature actually needs are present. The nested MCP entrypoints
+close over the long-lived service instance, so intentional state survives calls while
+the class remains focused on reusable business operations. The SDK derives names,
+descriptions, schemas, and structured output from the entrypoint signatures and
+docstrings. A local completion function returns `None` for references the feature does
+not own and is added to the shared `Complete` collector.
 
 ## Current MCP surface
 
@@ -119,14 +132,16 @@ complete for the model and text-only clients.
 
 Widget source imports `@modelcontextprotocol/ext-apps`, installs handlers before
 connecting, and reacts to host theme, style variables, fonts, and safe-area insets.
-Vite plus `vite-plugin-singlefile` produces a self-contained HTML document under the
-owning feature's Python package. The build artifact is committed so installing and
-running ForgeMCP requires Python only. The frontend lockfile controls reproducible UI
-builds.
+Vite plus `vite-plugin-singlefile` produces self-contained HTML under
+`src/forgemcp/assets/`. `Widget` locates it relative to the installed package. The
+Hatch wheel hook runs `npm ci` and the frontend build, then includes generated assets
+even when they are ignored as build output. The frontend lockfile controls reproducible
+UI builds.
 
-Icons are MCP metadata. Embedded `data:` SVG icons avoid network access; each tool
-must still choose an icon that identifies its operation rather than relying only on the
-server logo.
+Icons are separate files under `src/forgemcp/icons/`. `IconFile` converts a packaged
+file to portable `data:` metadata at runtime, preserving offline operation without
+hardcoded blobs in Python. Each tool still chooses an icon that identifies its
+operation rather than relying only on the server logo.
 
 ## Errors and trust boundaries
 
@@ -150,9 +165,11 @@ icons, progress, structured output, resources, prompts, and completions. The inc
 C++ project is reserved for integration and acceptance checks against real CMake,
 compilers, clangd, sanitizers, and debuggers.
 
-Widget changes must pass `npm run build --prefix frontend`; Python changes must pass
-`.\.venv\Scripts\python.exe -m pytest -q`. Packaging changes must also build a wheel
-and verify that every referenced widget HTML file is present in it.
+`.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
+frontend and Python wheel together. Python changes must also pass
+`.\.venv\Scripts\python.exe -m pytest -q`, and the built wheel must contain every
+referenced widget and icon. VS Code's `ForgeMCP: server` launch configuration invokes
+the build task before starting the server.
 
 ## Expected next modules
 
