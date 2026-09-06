@@ -6,6 +6,7 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 const widgets = {
   workspace: "workspace-overview",
   process: "process-overview",
+  toolsets: "toolsets",
 };
 
 export default defineConfig(({ mode }) => {
@@ -14,7 +15,7 @@ export default defineConfig(({ mode }) => {
     plugins: [viteSingleFile()],
     build: {
       outDir: fileURLToPath(new URL("../src/forgemcp/assets", import.meta.url)),
-      emptyOutDir: mode !== "process",
+      emptyOutDir: mode === "workspace",
       rollupOptions: {
         input: fileURLToPath(new URL(`${widget}.html`, import.meta.url)),
       },

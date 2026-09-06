@@ -6,6 +6,8 @@ ForgeMCP is intentionally at foundation stage. The `workspace` feature proves th
 module and registration pattern. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface before CMake, clangd, quality, and debugger behavior is added.
+The `toolchain` service discovers independent toolsets once at startup and exposes
+their paths and versions through a cache and read-only MCP surface.
 
 The design goal is a small composition root plus independent feature services. There
 is no plugin system, service locator, event bus, repository layer, or transport-neutral
@@ -27,6 +29,14 @@ src/forgemcp/
     service.py                  # subprocess lifecycle, streams, state, MCP inspection
     models.py                   # session results and MCP-facing process state
     errors.py                   # expected process failures
+  toolchain/
+    service.py                  # immutable cache, Python API, MCP registration
+    discovery.py                # provider orchestration and version probes
+    loader.py                   # deterministic pkgutil built-in enumeration
+    spec.py                     # toolsets, specs, commands, async parser execution
+    errors.py                   # expected configuration and command errors
+    providers/                  # system PATH, explicit CLI, Visual Studio layouts
+    tools/                      # one unbound SPEC per built-in module
 tests/
   conftest.py                   # isolated copy of the C++ acceptance workspace
   <feature>/test_service.py     # direct business behavior
@@ -56,8 +66,9 @@ interfaces and factories for hypothetical parsers or kit providers.
 7. Mount the validated Apps tools and resources through their public bindings and
    register the one server-wide completion handler.
 8. Run the selected transport; stdio is the default and the workspace defaults to the
-   server process working directory. The server lifespan closes remaining managed
-   processes during shutdown.
+   server process working directory. Before accepting requests, the server lifespan
+   awaits toolchain discovery; it closes remaining managed processes during shutdown,
+   including when discovery fails.
 
 Steps 3-7 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
 construction and consumes their bindings at that point. The empty `Apps` extension is
@@ -134,9 +145,15 @@ the only MCP primitives that support completion; static resources do not.
 ## External process execution
 
 `ProcessService` is the only module that calls `asyncio.create_subprocess_exec`.
-Feature services receive it through constructor injection, select trusted executables,
-and construct explicit argument lists. ForgeMCP never invokes a shell and does not
-expose a generic command-execution MCP tool.
+Feature services receive it through constructor injection, select executables, and
+construct explicit argument lists. Exec mode remains the default. Optional
+`shell=True` formats the executable and arguments for the native shell; process
+records retain the original executable, argument list, and shell flag. ForgeMCP does
+not expose a generic command-execution MCP tool.
+
+`start`, `start_protocol`, and `launch` support `inherit_environment=True`, which
+copies the server environment then overlays `env`. With `False`, only `env` is passed
+to the child. No environment values are added to operational lifecycle logs.
 
 The process module provides two concrete consumption modes:
 
@@ -181,6 +198,65 @@ IDs. The resource exposes detailed state and the complete text transcript; it ca
 start or stop a process. A well-formed URI whose process ID is not retained raises
 `ResourceNotFoundError`; other unexpected exceptions remain unwrapped so the SDK
 sanitizes them as resource crashes.
+
+## Toolset discovery and command execution
+
+`ProcessService -> ToolchainService` is wired explicitly in `server.py`. The lifespan
+awaits `ToolchainService.initialize()` before requests; an initialization lock prevents
+duplicate discovery. A complete sorted tuple is published atomically and retained
+for the server lifetime. There is no automatic refresh, watcher, global selection,
+service locator, or plugin framework.
+
+`loader.py` enumerates `forgemcp.toolchain.tools` with `pkgutil.iter_modules`, skips
+private names, sorts module names, and requires exactly one valid unbound `SPEC` per
+module. Duplicate logical names and invalid modules raise domain errors. Adding a
+built-in module automatically enables system and user discovery; VS-specific paths
+are added only in the VS provider.
+
+Providers own platform policy. System uses executable PATH lookup, including OS
+suffix handling, and creates one possibly empty toolset. Visual Studio uses the
+Installer's `vswhere`, checks shallow known installation layouts without PE inspection,
+and captures each instance's `VsDevCmd` environment through `cmd /c call ... && set`.
+The entire mapping is retained without an allowlist or per-value limits. Every such
+process uses `ProcessService`; its complete output remains in the normal transcript.
+One broken instance cannot suppress others. A failed environment capture leaves that
+instance visible with no bound tools, avoiding execution with an incorrect environment.
+
+Repeated CLI definitions are validated before discovery launches processes. Names
+and tool keys cannot repeat; paths must identify executable files, including inside
+the workspace. User toolsets inherit the server environment and never fall back to
+PATH on configuration errors. All version commands run through bound specs; failed
+or unrecognized versions remain null without removing found executables.
+
+`Toolset` and `ToolSpec` are frozen dataclasses with read-only mapping snapshots.
+Toolsets retain only their own bound specs and environment. The public Pydantic
+summaries/details are fresh views that omit environment and expose absolute paths.
+`list_toolsets()` and `get_toolset(id)` serve MCP; future feature services use
+`resolve_toolset(id)` and `get_tool(id, name)` with an explicitly supplied toolset ID.
+There are no `selected`, `current`, or `preferred` fields.
+
+`ToolCommand` separates a synchronous keyword argument builder from execution. Binding
+creates a new command with the executable, ProcessService, parser, and toolset
+environment. Commands and parsers use arbitrary string keys. Built-ins currently
+provide version probes; `cppvsdbg` deliberately has none. Parser helpers remain
+platform-independent and consume tagged stdout/stderr incrementally.
+
+`CommandExecution` launches lazily once, supports both `await` and `async for`, and
+retains `parsed_result` plus the terminal `process_result`. Its single event consumer
+receives live parser events through a bounded queue. Await-only execution discards
+events; events are not replayed as a second transcript. After streaming,
+`await execution.result()` returns the same cached result. Early parser completion
+still drains both pipes, and successful parsing never hides process failure. Parser
+exceptions name the command without copying output into errors. Cancellation and
+early closure of the event iterator terminate the managed process.
+
+`toolsets_list` returns summaries (the SDK wraps a list in `structuredContent.result`),
+and `toolset_get` returns one details object. Both report progress and carry read-only
+annotations, icons, Apps metadata, and SDK text fallback. The toolsets widget requests
+cached details when the user chooses an item; this UI choice never sets server-wide
+state. The static list resource and details template return markdown, and completion
+offers cached toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
+the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 
 ## MCP Apps and widget packaging
 

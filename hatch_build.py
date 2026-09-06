@@ -18,6 +18,7 @@ class CustomBuildHook(BuildHookInterface):
         outputs = [
             Path(self.root) / "src" / "forgemcp" / "assets" / "workspace-overview.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "process-overview.html",
+            Path(self.root) / "src" / "forgemcp" / "assets" / "toolsets.html",
         ]
         artifacts = build_data.setdefault("artifacts", [])
         if not isinstance(artifacts, list):

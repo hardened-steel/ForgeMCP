@@ -63,6 +63,7 @@ class ProcessSummary(BaseModel):
     )
     executable: str = Field(description="Executable requested by the owning service.")
     arguments: list[str] = Field(description="Arguments passed to the executable.")
+    shell: bool = Field(description="Whether the command runs through the native shell.")
     cwd: str = Field(description="Process working directory.")
     status: ProcessStatus = Field(description="Current process lifecycle state.")
     started_at: datetime = Field(description="UTC start timestamp.")

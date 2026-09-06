@@ -15,6 +15,17 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_discovery(monkeypatch):
+    """Workspace protocol tests must not depend on host installations."""
+    from forgemcp.toolchain import discovery
+    from forgemcp.toolchain.providers import visual_studio
+    monkeypatch.setattr(discovery, "load_tools", lambda: ())
+    async def no_visual_studio(*args):
+        return ()
+    monkeypatch.setattr(visual_studio, "discover", no_visual_studio)
+
+
 @pytest.mark.anyio
 async def test_server_exposes_app_tool_progress_and_structured_output(
     cpp_acceptance_project: Path,

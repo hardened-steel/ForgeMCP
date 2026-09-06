@@ -14,21 +14,29 @@ from mcp.server.apps import Apps
 from forgemcp import __version__
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
+from forgemcp.toolchain.errors import ToolchainError
+from forgemcp.toolchain.loader import load_tools
+from forgemcp.toolchain.providers.user import parse_toolsets
+from forgemcp.toolchain.service import ToolchainService
 from forgemcp.workspace.service import WorkspaceService
 
 
-def create_server(workspace_root: Path | None = None) -> MCPServer:
+def create_server(
+    workspace_root: Path | None = None, *, toolsets: list[list[str]] | None = None,
+) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
     root = workspace_root or Path.cwd()
     processes = ProcessService(root)
+    toolchains = ToolchainService(processes, toolsets or ())
     workspace = WorkspaceService(root)
-    services = (workspace, processes)
+    services = (workspace, processes, toolchains)
     apps = Apps()
     complete = Complete()
 
     @asynccontextmanager
     async def lifespan(_: MCPServer) -> AsyncIterator[dict[str, object]]:
         try:
+            await toolchains.initialize()
             yield {}
         finally:
             await processes.close()
@@ -68,8 +76,8 @@ def create_server(workspace_root: Path | None = None) -> MCPServer:
 mcp = create_server()
 
 
-def main() -> None:
-    """Run ForgeMCP over stdio."""
+def argument_parser() -> argparse.ArgumentParser:
+    """Build the operator CLI, including repeated independent toolsets."""
     parser = argparse.ArgumentParser(description="ForgeMCP C/C++ development server")
     parser.add_argument(
         "--workspace",
@@ -77,8 +85,20 @@ def main() -> None:
         default=Path.cwd(),
         help="Workspace root (defaults to the server process working directory).",
     )
+    parser.add_argument("--toolset", action="append", nargs="+", default=[],
+                        metavar="NAME_OR_TOOL=PATH", help="NAME TOOL=PATH [...]; repeat for each toolset.")
+    return parser
+
+
+def main() -> None:
+    """Run ForgeMCP over stdio."""
+    parser = argument_parser()
     arguments = parser.parse_args()
-    create_server(arguments.workspace).run(transport="stdio")
+    try:
+        parse_toolsets(arguments.toolset, load_tools())
+    except ToolchainError as error:
+        parser.error(str(error))
+    create_server(arguments.workspace, toolsets=arguments.toolset).run(transport="stdio")
 
 
 if __name__ == "__main__":

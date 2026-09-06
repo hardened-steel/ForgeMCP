@@ -7,6 +7,8 @@ import codecs
 import locale
 import logging
 import os
+import re
+import shlex
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -60,6 +62,7 @@ class ProcessRecord:
     process_id: str
     executable: str
     arguments: tuple[str, ...]
+    shell: bool
     cwd: Path
     encoding: str
     encoding_errors: Literal["strict", "replace"]
@@ -119,6 +122,8 @@ class ProcessService:
         *,
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
+        shell: bool = False,
+        inherit_environment: bool = True,
         encoding: str | None = None,
         encoding_errors: Literal["strict", "replace"] = "replace",
         timeout: float | None = None,
@@ -130,6 +135,8 @@ class ProcessService:
             arguments,
             cwd=cwd,
             env=env,
+            shell=shell,
+            inherit_environment=inherit_environment,
             encoding=encoding,
             encoding_errors=encoding_errors,
             timeout=timeout,
@@ -146,6 +153,8 @@ class ProcessService:
         *,
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
+        shell: bool = False,
+        inherit_environment: bool = True,
         encoding: str | None = None,
         encoding_errors: Literal["strict", "replace"] = "replace",
         raw_stdout: bool = False,
@@ -158,6 +167,8 @@ class ProcessService:
             arguments,
             cwd=cwd,
             env=env,
+            shell=shell,
+            inherit_environment=inherit_environment,
             encoding=encoding,
             encoding_errors=encoding_errors,
             timeout=timeout,
@@ -180,6 +191,8 @@ class ProcessService:
         timeout_mode: ProcessTimeoutMode,
         read_mode: ProcessReadMode,
         raw_stdout: bool,
+        shell: bool = False,
+        inherit_environment: bool = True,
     ) -> ProcessRecord:
         """Create and begin tracking one subprocess."""
         if timeout is not None and timeout <= 0:
@@ -207,6 +220,7 @@ class ProcessService:
             process_id=process_id,
             executable=str(executable),
             arguments=tuple(arguments),
+            shell=shell,
             cwd=working_directory,
             encoding=selected_encoding,
             encoding_errors=encoding_errors,
@@ -223,21 +237,31 @@ class ProcessService:
         )
         self.records[process_id] = record
 
-        child_environment = None
-        if env is not None:
-            child_environment = os.environ.copy()
-            child_environment.update(env)
+        child_environment = os.environ.copy() if inherit_environment else {}
+        child_environment.update(env or {})
 
+        cancelled_during_launch = False
         try:
-            process = await asyncio.create_subprocess_exec(
-                record.executable,
-                *record.arguments,
+            launch = asyncio.create_subprocess_shell if shell else asyncio.create_subprocess_exec
+            argv = (
+                (self.format_command(record.executable, record.arguments),)
+                if shell else (record.executable, *record.arguments)
+            )
+            launch_task = asyncio.create_task(launch(
+                *argv,
                 cwd=record.cwd,
                 env=child_environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-            )
+            ))
+            try:
+                process = await asyncio.shield(launch_task)
+            except asyncio.CancelledError:
+                # A process can exist before asyncio returns its transport. Finish
+                # acquiring it so cancellation cannot orphan a starting child.
+                cancelled_during_launch = True
+                process = await asyncio.shield(launch_task)
         except (OSError, ValueError) as error:
             record.status = ProcessStatus.FAILED
             record.error = f"{type(error).__name__}: {error}"
@@ -257,7 +281,30 @@ class ProcessService:
             record.timeout_task = asyncio.create_task(self.watch_timeout(record))
 
         logger.info("Process %s started", record.process_id)
+        if cancelled_during_launch:
+            await asyncio.shield(self.stop_record(record, ProcessStatus.TERMINATED))
+            raise asyncio.CancelledError
         return record
+
+    @staticmethod
+    def format_command(executable: str | Path, arguments: Sequence[str]) -> str:
+        """Quote argv for the native shell, preserving the original record fields."""
+        argv = [str(executable), *arguments]
+        if os.name != "nt":
+            return shlex.join(argv)
+        # CRT argv quoting, then cmd escaping. Quoting alone doesn't protect a
+        # percent expansion or a metacharacter following an embedded quote.
+        quoted = []
+        for value in argv:
+            if not quoted:
+                quoted.append(re.sub(r'([()%!^"<>&|\s])', r'^\1', '"' + value + '"'))
+                continue
+            item = re.sub(r'(\\*)"', lambda match: match[1] * 2 + '\\"', value)
+            item = re.sub(r'(\\+)$', lambda match: match[1] * 2, item)
+            item = '"' + item + '"'
+            item = re.sub(r'([()%!^"<>&|])', r'^\1', item)
+            quoted.append(item)
+        return " ".join(quoted)
 
     async def read_pipe(
         self,
@@ -551,6 +598,7 @@ class ProcessService:
             pid=record.pid,
             executable=record.executable,
             arguments=list(record.arguments),
+            shell=record.shell,
             cwd=str(record.cwd),
             status=record.status,
             started_at=record.started_at,
