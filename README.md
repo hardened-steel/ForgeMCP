@@ -12,14 +12,21 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
   workspace-relative C/C++ file paths.
 - Prompt `inspect_cpp_workspace` starts a focused, read-only project inspection.
 - Completions suggest supported resource extensions and prompt focus values.
+- Tool `processes_overview` shows running and completed external development tools.
+- Resource template `forgemcp://processes/{process_id}` exposes the retained state and
+  text transcript of one process.
 
-The tool remains useful in clients without MCP Apps support because the Python SDK
-serializes its typed result into both text `content` and `structuredContent`.
+The tools remain useful in clients without MCP Apps support because the Python SDK
+serializes their typed results into both text `content` and `structuredContent`.
+
+ForgeMCP does not expose arbitrary command execution over MCP. Feature services use
+the shared process service internally; its public MCP surface is read-only.
 
 ## Requirements
 
 - Python 3.11 or newer
-- Node.js `^20.19.0` or `>=22.12.0` only when changing widgets
+- Node.js `^20.19.0` or `>=22.12.0` for clean editable installs, wheel builds,
+  and widget development
 
 The server is built against MCP Python SDK `2.1.1`.
 

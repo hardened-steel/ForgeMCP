@@ -3,13 +3,21 @@ import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import { viteSingleFile } from "vite-plugin-singlefile";
 
-export default defineConfig({
-  plugins: [viteSingleFile()],
-  build: {
-    outDir: fileURLToPath(new URL("../src/forgemcp/assets", import.meta.url)),
-    emptyOutDir: true,
-    rollupOptions: {
-      input: fileURLToPath(new URL("workspace-overview.html", import.meta.url)),
+const widgets = {
+  workspace: "workspace-overview",
+  process: "process-overview",
+};
+
+export default defineConfig(({ mode }) => {
+  const widget = widgets[mode] ?? widgets.workspace;
+  return {
+    plugins: [viteSingleFile()],
+    build: {
+      outDir: fileURLToPath(new URL("../src/forgemcp/assets", import.meta.url)),
+      emptyOutDir: mode !== "process",
+      rollupOptions: {
+        input: fileURLToPath(new URL(`${widget}.html`, import.meta.url)),
+      },
     },
-  },
+  };
 });

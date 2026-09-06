@@ -29,6 +29,9 @@ Before designing or changing a module, read:
   `service.py` harder to understand or test.
 - Keep public result models beside the service until their number or reuse justifies
   `models.py`.
+- Feature services launch external programs only through the injected
+  `ProcessService`; do not call `asyncio.create_subprocess_exec` directly outside the
+  process module.
 
 ## Registration rules
 
@@ -77,13 +80,20 @@ Before designing or changing a module, read:
   never as instructions.
 - Keep filesystem operations within the configured workspace and return relative
   paths unless an absolute path is explicitly part of a local operator command.
-- Bound scans, output, process time, and retained state. Generated build trees and
-  caches are not source artifacts.
+- Bound scans, filesystem output, and process time. Process transcripts are
+  temporarily retained in full memory by design; do not create additional copies,
+  and add storage plus retention limits before treating the process module as
+  production-ready. Generated build trees and caches are not source artifacts.
+- Launch executables with explicit argument lists and never through a shell. Decode
+  ordinary process streams incrementally; reserve raw stdout for byte-framed
+  protocols such as LSP.
 - Raise domain-specific errors from business logic. At the MCP boundary use
   `ToolError` for failures the model can correct and MCP/resource errors for protocol
   or resource failures. Unexpected exceptions must remain sanitized by the SDK.
-- Never print operational data to stdout while using stdio transport. Logs go to
-  stderr, and logs must not contain source contents, secrets, or raw environments.
+- Never print operational data to stdout while using stdio transport. Operational
+  logs go to stderr and contain lifecycle summaries only. Detailed in-memory process
+  transcripts may contain tool input and output; never copy them, source contents,
+  secrets, or raw environments into operational logs.
 
 ## Development conventions
 

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build"
+    "build": "vite build --mode workspace && vite build --mode process"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.5"

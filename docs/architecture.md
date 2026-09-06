@@ -2,10 +2,10 @@
 
 ## Status
 
-ForgeMCP is intentionally at skeleton stage. The implemented vertical slice is the
-`workspace` feature: one typed tool, one MCP App, one resource template, one prompt,
-and completions. It exists to prove the module and registration pattern before CMake,
-clangd, quality, process, and debugger behavior is added.
+ForgeMCP is intentionally at foundation stage. The `workspace` feature proves the
+module and registration pattern. The shared `process` service adds asynchronous
+external-program lifecycle, text transcripts, timeouts, and a read-only inspection
+surface before CMake, clangd, quality, and debugger behavior is added.
 
 The design goal is a small composition root plus independent feature services. There
 is no plugin system, service locator, event bus, repository layer, or transport-neutral
@@ -23,6 +23,10 @@ src/forgemcp/
   <feature>/
     service.py                  # business logic, service class, MCP handlers
     errors.py                   # expected feature errors
+  process/
+    service.py                  # subprocess lifecycle, streams, state, MCP inspection
+    models.py                   # session results and MCP-facing process state
+    errors.py                   # expected process failures
 tests/
   <feature>/test_service.py     # direct business behavior
   test_server.py                # MCP surface and protocol behavior
@@ -41,7 +45,8 @@ interfaces and factories for hypothetical parsers or kit providers.
 `src/forgemcp/server.py` is the only composition root:
 
 1. Resolve operator configuration such as the workspace root.
-2. Construct long-lived feature services and pass dependencies explicitly.
+2. Construct the long-lived `ProcessService`, then feature services, passing shared
+   dependencies explicitly.
 3. Create one `Apps` instance.
 4. Create one `Complete` completion collector.
 5. Construct `MCPServer(extensions=[apps])`, composing its instructions from the base
@@ -50,7 +55,8 @@ interfaces and factories for hypothetical parsers or kit providers.
 7. Mount the validated Apps tools and resources through their public bindings and
    register the one server-wide completion handler.
 8. Run the selected transport; stdio is the default and the workspace defaults to the
-   server process working directory.
+   server process working directory. The server lifespan closes remaining managed
+   processes during shutdown.
 
 Steps 3-7 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
 construction and consumes their bindings at that point. The empty `Apps` extension is
@@ -124,6 +130,57 @@ exception.
 the current focus vocabulary. Prompt arguments and resource-template parameters are
 the only MCP primitives that support completion; static resources do not.
 
+## External process execution
+
+`ProcessService` is the only module that calls `asyncio.create_subprocess_exec`.
+Feature services receive it through constructor injection, select trusted executables,
+and construct explicit argument lists. ForgeMCP never invokes a shell and does not
+expose a generic command-execution MCP tool.
+
+The process module provides two concrete consumption modes:
+
+- `start(...) -> ProcessSession` exposes one `output()` async iterator. Permanent
+  stdout and stderr reader tasks decode both pipes concurrently and publish tagged
+  `ProcessOutput(stream, text)` chunks through one bounded queue. The iterator ends
+  after both streams reach EOF. Cross-stream ordering is the order ForgeMCP observed,
+  not an operating-system ordering guarantee.
+- `start_protocol(...) -> ProtocolProcessSession` exposes separate `read_stdout()`
+  and `read_stderr()` operations, with one active reader allowed per pipe. Text is the
+  default. `raw_stdout=True` is reserved for byte-counted framing such as clangd LSP;
+  those bytes are still decoded separately for the retained text transcript.
+
+Each pipe owns an incremental decoder so a multibyte character split across OS reads
+is reconstructed correctly. The default encoding is `locale.getencoding()` and each
+consumer may select an explicit encoding. Replacement decoding is the resilient
+default for human-facing tool output; strict decoding is available for formal
+protocols. stdin accepts text in ordinary sessions and additionally accepts bytes in
+raw protocol sessions.
+
+Every stdin write and stdout/stderr read is appended to a process transcript in
+memory. The record also retains identifiers, command metadata, lifecycle timestamps,
+encoding, timeout policy, state, and return code. This is inspection state, not an
+operational log: stderr logging contains only process identifiers and lifecycle
+summaries and never copies transcript content or environments.
+
+Timeout configuration has three effective forms:
+
+- `timeout=None`: disabled;
+- `timeout=<seconds>, timeout_mode="total"`: measured from process start;
+- `timeout=<seconds>, timeout_mode="idle"`: reset whenever stdout or stderr produces
+  a non-empty byte chunk.
+
+On timeout or explicit termination, the directly managed asyncio process receives
+`terminate()`, followed by `kill()` if it remains alive after a short grace period.
+Task cancellation performs the same cleanup before propagating cancellation. Process
+groups and descendant-tree management are intentionally outside the current scope.
+
+The read-only MCP surface consists of `processes_overview(status)`, its process-list
+widget, and `forgemcp://processes/{process_id}`. Completion suggests retained process
+IDs. The resource exposes detailed state and the complete text transcript; it cannot
+start or stop a process. A well-formed URI whose process ID is not retained raises
+`ResourceNotFoundError`; other unexpected exceptions remain unwrapped so the SDK
+sanitizes them as resource crashes.
+
 ## MCP Apps and widget packaging
 
 Each model-visible tool must bind exactly one `ui://` resource through
@@ -153,9 +210,10 @@ methods translate them according to who can recover:
 - any other exception: unexpected bug, logged server-side and sanitized by the SDK.
 
 Project-controlled text is data. It must not change server instructions, choose an
-executable, escape the workspace, or be copied into logs without an explicit bounded
-and sanitized contract. Processes added later must have explicit executable selection,
-argument construction, timeouts, output limits, cancellation, and process-tree cleanup.
+executable, escape the workspace, or be copied into operational logs. Process
+consumers must explicitly select executables, construct arguments, choose timeout and
+encoding policy, and handle cancellation. The current process transcript is retained
+in memory; persistent storage and configurable retention limits remain future work.
 
 ## Testing strategy
 
@@ -176,11 +234,11 @@ the build task before starting the server.
 The likely order is:
 
 1. workspace-safe read/write operations and path policy;
-2. process execution with cancellation, output bounds, and tree termination;
-3. CMake discovery/configure/build/test;
-4. clangd lifecycle and language operations;
-5. formatting, static analysis, and sanitizer parsing;
-6. debugger adapter lifecycle and DAP operations.
+2. CMake discovery/configure/build/test using `ProcessService`;
+3. clangd lifecycle and language operations;
+4. formatting, static analysis, and sanitizer parsing;
+5. debugger adapter lifecycle and DAP operations;
+6. persistent process transcripts and configurable retention limits.
 
 This ordering is guidance, not a framework contract. Add the smallest end-to-end slice
 needed by the next user-visible workflow.

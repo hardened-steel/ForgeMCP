@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import inspect
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -11,15 +13,25 @@ from mcp.server.apps import Apps
 
 from forgemcp import __version__
 from forgemcp.completion import Complete
+from forgemcp.process.service import ProcessService
 from forgemcp.workspace.service import WorkspaceService
 
 
 def create_server(workspace_root: Path | None = None) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
-    workspace = WorkspaceService(workspace_root or Path.cwd())
-    services = (workspace,)
+    root = workspace_root or Path.cwd()
+    processes = ProcessService(root)
+    workspace = WorkspaceService(root)
+    services = (workspace, processes)
     apps = Apps()
     complete = Complete()
+
+    @asynccontextmanager
+    async def lifespan(_: MCPServer) -> AsyncIterator[dict[str, object]]:
+        try:
+            yield {}
+        finally:
+            await processes.close()
 
     service_instructions = [inspect.getdoc(type(service)) for service in services]
     instructions = "\n\n".join(
@@ -36,6 +48,7 @@ def create_server(workspace_root: Path | None = None) -> MCPServer:
         version=__version__,
         icons=[WorkspaceService.ICON.icon],
         extensions=[apps],
+        lifespan=lifespan,
     )
 
     for service in services:

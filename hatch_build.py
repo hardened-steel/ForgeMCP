@@ -15,13 +15,16 @@ class CustomBuildHook(BuildHookInterface):
 
     def initialize(self, version: str, build_data: dict[str, object]) -> None:
         frontend = Path(self.root) / "frontend"
-        output = Path(self.root) / "src" / "forgemcp" / "assets" / "workspace-overview.html"
+        outputs = [
+            Path(self.root) / "src" / "forgemcp" / "assets" / "workspace-overview.html",
+            Path(self.root) / "src" / "forgemcp" / "assets" / "process-overview.html",
+        ]
         artifacts = build_data.setdefault("artifacts", [])
         if not isinstance(artifacts, list):
             raise TypeError("Hatch build data 'artifacts' must be a list.")
         artifacts.append("src/forgemcp/assets/*.html")
 
-        if version == "editable" and output.is_file():
+        if version == "editable" and all(output.is_file() for output in outputs):
             return
 
         command = "npm.cmd" if os.name == "nt" else "npm"
@@ -31,5 +34,6 @@ class CustomBuildHook(BuildHookInterface):
 
         subprocess.run([npm, "ci", "--no-audit", "--no-fund"], cwd=frontend, check=True)
         subprocess.run([npm, "run", "build"], cwd=frontend, check=True)
-        if not output.is_file():
-            raise RuntimeError(f"Frontend build did not produce {output}.")
+        missing = [str(output) for output in outputs if not output.is_file()]
+        if missing:
+            raise RuntimeError(f"Frontend build did not produce: {', '.join(missing)}.")
