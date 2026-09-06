@@ -5,6 +5,9 @@ It is deliberately portable across MSVC, Clang, and GCC and requires CMake 3.23
 or newer.  Never use it as a real user project and do not commit generated build
 trees, `compile_commands.json`, binaries, PDBs, or clangd caches.
 
+Pytest copies this entire directory into a fresh temporary workspace through the
+`cpp_acceptance_project` fixture. Tests must modify the copy, never this source tree.
+
 The normal path is `cmake --preset ninja-debug`, followed by
 `cmake --build --preset build-ninja-debug` and `ctest --preset test-ninja-debug`.
 In ForgeMCP, select a discovered kit with `cmake__list_kits` /

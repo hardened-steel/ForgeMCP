@@ -28,6 +28,7 @@ src/forgemcp/
     models.py                   # session results and MCP-facing process state
     errors.py                   # expected process failures
 tests/
+  conftest.py                   # isolated copy of the C++ acceptance workspace
   <feature>/test_service.py     # direct business behavior
   test_server.py                # MCP surface and protocol behavior
 frontend/
@@ -217,11 +218,17 @@ in memory; persistent storage and configurable retention limits remain future wo
 
 ## Testing strategy
 
-Business tests call service methods directly with temporary workspaces. Protocol tests
-use the SDK's in-process `Client` and assert the public contract: schemas, Apps metadata,
-icons, progress, structured output, resources, prompts, and completions. The included
-C++ project is reserved for integration and acceptance checks against real CMake,
-compilers, clangd, sanitizers, and debuggers.
+Business tests call service methods directly. The function-scoped
+`cpp_acceptance_project` fixture copies the complete
+`examples/cpp-acceptance-project/` tree into pytest's `tmp_path`, giving every test an
+independent workspace it may modify. Existing scenarios should use this shared fixture
+instead of constructing ad-hoc C++ directory trees.
+
+Protocol tests use the SDK's in-process `Client` and the same isolated workspace to
+assert the public contract: schemas, Apps metadata, icons, progress, structured
+output, resources, prompts, and completions. The source acceptance project remains a
+portable fixture for later checks against real CMake, compilers, clangd, sanitizers,
+and debuggers; tests never operate on it in place.
 
 `.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
 frontend and Python wheel together. Python changes must also pass

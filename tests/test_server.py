@@ -16,9 +16,10 @@ def anyio_backend() -> str:
 
 
 @pytest.mark.anyio
-async def test_server_exposes_app_tool_progress_and_structured_output(tmp_path: Path) -> None:
-    (tmp_path / "main.cpp").write_text("int main() {}", encoding="utf-8")
-    server = create_server(tmp_path)
+async def test_server_exposes_app_tool_progress_and_structured_output(
+    cpp_acceptance_project: Path,
+) -> None:
+    server = create_server(cpp_acceptance_project)
     progress: list[tuple[float, float | None, str | None]] = []
 
     async def collect(value: float, total: float | None, message: str | None) -> None:
@@ -45,15 +46,16 @@ async def test_server_exposes_app_tool_progress_and_structured_output(tmp_path: 
     assert tool.icons
     assert result.is_error is False
     assert result.structured_content is not None
-    assert result.structured_content["source_files"] == 1
+    assert result.structured_content["source_files"] == 12
     assert [item[0] for item in progress] == [1.0, 2.0, 3.0]
     assert app.contents[0].mime_type == APP_MIME_TYPE
 
 
 @pytest.mark.anyio
-async def test_server_exposes_resource_prompt_and_completions(tmp_path: Path) -> None:
-    (tmp_path / "main.cpp").write_text("", encoding="utf-8")
-    server = create_server(tmp_path)
+async def test_server_exposes_resource_prompt_and_completions(
+    cpp_acceptance_project: Path,
+) -> None:
+    server = create_server(cpp_acceptance_project)
 
     async with Client(server, raise_exceptions=True) as client:
         templates = await client.list_resource_templates()
@@ -74,17 +76,16 @@ async def test_server_exposes_resource_prompt_and_completions(tmp_path: Path) ->
     assert any(item.name == WorkspaceService.PROMPT for item in prompts.prompts)
     assert resource_completion.completion.values == ["cpp"]
     assert prompt_completion.completion.values == ["toolchain"]
-    assert "main.cpp" in resource.contents[0].text
+    assert "src/math.cpp" in resource.contents[0].text
 
 
 @pytest.mark.anyio
 async def test_default_workspace_is_server_process_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    cpp_acceptance_project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "from-pwd.cpp").write_text("", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(cpp_acceptance_project)
 
     async with Client(create_server(), raise_exceptions=True) as client:
         resource = await client.read_resource("forgemcp://workspace/files/cpp")
 
-    assert "from-pwd.cpp" in resource.contents[0].text
+    assert "src/math.cpp" in resource.contents[0].text

@@ -10,48 +10,47 @@ from forgemcp.workspace.errors import (
 from forgemcp.workspace.service import WorkspaceService
 
 
-def test_overview_counts_cpp_files(tmp_path: Path) -> None:
-    (tmp_path / "CMakeLists.txt").write_text("project(example)", encoding="utf-8")
-    (tmp_path / "main.cpp").write_text("int main() {}", encoding="utf-8")
-    include = tmp_path / "include"
-    include.mkdir()
-    (include / "example.hpp").write_text("#pragma once", encoding="utf-8")
+def test_overview_counts_cpp_files(cpp_acceptance_project: Path) -> None:
+    overview = WorkspaceService(cpp_acceptance_project).overview()
 
-    overview = WorkspaceService(tmp_path).overview()
-
-    assert overview.source_files == 1
-    assert overview.header_files == 1
-    assert overview.files_by_extension == {"cpp": 1, "hpp": 1}
+    assert overview.source_files == 12
+    assert overview.header_files == 3
+    assert overview.files_by_extension == {"cpp": 12, "hpp": 3}
     assert overview.has_cmake_lists is True
+    assert overview.has_cmake_presets is True
     assert overview.scan_truncated is False
 
 
-def test_files_are_relative_sorted_and_filtered(tmp_path: Path) -> None:
-    (tmp_path / "z.cpp").write_text("", encoding="utf-8")
-    source = tmp_path / "src"
-    source.mkdir()
-    (source / "a.cpp").write_text("", encoding="utf-8")
-    (source / "ignored.py").write_text("", encoding="utf-8")
+def test_files_are_relative_sorted_and_filtered(cpp_acceptance_project: Path) -> None:
+    files, truncated = WorkspaceService(cpp_acceptance_project).files(".cpp")
 
-    files, truncated = WorkspaceService(tmp_path).files(".cpp")
-
-    assert files == ["src/a.cpp", "z.cpp"]
+    assert files == [
+        "analysis/clangd_anchors.cpp",
+        "analysis/code_action.cpp",
+        "analysis/format_me.cpp",
+        "analysis/tidy_me.cpp",
+        "app/good_main.cpp",
+        "app/warning_main.cpp",
+        "debug/debug_main.cpp",
+        "negative/compile_error.cpp",
+        "negative/link_error.cpp",
+        "src/hierarchy.cpp",
+        "src/math.cpp",
+        "tests/test_main.cpp",
+    ]
     assert truncated is False
 
 
-def test_rejects_unsupported_extension(tmp_path: Path) -> None:
+def test_rejects_unsupported_extension(cpp_acceptance_project: Path) -> None:
     with pytest.raises(UnsupportedExtensionError):
-        WorkspaceService(tmp_path).files("py")
+        WorkspaceService(cpp_acceptance_project).files("py")
 
 
-def test_rejects_missing_workspace(tmp_path: Path) -> None:
+def test_rejects_missing_workspace(cpp_acceptance_project: Path) -> None:
     with pytest.raises(WorkspaceNotFoundError):
-        WorkspaceService(tmp_path / "missing")
+        WorkspaceService(cpp_acceptance_project / "missing")
 
 
-def test_rejects_workspace_file(tmp_path: Path) -> None:
-    workspace_file = tmp_path / "workspace.txt"
-    workspace_file.write_text("", encoding="utf-8")
-
+def test_rejects_workspace_file(cpp_acceptance_project: Path) -> None:
     with pytest.raises(WorkspaceNotDirectoryError):
-        WorkspaceService(workspace_file)
+        WorkspaceService(cpp_acceptance_project / "README.md")

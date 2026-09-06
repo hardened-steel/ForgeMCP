@@ -102,8 +102,12 @@ Before designing or changing a module, read:
 - Prefer small Pydantic result models over unstructured dictionaries for tools.
 - Test business methods directly and test MCP metadata/protocol behavior through the
   SDK's in-process `Client`.
-- Use `examples/cpp-acceptance-project/` for cross-module acceptance scenarios. Do
-  not commit its build trees, binaries, PDBs, compilation databases, or tool caches.
+- Service and protocol tests that need a workspace use the function-scoped
+  `cpp_acceptance_project` fixture from `tests/conftest.py`. It copies the complete
+  `examples/cpp-acceptance-project/` directory into `tmp_path`; tests may freely
+  modify only that isolated copy.
+- Extend `examples/cpp-acceptance-project/` when a reusable C/C++ scenario is needed.
+  Do not commit its build trees, binaries, PDBs, compilation databases, or tool caches.
 
 ## Validation
 

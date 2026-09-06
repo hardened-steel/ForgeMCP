@@ -69,6 +69,13 @@ builds the wheel first and then starts the server for this repository.
 
 All MCP traffic uses stdout. Operational logs must go to stderr.
 
+## Tests
+
+Tests that need a C/C++ workspace use the shared `cpp_acceptance_project` fixture from
+`tests/conftest.py`. It copies the complete acceptance project into a fresh pytest
+temporary directory for each test, so tests can modify their workspace without
+changing repository files.
+
 ## Verify
 
 ```powershell
