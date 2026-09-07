@@ -23,6 +23,13 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
 The tools remain useful in clients without MCP Apps support because the Python SDK
 serializes their typed results into both text `content` and `structuredContent`.
 
+All widgets share a compact console style with a fixed 420px height and adapt to the
+host width. Long values wrap and remain selectable; overflow scrolls vertically.
+Fields, local filters, copy icons and syntax-highlighted JSON show the supplied result
+without making additional tool calls. Process times are readable to seconds; JSON and
+copying preserve the original precision. A toolsets list shows summaries, while a
+`toolset_get` result shows the details returned by that call.
+
 ForgeMCP does not expose arbitrary command execution over MCP. Feature services use
 the shared process service internally; its public MCP surface is read-only.
 
@@ -123,6 +130,7 @@ changing repository files.
 ## Verify
 
 ```powershell
+npm test --prefix frontend
 .\.venv\Scripts\python.exe -m build --wheel
 .\.venv\Scripts\python.exe -m pytest -q
 git diff --check

@@ -6,21 +6,7 @@
     <title>Workspace overview</title>
   </head>
   <body>
-    <main class="card" aria-live="polite">
-      <header>
-        <span class="eyebrow">ForgeMCP</span>
-        <h1 id="workspace-name">Workspace overview</h1>
-      </header>
-      <div class="metrics">
-        <section><strong id="source-count">—</strong><span>source files</span></section>
-        <section><strong id="header-count">—</strong><span>header files</span></section>
-      </div>
-      <div class="badges">
-        <span id="cmake-list" class="badge">CMakeLists.txt</span>
-        <span id="cmake-presets" class="badge">CMake presets</span>
-      </div>
-      <p id="status">Waiting for tool result…</p>
-    </main>
+    <main id="widget" aria-label="Workspace overview"></main>
     <script type="module" src="/src/workspace-overview.js"></script>
   </body>
 </html>

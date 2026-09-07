@@ -42,7 +42,9 @@ tests/
   <feature>/test_service.py     # direct business behavior
   test_server.py                # MCP surface and protocol behavior
 frontend/
-  src/                          # widget JavaScript and CSS
+  src/shared/                   # common TUI styles, renderer, formatting, Apps bridge
+  src/*.js                      # small feature widget entrypoints
+  tests/                        # Node + jsdom behavior tests; no browser required
   *.html                        # Vite entry points
 examples/cpp-acceptance-project # portable CMake fixture
 ```
@@ -252,9 +254,10 @@ early closure of the event iterator terminate the managed process.
 
 `toolsets_list` returns summaries (the SDK wraps a list in `structuredContent.result`),
 and `toolset_get` returns one details object. Both report progress and carry read-only
-annotations, icons, Apps metadata, and SDK text fallback. The toolsets widget requests
-cached details when the user chooses an item; this UI choice never sets server-wide
-state. The static list resource and details template return markdown, and completion
+annotations, icons, Apps metadata, and SDK text fallback. The toolsets widget displays
+only the supplied result: summaries for a list call, or details of one toolset for a
+get call. It never requests details or selects server-wide state. The static list
+resource and details template return markdown, and completion
 offers cached toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
 the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 
@@ -276,6 +279,115 @@ Icons are separate files under `src/forgemcp/icons/`. `IconFile` converts a pack
 file to portable `data:` metadata at runtime, preserving offline operation without
 hardcoded blobs in Python. Each tool still chooses an icon that identifies its
 operation rather than relying only on the server logo.
+
+### Shared widget implementation
+
+Every widget uses the same compact console/TUI presentation. The current workspace,
+process, and toolsets views share these files under `frontend/src/shared/`:
+
+| File | Responsibility |
+| --- | --- |
+| `widget.css` | Geometry, host-aware palette, typography, controls, field grids, scrolling and syntax colors |
+| `copy.svg` | Small local copy icon, inlined by the frontend build |
+| `presentation.js` | Pure formatting and projections of the three concrete result shapes |
+| `result-view.js` | Shared DOM renderer, local filters, Fields/JSON switch, tooltips and copying |
+| `app.js` | Apps connection, result lifecycle and host context; imports the shared CSS |
+
+An HTML entrypoint contains `<main id="widget" aria-label="Descriptive name"></main>`
+and one module script. Its JavaScript supplies the tool name and a pure projection:
+
+```javascript
+import { connectWidget } from "./shared/app.js";
+import { processPresentation } from "./shared/presentation.js";
+
+await connectWidget({
+  toolName: "processes_overview",
+  describe: processPresentation,
+});
+```
+
+The projection returns `toolName`, `summary`, and `records`. Use `records: null`
+for a field-oriented result. For collections, return the complete array, all other
+top-level fields in `summary`, and `titleKey` plus an optional `categoryKey` for
+record headings and local filtering. It must not modify or discard original fields.
+The original structured object remains the source for JSON and copying.
+
+Use the existing renderer for new results that fit these two forms. If a future
+feature needs a specialized view, reuse `widget.css` and the shared controls and
+formatters; add only its actual presentation needs. Do not copy a stylesheet into a
+feature directory or introduce per-widget palettes, sizes or spacing. Change common
+tokens and rules centrally so all widgets stay consistent. This is shared
+presentation for concrete callers, not a widget registry or plugin framework.
+
+### Visual and interaction contract
+
+These requirements apply to all existing and future widgets:
+
+- **Geometry:** the outer widget is always 420 CSS pixels high and fills 100% of the
+  width supplied by the host, with no fixed or maximum width. Safe-area padding is
+  included inside that height. Switching views, filtering, receiving a result and
+  expanding data must not resize it. The content area scrolls vertically; header,
+  controls and footer remain in place. No horizontal scrollbar.
+- **Density:** use 13px monospace text with a 1.35 line height, compact rows, small
+  control padding and thin neutral separators. Avoid large cards, generous blank
+  space, rounded dashboard panels and oversized headings. Touch controls can have
+  larger hit areas without increasing the outer widget height.
+- **Palette:** neutral graphite surfaces in dark mode and neutral pale surfaces in
+  light mode, with host background/text/border variables and host monospace fonts.
+  Cyan marks active controls and JSON keys, amber marks booleans and warnings,
+  lavender marks numbers, and muted green marks successful completion. Red marks
+  `failed`, `timed_out` and nonzero exit codes; `terminated` is amber. Use color
+  sparingly and retain the literal status text so color is never the only signal.
+- **Complete text:** render every supplied field and record, including unknown
+  fields, nulls, empty collections and backend flags such as `scan_truncated`.
+  Do not add row/character limits, slicing, pagination caps, ellipsis, line clamps
+  or hidden overflow that clips data. Long names, labels, paths and JSON wrap within
+  their column and remain selectable. Key/value columns must have independent
+  wrapping and a gap: `had_decoding_errors` cannot overlap its value. Backend scan
+  limits are a separate contract; show the returned truncation flag explicitly.
+- **Readable fields:** scalar arrays appear as compact comma-separated wrapping
+  lists; objects use nested labeled values, not serialized JSON pasted into a cell.
+  Preserve all entries and distinguish empty list, empty object, empty string and
+  null. Process timestamps show a readable date/time to whole seconds with explicit
+  UTC and ISO 8601 in parentheses, for example
+  `7 Sept 2026, 12:45:12 UTC (2026-09-07T12:45:12Z)`. Display conversion does not
+  alter the original timestamp, precision or offset in JSON/copy.
+- **JSON:** provide a syntax-highlighted JSON view of the complete original
+  structured result, unaffected by local filters. Highlight keys, strings, numbers,
+  booleans, null and punctuation. Insert untrusted text with DOM text nodes, never
+  interpret result strings as HTML. Line wrapping must preserve selectable content.
+- **Local interaction:** allow text and category filters, view switches, tooltips,
+  keyboard navigation and copying. Show matched/total counts and an explicit
+  no-match state. Filters are reversible and have no effect on the source result.
+  All supplied records are visible by default; none is silently omitted.
+- **Copying:** provide small labeled copy icons for individual original values
+  and a Copy all action for the entire original result, including filtered records.
+  Copy strings verbatim and objects/arrays as JSON. If clipboard permission is
+  unavailable, try the local selection fallback; if that also fails, select the
+  complete original value for manual copying and explain the keyboard shortcut.
+  Never claim a copy succeeded when it did not.
+- **Snapshot only:** widgets display one particular tool invocation's
+  `structuredContent`. They must not call tools, read resources, fetch data,
+  poll, refresh, or offer refresh buttons. The shared renderer receives no App or
+  transport object. A `toolsets_list` result contains summaries only; detailed
+  fields appear only when `toolset_get` itself supplies them. Interactivity does
+  not authorize additional MCP calls.
+- **Lifecycle and accessibility:** register handlers before `app.connect()`,
+  apply initial and changed host theme, fonts, style variables and safe-area insets.
+  Clear previous data and filters when another invocation starts or fails, and
+  ignore late clipboard completion after replacement/teardown. Show useful waiting,
+  empty, error and missing-structured-data states; do not parse text fallback into
+  invented structured data. Use semantic controls, visible focus, accessible icon
+  labels and copy/status feedback. Load no external assets; host fonts are applied
+  through the SDK. Useful MCP text fallback remains independent of the widget.
+
+When adding a widget, wire its source into the Vite build and Python `Widget` binding,
+add representative DOM tests, and verify its generated HTML and icon are packaged.
+Tests should cover full values, extra fields, long paths, local filtering without
+data loss, JSON escaping, copying, empty/error states and replacement of results.
+Run `npm test --prefix frontend` and `npm run build --prefix frontend`; these use
+Node/jsdom and Vite without launching a browser. DOM tests do not prove pixel layout;
+visual review remains a separate step.
 
 ## Errors and trust boundaries
 
