@@ -17,6 +17,32 @@ const click = (root, label) => [...root.querySelectorAll("button")].find(
 ).click();
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("every copy button has inline SVG geometry without loading an image or requiring hover", (t) => {
+  for (const [describe, data] of [
+    [workspacePresentation, { name: "Workspace" }],
+    [processPresentation, { processes: [{ status: "running" }] }],
+    [toolsetPresentation, { result: [{ name: "System", tools: ["cmake"] }] }],
+  ]) {
+    const { root } = mount(t, describe, data);
+    const buttons = root.querySelectorAll(".fm-copy, .fm-copy-all");
+    assert.ok(buttons.length >= 2);
+    for (const button of buttons) {
+      const svg = button.querySelector("svg.fm-icon");
+      assert.ok(svg);
+      assert.equal(svg.namespaceURI, "http://www.w3.org/2000/svg");
+      assert.equal(svg.getAttribute("stroke"), "currentColor");
+      assert.equal(svg.getAttribute("fill"), "none");
+      assert.equal(svg.getAttribute("width"), "14");
+      assert.equal(svg.getAttribute("height"), "14");
+      assert.equal(svg.getAttribute("aria-hidden"), "true");
+      assert.ok(svg.querySelector("rect"));
+      assert.ok(svg.querySelector("path").getAttribute("d"));
+      assert.equal(svg.querySelector("image, use"), null);
+      assert.match(button.getAttribute("aria-label"), /^Copy /);
+    }
+  }
+});
+
 test("workspace displays every field, extension count, and scan warning", (t) => {
   const data = { name: "Workspace", source_files: 9, header_files: 4,
     files_by_extension: { ".cpp": 9, ".h": 4 }, has_cmake_lists: true,

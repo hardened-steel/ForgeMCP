@@ -1,4 +1,5 @@
 import { copyText, isObject, jsonTokens, statusTone, timestamp } from "./presentation.js";
+import { createCopyIcon } from "./copy-icon.js";
 
 /** Shared local-only view of one result. The App/transport is deliberately not passed here. */
 export function createResultView(root, { toolName, describe }) {
@@ -15,11 +16,7 @@ export function createResultView(root, { toolName, describe }) {
     node.type = "button";
     return node;
   };
-  const icon = () => {
-    const node = element("span", "fm-icon");
-    node.setAttribute("aria-hidden", "true");
-    return node;
-  };
+  const icon = () => createCopyIcon(doc);
   let raw;
   let presentation;
   let mode = "fields";

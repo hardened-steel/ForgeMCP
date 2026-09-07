@@ -288,7 +288,7 @@ process, and toolsets views share these files under `frontend/src/shared/`:
 | File | Responsibility |
 | --- | --- |
 | `widget.css` | Geometry, host-aware palette, typography, controls, field grids, scrolling and syntax colors |
-| `copy.svg` | Small local copy icon, inlined by the frontend build |
+| `copy-icon.js` | Shared inline SVG copy icon, with no image requests or CSS masks |
 | `presentation.js` | Pure formatting and projections of the three concrete result shapes |
 | `result-view.js` | Shared DOM renderer, local filters, Fields/JSON switch, tooltips and copying |
 | `app.js` | Apps connection, result lifecycle and host context; imports the shared CSS |
@@ -362,6 +362,8 @@ These requirements apply to all existing and future widgets:
   All supplied records are visible by default; none is silently omitted.
 - **Copying:** provide small labeled copy icons for individual original values
   and a Copy all action for the entire original result, including filtered records.
+  Render the icon as inline SVG with a visible `currentColor` stroke even before
+  hover. Do not use CSS image masks: embedded hosts may block their image URLs.
   Copy strings verbatim and objects/arrays as JSON. If clipboard permission is
   unavailable, try the local selection fallback; if that also fails, select the
   complete original value for manual copying and explain the keyboard shortcut.

@@ -52,7 +52,7 @@ body { margin: 0; background: transparent; }
 .fm-label { color: var(--fm-muted); overflow-wrap: anywhere; white-space: normal; }
 .fm-value { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; }
 .fm-widget .fm-copy { display: flex; align-items: center; justify-content: center; color: var(--fm-muted); padding: 1px; width: 22px; min-height: 20px; }
-.fm-icon { width: 14px; height: 14px; flex: none; background: currentColor; mask: url("./copy.svg") center / contain no-repeat; }
+.fm-icon { display: block; width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; pointer-events: none; }
 .fm-record { padding: 6px 0; border-bottom: 1px solid var(--fm-border); }
 .fm-record-heading { display: flex; align-items: baseline; gap: 7px; color: var(--fm-accent); margin: 0 0 3px; font: inherit; overflow-wrap: anywhere; }
 .fm-index { color: var(--fm-muted); font-size: 11px; flex: none; }
