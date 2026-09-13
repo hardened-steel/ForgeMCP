@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -34,7 +34,7 @@ def create_server(
     complete = Complete()
 
     @asynccontextmanager
-    async def lifespan(_: MCPServer) -> AsyncIterator[dict[str, object]]:
+    async def lifespan(_: MCPServer) -> AsyncGenerator[dict[str, object]]:
         try:
             await toolchains.initialize()
             yield {}
@@ -70,10 +70,6 @@ def create_server(
         mcp.add_resource(resource.resource)
     complete.register(mcp)
     return mcp
-
-
-# `mcp dev src/forgemcp/server.py` uses the server process working directory.
-mcp = create_server()
 
 
 def argument_parser() -> argparse.ArgumentParser:
