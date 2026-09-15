@@ -80,8 +80,7 @@ class ToolchainService:
                 self.initialized = True
 
     def list_toolsets(self) -> tuple[ToolsetSummary, ...]:
-        return tuple(ToolsetSummary(id=item.id, name=item.name,
-                                    tools=[tool.name for tool in item.tools]) for item in self.cache)
+        return tuple(ToolsetSummary(id=item.id, name=item.name, tools=[tool.name for tool in item.tools]) for item in self.cache)
 
     def resolve_toolset(self, toolset_id: str) -> Toolset:
         for toolset in self.cache:
@@ -91,14 +90,18 @@ class ToolchainService:
 
     def get_toolset(self, toolset_id: str) -> ToolsetDetails:
         toolset = self.resolve_toolset(toolset_id)
-        return ToolsetDetails(id=toolset.id, name=toolset.name, tools=[
-            ToolInfo(name=tool.name, kind=tool.kind, path=str(tool.path), version=tool.version)
-            for tool in toolset.tools
-        ])
+        return ToolsetDetails(
+            id=toolset.id, name=toolset.name, tools=[
+                ToolInfo(name=tool.name, kind=tool.kind, path=str(tool.path), version=tool.version)
+                for tool in toolset.tools
+            ]
+        )
 
     def get_tool(self, toolset_id: str, tool_name: str) -> ToolSpec | None:
-        return next((tool for tool in self.resolve_toolset(toolset_id).tools
-                     if tool.name == tool_name), None)
+        return next(
+            (tool for tool in self.resolve_toolset(toolset_id).tools if tool.name == tool_name),
+            None
+        )
 
     def summaries_markdown(self) -> str:
         lines = ["# Toolsets", "", "| ID | Name | Tools |", "| --- | --- | --- |"]

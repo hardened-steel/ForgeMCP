@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
+from pydantic.dataclasses import dataclass
 
 
 ProcessStream = Literal["stdin", "stdout", "stderr"]
@@ -32,17 +32,18 @@ class ProcessEncoding:
     errors: Literal["strict", "replace"] = "replace"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ProcessLogEntry:
     """One text entry retained in the in-memory process transcript."""
 
     timestamp: datetime = Field(description="When this log entry appeared.", default_factory=lambda: datetime.now(timezone.utc))
+    time: float = Field(repr=False)
     stream: Literal["stdout", "stderr", "stdin"]
     text: str
 
 
 @dataclass(frozen=True)
-class ProcessSummary(BaseModel):
+class ProcessSummary:
     """Model-visible summary of one tracked process."""
 
     process_id: int = Field(description="Stable identifier assigned by ForgeMCP.")
@@ -50,7 +51,7 @@ class ProcessSummary(BaseModel):
     arguments: list[str] = Field(description="Arguments passed to the executable.")
     cwd: str = Field(description="Process working directory.")
     encoding: str = Field(description="Encoding used for the retained text transcript.")
-    timeout: ProcessTimeout | None = Field(description="Configured timeout mode and duration.")
+    timeout: ProcessTimeout = Field(description="Configured timeout mode and duration.")
 
 
 class ProcessStatus(BaseModel):
@@ -60,7 +61,7 @@ class ProcessStatus(BaseModel):
     started: datetime = Field(description="UTC start timestamp.", default_factory=lambda: datetime.now(timezone.utc))
     work_time: float = Field(description="Process work time in seconds.", ge=0, default=0)
     current_status: Literal["interrupted", "running"] | int = Field(description="Exit status or process status.")
-    transcript: list[ProcessLogEntry] = Field(description="Process log. All communications will be saved here.", default_factory=lambda: [])
+    transcript: list[ProcessLogEntry] = Field(description="Process log. All communications will be saved here.", default_factory=list)
 
 
 class ProcessOverview(BaseModel):

@@ -31,7 +31,7 @@ async def instance_environment(root: Path, processes: ProcessService) -> dict[st
     # cmd is the explicit interpreter for the batch script. Shell operators here
     # are provider-owned, not executable arguments supplied by project data.
     comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-    session = await processes.start(
+    session = await processes.launch(
         comspec, ("/u", "/d", "/s", "/c", "call", str(batch), "-no_logo", "-arch=x64", "&&", "set"),
         encoding="utf-16-le", timeout=60,
     )

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
+
+from pydantic import Field
 from forgemcp import markdown
 
 from mcp.server import MCPServer
@@ -56,53 +58,79 @@ class ProcessRecord:
 
     summary: ProcessSummary
     status: ProcessStatus
-    lock = asyncio.Lock()
-    task: asyncio.Future
+    start: float = field(init=False, default=0)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    task: asyncio.Future[list[None]] | None = field(init=False, default=None)
 
 
     async def terminate(self, process: Process) -> None:
-        process.terminate()
         try:
-            async with asyncio.timeout(2):
+            process.terminate()
+            try:
+                async with asyncio.timeout(2):
+                    await process.wait()
+            except TimeoutError:
+                process.kill()
                 await process.wait()
-        except TimeoutError:
-            process.kill()
+        except ProcessLookupError:
+            await process.wait()
 
 
     async def monitor(self, process: Process) -> None:
+        loop = asyncio.get_running_loop()
+        self.start = loop.time()
+
         status = self.status
         summary = self.summary
         timeout = summary.timeout
         task = asyncio.create_task(process.wait())
-        while True:
-            try:
-                result = await asyncio.wait_for(asyncio.shield(task), 0.250)
-                now = datetime.now(timezone.utc)
-                duration = now - self.status.started
-                async with self.lock:
-                    self.status.current_status = result
-                    self.status.work_time = duration.microseconds / 1_000_000
-                    logger.info(f"Process {summary.process_id} finished with return code {result}")
-                    break
-            except TimeoutError:
-                now = datetime.now(timezone.utc)
-                duration = now - status.started
-                async with self.lock:
-                    status.work_time = duration.microseconds / 1_000_000
+        try:
+            while True:
+                finished = False
+                message: str
+                result: Literal["interrupted", "running"] | int
+
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(task), 0.250)
+                    finished = True
+                    message = f"Process {summary.process_id} finished with return code {result}"
+                except TimeoutError:
+                    pass
+
+                now = loop.time()
+                duration = now - self.start
+
+                if not finished:
                     if timeout.total is not None:
-                        if duration > timeout.total:
+                        finished = duration > timeout.total
+                        if finished:
                             await self.terminate(process)
-                            self.status.current_status = "interrupted"
-                            self.status.work_time = duration.microseconds / 1_000_000
-                            logger.info(f"Process {summary.process_id} interrupted by timeout {timeout.total}")
-                            break
-                    if timeout.idle is not None:
-                        if now - (status.transcript[-1].timestamp if len(status.transcript) else status.started) > timeout.idle:
+                            result = "interrupted"
+                            message =  f"Process {summary.process_id} interrupted by timeout {timeout.total}"
+
+                    if not finished and timeout.idle is not None:
+                        async with self.lock:
+                            finished = now - (status.transcript[-1].time if len(status.transcript) else self.start) > timeout.idle
+                        if finished:
                             await self.terminate(process)
-                            self.status.current_status = "interrupted"
-                            self.status.work_time = duration.microseconds / 1_000_000
-                            logger.info(f"Process {summary.process_id} interrupted by idle {timeout.idle}")
-                            break
+                            result = "interrupted"
+                            message =  f"Process {summary.process_id} interrupted by idle {timeout.idle}"
+
+                if finished:
+                    async with self.lock:
+                        self.status.work_time = duration
+                        self.status.current_status = result
+                    logger.info(message)
+                    break
+                else:
+                    async with self.lock:
+                        self.status.work_time = duration
+        finally:
+            if task.cancel():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
     async def read_stream(
@@ -113,21 +141,24 @@ class ProcessRecord:
         queue: asyncio.Queue[str | None]
     ) -> None:
         try:
+            loop = asyncio.get_running_loop()
             while True:
                 chunk = await reader.read(128)
                 if not chunk:
                     break
 
                 text = decoder.decode(chunk)
-                queue.put(text)
+                await queue.put(text)
                 async with self.lock:
-                    self.status.transcript.append(ProcessLogEntry(stream=stream, text=text))
+                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream=stream, text=text))
 
             if text := decoder.final():
-                queue.put(text)
+                async with self.lock:
+                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream=stream, text=text))
+                await queue.put(text)
 
         finally:
-            queue.put(None)
+            await queue.put(None)
 
 
     async def write_stream(
@@ -136,17 +167,22 @@ class ProcessRecord:
         encoder: ChunkEncoder,
         queue: asyncio.Queue[str | None]
     ) -> None:
-        while True:
-            text = await queue.get()
-            if text is None:
-                writer.write(encoder.final())
-                await writer.drain()
-                break
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                text = await queue.get()
+                if text is None:
+                    writer.write(encoder.final())
+                    await writer.drain()
+                    break
 
-            writer.write(encoder.encode(text))
-            async with self.lock:
-                self.status.transcript.append(ProcessLogEntry(stream="stdin", text=text))
-            await writer.drain()
+                writer.write(encoder.encode(text))
+                async with self.lock:
+                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream="stdin", text=text))
+                await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 class ChunkDecoder:
@@ -191,11 +227,7 @@ class ProcessService:
     WIDGET = Widget("assets/process-overview.html")
     ICON = IconFile("icons/process.svg")
     RESOURCE_URI = "forgemcp://processes/{process_id}"
-    QUEUE_SIZE = 128
-    READ_SIZE = 64 * 1024
-    TERMINATE_GRACE_SECONDS = 2.0
-    EOF = object()
-    RUNNING_STATUSES = frozenset({ProcessStatus.STARTING, ProcessStatus.RUNNING})
+
 
     def __init__(self, workspace_root: Path) -> None:
         self.id_counter = 0
@@ -252,9 +284,9 @@ class ProcessService:
             current_status="running"
         )
 
-        stdin  = asyncio.Queue[str | None](8)
-        stdout = asyncio.Queue[str | None](8)
-        stderr = asyncio.Queue[str | None](8)
+        stdin  = asyncio.Queue[str | None]()
+        stdout = asyncio.Queue[str | None]()
+        stderr = asyncio.Queue[str | None]()
         
         record = ProcessRecord(summary, status)
         self.records[self.id_counter] = record
@@ -372,8 +404,8 @@ class ProcessSession:
     async def __aexit__(self, exception_type: Any, exception: Any, traceback: Any) -> None:
         await self.record.terminate(self.process)
 
-    def output(self) -> AsyncIterator[ProcessOutput]:
-        return self.service.output(self.process_id)
+    #def output(self) -> AsyncIterator[ProcessOutput]:
+    #    return self.service.output(self.process_id)
 
     async def write_stdin(self, text: str) -> None:
         await self.service.write_stdin(self.process_id, text)
@@ -381,8 +413,8 @@ class ProcessSession:
     async def close_stdin(self) -> None:
         await self.service.close_stdin(self.process_id)
 
-    async def wait(self) -> ProcessResult:
-        return await self.service.wait(self.process_id)
+    #async def wait(self) -> ProcessResult:
+    #    return await self.service.wait(self.process_id)
 
-    async def terminate(self) -> ProcessResult:
-        return await self.service.terminate(self.process_id)
+    #async def terminate(self) -> ProcessResult:
+    #    return await self.service.terminate(self.process_id)
