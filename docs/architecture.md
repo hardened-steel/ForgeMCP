@@ -148,33 +148,45 @@ the only MCP primitives that support completion; static resources do not.
 
 `ProcessService` is the only module that calls `asyncio.create_subprocess_exec`.
 Feature services receive it through constructor injection, select executables, and
-construct explicit argument lists. Exec mode remains the default. Optional
-`shell=True` formats the executable and arguments for the native shell; process
-records retain the original executable, argument list, and shell flag. ForgeMCP does
-not expose a generic command-execution MCP tool.
+construct explicit argument lists. `launch` uses exec mode; interpreters such as
+`cmd.exe` must be selected explicitly by the owning feature. ForgeMCP does not expose
+a generic command-execution MCP tool.
 
-`start`, `start_protocol`, and `launch` support `inherit_environment=True`, which
+`launch` supports `inherit_environment=True`, which
 copies the server environment then overlays `env`. With `False`, only `env` is passed
 to the child. No environment values are added to operational lifecycle logs.
 
-The process module provides two concrete consumption modes:
+`async with await processes.launch(...) as session` is the shared API for short
+commands and long-running sessions. Launch starts a supervisor coroutine owned by
+the session. Its TaskGroup owns stdout and stderr readers, a stdin writer, and a
+monitor. Worker failures do not cancel the consumer directly: the supervisor first
+cleans up the process, then exposes the retained failure through `output()`, `wait()`,
+or an otherwise successful context exit.
 
-- `start(...) -> ProcessSession` exposes one `output()` async iterator. Permanent
-  stdout and stderr reader tasks decode both pipes concurrently and publish tagged
-  `ProcessOutput(stream, text)` chunks through one bounded queue. The iterator ends
-  after both streams reach EOF. Cross-stream ordering is the order ForgeMCP observed,
-  not an operating-system ordering guarantee.
-- `start_protocol(...) -> ProtocolProcessSession` exposes separate `read_stdout()`
-  and `read_stderr()` operations, with one active reader allowed per pipe. Text is the
-  default. `raw_stdout=True` is reserved for byte-counted framing such as clangd LSP;
-  those bytes are still decoded separately for the retained text transcript.
+`output()` has one consumer and yields `ProcessOutput(stream, text)` chunks from both
+pipes through one currently unbounded queue. It ends after both pipes reach EOF;
+failed reads and timeouts are not successful EOF. Cross-stream ordering is the order
+ForgeMCP observed, not an operating-system ordering guarantee. Unconsumed output and
+the full transcript remain an in-memory retention limitation.
+
+`write_stdin(text)` queues text for the stdin writer without waiting for transport
+drain. The queue carries `str | None`; `close_stdin()` queues `None` after prior
+writes and is repeatable. `wait()` waits
+for process exit and completed readers, returns the exit code, and can be repeated;
+it does not implicitly close stdin. Nonzero exit codes are interpreted by the tool
+module. `close()` and context exit stop a remaining process and await all workers.
+`ProcessService.close()` closes remaining sessions during server shutdown. The
+session exposes `process_id` and `returncode` without exposing its queue protocol as
+the consumer API.
 
 Each pipe owns an incremental decoder so a multibyte character split across OS reads
 is reconstructed correctly. The default encoding is `locale.getencoding()` and each
 consumer may select an explicit encoding. Replacement decoding is the resilient
 default for human-facing tool output; strict decoding is available for formal
-protocols. stdin accepts text in ordinary sessions and additionally accepts bytes in
-raw protocol sessions.
+protocols. All consumer I/O is text. A tool can choose strict `latin_1` for a reversible
+one-character-per-byte representation, then frame and decode protocol messages in its
+own module. Such transcripts retain that Latin-1 representation, not decoded UTF-8
+protocol text. There is no separate raw mode or protocol session class.
 
 Every stdin write and stdout/stderr read is appended to a process transcript in
 memory. The record also retains identifiers, command metadata, lifecycle timestamps,
@@ -182,16 +194,19 @@ encoding, timeout policy, state, and return code. This is inspection state, not 
 operational log: stderr logging contains only process identifiers and lifecycle
 summaries and never copies transcript content or environments.
 
-Timeout configuration has three effective forms:
-
-- `timeout=None`: disabled;
-- `timeout=<seconds>, timeout_mode="total"`: measured from process start;
-- `timeout=<seconds>, timeout_mode="idle"`: reset whenever stdout or stderr produces
-  a non-empty byte chunk.
+`ProcessTimeout(total=None, idle=None)` disables both timeouts. Each non-null field
+sets seconds for its limit; total and idle may be enabled together. Total time uses
+the monitor's monotonic start time. Idle measures time since the latest transcript
+entry, including stdin. Timeout raises the existing `ProcessError` after termination;
+stream failures use `ProcessStreamError`.
 
 On timeout or explicit termination, the directly managed asyncio process receives
 `terminate()`, followed by `kill()` if it remains alive after a short grace period.
-Task cancellation performs the same cleanup before propagating cancellation. Process
+Cancellation of an individual I/O or wait operation does not close the session.
+Explicit `close()` and context exit await cleanup, including during cancellation.
+Launch directly awaits `asyncio.create_subprocess_exec` without a separate task or
+custom cancellation handler. Cleanup after worker failure drains unread pipes without
+retaining the discarded tail. Process
 groups and descendant-tree management are intentionally outside the current scope.
 
 The read-only MCP surface consists of `processes_overview(status)`, its process-list

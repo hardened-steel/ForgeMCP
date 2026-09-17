@@ -2,20 +2,20 @@
 
 from .models import (
     ProcessOutput,
-    ProcessResult,
+    ProcessEncoding,
+    ProcessTimeout,
     ProcessStatus,
 )
 from .service import (
     ProcessService,
     ProcessSession,
-    ProtocolProcessSession,
 )
 
 __all__ = [
     "ProcessOutput",
-    "ProcessResult",
+    "ProcessEncoding",
+    "ProcessTimeout",
     "ProcessService",
     "ProcessSession",
     "ProcessStatus",
-    "ProtocolProcessSession",
 ]
