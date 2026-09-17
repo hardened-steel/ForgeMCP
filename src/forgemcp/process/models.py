@@ -32,6 +32,14 @@ class ProcessEncoding:
     errors: Literal["strict", "replace"] = "replace"
 
 
+@dataclass(frozen=True)
+class ProcessOutput:
+    """One decoded chunk from a combined stdout/stderr stream."""
+
+    stream: Literal["stdout", "stderr"]
+    text: str
+
+
 @dataclass(frozen=True, kw_only=True)
 class ProcessLogEntry:
     """One text entry retained in the in-memory process transcript."""

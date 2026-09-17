@@ -9,6 +9,7 @@ import locale
 import logging
 import os
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from .models import (
     ProcessEncoding,
     ProcessStatus,
     ProcessStream,
+    ProcessOutput,
     ProcessSummary,
 )
 
@@ -60,7 +62,6 @@ class ProcessRecord:
     status: ProcessStatus
     start: float = field(init=False, default=0)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    task: asyncio.Future[list[None]] | None = field(init=False, default=None)
 
 
     async def terminate(self, process: Process) -> None:
@@ -180,9 +181,12 @@ class ProcessRecord:
                 async with self.lock:
                     self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream="stdin", text=text))
                 await writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            with suppress(BrokenPipeError, ConnectionResetError):
+                await writer.wait_closed()
 
 
 class ChunkDecoder:
@@ -192,7 +196,7 @@ class ChunkDecoder:
             codecs.lookup(selected_encoding)
         except LookupError as error:
             raise ProcessStartError(f"Unknown process encoding: {selected_encoding}") from error
-        self.decoder = codecs.getincrementaldecoder(encoding.driver)(errors=encoding.errors)
+        self.decoder = codecs.getincrementaldecoder(selected_encoding)(errors=encoding.errors)
 
 
     def decode(self, array: bytes) -> str:
@@ -210,7 +214,7 @@ class ChunkEncoder:
             codecs.lookup(selected_encoding)
         except LookupError as error:
             raise ProcessStartError(f"Unknown process encoding: {selected_encoding}") from error
-        self.encoder = codecs.getincrementalencoder(encoding.driver)(errors=encoding.errors)
+        self.encoder = codecs.getincrementalencoder(selected_encoding)(errors=encoding.errors)
 
 
     def encode(self, string: str) -> bytes:
@@ -246,7 +250,7 @@ class ProcessService:
         encoding: ProcessEncoding = ProcessEncoding('default'),
         timeout: ProcessTimeout = ProcessTimeout(),
     ) -> ProcessSession:
-        """Start a process whose stdout and stderr are consumed separately."""
+        """Start a process; manage its streams with async with await service.launch(...)."""
         working_directory = (cwd or self.root).resolve()
         if not working_directory.is_dir():
             raise ProcessStartError(f"Process working directory does not exist: {working_directory}")
@@ -260,23 +264,27 @@ class ProcessService:
         child_environment = os.environ.copy() if inherit_environment else {}
         child_environment.update(env or {})
 
+        summary = ProcessSummary(
+            process_id=self.id_counter,
+            executable=str(executable),
+            arguments=list(arguments),
+            cwd=str(working_directory),
+            encoding=encoding.driver,
+            timeout=timeout
+        )
+        stdout_decoder = ChunkDecoder(encoding)
+        stderr_decoder = ChunkDecoder(encoding)
+        stdin_encoder = ChunkEncoder(encoding)
+        self.id_counter += 1
+
         process = await asyncio.create_subprocess_exec(
             executable,
             *arguments,
-            cwd=cwd,
+            cwd=working_directory,
             env=child_environment,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-        )
-
-        summary = ProcessSummary(
-            process_id=self.id_counter,
-            executable=executable,
-            arguments=arguments,
-            cwd=working_directory,
-            encoding=encoding.driver,
-            timeout=timeout
         )
 
         status = ProcessStatus(
@@ -289,17 +297,12 @@ class ProcessService:
         stderr = asyncio.Queue[str | None]()
         
         record = ProcessRecord(summary, status)
-        self.records[self.id_counter] = record
-        self.id_counter += 1
+        self.records[summary.process_id] = record
 
-        record.task = asyncio.gather(
-            record.read_stream("stdout", process.stdout, ChunkDecoder(encoding), stdout),
-            record.read_stream("stderr", process.stderr, ChunkDecoder(encoding), stderr),
-            record.write_stream(process.stdin, ChunkEncoder(encoding), stdin),
-            record.monitor(process)
+        return ProcessSession(
+            process, record, stdin, stdout, stderr,
+            stdout_decoder, stderr_decoder, stdin_encoder,
         )
-
-        return ProcessSession(process, record, stdin, stdout, stderr)
 
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
@@ -390,28 +393,67 @@ class ProcessService:
 
 @dataclass
 class ProcessSession:
-    """Combined-output view of one tracked process."""
+    """Own one process and its stream tasks for an async context."""
     process: Process
     record: ProcessRecord
     stdin: asyncio.Queue[str | None]
     stdout: asyncio.Queue[str | None]
     stderr: asyncio.Queue[str | None]
+    stdout_decoder: ChunkDecoder
+    stderr_decoder: ChunkDecoder
+    stdin_encoder: ChunkEncoder
+    group: asyncio.TaskGroup = field(init=False, default_factory=asyncio.TaskGroup)
+    tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list)
 
 
     async def __aenter__(self) -> ProcessSession:
+        await self.group.__aenter__()
+        self.tasks = [
+            self.group.create_task(
+                self.record.read_stream(
+                    "stdout", cast(asyncio.StreamReader, self.process.stdout), self.stdout_decoder, self.stdout,
+                )
+            ),
+            self.group.create_task(
+                self.record.read_stream(
+                    "stderr", cast(asyncio.StreamReader, self.process.stderr), self.stderr_decoder, self.stderr,
+                )
+            ),
+            self.group.create_task(
+                self.record.write_stream(
+                    cast(asyncio.StreamWriter, self.process.stdin), self.stdin_encoder, self.stdin,
+                )
+            ),
+            self.group.create_task(self.record.monitor(self.process)),
+        ]
         return self
 
     async def __aexit__(self, exception_type: Any, exception: Any, traceback: Any) -> None:
-        await self.record.terminate(self.process)
+        try:
+            await self.close()
+        except BaseException as error:
+            await self.group.__aexit__(type(error), error, error.__traceback__)
+        else:
+            await self.group.__aexit__(exception_type, exception, traceback)
+
+    async def close(self) -> None:
+        """Stop the process and cancel its tasks; context exit joins the group."""
+        try:
+            await self.record.terminate(self.process)
+        finally:
+            current = asyncio.current_task()
+            for task in self.tasks:
+                if task is not current:
+                    task.cancel()
 
     #def output(self) -> AsyncIterator[ProcessOutput]:
     #    return self.service.output(self.process_id)
 
     async def write_stdin(self, text: str) -> None:
-        await self.service.write_stdin(self.process_id, text)
+        await self.stdin.put(text)
 
     async def close_stdin(self) -> None:
-        await self.service.close_stdin(self.process_id)
+        await self.stdin.put(None)
 
     #async def wait(self) -> ProcessResult:
     #    return await self.service.wait(self.process_id)
