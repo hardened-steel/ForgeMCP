@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,25 +17,34 @@ from forgemcp.toolchain.errors import (
 from forgemcp.toolchain.loader import load_tools
 from forgemcp.toolchain.providers import system, user, visual_studio
 from forgemcp.toolchain.service import ToolchainService
-from forgemcp.toolchain.spec import ToolCommand, ToolKind, ToolSpec, version_parser
+from forgemcp.toolchain.spec import ToolInfo, ToolKind, ToolSpec
 
 
-def python_spec():
-    return ToolSpec("python", ToolKind.OTHER, None, None,
-        {"version": ToolCommand(lambda: ("-c", "import sys; print('version 12.3',file=sys.stderr)"), parser="version")},
-        {"version": version_parser(r"version ([0-9.]+)")})
+def python_info():
+    def create_spec(path, processes, environment, inherit_environment):
+        async def version():
+            async with await processes.launch(
+                path, ("-c", "import sys; print('12.3',file=sys.stderr)"),
+                env=environment, inherit_environment=inherit_environment,
+            ) as session:
+                await session.close_stdin()
+                output = "".join([chunk.text async for chunk in session.output()])
+                assert await session.wait() == 0
+                return output.strip()
+        return ToolSpec("python", ToolKind.OTHER, path, {"version": version})
+    return ToolInfo("python", ToolKind.OTHER, create_spec)
 
 
 @pytest.mark.anyio
 async def test_system_controlled_path_and_empty_toolset(cpp_acceptance_project, monkeypatch):
     processes = ProcessService(cpp_acceptance_project)
     monkeypatch.setenv("PATH", str(Path(sys.executable).parent))
-    spec = python_spec()
+    spec = python_info()
     try:
         toolset = system.discover((spec,), processes)
         assert toolset.id == "system" and toolset.name == "System"
         assert toolset.tools[0].path == Path(sys.executable).resolve()
-        assert await toolset.tools[0].commands["version"]() == "12.3"
+        assert await toolset.tools[0].methods["version"]() == "12.3"
         monkeypatch.setenv("PATH", str(cpp_acceptance_project))
         assert system.discover((spec,), processes).tools == ()
     finally:
@@ -58,7 +66,9 @@ def test_user_configuration_multiple_exact_paths_and_stable_ids(cpp_acceptance_p
     assert result[0].id != result[1].id
     assert result[0].tools[0].path == executable.resolve()
     assert all(item.inherit_environment and item.environment is None for item in result)
-    assert result == user.discover(user.parse_toolsets(groups, specs), specs, processes)
+    repeated = user.discover(user.parse_toolsets(groups, specs), specs, processes)
+    assert [(item.id, item.tools[0].path) for item in result] == [(item.id, item.tools[0].path) for item in repeated]
+    assert not processes.records
 
 
 @pytest.mark.parametrize("groups,error", [
@@ -77,39 +87,25 @@ def test_bad_user_configuration_has_no_fallback(groups, error):
 
 
 @pytest.mark.anyio
-async def test_cache_versions_absent_commands_failure_isolation_and_api(cpp_acceptance_project, monkeypatch):
+async def test_discovery_does_not_query_versions_and_returns_containers(cpp_acceptance_project, monkeypatch):
     processes = ProcessService(cpp_acceptance_project)
-    good = python_spec()
-    failed = replace(good, name="failed", commands={"version": ToolCommand(lambda: ("-c", "raise SystemExit(8)"), parser="version")})
-    no_version = replace(good, name="no-version", commands={}, parsers={})
-    unparsed = replace(good, name="unparsed", commands={"version": ToolCommand(lambda: ("-V",))}, parsers={})
-    specs = (good, failed, no_version, unparsed)
-    monkeypatch.setattr(discovery, "load_tools", lambda: specs)
+    monkeypatch.setattr(discovery, "load_tools", lambda: (python_info(),))
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
     async def no_vs(*args):
         return ()
     monkeypatch.setattr(visual_studio, "discover", no_vs)
     service = ToolchainService(processes)
-    try:
-        await asyncio.gather(service.initialize(), service.initialize())
-        assert len(processes.records) == 3
-        before = service.cache
-        monkeypatch.setattr(discovery, "load_tools", lambda: pytest.fail("cache reloaded"))
-        await service.initialize()
-        assert service.cache is before
-        assert service.get_tool("system", "python").version == "12.3"
-        assert service.get_tool("system", "failed").version is None
-        assert service.get_tool("system", "missing") is None
-        assert service.resolve_toolset("system").tools[0].name == "failed"
-        details = service.get_toolset("system")
-        details.tools.clear()
-        assert len(service.get_toolset("system").tools) == 4
-        assert "environment" not in service.get_toolset("system").model_dump()
-        with pytest.raises(ToolsetNotFoundError):
-            service.get_toolset("unknown")
-        assert len(processes.records) == 3
-    finally:
-        await processes.close()
+    await asyncio.gather(service.initialize(), service.initialize())
+    before = service.toolsets
+    monkeypatch.setattr(discovery, "load_tools", lambda: pytest.fail("discovery repeated"))
+    await service.initialize()
+    assert service.toolsets is before
+    assert service.get_tool("system", "python") is service.get_toolset("system").tools[0]
+    assert service.get_tool("system", "missing") is None
+    assert service.list_toolsets() is before
+    with pytest.raises(ToolsetNotFoundError):
+        service.get_toolset("unknown")
+    assert not processes.records
 
 
 @pytest.mark.anyio
@@ -135,7 +131,7 @@ async def test_vsdevcmd_environment_preserves_values_and_transcript(cpp_acceptan
         assert environment["FORGEMCP_UNICODE"] == "Лаборатория 日本語"
         assert len(environment["FORGEMCP_LONG"]) == 5000
         record = next(iter(processes.records.values()))
-        assert any("FORGEMCP_INSTANCE=instance-one" in entry.text for entry in record.transcript)
+        assert "FORGEMCP_INSTANCE=instance-one" in "".join(entry.text for entry in record.status.transcript)
     finally:
         await processes.close()
 
@@ -149,10 +145,10 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(cpp
     instances = [dict(instanceId=str(index), displayName=f"VS {index}", installationPath=str(root))
                  for index, root in enumerate(roots)]
     class ListingProcesses(ProcessService):
-        async def start(self, executable, arguments=(), **kwargs):
+        async def launch(self, executable, arguments=(), **kwargs):
             if str(executable) == "vswhere.exe":
-                return await super().start(sys.executable, ("-c", f"print({json.dumps(instances)!r})"), **kwargs)
-            return await super().start(executable, arguments, **kwargs)
+                return await super().launch(sys.executable, ("-c", f"print({json.dumps(instances)!r})"), **kwargs)
+            return await super().launch(executable, arguments, **kwargs)
     processes = ListingProcesses(cpp_acceptance_project)
     monkeypatch.setattr(visual_studio, "os", SimpleNamespace(name="nt", environ=os.environ))
     monkeypatch.setattr(visual_studio, "vswhere_path", lambda: Path("vswhere.exe"))
@@ -168,18 +164,20 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(cpp
         assert result[0].tools[0].name == "clang"
         assert len(result[0].tools) == 1
         for index in (0, 2):
-            command = result[index].tools[0].commands["version"]
-            assert command.environment == {"INSTANCE": str(roots[index])}
-            assert command.inherit_environment is False
-        assert processes.overview().completed == 1
-        assert any("installationPath" in entry.text for entry in next(iter(processes.records.values())).transcript)
+            assert result[index].environment == {"INSTANCE": str(roots[index])}
+            assert result[index].inherit_environment is False
+            assert callable(result[index].tools[0].methods["version"])
+        assert len(processes.records) == 1
+        record = next(iter(processes.records.values()))
+        assert record.status.current_status == 0
+        assert "installationPath" in "".join(entry.text for entry in record.status.transcript)
     finally:
         await processes.close()
 
 
 @pytest.mark.anyio
 async def test_mcp_tools_resources_progress_completions_and_transcripts(cpp_acceptance_project, monkeypatch):
-    monkeypatch.setattr(discovery, "load_tools", lambda: (python_spec(),))
+    monkeypatch.setattr(discovery, "load_tools", lambda: (python_info(),))
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
     async def no_vs(*args):
         return ()
@@ -198,16 +196,18 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(cpp_acce
             assert tool.meta["ui"]["resourceUri"] == ToolchainService.WIDGET.uri
         result = await client.call_tool("toolsets_list", {}, progress_callback=collect)
         assert result.structured_content == {"result": [{"id": "system", "name": "System", "tools": ["python"]}]}
-        assert result.content and progress == [1., 2.]
+        assert result.content and progress == [0., 1.]
         progress.clear()
         result = await client.call_tool("toolset_get", {"toolset_id": "system"}, progress_callback=collect)
-        assert progress == [1., 2.]
-        assert result.structured_content["tools"][0] == dict(name="python", kind="other", path=str(Path(sys.executable).resolve()), version="12.3")
+        assert progress == [0., 1.]
+        tool_info = result.structured_content["tools"][0]
+        assert Path(tool_info["path"]) == Path(sys.executable).resolve()
+        assert tool_info == dict(name="python", kind="other", path=tool_info["path"], version="12.3")
         overview = await client.call_tool("processes_overview", {})
         assert overview.structured_content["completed"] == 1
         pid = overview.structured_content["processes"][0]["process_id"]
         transcript = await client.read_resource(f"forgemcp://processes/{pid}")
-        assert "version 12.3" in transcript.contents[0].text
+        assert "12.3" in transcript.contents[0].text
         listing = await client.read_resource(ToolchainService.LIST_URI)
         details = await client.read_resource("forgemcp://toolsets/system")
         assert "System" in listing.contents[0].text and "12.3" in details.contents[0].text
@@ -215,8 +215,9 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(cpp_acce
         assert completion.completion.values == ["system"]
         app = await client.read_resource(ToolchainService.WIDGET.uri)
         assert "Available toolsets" in app.contents[0].text
-        # Reads and ordinary list/get calls never probe again.
-        assert (await client.call_tool("processes_overview", {})).structured_content["completed"] == 1
+        # Details query again, while list calls do not launch version probes.
+        await client.call_tool("toolsets_list", {})
+        assert (await client.call_tool("processes_overview", {})).structured_content["completed"] == 2
 
 
 @pytest.mark.anyio
@@ -241,10 +242,53 @@ async def test_invalid_user_path_launches_nothing(cpp_acceptance_project, monkey
     with pytest.raises(InvalidToolPathError):
         await service.initialize()
     assert processes.records == {}
-    assert service.cache == () and service.initialized is False
+    assert service.toolsets == () and service.initialized is False
 
 
 def test_cli_repeated_option():
     from forgemcp.server import argument_parser
     parsed = argument_parser().parse_args(["--toolset", "LLVM 20", "clang=a", "clang++=b", "--toolset", "LLVM 22", "clang=c"])
     assert parsed.toolset == [["LLVM 20", "clang=a", "clang++=b"], ["LLVM 22", "clang=c"]]
+
+
+@pytest.mark.anyio
+async def test_mcp_version_failures_are_isolated_and_not_cached(cpp_acceptance_project, monkeypatch):
+    from forgemcp.server import create_server
+    from forgemcp.toolchain.errors import ToolParserError
+    calls = []
+
+    def info(name, failure=None, available=True):
+        def create_spec(path, processes, environment, inherit_environment):
+            async def version():
+                calls.append(name)
+                if failure:
+                    raise failure("PRIVATE_TRANSCRIPT")
+                return str(calls.count(name))
+            return ToolSpec(name, ToolKind.OTHER, path, {"version": version} if available else {})
+        return ToolInfo(name, ToolKind.OTHER, create_spec)
+
+    infos = (info("good"), info("failed", ToolCommandError), info("unparsed", ToolParserError),
+             info("unavailable", available=False))
+    monkeypatch.setattr(discovery, "load_tools", lambda: infos)
+    monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
+    async def no_vs(*args):
+        return ()
+    monkeypatch.setattr(visual_studio, "discover", no_vs)
+    async with Client(create_server(cpp_acceptance_project), raise_exceptions=True) as client:
+        await client.call_tool("toolsets_list", {})
+        await client.read_resource(ToolchainService.LIST_URI)
+        assert calls == []
+        for expected in ("1", "2"):
+            result = await client.call_tool("toolset_get", {"toolset_id": "system"})
+            assert not result.is_error
+            versions = {item["name"]: item["version"] for item in result.structured_content["tools"]}
+            assert versions == {"good": expected, "failed": None, "unparsed": None, "unavailable": None}
+            assert "environment" not in result.structured_content
+            assert "PRIVATE_TRANSCRIPT" not in str(result.content)
+        resource = await client.read_resource("forgemcp://toolsets/system")
+        text = resource.contents[0].text
+        assert "| good |" in text and "| 3 |" in text and "Unknown" in text
+        assert "PRIVATE_TRANSCRIPT" not in text
+        assert calls.count("good") == 3
+        assert calls.count("failed") == calls.count("unparsed") == 3
+        assert "unavailable" not in calls

@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from forgemcp.process.service import ProcessService
+from forgemcp.process.service import ProcessService, ChunkDecoder
+from forgemcp.process.models import ProcessEncoding, ProcessTimeout
+from forgemcp.process.errors import ProcessError, ProcessExitedError, ProcessStreamError, ProcessStartError
 
 
 @pytest.fixture
@@ -15,99 +17,209 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture
+async def processes(cpp_acceptance_project):
+    service = ProcessService(cpp_acceptance_project)
+    async with asyncio.timeout(15):
+        try:
+            yield service
+        finally:
+            await service.close()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("inherit", [True, False])
-@pytest.mark.parametrize("protocol", [True, False])
-async def test_environment_modes(cpp_acceptance_project, monkeypatch, inherit, protocol):
+async def test_environment_modes(processes, monkeypatch, inherit):
     monkeypatch.setenv("FORGEMCP_PARENT_TEST", "parent")
-    processes = ProcessService(cpp_acceptance_project)
-    try:
-        start = processes.start_protocol if protocol else processes.start
-        session = await start(sys.executable, ("-c", "import os,json; print(json.dumps(dict(os.environ)))"),
-                              env={"FORGEMCP_CHILD_TEST": "child"}, inherit_environment=inherit)
-        if protocol:
-            pieces = []
-            while (piece := await session.read_stdout()) is not None:
-                pieces.append(piece)
-            while await session.read_stderr() is not None:
-                pass
-            output = "".join(pieces)
-        else:
-            output = "".join([chunk.text async for chunk in session.output() if chunk.stream == "stdout"])
-        result = await session.wait()
-        assert result.return_code == 0
-        environment = json.loads(output)
-        assert environment["FORGEMCP_CHILD_TEST"] == "child"
-        assert ("FORGEMCP_PARENT_TEST" in environment) == inherit
-        assert not processes.details(session.process_id).shell
-    finally:
-        await processes.close()
+    async with await processes.launch(
+        sys.executable, ("-c", "import os,json; print(json.dumps(dict(os.environ)))"),
+        env={"FORGEMCP_CHILD_TEST": "child"}, inherit_environment=inherit,
+    ) as session:
+        output = "".join([chunk.text async for chunk in session.output()])
+        assert await session.wait() == 0
+    environment = json.loads(output)
+    assert environment["FORGEMCP_CHILD_TEST"] == "child"
+    assert ("FORGEMCP_PARENT_TEST" in environment) == inherit
 
 
 @pytest.mark.anyio
-@pytest.mark.skipif(os.name != "nt", reason="Windows executable names and shell")
-async def test_shell_executable_path_is_literal(cpp_acceptance_project):
+async def test_arguments_are_literal_and_retained(processes, cpp_acceptance_project):
+    values = ["hello world", "a&b", "(x)", "", "a|b", "a>b", 'quote" & literal',
+              "%FORGEMCP_SHELL_TEST%", "bang!", "caret^"]
+    arguments = ("-c", "import json,sys; print(json.dumps(sys.argv[1:]))", *values)
+    async with await processes.launch(sys.executable, arguments) as session:
+        output = "".join([chunk.text async for chunk in session.output()])
+        assert await session.wait() == 0
+        summary = processes.records[session.process_id].summary
+        assert summary.arguments == list(arguments)
+        assert summary.executable == sys.executable
+        assert summary.cwd == str(cpp_acceptance_project.resolve())
+    assert json.loads(output) == values
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable paths")
+async def test_executable_path_is_literal(processes, cpp_acceptance_project):
     folder = cpp_acceptance_project / "Tools %FORGEMCP_SHELL_TEST% & more"
     folder.mkdir()
     executable = folder / "python.exe"
     shutil.copy2(sys.executable, executable)
     (folder / "pyvenv.cfg").write_text((Path(sys.executable).parent.parent / "pyvenv.cfg").read_text())
-    processes = ProcessService(cpp_acceptance_project)
-    try:
-        session = await processes.start(executable, ("-c", "print(123)"), shell=True,
-                                        env={"FORGEMCP_SHELL_TEST": "expanded"}, timeout=5)
-        output = "".join([chunk.text async for chunk in session.output() if chunk.stream == "stdout"])
-        assert (await session.wait()).return_code == 0
-        assert output.strip() == "123"
-    finally:
-        await processes.close()
+    async with await processes.launch(executable, ("-c", "print(123)")) as session:
+        assert "".join([item.text async for item in session.output() if item.stream == "stdout"]).strip() == "123"
+        assert await session.wait() == 0
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("shell", [False, True])
-async def test_shell_arguments_and_original_record(cpp_acceptance_project, shell):
-    script = cpp_acceptance_project / "echo args.py"
-    script.write_text("import json,sys; print(json.dumps(sys.argv[1:]))")
-    values = ["hello world", "a&b", "(x)", "", "trailing\\", "a|b", "a>b",
-              'quote" & literal', '%FORGEMCP_SHELL_TEST%', "bang!", "caret^", "space \\"]
-    processes = ProcessService(cpp_acceptance_project)
-    try:
-        arguments = (str(script), *values)
-        session = await processes.start(sys.executable, arguments, shell=shell, timeout=5,
-                                        env={"FORGEMCP_SHELL_TEST": "expanded"})
-        output = "".join([chunk.text async for chunk in session.output() if chunk.stream == "stdout"])
-        assert (await session.wait()).return_code == 0
-        assert json.loads(output) == values
-        record = processes.record(session.process_id)
-        assert record.arguments == arguments
-        assert record.executable == sys.executable
-        assert record.shell == shell
-        assert processes.overview().processes[0].shell == shell
-    finally:
-        await processes.close()
+async def test_stdin_fifo_eof_both_outputs_and_repeat_wait(processes):
+    code = "import sys; data=sys.stdin.read(); print(data,end=''); print('err',file=sys.stderr)"
+    async with await processes.launch(sys.executable, ("-c", code)) as session:
+        await session.write_stdin("first")
+        await session.write_stdin("second")
+        await session.close_stdin()
+        await session.close_stdin()
+        with pytest.raises(ProcessExitedError):
+            await session.write_stdin("late")
+        output = {"stdout": "", "stderr": ""}
+        async for chunk in session.output():
+            output[chunk.stream] += chunk.text
+        assert output == {"stdout": "firstsecond", "stderr": "err" + os.linesep}
+        assert await session.wait() == await session.wait() == session.returncode == 0
+        with pytest.raises(ProcessStreamError):
+            await anext(session.output())
+    record = processes.records[session.process_id]
+    assert record.status.current_status == 0
+    assert "".join(entry.text for entry in record.status.transcript if entry.stream == "stdin") == "firstsecond"
 
 
 @pytest.mark.anyio
-async def test_cancel_during_launch_tracks_and_terminates_child(cpp_acceptance_project, monkeypatch):
-    created = asyncio.Event()
-    release = asyncio.Event()
-    original = asyncio.create_subprocess_exec
-    async def delayed(*args, **kwargs):
-        process = await original(*args, **kwargs)
-        created.set()
-        await release.wait()
-        return process
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed)
-    processes = ProcessService(cpp_acceptance_project)
-    try:
-        task = asyncio.create_task(processes.start(sys.executable, ("-c", "import time; time.sleep(30)")))
-        await asyncio.wait_for(created.wait(), 5)
-        task.cancel()
-        release.set()
+async def test_wait_drains_large_output_without_consumer(processes):
+    code = "import sys; sys.stdout.write('x'*200000); sys.stderr.write('y'*200000); sys.exit(7)"
+    async with await processes.launch(sys.executable, ("-c", code)) as session:
+        assert await session.wait() == 7
+        output = {"stdout": "", "stderr": ""}
+        async for chunk in session.output():
+            output[chunk.stream] += chunk.text
+        assert output == {"stdout": "x"*200000, "stderr": "y"*200000}
+
+
+@pytest.mark.anyio
+async def test_cancel_wait_does_not_stop_session(processes):
+    async with await processes.launch(sys.executable, ("-c", "import sys; sys.stdin.read()")) as session:
+        waiter = asyncio.create_task(session.wait())
+        await asyncio.sleep(0)
+        waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 5)
-        assert len(processes.records) == 1
-        assert processes.overview().running == 0
-        assert next(iter(processes.records.values())).process.returncode is not None
-    finally:
-        await processes.close()
+            await waiter
+        assert session.returncode is None
+        assert not session.task.done()
+        await session.close_stdin()
+        assert await session.wait() == 0
+
+
+@pytest.mark.anyio
+async def test_context_cancellation_stops_workers(processes):
+    ready = asyncio.Event()
+    sessions = []
+    async def owner():
+        async with await processes.launch(sys.executable, ("-c", "import time; time.sleep(30)")) as session:
+            sessions.append(session)
+            ready.set()
+            await asyncio.Event().wait()
+    task = asyncio.create_task(owner())
+    await ready.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sessions[0].returncode is not None
+    assert sessions[0].task.done()
+    await sessions[0].close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["total", "idle"])
+async def test_timeout_reaches_output_and_wait(processes, mode):
+    session = await processes.launch(sys.executable, ("-c", "import time; time.sleep(30)"),
+                                     timeout=ProcessTimeout(**{mode: .1}))
+    with pytest.raises(ProcessError):
+        async with session:
+            async for _ in session.output():
+                pass
+    with pytest.raises(ProcessError):
+        await session.wait()
+    assert session.returncode is not None
+    assert session.task.done()
+    assert processes.records[session.process_id].status.current_status == "interrupted"
+
+
+@pytest.mark.anyio
+async def test_decode_failure_is_not_eof(processes):
+    with pytest.raises(ProcessStreamError):
+        async with await processes.launch(
+            sys.executable, ("-c", "import sys; sys.stdout.buffer.write(bytes([255]))"),
+            encoding=ProcessEncoding("utf-8", errors="strict"),
+        ) as session:
+            async for _ in session.output():
+                pass
+    assert session.returncode is not None
+    with pytest.raises(ProcessStreamError):
+        await session.wait()
+
+
+def test_incremental_decoder_and_latin1():
+    decoder = ChunkDecoder(ProcessEncoding("utf-8", errors="strict"))
+    data = "日本語".encode()
+    assert "".join(decoder.decode(bytes([byte])) for byte in data) + decoder.final() == "日本語"
+    decoder = ChunkDecoder(ProcessEncoding("latin_1", errors="strict"))
+    assert decoder.decode(bytes(range(256))).encode("latin_1") == bytes(range(256))
+
+
+@pytest.mark.anyio
+async def test_service_close_stops_all_sessions(processes):
+    sessions = [await processes.launch(sys.executable, ("-c", "import time; time.sleep(30)")) for _ in range(2)]
+    await processes.close()
+    await processes.close()
+    assert all(session.returncode is not None and session.task.done() for session in sessions)
+
+
+@pytest.mark.anyio
+async def test_invalid_launch_has_no_records(processes, cpp_acceptance_project):
+    for kwargs in ({"cwd": cpp_acceptance_project.parent}, {"encoding": ProcessEncoding("invalid-codec")}):
+        with pytest.raises(ProcessStartError):
+            await processes.launch(sys.executable, **kwargs)
+    with pytest.raises(ProcessStartError):
+        await processes.launch(cpp_acceptance_project / "missing-program")
+    assert not processes.records
+
+
+@pytest.mark.anyio
+async def test_cancel_output_does_not_close_session(processes):
+    async with await processes.launch(sys.executable, ("-c", "import sys; sys.stdin.read()")) as session:
+        reader = asyncio.create_task(anext(session.output()))
+        await asyncio.sleep(0)
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+        assert session.returncode is None
+        await session.close_stdin()
+        assert await session.wait() == 0
+
+
+@pytest.mark.anyio
+async def test_launch_cancellation_delegates_to_asyncio(processes, monkeypatch):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    async def launch(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
+    task = asyncio.create_task(processes.launch(sys.executable))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+    assert not processes.records

@@ -397,7 +397,7 @@ class ProcessService:
                     document.add(markdown.OrderedList(record.summary.arguments))
 
                     table = markdown.Table(["Settings", "Values"])
-                    table.add(["id", record.summary.process_id])
+                    table.add(["id", str(record.summary.process_id)])
                     table.add(["state", str(record.status.current_status)])
                     table.add(["encoding", record.summary.encoding])
                     document.add(table)
@@ -405,7 +405,7 @@ class ProcessService:
                     document.add(markdown.Heading("process log", level=2))
                     table = markdown.Table(["timestamp", "direction", "text"])
                     for log_entry in record.status.transcript:
-                        table.add([log_entry.timestamp, log_entry.stream, log_entry.text])
+                        table.add([log_entry.timestamp.isoformat(), log_entry.stream, log_entry.text])
                     document.add(table)
 
                 return document.render()
