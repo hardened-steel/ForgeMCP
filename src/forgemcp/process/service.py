@@ -469,15 +469,21 @@ class ProcessSession:
         stderr = cast(asyncio.StreamReader, self.process.stderr)
         try:
             async with asyncio.TaskGroup() as group:
-                group.create_task(self.record.read_stream(
-                    "stdout", stdout, self.stdout_decoder, self.output_queue,
-                ))
-                group.create_task(self.record.read_stream(
-                    "stderr", stderr, self.stderr_decoder, self.output_queue,
-                ))
-                writer = group.create_task(self.record.write_stream(
-                    cast(asyncio.StreamWriter, self.process.stdin), self.stdin_encoder, self.stdin,
-                ))
+                group.create_task(
+                    self.record.read_stream(
+                        "stdout", stdout, self.stdout_decoder, self.output_queue,
+                    )
+                )
+                group.create_task(
+                    self.record.read_stream(
+                        "stderr", stderr, self.stderr_decoder, self.output_queue,
+                    )
+                )
+                writer = group.create_task(
+                    self.record.write_stream(
+                        cast(asyncio.StreamWriter, self.process.stdin), self.stdin_encoder, self.stdin,
+                    )
+                )
                 monitor = group.create_task(self.record.monitor(self.process, self.stopping))
                 await monitor
                 writer.cancel()
