@@ -1,1 +1,1 @@
-"""Each public module exports exactly one unbound SPEC."""
+"""Each public module exports INFO and its concrete Methods TypedDict."""

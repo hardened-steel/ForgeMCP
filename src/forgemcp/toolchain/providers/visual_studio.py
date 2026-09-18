@@ -7,11 +7,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from forgemcp.process.errors import ProcessError
-from forgemcp.process.models import ProcessStatus
+from forgemcp.process.models import ProcessEncoding, ProcessTimeout
 from forgemcp.process.service import ProcessService
 
 from ..errors import ToolCommandError
-from ..spec import Toolset, ToolSpec
+from ..spec import ToolInfo, Toolset
 
 
 MAX_INSTANCES = 128
@@ -33,7 +33,7 @@ async def instance_environment(root: Path, processes: ProcessService) -> dict[st
     comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
     session = await processes.launch(
         comspec, ("/u", "/d", "/s", "/c", "call", str(batch), "-no_logo", "-arch=x64", "&&", "set"),
-        encoding="utf-16-le", timeout=60,
+        encoding=ProcessEncoding("utf-16-le"), timeout=ProcessTimeout(total=60),
     )
     environment: dict[str, str] = {}
     pending = ""
@@ -54,7 +54,7 @@ async def instance_environment(root: Path, processes: ProcessService) -> dict[st
             if separator and name:
                 environment[name] = value
         result = await session.wait()
-    if result.status != ProcessStatus.EXITED or result.return_code != 0 or not environment:
+    if result != 0 or not environment:
         raise ToolCommandError("Visual Studio developer environment failed.")
     return environment
 
@@ -91,16 +91,16 @@ def locate(root: Path, name: str) -> Path | None:
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
-async def discover(specs: tuple[ToolSpec, ...], processes: ProcessService) -> tuple[Toolset, ...]:
+async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tuple[Toolset, ...]:
     if os.name != "nt":
         return ()
     executable = vswhere_path()
     if executable is None:
         return ()
     try:
-        session = await processes.start(
+        session = await processes.launch(
             executable, ("-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"),
-            encoding="utf-8", timeout=30,
+            encoding=ProcessEncoding("utf-8"), timeout=ProcessTimeout(total=30),
         )
         async with session:
             await session.close_stdin()
@@ -112,7 +112,7 @@ async def discover(specs: tuple[ToolSpec, ...], processes: ProcessService) -> tu
                         raise ToolCommandError("Visual Studio instance listing is too large.")
                     document += output.text
             terminal = await session.wait()
-        if terminal.status != ProcessStatus.EXITED or terminal.return_code != 0:
+        if terminal != 0:
             return ()
         instances = json.loads(document)
         if not isinstance(instances, list):
@@ -143,8 +143,7 @@ async def discover(specs: tuple[ToolSpec, ...], processes: ProcessService) -> tu
             try:
                 path = locate(root, spec.name)
                 if path is not None:
-                    bound.append(spec.bind(path=path, processes=processes,
-                                           environment=environment, inherit_environment=False))
+                    bound.append(spec.create_spec(path, processes, environment, False))
             except OSError:
                 continue
         found.append(Toolset(identifier, instance["displayName"], tuple(bound), environment, False))

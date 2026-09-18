@@ -1,4 +1,4 @@
-"""Immutable discovery cache, consumer API, and read-only MCP inspection."""
+"""Toolset containers, consumer API, and read-only MCP inspection."""
 
 from __future__ import annotations
 
@@ -15,12 +15,13 @@ from mcp.types import (
 )
 from pydantic import BaseModel
 
+from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
 
 from . import discovery
-from .errors import ToolsetNotFoundError
+from .errors import ToolCommandError, ToolParserError, ToolsetNotFoundError
 from .spec import ToolKind, Toolset, ToolSpec
 
 
@@ -30,7 +31,7 @@ class ToolsetSummary(BaseModel):
     tools: list[str]
 
 
-class ToolInfo(BaseModel):
+class ToolDetails(BaseModel):
     name: str
     kind: ToolKind
     path: str
@@ -40,18 +41,11 @@ class ToolInfo(BaseModel):
 class ToolsetDetails(BaseModel):
     id: str
     name: str
-    tools: list[ToolInfo]
-
-
-def markdown(value: str) -> str:
-    """Escape untrusted names and paths used in markdown table cells."""
-    for character in ("\\", "`", "*", "_", "[", "]", "<", ">", "|", "#"):
-        value = value.replace(character, "\\" + character)
-    return value.replace("\r", " ").replace("\n", " ")
+    tools: list[ToolDetails]
 
 
 class ToolchainService:
-    """Inspect cached independent toolsets, then pass an explicit toolset ID to consumers.
+    """Inspect independent toolsets, then pass an explicit toolset ID to consumers.
 
     Toolsets may be incomplete. No current or preferred toolset is selected. Absolute
     executable paths and versions are public; toolset environments remain internal.
@@ -67,97 +61,96 @@ class ToolchainService:
     ) -> None:
         self.processes = processes
         self.definitions = tuple(tuple(group) for group in definitions)
-        self.cache: tuple[Toolset, ...] = ()
+        self.toolsets: tuple[Toolset, ...] = ()
         self.initialized = False
         self.discovery_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
-        """Discover once and publish the complete immutable snapshot atomically."""
+        """Discover once and publish the complete collection atomically."""
         async with self.discovery_lock:
             if not self.initialized:
                 toolsets = await discovery.discover(self.processes, self.definitions)
-                self.cache = toolsets
+                self.toolsets = toolsets
                 self.initialized = True
 
-    def list_toolsets(self) -> tuple[ToolsetSummary, ...]:
-        return tuple(ToolsetSummary(id=item.id, name=item.name, tools=[tool.name for tool in item.tools]) for item in self.cache)
+    def list_toolsets(self) -> tuple[Toolset, ...]:
+        return self.toolsets
 
-    def resolve_toolset(self, toolset_id: str) -> Toolset:
-        for toolset in self.cache:
+    def get_toolset(self, toolset_id: str) -> Toolset:
+        for toolset in self.toolsets:
             if toolset.id == toolset_id:
                 return toolset
         raise ToolsetNotFoundError(f"Unknown toolset ID {toolset_id!r}.")
 
-    def get_toolset(self, toolset_id: str) -> ToolsetDetails:
-        toolset = self.resolve_toolset(toolset_id)
-        return ToolsetDetails(
-            id=toolset.id, name=toolset.name, tools=[
-                ToolInfo(name=tool.name, kind=tool.kind, path=str(tool.path), version=tool.version)
-                for tool in toolset.tools
-            ]
-        )
-
     def get_tool(self, toolset_id: str, tool_name: str) -> ToolSpec | None:
         return next(
-            (tool for tool in self.resolve_toolset(toolset_id).tools if tool.name == tool_name),
-            None
+            (tool for tool in self.get_toolset(toolset_id).tools if tool.name == tool_name),
+            None,
         )
-
-    def summaries_markdown(self) -> str:
-        lines = ["# Toolsets", "", "| ID | Name | Tools |", "| --- | --- | --- |"]
-        for item in self.list_toolsets():
-            lines.append(f"| {markdown(item.id)} | {markdown(item.name)} | "
-                         f"{markdown(', '.join(item.tools))} |")
-        return "\n".join(lines)
-
-    def details_markdown(self, toolset_id: str) -> str:
-        item = self.get_toolset(toolset_id)
-        lines = [f"# {markdown(item.name)}", "", f"ID: {markdown(item.id)}", "",
-                 "| Tool | Kind | Absolute path | Version |", "| --- | --- | --- | --- |"]
-        for tool in item.tools:
-            lines.append("| " + " | ".join(markdown(value) for value in (
-                tool.name, tool.kind.value, tool.path, tool.version or "Unknown",
-            )) + " |")
-        return "\n".join(lines)
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         icon = self.ICON.icon
         annotations = ToolAnnotations(read_only_hint=True, destructive_hint=False,
                                       idempotent_hint=True, open_world_hint=False)
 
+        async def read_tool(tool: ToolSpec) -> ToolDetails:
+            # Versions belong only to the current MCP response, never the spec.
+            version = None
+            if "version" in tool.methods:
+                try:
+                    version = await tool.methods["version"]()
+                except (ToolCommandError, ToolParserError):
+                    pass
+            return ToolDetails(name=tool.name, kind=tool.kind, path=str(tool.path), version=version)
+
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
         async def toolsets_list(ctx: Context) -> list[ToolsetSummary]:
-            """List all cached toolsets and the tools available in each."""
-            await ctx.report_progress(1, total=2, message="Reading cached toolsets")
-            result = list(self.list_toolsets())
-            await ctx.report_progress(2, total=2, message="Toolsets ready")
+            """List all discovered toolsets and the tools available in each."""
+            await ctx.report_progress(0, total=1, message="Reading toolsets")
+            result = [ToolsetSummary(id=item.id, name=item.name, tools=[tool.name for tool in item.tools])
+                      for item in self.list_toolsets()]
+            await ctx.report_progress(1, total=1, message="Toolsets ready")
             return result
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
         async def toolset_get(toolset_id: str, ctx: Context) -> ToolsetDetails:
-            """Read cached tool paths, kinds, and versions for an explicit toolset ID."""
-            await ctx.report_progress(1, total=2, message="Reading cached toolset")
+            """Read tool paths and kinds, querying available versions for this request."""
             try:
-                result = self.get_toolset(toolset_id)
+                toolset = self.get_toolset(toolset_id)
             except ToolsetNotFoundError as error:
                 raise ToolError(str(error)) from error
-            await ctx.report_progress(2, total=2, message="Toolset ready")
-            return result
+            total = len(toolset.tools)
+            await ctx.report_progress(0, total=total, message="Reading tool versions")
+            details = []
+            for index, tool in enumerate(toolset.tools, start=1):
+                details.append(await read_tool(tool))
+                await ctx.report_progress(index, total=total, message=f"Read {tool.name}")
+            return ToolsetDetails(id=toolset.id, name=toolset.name, tools=details)
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[icon])
         def toolsets() -> str:
-            """Read a markdown summary of all cached toolsets."""
-            return self.summaries_markdown()
+            """Read a markdown summary of all discovered toolsets."""
+            table = markdown.Table(["ID", "Name", "Tools"])
+            for item in self.list_toolsets():
+                table.add([item.id, item.name, ", ".join(tool.name for tool in item.tools)])
+            return markdown.Document([markdown.Heading("Toolsets"), table]).render()
 
         @mcp.resource(self.DETAILS_URI, mime_type="text/markdown", icons=[icon])
-        def toolset_details(toolset_id: str) -> str:
-            """Read the cached executable paths and versions of one toolset."""
+        async def toolset_details(toolset_id: str) -> str:
+            """Read executable paths and query available versions of one toolset."""
             try:
-                return self.details_markdown(toolset_id)
+                toolset = self.get_toolset(toolset_id)
             except ToolsetNotFoundError as error:
                 raise ResourceNotFoundError(str(error)) from error
+            table = markdown.Table(["Tool", "Kind", "Absolute path", "Version"])
+            for tool in toolset.tools:
+                detail = await read_tool(tool)
+                table.add([detail.name, detail.kind.value, detail.path, detail.version or "Unknown"])
+            return markdown.Document([
+                markdown.Heading(toolset.name), markdown.Paragraph(f"ID: {toolset.id}"), table,
+            ]).render()
 
         async def toolset_completion(
             ref: PromptReference | ResourceTemplateReference,
@@ -166,7 +159,7 @@ class ToolchainService:
             if (not isinstance(ref, ResourceTemplateReference) or ref.uri != self.DETAILS_URI
                     or argument.name != "toolset_id"):
                 return None
-            values = [item.id for item in self.cache if item.id.startswith(argument.value)]
+            values = [item.id for item in self.toolsets if item.id.startswith(argument.value)]
             return Completion(values=values[:100], total=len(values), has_more=len(values) > 100)
 
         complete.add_completion(toolset_completion)

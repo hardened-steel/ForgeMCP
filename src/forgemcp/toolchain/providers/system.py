@@ -7,10 +7,10 @@ from pathlib import Path
 
 from forgemcp.process.service import ProcessService
 
-from ..spec import Toolset, ToolSpec
+from ..spec import ToolInfo, Toolset
 
 
-def locate(spec: ToolSpec) -> Path | None:
+def locate(spec: ToolInfo) -> Path | None:
     name = spec.name
     # POSIX link is a filesystem utility, not Microsoft's linker.
     if os.name != "nt" and name in {"cl", "link", "msbuild", "cppvsdbg"}:
@@ -35,7 +35,7 @@ def locate(spec: ToolSpec) -> Path | None:
     return None
 
 
-def discover(specs: tuple[ToolSpec, ...], processes: ProcessService) -> Toolset:
+def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> Toolset:
     found = []
     for spec in specs:
         try:
@@ -43,5 +43,5 @@ def discover(specs: tuple[ToolSpec, ...], processes: ProcessService) -> Toolset:
         except OSError:
             continue
         if path is not None:
-            found.append(spec.bind(path=path, processes=processes))
+            found.append(spec.create_spec(path, processes, None, True))
     return Toolset("system", "System", tuple(found), None, True)

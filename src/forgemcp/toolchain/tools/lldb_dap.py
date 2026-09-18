@@ -1,10 +1,25 @@
-"""Commands and parsers for lldb-dap."""
+"""Typed methods for lldb-dap."""
 
-from ..spec import ToolCommand, ToolKind, ToolSpec, version_parser
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TypedDict
+
+from forgemcp.process.service import ProcessService
+
+from ..spec import ToolInfo, ToolKind, ToolSpec
 
 
-SPEC = ToolSpec(
-    name="lldb-dap", kind=ToolKind.DEBUGGER, path=None, version=None,
-    commands={},
-    parsers={},
-)
+class Methods(TypedDict):
+    pass
+
+
+def create_spec(
+    path: Path, processes: ProcessService,
+    environment: Mapping[str, str] | None = None, inherit_environment: bool = True,
+) -> ToolSpec:
+    path = path.resolve()
+    methods: Methods = {}
+    return ToolSpec(INFO.name, INFO.kind, path, methods)
+
+
+INFO = ToolInfo(name='lldb-dap', kind=ToolKind.DEBUGGER, create_spec=create_spec)

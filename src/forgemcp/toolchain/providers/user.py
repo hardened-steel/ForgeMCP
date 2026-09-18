@@ -13,7 +13,7 @@ from forgemcp.process.service import ProcessService
 from ..errors import (
     DuplicateToolsetError, InvalidToolPathError, ToolCommandError, UnknownToolError,
 )
-from ..spec import Toolset, ToolSpec
+from ..spec import ToolInfo, Toolset
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class UserToolset:
 
 
 def parse_toolsets(
-    values: Sequence[Sequence[str]], specs: tuple[ToolSpec, ...],
+    values: Sequence[Sequence[str]], specs: tuple[ToolInfo, ...],
 ) -> tuple[UserToolset, ...]:
     known = {spec.name for spec in specs}
     names: set[str] = set()
@@ -62,12 +62,12 @@ def parse_toolsets(
 
 
 def discover(
-    definitions: tuple[UserToolset, ...], specs: tuple[ToolSpec, ...], processes: ProcessService,
+    definitions: tuple[UserToolset, ...], specs: tuple[ToolInfo, ...], processes: ProcessService,
 ) -> tuple[Toolset, ...]:
     by_name = {spec.name: spec for spec in specs}
     result = []
     for definition in definitions:
-        tools = tuple(by_name[name].bind(path=path, processes=processes)
+        tools = tuple(by_name[name].create_spec(path, processes, None, True)
                       for name, path in definition.paths.items())
         identifier = "user-" + hashlib.sha256(definition.name.encode("utf-8")).hexdigest()
         result.append(Toolset(identifier, definition.name, tools, None, True))

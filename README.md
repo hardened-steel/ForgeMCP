@@ -15,10 +15,11 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
 - Tool `processes_overview` shows running and completed external development tools.
 - Resource template `forgemcp://processes/{process_id}` exposes the retained state and
   text transcript of one process.
-- Tool `toolsets_list` lists every cached toolset; `toolset_get(toolset_id)` returns
+- Tool `toolsets_list` lists every discovered toolset; `toolset_get(toolset_id)` returns
   its absolute executable paths, kinds, and versions. Both open the toolsets widget.
 - Resources `forgemcp://toolsets` and `forgemcp://toolsets/{toolset_id}` expose the
-  same cached state as markdown, with completion for retained toolset IDs.
+  toolsets as markdown, querying available versions for details, with completion
+  for retained toolset IDs.
 
 The tools remain useful in clients without MCP Apps support because the Python SDK
 serializes their typed results into both text `content` and `structuredContent`.
@@ -35,7 +36,7 @@ the shared process service internally; its public MCP surface is read-only.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.13 or newer
 - Node.js `^20.19.0` or `>=22.12.0` for clean editable installs, wheel builds,
   and widget development
 
@@ -112,10 +113,12 @@ Built-ins cover CMake, CTest, Ninja, Make, MSBuild, MSVC (`cl`), `link`, Clang,
 `clang++`, `clang-cl`, GCC, `g++`, LLD, `lld-link`, clangd, Git, LLDB-DAP, GDB, and
 `cppvsdbg`. The last adapter may be found as `OpenDebugAD7.exe` or VS Code's bundled
 `vsdbg.exe`; it has no portable version probe. An unknown or failed version probe
-leaves the discovered path available with a null version.
+leaves the discovered path available with a null version. Version methods for `cl`,
+`link`, `cppvsdbg`, and `lldb-dap` are not implemented in this iteration.
 
-Discovery is cached for the server lifetime. List/get tools and resource reads never
-repeat probes; restart the server to discover changed installations. All probes,
+Toolsets are discovered once per server lifetime; restart to discover changed
+installations. Detail tools and resources query available versions on each request,
+without caching them. Listing toolsets does not launch version probes. All probes,
 `vswhere`, and the command capturing `VsDevCmd` plus `set` remain visible in the process
 overview and retain their transcripts. Toolset resources omit environments; the
 environment capture's stdout is retained in its ordinary process transcript.

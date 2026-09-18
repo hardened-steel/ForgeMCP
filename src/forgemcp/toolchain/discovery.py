@@ -1,11 +1,10 @@
-"""Assemble independent toolsets and probe their bound version commands once."""
+"""Assemble independent toolsets with ready executable specs."""
 
 from collections.abc import Sequence
-from dataclasses import replace
 
 from forgemcp.process.service import ProcessService
 
-from .errors import DuplicateToolsetError, ToolCommandError, ToolParserError
+from .errors import DuplicateToolsetError
 from .loader import load_tools
 from .providers import system, user, visual_studio
 from .spec import Toolset
@@ -22,18 +21,4 @@ async def discover(
     toolsets.extend(user.discover(users, specs, processes))
     if len({toolset.id for toolset in toolsets}) != len(toolsets):
         raise DuplicateToolsetError("Discovery produced duplicate toolset IDs.")
-    result = []
-    for toolset in sorted(toolsets, key=lambda item: item.id):
-        tools = []
-        for tool in toolset.tools:
-            version = None
-            if "version" in tool.commands:
-                try:
-                    parsed = await tool.commands["version"]()
-                    if isinstance(parsed, str):
-                        version = parsed
-                except (ToolCommandError, ToolParserError):
-                    pass
-            tools.append(replace(tool, version=version))
-        result.append(replace(toolset, tools=tuple(tools)))
-    return tuple(result)
+    return tuple(sorted(toolsets, key=lambda item: item.id))

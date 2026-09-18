@@ -6,7 +6,7 @@ class ToolchainError(Exception):
 
 
 class ToolModuleError(ToolchainError):
-    """A built-in tool module does not satisfy the SPEC contract."""
+    """A built-in tool module does not satisfy the INFO contract."""
 
 
 class DuplicateToolSpecError(ToolModuleError):
@@ -18,7 +18,7 @@ class UnknownToolError(ToolchainError):
 
 
 class ToolsetNotFoundError(ToolchainError):
-    """The requested toolset is not in the discovery cache."""
+    """The requested toolset is not in the toolchain."""
 
 
 class DuplicateToolsetError(ToolchainError):
@@ -30,7 +30,7 @@ class InvalidToolPathError(ToolchainError):
 
 
 class ToolCommandError(ToolchainError):
-    """Command binding, arguments, or process execution failed."""
+    """Tool arguments or process execution failed."""
 
 
 class ToolParserError(ToolchainError):

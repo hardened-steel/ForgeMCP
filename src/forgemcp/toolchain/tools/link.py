@@ -1,17 +1,25 @@
-"""Commands and parsers for link."""
+"""Typed methods for link."""
 
-from ..spec import ToolCommand, ToolKind, ToolSpec, version_parser
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TypedDict
+
+from forgemcp.process.service import ProcessService
+
+from ..spec import ToolInfo, ToolKind, ToolSpec
 
 
-def version_arguments() -> tuple[str, ...]:
-    return ("/?",)
+class Methods(TypedDict):
+    pass
 
 
-parse_version = version_parser("Linker Version ([0-9.]+)")
+def create_spec(
+    path: Path, processes: ProcessService,
+    environment: Mapping[str, str] | None = None, inherit_environment: bool = True,
+) -> ToolSpec:
+    path = path.resolve()
+    methods: Methods = {}
+    return ToolSpec(INFO.name, INFO.kind, path, methods)
 
-SPEC = ToolSpec(
-    name="link", kind=ToolKind.LINKER, path=None, version=None,
-    # LINK's help command uses 1100 for a normal help-only invocation.
-    commands={"version": ToolCommand(version_arguments, parser="version", success_codes=frozenset({0, 1100}))},
-    parsers={"version": parse_version},
-)
+
+INFO = ToolInfo(name='link', kind=ToolKind.LINKER, create_spec=create_spec)

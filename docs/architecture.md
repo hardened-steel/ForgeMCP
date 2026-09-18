@@ -7,7 +7,7 @@ module and registration pattern. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface before CMake, clangd, quality, and debugger behavior is added.
 The `toolchain` service discovers independent toolsets once at startup and exposes
-their paths and versions through a cache and read-only MCP surface.
+their paths and on-demand versions through a read-only MCP surface.
 
 The design goal is a small composition root plus independent feature services. There
 is no plugin system, service locator, event bus, repository layer, or transport-neutral
@@ -30,13 +30,13 @@ src/forgemcp/
     models.py                   # session results and MCP-facing process state
     errors.py                   # expected process failures
   toolchain/
-    service.py                  # immutable cache, Python API, MCP registration
-    discovery.py                # provider orchestration and version probes
+    service.py                  # toolset container, Python API, MCP registration
+    discovery.py                # provider orchestration and ready spec assembly
     loader.py                   # deterministic pkgutil built-in enumeration
-    spec.py                     # toolsets, specs, commands, async parser execution
+    spec.py                     # tool metadata, ready specs, and toolset containers
     errors.py                   # expected configuration and command errors
     providers/                  # system PATH, explicit CLI, Visual Studio layouts
-    tools/                      # one unbound SPEC per built-in module
+    tools/                      # INFO, create_spec, and typed methods per tool
 tests/
   conftest.py                   # isolated copy of the C++ acceptance workspace
   <feature>/test_service.py     # direct business behavior
@@ -225,8 +225,8 @@ for the server lifetime. There is no automatic refresh, watcher, global selectio
 service locator, or plugin framework.
 
 `loader.py` enumerates `forgemcp.toolchain.tools` with `pkgutil.iter_modules`, skips
-private names, sorts module names, and requires exactly one valid unbound `SPEC` per
-module. Duplicate logical names and invalid modules raise domain errors. Adding a
+private names, sorts module names, and requires exactly one valid `INFO: ToolInfo`
+per module. `ToolInfo` contains the logical name, kind, and `create_spec` callable. Duplicate logical names and invalid modules raise domain errors. Adding a
 built-in module automatically enables system and user discovery; VS-specific paths
 are added only in the VS provider.
 
@@ -242,30 +242,35 @@ instance visible with no bound tools, avoiding execution with an incorrect envir
 Repeated CLI definitions are validated before discovery launches processes. Names
 and tool keys cannot repeat; paths must identify executable files, including inside
 the workspace. User toolsets inherit the server environment and never fall back to
-PATH on configuration errors. All version commands run through bound specs; failed
-or unrecognized versions remain null without removing found executables.
+PATH on configuration errors. Discovery creates specs without querying tool versions.
 
-`Toolset` and `ToolSpec` are frozen dataclasses with read-only mapping snapshots.
-Toolsets retain only their own bound specs and environment. The public Pydantic
-summaries/details are fresh views that omit environment and expose absolute paths.
-`list_toolsets()` and `get_toolset(id)` serve MCP; future feature services use
-`resolve_toolset(id)` and `get_tool(id, name)` with an explicitly supplied toolset ID.
-There are no `selected`, `current`, or `preferred` fields.
+`ToolSpec` is created with its name, kind, executable path, and `methods` dictionary.
+It has no partially initialized state, bind/replace step, or stored version. Providers
+call `ToolInfo.create_spec(path, processes, environment, inherit_environment)` after
+finding an executable. Toolsets contain ready specs and their environment; the service
+contains the discovered toolsets. `list_toolsets()` and `get_toolset(id)` return these
+containers, and `get_tool(id, name)` returns a spec or None. There are no `selected`,
+`current`, or `preferred` fields.
 
-`ToolCommand` separates a synchronous keyword argument builder from execution. Binding
-creates a new command with the executable, ProcessService, parser, and toolset
-environment. Commands and parsers use arbitrary string keys. Built-ins currently
-provide version probes; `cppvsdbg` deliberately has none. Parser helpers remain
-platform-independent and consume tagged stdout/stderr incrementally.
+Each tool module declares its own `Methods` TypedDict and implements callables locally
+inside `create_spec`. Toolchain sees only an optional, read-only `version` callable in
+`ToolMethods`; concrete consumers import the tool module's `Methods` and cast
+`spec.methods` to that type. No inheritance between these TypedDicts is required.
+Argument conversion, process execution, and parsing stay inside the tool module.
+There is no generic ToolCommand, parser registry, or CommandExecution wrapper.
 
-`CommandExecution` launches lazily once, supports both `await` and `async for`, and
-retains `parsed_result` plus the terminal `process_result`. Its single event consumer
-receives live parser events through a bounded queue. Await-only execution discards
-events; events are not replayed as a second transcript. After streaming,
-`await execution.result()` returns the same cached result. Early parser completion
-still drains both pipes, and successful parsing never hides process failure. Parser
-exceptions name the command without copying output into errors. Cancellation and
-early closure of the event iterator terminate the managed process.
+Current implementations provide only version methods, with a 15-second process limit
+and a small retained banner from each output stream. They consume both streams and
+check exit status before returning a parsed version string. `cl`, `link`, `cppvsdbg`,
+and `lldb-dap` currently have empty method dictionaries. Longer sessions can later be
+exposed through explicitly typed iterator or context-manager methods without changing
+the containers.
+
+Only MCP detail handlers call `methods["version"]()` when available. Versions are not
+cached: each details request obtains fresh values; unsupported, failed, or unrecognized
+versions appear as null in structured output. Pydantic response models omit toolset
+environments and expose absolute executable paths. Resource documents use the shared
+`markdown` module; the former manual Markdown formatting helpers are removed.
 
 `toolsets_list` returns summaries (the SDK wraps a list in `structuredContent.result`),
 and `toolset_get` returns one details object. Both report progress and carry read-only
@@ -273,7 +278,7 @@ annotations, icons, Apps metadata, and SDK text fallback. The toolsets widget di
 only the supplied result: summaries for a list call, or details of one toolset for a
 get call. It never requests details or selects server-wide state. The static list
 resource and details template return markdown, and completion
-offers cached toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
+offers discovered toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
 the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 
 ## MCP Apps and widget packaging
