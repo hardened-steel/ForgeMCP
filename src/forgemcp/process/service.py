@@ -335,7 +335,7 @@ class ProcessService:
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
             """Register read-only process inspection entrypoints."""
             icon = self.ICON.icon
-            
+
             async def get_stream_content(self, process_id: int, stream: ProcessStream) -> str:
                 """Get process stream content"""
                 record = self.records[process_id]
@@ -379,7 +379,7 @@ class ProcessService:
 
                 await ctx.report_progress(len(records), total=len(records), message="Process state ready")
                 return ProcessOverview(running=running, completed=completed, processes=processes)
-    
+
             apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
 
             @mcp.resource(self.RESOURCE_URI, mime_type="text/markdown", icons=[icon])
@@ -409,7 +409,7 @@ class ProcessService:
                     document.add(table)
 
                 return document.render()
-    
+
             async def process_completion(
                 ref: PromptReference | ResourceTemplateReference,
                 argument: CompletionArgument,
