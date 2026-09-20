@@ -26,7 +26,11 @@ async def scripted_processes(cpp_acceptance_project):
             self.calls.append((executable, arguments, kwargs.copy()))
             if self.timeout is not None:
                 kwargs["timeout"] = self.timeout
-            session = await super().launch(sys.executable, ("-u", "-c", self.code), **kwargs)
+            session = await super().launch(
+                sys.executable,
+                ("-u", "-c", self.code),
+                **kwargs,
+            )
             self.started.set()
             return session
 

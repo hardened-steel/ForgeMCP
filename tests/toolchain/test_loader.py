@@ -11,7 +11,9 @@ def test_load_all_builtin_modules():
     specs = load_tools()
     assert len(specs) == 19
     assert len({spec.name for spec in specs}) == 19
-    assert {"clang++", "g++", "cl", "cppvsdbg", "lldb-dap"} <= {spec.name for spec in specs}
+    assert {"clang++", "g++", "cl", "cppvsdbg", "lldb-dap"} <= {
+        spec.name for spec in specs
+    }
     assert all(callable(spec.create_spec) for spec in specs)
 
 
@@ -35,12 +37,19 @@ def test_enumeration_is_dynamic_sorted_and_skips_private(tmp_path, monkeypatch):
         load_tools(loaded)
 
 
-@pytest.mark.parametrize("source", ["", "INFO=42", "raise RuntimeError('sensitive')",
-    "from forgemcp.toolchain.spec import ToolInfo,ToolKind\nINFO=ToolInfo('x',ToolKind.OTHER,None)",
-    "from forgemcp.toolchain.spec import ToolInfo,ToolKind\nINFO=ToolInfo('x',ToolKind.OTHER,lambda *args: None)\nOTHER=INFO"])
-
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        "INFO=42",
+        "raise RuntimeError('sensitive')",
+        "from forgemcp.toolchain.spec import ToolInfo,ToolKind\nINFO=ToolInfo('x',ToolKind.OTHER,None)",
+        "from forgemcp.toolchain.spec import ToolInfo,ToolKind\nINFO=ToolInfo('x',ToolKind.OTHER,lambda *args: None)\nOTHER=INFO",
+    ],
+)
 def test_invalid_modules_are_domain_errors(tmp_path, monkeypatch, source):
     import types
+
     package = types.ModuleType("invalid_tools")
     package.__path__ = [str(tmp_path)]
     (tmp_path / "invalid.py").write_text(source)

@@ -13,6 +13,7 @@ authors = [{ name = "ForgeMCP contributors" }]
 dependencies = [
     "mcp[cli]==2.1.1",
     "pydantic>=2.13",
+    "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]

@@ -19,16 +19,20 @@ from forgemcp.toolchain.loader import load_tools
 from forgemcp.toolchain.providers.user import parse_toolsets
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.workspace.service import WorkspaceService
+from forgemcp.workspace.errors import WorkspaceError
 
 
 def create_server(
-    workspace_root: Path | None = None, *, toolsets: list[list[str]] | None = None,
+    workspace_root: Path | None = None,
+    *,
+    toolsets: list[list[str]] | None = None,
+    storage_root: Path | None = None,
 ) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
     root = workspace_root or Path.cwd()
-    processes = ProcessService(root)
+    workspace = WorkspaceService(root, storage_root)
+    processes = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
     toolchains = ToolchainService(processes, toolsets or ())
-    workspace = WorkspaceService(root)
     services = (workspace, processes, toolchains)
     apps = Apps()
     complete = Complete()
@@ -81,8 +85,19 @@ def argument_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="Workspace root (defaults to the server process working directory).",
     )
-    parser.add_argument("--toolset", action="append", nargs="+", default=[],
-                        metavar="NAME_OR_TOOL=PATH", help="NAME TOOL=PATH [...]; repeat for each toolset.")
+    parser.add_argument(
+        "--toolset",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="NAME_OR_TOOL=PATH",
+        help="NAME TOOL=PATH [...]; repeat for each toolset.",
+    )
+    parser.add_argument(
+        "--workspace-storage",
+        type=Path,
+        help="Service storage directory (defaults to .<project>.forgemcp beside the project).",
+    )
     return parser
 
 
@@ -92,9 +107,14 @@ def main() -> None:
     arguments = parser.parse_args()
     try:
         parse_toolsets(arguments.toolset, load_tools())
-    except ToolchainError as error:
+        server = create_server(
+            arguments.workspace,
+            toolsets=arguments.toolset,
+            storage_root=arguments.workspace_storage,
+        )
+    except (ToolchainError, WorkspaceError) as error:
         parser.error(str(error))
-    create_server(arguments.workspace, toolsets=arguments.toolset).run(transport="stdio")
+    server.run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@ import { createResultView } from "./result-view.js";
 import "./widget.css";
 
 /** Lifecycle bridge only; no tool calls, resource reads, polling, or result fetching. */
-export async function connectWidget({ toolName, describe }) {
+export async function connectWidget({ toolName, describe, renderValue }) {
   const root = document.getElementById("widget");
-  const view = createResultView(root, { toolName, describe });
+  const view = createResultView(root, { toolName, describe, renderValue });
   const app = new App({ name: `ForgeMCP ${toolName}`, version: "0.2.0" });
   const contextChanged = (context) => {
     if (!context) return;

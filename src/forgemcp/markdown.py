@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import re
 from collections.abc import Iterable, Sequence
 from typing import Self
 
@@ -164,7 +165,14 @@ class CodeBlock(Node):
         self.language = language
 
     def render(self) -> str:
-        return f"```{self.language}\n{self.code}\n```"
+        fence = "`" * max(
+            3,
+            max(
+                (len(match[0]) + 1 for match in re.finditer(r"`+", self.code)),
+                default=3,
+            ),
+        )
+        return f"{fence}{self.language}\n{self.code}\n{fence}"
 
 
 class Blockquote(Node):
@@ -174,7 +182,9 @@ class Blockquote(Node):
         self.content = content
 
     def render(self) -> str:
-        return "\n".join(f"> {line}" for line in _render_content(self.content).splitlines())
+        return "\n".join(
+            f"> {line}" for line in _render_content(self.content).splitlines()
+        )
 
 
 class HorizontalRule(Node):
@@ -187,7 +197,9 @@ class HorizontalRule(Node):
 def _render_list_item(prefix: str, item: Content) -> str:
     lines = _render_content(item).splitlines() or [""]
     indentation = " " * len(prefix)
-    return "\n".join([f"{prefix}{lines[0]}", *(f"{indentation}{line}" for line in lines[1:])])
+    return "\n".join(
+        [f"{prefix}{lines[0]}", *(f"{indentation}{line}" for line in lines[1:])]
+    )
 
 
 class UnorderedList(Node):
@@ -238,7 +250,9 @@ class Table(Node):
 
     def add(self, row: Sequence[Content]) -> Self:
         if len(row) != len(self.headers):
-            raise ValueError("table row must have the same number of cells as the header")
+            raise ValueError(
+                "table row must have the same number of cells as the header"
+            )
         self.rows.append(list(row))
         return self
 
@@ -249,7 +263,11 @@ class Table(Node):
 
         separator = f"| {' | '.join('---' for _ in self.headers)} |"
         return "\n".join(
-            [render_row(self.headers), separator, *(render_row(row) for row in self.rows)]
+            [
+                render_row(self.headers),
+                separator,
+                *(render_row(row) for row in self.rows),
+            ]
         )
 
 

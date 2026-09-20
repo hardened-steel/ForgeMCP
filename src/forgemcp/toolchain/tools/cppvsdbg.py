@@ -14,8 +14,10 @@ class Methods(TypedDict):
 
 
 def create_spec(
-    path: Path, processes: ProcessService,
-    environment: Mapping[str, str] | None = None, inherit_environment: bool = True,
+    path: Path,
+    processes: ProcessService,
+    environment: Mapping[str, str] | None = None,
+    inherit_environment: bool = True,
 ) -> ToolSpec:
     path = path.resolve()
     methods: Methods = {}

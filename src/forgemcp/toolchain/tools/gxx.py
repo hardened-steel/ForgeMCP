@@ -18,8 +18,10 @@ class Methods(TypedDict):
 
 
 def create_spec(
-    path: Path, processes: ProcessService,
-    environment: Mapping[str, str] | None = None, inherit_environment: bool = True,
+    path: Path,
+    processes: ProcessService,
+    environment: Mapping[str, str] | None = None,
+    inherit_environment: bool = True,
 ) -> ToolSpec:
     path = path.resolve()
 
@@ -27,8 +29,11 @@ def create_spec(
         output = {"stdout": "", "stderr": ""}
         try:
             async with await processes.launch(
-                path, ('-dumpfullversion', '-dumpversion'), env=environment,
-                inherit_environment=inherit_environment, timeout=ProcessTimeout(total=15),
+                path,
+                ('-dumpfullversion', '-dumpversion'),
+                env=environment,
+                inherit_environment=inherit_environment,
+                timeout=ProcessTimeout(total=15),
             ) as session:
                 await session.close_stdin()
                 async for chunk in session.output():
@@ -41,7 +46,11 @@ def create_spec(
         except ProcessError as error:
             raise ToolCommandError(f"Cannot read {INFO.name} version.") from error
         for text in output.values():
-            if match := re.search('^([0-9]+\\.[0-9]+[^\\s]*)', text, re.IGNORECASE | re.MULTILINE):
+            if match := re.search(
+                '^([0-9]+\\.[0-9]+[^\\s]*)',
+                text,
+                re.IGNORECASE | re.MULTILINE,
+            ):
                 return match.group(1)
         raise ToolParserError(f"Cannot parse {INFO.name} version.")
 

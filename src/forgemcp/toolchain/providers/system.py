@@ -25,10 +25,15 @@ def locate(spec: ToolInfo) -> Path | None:
         for folder in (".vscode", ".vscode-insiders"):
             extensions = Path.home() / folder / "extensions"
             if extensions.is_dir():
-                for extension in sorted(islice(extensions.iterdir(), 512), reverse=True):
+                for extension in sorted(
+                    islice(extensions.iterdir(), 512),
+                    reverse=True,
+                ):
                     if extension.name.startswith("ms-vscode.cpptools-"):
-                        for relative in ("debugAdapters/vsdbg/bin/vsdbg.exe",
-                                         "debugAdapters/bin/OpenDebugAD7.exe"):
+                        for relative in (
+                            "debugAdapters/vsdbg/bin/vsdbg.exe",
+                            "debugAdapters/bin/OpenDebugAD7.exe",
+                        ):
                             path = extension / relative
                             if path.is_file():
                                 return path.resolve()

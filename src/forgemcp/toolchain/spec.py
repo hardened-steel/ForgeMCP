@@ -44,7 +44,9 @@ class ToolInfo:
 
     name: str
     kind: ToolKind
-    create_spec: Callable[[Path, ProcessService, Mapping[str, str] | None, bool], ToolSpec]
+    create_spec: Callable[
+        [Path, ProcessService, Mapping[str, str] | None, bool], ToolSpec
+    ]
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,14 @@ class Toolset:
     def __post_init__(self) -> None:
         if len({tool.name for tool in self.tools}) != len(self.tools):
             raise ToolCommandError("Toolset contains duplicate tool names.")
-        object.__setattr__(self, "tools", tuple(sorted(self.tools, key=lambda tool: tool.name)))
+        object.__setattr__(
+            self,
+            "tools",
+            tuple(sorted(self.tools, key=lambda tool: tool.name)),
+        )
         if self.environment is not None:
-            object.__setattr__(self, "environment", MappingProxyType(dict(self.environment)))
+            object.__setattr__(
+                self,
+                "environment",
+                MappingProxyType(dict(self.environment)),
+            )

@@ -16,7 +16,14 @@ class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, object]) -> None:
         frontend = Path(self.root) / "frontend"
         outputs = [
-            Path(self.root) / "src" / "forgemcp" / "assets" / "workspace-overview.html",
+            *(
+                Path(self.root)
+                / "src"
+                / "forgemcp"
+                / "assets"
+                / f"workspace-{kind}.html"
+                for kind in ("tree", "file", "search", "result")
+            ),
             Path(self.root) / "src" / "forgemcp" / "assets" / "process-overview.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "toolsets.html",
         ]
@@ -31,7 +38,9 @@ class CustomBuildHook(BuildHookInterface):
         command = "npm.cmd" if os.name == "nt" else "npm"
         npm = shutil.which(command)
         if npm is None:
-            raise RuntimeError("Node.js and npm are required to build ForgeMCP widgets.")
+            raise RuntimeError(
+                "Node.js and npm are required to build ForgeMCP widgets."
+            )
 
         subprocess.run([npm, "ci", "--no-audit", "--no-fund"], cwd=frontend, check=True)
         subprocess.run([npm, "run", "build"], cwd=frontend, check=True)

@@ -1,102 +1,202 @@
+import base64
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 import pytest
 from mcp import Client
 from mcp.client import advertise
 from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID
-from mcp.types import PromptReference, ResourceTemplateReference
+from mcp.types import ResourceTemplateReference
+from mcp.shared.exceptions import MCPError
 
-from forgemcp.server import create_server
+from forgemcp.server import argument_parser, create_server
 from forgemcp.workspace.service import WorkspaceService
 
 
 @pytest.fixture
-def anyio_backend() -> str:
+def anyio_backend():
     return "asyncio"
 
 
 @pytest.fixture(autouse=True)
 def isolate_host_discovery(monkeypatch):
-    """Workspace protocol tests must not depend on host installations."""
     from forgemcp.toolchain import discovery
     from forgemcp.toolchain.providers import visual_studio
+
     monkeypatch.setattr(discovery, "load_tools", lambda: ())
-    async def no_visual_studio(*args):
+
+    async def discover(*args):
         return ()
-    monkeypatch.setattr(visual_studio, "discover", no_visual_studio)
+
+    monkeypatch.setattr(visual_studio, "discover", discover)
 
 
 @pytest.mark.anyio
-async def test_server_exposes_app_tool_progress_and_structured_output(
-    cpp_acceptance_project: Path,
-) -> None:
+async def test_workspace_tools_have_apps_schemas_icons_and_progress(
+    cpp_acceptance_project,
+):
     server = create_server(cpp_acceptance_project)
-    progress: list[tuple[float, float | None, str | None]] = []
+    progress = []
 
-    async def collect(value: float, total: float | None, message: str | None) -> None:
-        progress.append((value, total, message))
+    async def collect(value, total, message):
+        progress.append((value, total))
 
     async with Client(
         server,
         extensions=[advertise(EXTENSION_ID, {"mimeTypes": [APP_MIME_TYPE]})],
-        raise_exceptions=True,
     ) as client:
-        tools = await client.list_tools()
-        tool = next(item for item in tools.tools if item.name == "workspace_overview")
-        result = await client.call_tool("workspace_overview", {}, progress_callback=collect)
-        app = await client.read_resource(WorkspaceService.WIDGET.uri)
-
+        tools = [
+            tool
+            for tool in (await client.list_tools()).tools
+            if tool.name.startswith("workspace_")
+        ]
+        assert len(tools) == 10
+        assert "workspace_overview" not in {tool.name for tool in tools}
+        assert (await client.list_prompts()).prompts == []
+        for tool in tools:
+            assert tool.output_schema and tool.icons and tool.meta["ui"]["resourceUri"]
+            assert "ctx" not in tool.input_schema.get("properties", {})
+            assert "expected_revision" not in tool.input_schema.get("properties", {})
+            app = await client.read_resource(tool.meta["ui"]["resourceUri"])
+            assert app.contents[0].mime_type == APP_MIME_TYPE
+        result = await client.call_tool("workspace_list", {}, progress_callback=collect)
+        assert not result.is_error and result.structured_content["root"] == "project"
+        assert result.content
+        assert progress == [(0, 1), (1, 1)]
         assert WorkspaceService.__doc__ in client.instructions
 
-    assert tool.meta is not None
-    assert tool.meta["ui"]["resourceUri"] == WorkspaceService.WIDGET.uri
-    assert tool.description == "Summarize the configured C/C++ workspace without modifying it."
-    assert tool.output_schema is not None
-    assert tool.annotations is not None
-    assert tool.annotations.title is None
-    assert tool.icons
-    assert result.is_error is False
-    assert result.structured_content is not None
-    assert result.structured_content["source_files"] == 12
-    assert [item[0] for item in progress] == [1.0, 2.0, 3.0]
-    assert app.contents[0].mime_type == APP_MIME_TYPE
+
+@pytest.mark.anyio
+async def test_full_file_workflow_through_client(cpp_acceptance_project):
+    async with Client(create_server(cpp_acceptance_project)) as client:
+
+        async def call(name, **arguments):
+            result = await client.call_tool("workspace_" + name, arguments)
+            assert not result.is_error, result.content
+            return result.structured_content
+
+        assert (await call("mkdir", path="new"))["action"] == "created"
+        assert (await call("write_file", path="new/a.txt", text="one\ntwo two\n"))[
+            "lines_added"
+        ] == 2
+        assert (
+            await call(
+                "edit_file",
+                path="new/a.txt",
+                old_text="two",
+                new_text="three",
+                replace_all=True,
+            )
+        )["replacements"] == 2
+        assert (await call("read_file", path="new/a.txt", start_line=2))[
+            "text"
+        ] == "three three\n"
+        assert (await call("file_info", path="new/a.txt"))["size_bytes"] == len(
+            b"one\nthree three\n"
+        )
+        assert (await call("find_files", pattern="new/*.txt"))["paths"] == ["new/a.txt"]
+        assert (await call("search", query="three", path="new"))["matches"][0][
+            "line"
+        ] == 2
+        assert (await call("move", source="new/a.txt", destination="new/b.txt"))[
+            "action"
+        ] == "moved"
+        assert (await call("delete", path="new/b.txt"))["action"] == "deleted"
+        await call("delete", path="new")
+        failed = await client.call_tool("workspace_read_file", {"path": "../outside"})
+        assert failed.is_error
 
 
 @pytest.mark.anyio
-async def test_server_exposes_resource_prompt_and_completions(
-    cpp_acceptance_project: Path,
-) -> None:
-    server = create_server(cpp_acceptance_project)
-
-    async with Client(server, raise_exceptions=True) as client:
-        templates = await client.list_resource_templates()
-        prompts = await client.list_prompts()
-        resource_completion = await client.complete(
-            ResourceTemplateReference(uri=WorkspaceService.FILES_URI),
-            {"name": "extension", "value": "cp"},
+async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_project):
+    workspace = WorkspaceService(cpp_acceptance_project)
+    workspace.mkdir("resource data")
+    text = "α\r\nfoo(x)/../#&\r\n```\n"
+    workspace.write_file("resource data/a#%.cpp", text)
+    (cpp_acceptance_project / "resource data/data.bin").write_bytes(b"\x00\xff\x01")
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        templates = (await client.list_resource_templates()).resource_templates
+        workspace_templates = [
+            item
+            for item in templates
+            if str(item.uri_template).startswith("forgemcp://workspace/")
+        ]
+        assert len(workspace_templates) == 6
+        uri = workspace.file_uri("project", "resource data/a#%.cpp")
+        result = await client.read_resource(uri)
+        assert result.contents[0].text == text
+        assert result.contents[0].mime_type == "text/plain"
+        raw = await client.read_resource(
+            "forgemcp://workspace/project/raw/resource%20data/data.bin"
         )
-        prompt_completion = await client.complete(
-            PromptReference(name=WorkspaceService.PROMPT),
-            {"name": "focus", "value": "to"},
-        )
-        resource = await client.read_resource("forgemcp://workspace/files/cpp")
-
-    assert any(
-        item.uri_template == WorkspaceService.FILES_URI for item in templates.resource_templates
-    )
-    assert any(item.name == WorkspaceService.PROMPT for item in prompts.prompts)
-    assert resource_completion.completion.values == ["cpp"]
-    assert prompt_completion.completion.values == ["toolchain"]
-    assert "src/math.cpp" in resource.contents[0].text
+        assert base64.b64decode(raw.contents[0].blob) == b"\x00\xff\x01"
+        assert raw.contents[0].mime_type == "application/octet-stream"
+        cases = [
+            ("list", {"path": "resource data", "depth": "all"}, "a#%.cpp"),
+            (
+                "find-files",
+                {"pattern": "resource data/*.cpp", "extensions": "cpp"},
+                "a%23%25.cpp",
+            ),
+            ("file-info", {"path": "resource data/a#%.cpp"}, "size\\_bytes"),
+            (
+                "search",
+                {
+                    "query": r"foo\(x\)/\.\./#&",
+                    "regex": "true",
+                    "path": "resource data",
+                },
+                "foo(x)/../#&",
+            ),
+        ]
+        for name, arguments, expected in cases:
+            resource = await client.read_resource(
+                f"forgemcp://workspace/project/{name}?{urlencode(arguments, quote_via=quote)}"
+            )
+            assert resource.contents[0].mime_type == "text/markdown"
+            assert expected in resource.contents[0].text
+        for template, argument, prefix, expected in [
+            (WorkspaceService.FILE_URI, "root", "st", "storage"),
+            (WorkspaceService.FILE_URI, "path", "src/ma", "src/math.cpp"),
+            (WorkspaceService.LIST_URI, "depth", "a", "all"),
+            (WorkspaceService.SEARCH_URI, "regex", "t", "true"),
+            (WorkspaceService.FIND_URI, "extensions", "cp", "cpp"),
+        ]:
+            completion = await client.complete(
+                ResourceTemplateReference(uri=template),
+                {"name": argument, "value": prefix},
+            )
+            assert expected in completion.completion.values
+        for uri in (
+            "forgemcp://workspace/project/file/%2E%2E/secret",
+            "forgemcp://workspace/project/search?query=%5B&regex=true",
+            "forgemcp://workspace/project/file-info",
+            "forgemcp://workspace/project/search",
+        ):
+            with pytest.raises(MCPError):
+                await client.read_resource(uri)
 
 
 @pytest.mark.anyio
-async def test_default_workspace_is_server_process_directory(
-    cpp_acceptance_project: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_default_project_custom_storage_and_resource_updates(
+    cpp_acceptance_project,
+    monkeypatch,
+):
     monkeypatch.chdir(cpp_acceptance_project)
-
-    async with Client(create_server(), raise_exceptions=True) as client:
-        resource = await client.read_resource("forgemcp://workspace/files/cpp")
-
-    assert "src/math.cpp" in resource.contents[0].text
+    storage = cpp_acceptance_project / "service-data"
+    options = argument_parser().parse_args(["--workspace-storage", str(storage)])
+    assert options.workspace_storage == storage
+    async with Client(create_server(storage_root=storage)) as client:
+        await client.call_tool("workspace_mkdir", {"path": "index", "root": "storage"})
+        for text in ("first", "second"):
+            await client.call_tool(
+                "workspace_write_file",
+                {"path": "index/state", "text": text, "root": "storage"},
+            )
+            result = await client.read_resource(
+                "forgemcp://workspace/storage/file/index/state"
+            )
+            assert result.contents[0].text == text
+        assert (
+            await client.call_tool("workspace_read_file", {"path": "README.md"})
+        ).structured_content["path"] == "README.md"

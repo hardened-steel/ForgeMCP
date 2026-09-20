@@ -2,8 +2,8 @@
 
 ## Status
 
-ForgeMCP is intentionally at foundation stage. The `workspace` feature proves the
-module and registration pattern. The shared `process` service adds asynchronous
+ForgeMCP is intentionally at foundation stage. The `workspace` feature manages
+project files and a separate service-storage root. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface before CMake, clangd, quality, and debugger behavior is added.
 The `toolchain` service discovers independent toolsets once at startup and exposes
@@ -58,8 +58,8 @@ interfaces and factories for hypothetical parsers or kit providers.
 `src/forgemcp/server.py` is the only composition root:
 
 1. Resolve operator configuration such as the workspace root.
-2. Construct the long-lived `ProcessService`, then feature services, passing shared
-   dependencies explicitly.
+2. Construct `WorkspaceService`, then `ProcessService` with the project and storage
+   directories as allowed working roots, then feature services with explicit dependencies.
 3. Create one `Apps` instance.
 4. Create one `Complete` completion collector.
 5. Construct `MCPServer(extensions=[apps])`, composing its instructions from the base
@@ -114,35 +114,94 @@ not own and is added to the shared `Complete` collector.
 
 ## Current MCP surface
 
-### `workspace_overview` tool
+### Workspace files
 
-The tool scans one configured workspace without modifying it and returns a
-`WorkspaceOverview` Pydantic model. The MCP Python SDK derives the output schema,
-validates the result, serializes JSON text into `content`, and sends the same object as
-`structuredContent` for the widget. The scan:
+`WorkspaceService` owns path checks, directory trees, metadata, UTF-8 reading,
+literal/regex searching, mutations, and storage directories. The ten tools are
+`workspace_list`, `workspace_find_files`, `workspace_file_info`, `workspace_read_file`,
+`workspace_search`, `workspace_write_file`, `workspace_edit_file`, `workspace_move`,
+`workspace_delete`, and `workspace_mkdir`. The former overview, file-extension
+resource, and inspection prompt are removed. There are no workspace prompts.
 
-- recognizes common C and C++ source/header extensions;
-- skips common VCS, virtual-environment, cache, build, and IDE directories;
-- does not follow directory symlinks;
-- is capped at 10,000 visited files; and
-- reports whether the result was truncated.
+Business methods are synchronous and return small Pydantic models; async tool
+entrypoints run them off the event loop and report the start/completion of one
+operation. The SDK derives structured output and useful JSON text fallback.
+Expected `WorkspaceError` failures become `ToolError` or `ResourceError` at the
+corresponding boundary. Platform-specific file ownership is isolated in
+`workspace/metadata.py`; unavailable owner or creation time is null.
 
-Its three progress notifications are monotonically increasing. They are safe to emit
-unconditionally because the SDK makes them a no-op when the caller did not request
-progress.
+Every public path is relative to `root=project` or `root=storage`. Path traversal,
+absolute paths, and resolutions outside the selected root are rejected. Trees
+display symlinks/junctions without descending into them. Explicit reads may follow
+in-root links; mutations reject linked path components. Moving or recursively
+removing a directory containing links is rejected. Workspace roots cannot be
+mutated. `protect_path(path, root=...)` lets dependent modules protect files or
+directories, including paths that do not exist yet. Protection also blocks moving
+or deleting their ancestors, and applies to storage cleanup. Read access remains
+available; there is no owner bypass or protection registry framework.
 
-### Workspace files resource
+Reads optionally select inclusive one-based lines and return their first line
+number. Writes create or overwrite using a sibling temporary file and `os.replace`,
+reporting whole-file removed/added line counts. Edits require a nonempty exact
+`old_text`: zero matches or multiple matches without `replace_all` leave the file
+unchanged. There are no revision hashes, optimistic-concurrency parameters, or
+multi-file transactions. UTF-8 and existing line endings are preserved outside
+the replaced text. Move supports files/directories and rejects existing destinations.
+Delete supports files and empty directories. Mkdir creates missing parents.
 
-`forgemcp://workspace/files/{extension}` returns bounded JSON containing at most 500
-sorted, workspace-relative paths. Supported extensions are offered through MCP
-completion. An unknown extension becomes `ResourceNotFoundError`, not an unhandled
-exception.
+Filename searches use a basename glob unless the pattern contains `/`, in which
+case it matches a path relative to the search directory; `**` supports nested
+directories. Text search uses the `regex` package, is line-oriented, and returns
+one result per matching line. Both searches skip dot directories and links but
+include ordinary build directories and dot files. Extension filters accept a
+leading dot and compare case-insensitively. Binary/non-UTF-8 files are reported in
+`skipped_files`. By explicit design, workspace scans currently have no application
+timeout, output cap, index, or pagination.
 
-### Inspection prompt
+### Service storage and future consumers
 
-`inspect_cpp_workspace(focus)` seeds a read-only inspection flow. Completion suggests
-the current focus vocabulary. Prompt arguments and resource-template parameters are
-the only MCP primitives that support completion; static resources do not.
+The default storage root is `.<project-name>.forgemcp` beside the project; the CLI
+can override it with `--workspace-storage`. It is created lazily. Storage must not
+equal or contain the project root. `storage_directory(key)` returns a small
+`StorageDirectory` with `path`, `subdirectory(key)`, and `remove()`. Persistent
+directories survive restarts. `temporary_directory(prefix)` is a context manager
+for a unique directory below storage/tmp; it removes that directory on exit.
+The caller must stop processes before deleting their directories.
+
+CMake can request `storage_directory("build").subdirectory("cmake-debug")`;
+clangd can request a persistent index directory. Workspace knows neither build
+configuration nor index lifecycle. Git can register `.git` with `protect_path`
+in its constructor. ProcessService receives plain allowed root paths, not a
+dependency on WorkspaceService. Its check restricts cwd, not OS-level file access.
+Watchers, Git change callbacks, and language-server synchronization/highlighting
+are deferred until those consumers are implemented.
+
+### Workspace resources
+
+Six templates are registered, with an explicit `project` or `storage` root:
+
+```text
+forgemcp://workspace/{root}/file{/path*}
+forgemcp://workspace/{root}/raw{/path*}
+forgemcp://workspace/{root}/list{?path,depth}
+forgemcp://workspace/{root}/find-files{?pattern,path,extensions}
+forgemcp://workspace/{root}/file-info{?path}
+forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
+```
+
+Text mirrors return complete UTF-8 text with `text/plain`; raw mirrors return exact
+bytes with `application/octet-stream`. The other four render the same business
+results as `text/markdown` through the shared Markdown helpers. Embedded code fences
+are escaped by choosing a longer fence. No per-file resource registration or cache
+is needed. Resource access reads current files and does not obey search exclusions.
+
+Query parameters use RFC 6570 percent encoding, including `%20` for spaces; `+`
+remains a literal plus. Resource depth `all` maps to tool depth null. Extensions use
+a comma-separated string; an omitted value means any extension, an empty value
+means extensionless files. Regex works in URI parameters. SDK path-security checks
+are exempted only for `query`/`pattern`, which are data; actual paths still pass SDK
+and workspace checks. Completions cover roots, paths, extensions, depth, and booleans;
+only completion responses observe the protocol's 100-value cap.
 
 ## External process execution
 
@@ -309,9 +368,15 @@ process, and toolsets views share these files under `frontend/src/shared/`:
 | --- | --- |
 | `widget.css` | Geometry, host-aware palette, typography, controls, field grids, scrolling and syntax colors |
 | `copy-icon.js` | Shared inline SVG copy icon, with no image requests or CSS masks |
-| `presentation.js` | Pure formatting and projections of the three concrete result shapes |
+| `presentation.js` | Pure formatting and process/toolset snapshot projections |
 | `result-view.js` | Shared DOM renderer, local filters, Fields/JSON switch, tooltips and copying |
 | `app.js` | Apps connection, result lifecycle and host context; imports the shared CSS |
+
+Workspace's four HTML entrypoints use `workspace-view.js` for projections and
+specialized tree/source values, passed through the shared renderer's optional
+`renderValue` callback. File/source values carry line numbers without altering
+the original text used by copying and JSON. Search/find results reuse the shared
+collection filters. Metadata and mutation results use the shared fields view.
 
 An HTML entrypoint contains `<main id="widget" aria-label="Descriptive name"></main>`
 and one module script. Its JavaScript supplies the tool name and a pure projection:

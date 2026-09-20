@@ -13,7 +13,6 @@ from forgemcp.process.service import ProcessService
 from ..errors import ToolCommandError
 from ..spec import ToolInfo, Toolset
 
-
 MAX_INSTANCES = 128
 MAX_LAYOUT_ENTRIES = 512
 
@@ -32,8 +31,21 @@ async def instance_environment(root: Path, processes: ProcessService) -> dict[st
     # are provider-owned, not executable arguments supplied by project data.
     comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
     session = await processes.launch(
-        comspec, ("/u", "/d", "/s", "/c", "call", str(batch), "-no_logo", "-arch=x64", "&&", "set"),
-        encoding=ProcessEncoding("utf-16-le"), timeout=ProcessTimeout(total=60),
+        comspec,
+        (
+            "/u",
+            "/d",
+            "/s",
+            "/c",
+            "call",
+            str(batch),
+            "-no_logo",
+            "-arch=x64",
+            "&&",
+            "set",
+        ),
+        encoding=ProcessEncoding("utf-16-le"),
+        timeout=ProcessTimeout(total=60),
     )
     environment: dict[str, str] = {}
     pending = ""
@@ -63,8 +75,10 @@ def directories(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     # Only enumerate known shallow layout directories, never a recursive tree scan.
-    return sorted((path for path in islice(root.iterdir(), MAX_LAYOUT_ENTRIES)
-                   if path.is_dir()), reverse=True)
+    return sorted(
+        (path for path in islice(root.iterdir(), MAX_LAYOUT_ENTRIES) if path.is_dir()),
+        reverse=True,
+    )
 
 
 def locate(root: Path, name: str) -> Path | None:
@@ -74,24 +88,48 @@ def locate(root: Path, name: str) -> Path | None:
             for host in ("Hostx64/x64", "Hostarm64/arm64", "Hostx86/x86"):
                 candidates.append(version / "bin" / host / f"{name}.exe")
     if name == "msbuild":
-        candidates += [root / "MSBuild/Current/Bin/amd64/MSBuild.exe",
-                       root / "MSBuild/Current/Bin/MSBuild.exe"]
+        candidates += [
+            root / "MSBuild/Current/Bin/amd64/MSBuild.exe",
+            root / "MSBuild/Current/Bin/MSBuild.exe",
+        ]
     if name in {"cmake", "ctest", "ninja"}:
         relative = "Ninja/ninja.exe" if name == "ninja" else f"CMake/bin/{name}.exe"
-        candidates.append(root / "Common7/IDE/CommonExtensions/Microsoft/CMake" / relative)
-    if name in {"clang", "clang++", "clang-cl", "lld", "lld-link", "clangd", "lldb-dap"}:
-        for folder in ("VC/Tools/Llvm/x64/bin", "VC/Tools/Llvm/ARM64/bin", "VC/Tools/Llvm/bin"):
+        candidates.append(
+            root / "Common7/IDE/CommonExtensions/Microsoft/CMake" / relative
+        )
+    if name in {
+        "clang",
+        "clang++",
+        "clang-cl",
+        "lld",
+        "lld-link",
+        "clangd",
+        "lldb-dap",
+    }:
+        for folder in (
+            "VC/Tools/Llvm/x64/bin",
+            "VC/Tools/Llvm/ARM64/bin",
+            "VC/Tools/Llvm/bin",
+        ):
             candidates.append(root / folder / f"{name}.exe")
     if name == "git":
-        candidates.append(root / "Common7/IDE/CommonExtensions/Microsoft/TeamFoundation/Team Explorer/Git/cmd/git.exe")
+        candidates.append(
+            root
+            / "Common7/IDE/CommonExtensions/Microsoft/TeamFoundation/Team Explorer/Git/cmd/git.exe"
+        )
     if name == "cppvsdbg":
-        for relative in ("Common7/IDE/Extensions/Microsoft/DebugAdapterHost/OpenDebugAD7.exe",
-                         "Common7/IDE/CommonExtensions/Microsoft/VC/Debugger/OpenDebugAD7.exe"):
+        for relative in (
+            "Common7/IDE/Extensions/Microsoft/DebugAdapterHost/OpenDebugAD7.exe",
+            "Common7/IDE/CommonExtensions/Microsoft/VC/Debugger/OpenDebugAD7.exe",
+        ):
             candidates.append(root / relative)
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
-async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tuple[Toolset, ...]:
+async def discover(
+    specs: tuple[ToolInfo, ...],
+    processes: ProcessService,
+) -> tuple[Toolset, ...]:
     if os.name != "nt":
         return ()
     executable = vswhere_path()
@@ -99,8 +137,10 @@ async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tu
         return ()
     try:
         session = await processes.launch(
-            executable, ("-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"),
-            encoding=ProcessEncoding("utf-8"), timeout=ProcessTimeout(total=30),
+            executable,
+            ("-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"),
+            encoding=ProcessEncoding("utf-8"),
+            timeout=ProcessTimeout(total=30),
         )
         async with session:
             await session.close_stdin()
@@ -109,7 +149,9 @@ async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tu
             async for output in session.output():
                 if output.stream == "stdout":
                     if len(document) + len(output.text) > 4 * 1024 * 1024:
-                        raise ToolCommandError("Visual Studio instance listing is too large.")
+                        raise ToolCommandError(
+                            "Visual Studio instance listing is too large."
+                        )
                     document += output.text
             terminal = await session.wait()
         if terminal != 0:
@@ -124,8 +166,10 @@ async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tu
     for instance in instances[:MAX_INSTANCES]:
         if not isinstance(instance, dict):
             continue
-        if not all(isinstance(instance.get(key), str) and instance[key]
-                   for key in ("instanceId", "installationPath", "displayName")):
+        if not all(
+            isinstance(instance.get(key), str) and instance[key]
+            for key in ("instanceId", "installationPath", "displayName")
+        ):
             continue
         identifier = "visual-studio-" + quote(instance["instanceId"], safe="")
         if identifier in seen:
@@ -146,5 +190,13 @@ async def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> tu
                     bound.append(spec.create_spec(path, processes, environment, False))
             except OSError:
                 continue
-        found.append(Toolset(identifier, instance["displayName"], tuple(bound), environment, False))
+        found.append(
+            Toolset(
+                identifier,
+                instance["displayName"],
+                tuple(bound),
+                environment,
+                False,
+            )
+        )
     return tuple(found)

@@ -61,7 +61,6 @@ class ProcessRecord:
     start: float = field(init=False, default=0)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-
     async def terminate(self, process: Process) -> None:
         try:
             process.terminate()
@@ -73,7 +72,6 @@ class ProcessRecord:
                 await process.wait()
         except ProcessLookupError:
             await process.wait()
-
 
     async def monitor(self, process: Process, stopping: asyncio.Event) -> None:
         loop = asyncio.get_running_loop()
@@ -112,16 +110,24 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            message =  f"Process {summary.process_id} interrupted by timeout {timeout.total}"
+                            message = f"Process {summary.process_id} interrupted by timeout {timeout.total}"
 
                     if not finished and timeout.idle is not None:
                         async with self.lock:
-                            finished = now - (status.transcript[-1].time if len(status.transcript) else self.start) > timeout.idle
+                            finished = (
+                                now
+                                - (
+                                    status.transcript[-1].time
+                                    if len(status.transcript)
+                                    else self.start
+                                )
+                                > timeout.idle
+                            )
                         if finished:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            message =  f"Process {summary.process_id} interrupted by idle {timeout.idle}"
+                            message = f"Process {summary.process_id} interrupted by idle {timeout.idle}"
 
                 if finished:
                     async with self.lock:
@@ -141,13 +147,12 @@ class ProcessRecord:
                 except asyncio.CancelledError:
                     pass
 
-
     async def read_stream(
         self,
         stream: Literal["stdout", "stderr"],
         reader: asyncio.StreamReader,
         decoder: ChunkDecoder,
-        queue: asyncio.Queue[ProcessOutput | None]
+        queue: asyncio.Queue[ProcessOutput | None],
     ) -> None:
         try:
             loop = asyncio.get_running_loop()
@@ -159,15 +164,21 @@ class ProcessRecord:
                 text = decoder.decode(chunk)
                 await queue.put(ProcessOutput(stream=stream, text=text))
                 async with self.lock:
-                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream=stream, text=text))
+                    self.status.transcript.append(
+                        ProcessLogEntry(time=loop.time(), stream=stream, text=text)
+                    )
 
             if text := decoder.final():
                 async with self.lock:
-                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream=stream, text=text))
+                    self.status.transcript.append(
+                        ProcessLogEntry(time=loop.time(), stream=stream, text=text)
+                    )
                 await queue.put(ProcessOutput(stream=stream, text=text))
 
         except (OSError, UnicodeError) as error:
-            raise ProcessStreamError(f"Cannot read process {self.summary.process_id} {stream}.") from error
+            raise ProcessStreamError(
+                f"Cannot read process {self.summary.process_id} {stream}."
+            ) from error
         else:
             queue.put_nowait(None)
 
@@ -177,12 +188,11 @@ class ProcessRecord:
         while await reader.read(64 * 1024):
             pass
 
-
     async def write_stream(
         self,
         writer: asyncio.StreamWriter,
         encoder: ChunkEncoder,
-        queue: asyncio.Queue[str | None]
+        queue: asyncio.Queue[str | None],
     ) -> None:
         try:
             loop = asyncio.get_running_loop()
@@ -197,10 +207,14 @@ class ProcessRecord:
 
                 writer.write(encoder.encode(text))
                 async with self.lock:
-                    self.status.transcript.append(ProcessLogEntry(time=loop.time(), stream="stdin", text=text))
+                    self.status.transcript.append(
+                        ProcessLogEntry(time=loop.time(), stream="stdin", text=text)
+                    )
                 await writer.drain()
         except (OSError, UnicodeError) as error:
-            raise ProcessStreamError(f"Cannot write process {self.summary.process_id} stdin.") from error
+            raise ProcessStreamError(
+                f"Cannot write process {self.summary.process_id} stdin."
+            ) from error
         finally:
             # Normal EOF already flushed above; cancellation must not wait for
             # a child that has stopped consuming buffered stdin.
@@ -211,17 +225,21 @@ class ProcessRecord:
 
 class ChunkDecoder:
     def __init__(self, encoding: ProcessEncoding):
-        selected_encoding = locale.getencoding() if encoding.driver == "default" else encoding.driver
+        selected_encoding = (
+            locale.getencoding() if encoding.driver == "default" else encoding.driver
+        )
         try:
             codecs.lookup(selected_encoding)
         except LookupError as error:
-            raise ProcessStartError(f"Unknown process encoding: {selected_encoding}") from error
-        self.decoder = codecs.getincrementaldecoder(selected_encoding)(errors=encoding.errors)
-
+            raise ProcessStartError(
+                f"Unknown process encoding: {selected_encoding}"
+            ) from error
+        self.decoder = codecs.getincrementaldecoder(selected_encoding)(
+            errors=encoding.errors
+        )
 
     def decode(self, array: bytes) -> str:
         return self.decoder.decode(array)
-
 
     def final(self) -> str:
         return self.decoder.decode(b"", final=True)
@@ -229,17 +247,21 @@ class ChunkDecoder:
 
 class ChunkEncoder:
     def __init__(self, encoding: ProcessEncoding):
-        selected_encoding = locale.getencoding() if encoding.driver == "default" else encoding.driver
+        selected_encoding = (
+            locale.getencoding() if encoding.driver == "default" else encoding.driver
+        )
         try:
             codecs.lookup(selected_encoding)
         except LookupError as error:
-            raise ProcessStartError(f"Unknown process encoding: {selected_encoding}") from error
-        self.encoder = codecs.getincrementalencoder(selected_encoding)(errors=encoding.errors)
-
+            raise ProcessStartError(
+                f"Unknown process encoding: {selected_encoding}"
+            ) from error
+        self.encoder = codecs.getincrementalencoder(selected_encoding)(
+            errors=encoding.errors
+        )
 
     def encode(self, string: str) -> bytes:
         return self.encoder.encode(string)
-
 
     def final(self) -> bytes:
         return self.encoder.encode("", final=True)
@@ -252,13 +274,17 @@ class ProcessService:
     ICON = IconFile("icons/process.svg")
     RESOURCE_URI = "forgemcp://processes/{process_id}"
 
-
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        allowed_roots: Sequence[Path] = (),
+    ) -> None:
         self.id_counter = 0
         self.root = workspace_root.resolve()
+        self.allowed_roots = (self.root, *(path.resolve() for path in allowed_roots))
         self.records: dict[int, ProcessRecord] = {}
         self.sessions: dict[int, ProcessSession] = {}
-
 
     async def launch(
         self,
@@ -274,13 +300,15 @@ class ProcessService:
         """Start a process; manage its streams with async with await service.launch(...)."""
         working_directory = (cwd or self.root).resolve()
         if not working_directory.is_dir():
-            raise ProcessStartError(f"Process working directory does not exist: {working_directory}")
-        try:
-            working_directory.relative_to(self.root)
-        except ValueError as error:
             raise ProcessStartError(
-                f"Process working directory must stay inside the workspace: {working_directory}"
-            ) from error
+                f"Process working directory does not exist: {working_directory}"
+            )
+        if not any(
+            working_directory.is_relative_to(root) for root in self.allowed_roots
+        ):
+            raise ProcessStartError(
+                f"Process working directory must stay inside the workspace or configured storage: {working_directory}"
+            )
 
         child_environment = os.environ.copy() if inherit_environment else {}
         child_environment.update(env or {})
@@ -291,7 +319,7 @@ class ProcessService:
             arguments=list(arguments),
             cwd=str(working_directory),
             encoding=encoding.driver,
-            timeout=timeout
+            timeout=timeout,
         )
         stdout_decoder = ChunkDecoder(encoding)
         stderr_decoder = ChunkDecoder(encoding)
@@ -317,12 +345,19 @@ class ProcessService:
         record = ProcessRecord(summary, status)
         self.records[summary.process_id] = record
         session = ProcessSession(
-            process, record, stdin, output,
-            stdout_decoder, stderr_decoder, stdin_encoder,
+            process,
+            record,
+            stdin,
+            output,
+            stdout_decoder,
+            stderr_decoder,
+            stdin_encoder,
         )
         session.task = asyncio.create_task(session.run())
         self.sessions[summary.process_id] = session
-        session.task.add_done_callback(lambda _: self.sessions.pop(summary.process_id, None))
+        session.task.add_done_callback(
+            lambda _: self.sessions.pop(summary.process_id, None)
+        )
         return session
 
     async def close(self) -> None:
@@ -331,103 +366,135 @@ class ProcessService:
             for session in tuple(self.sessions.values()):
                 group.create_task(session.close())
 
-
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
-            """Register read-only process inspection entrypoints."""
-            icon = self.ICON.icon
+        """Register read-only process inspection entrypoints."""
+        icon = self.ICON.icon
 
-            async def get_stream_content(self, process_id: int, stream: ProcessStream) -> str:
-                """Get process stream content"""
-                record = self.records[process_id]
-                result = ""
+        async def get_stream_content(
+            self,
+            process_id: int,
+            stream: ProcessStream,
+        ) -> str:
+            """Get process stream content"""
+            record = self.records[process_id]
+            result = ""
+            async with record.lock:
+                for log_entry in record.status.transcript:
+                    if log_entry.stream == stream:
+                        result += log_entry.text
+            return result
+
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[icon],
+            annotations=ToolAnnotations(
+                read_only_hint=True,
+                destructive_hint=False,
+                idempotent_hint=True,
+                open_world_hint=False,
+            ),
+        )
+        async def processes_overview(
+            ctx: Context,
+            status: Literal["all", "running", "completed"] = "all",
+        ) -> ProcessOverview:
+            """Show current and completed external processes managed by ForgeMCP."""
+            records = tuple(self.records.values())
+            completed = 0
+            running = 0
+            processes: list[ProcessSummary] = []
+            for i, record in enumerate(records):
+                await ctx.report_progress(
+                    i,
+                    total=len(records),
+                    message=f"Reading process state: {i}",
+                )
                 async with record.lock:
-                    for log_entry in record.status.transcript:
-                        if log_entry.stream == stream:
-                            result += log_entry.text
-                return result
+                    if record.status.current_status == "running":
+                        running += 1
+                        if status == "all" or status == "running":
+                            processes.append(record.summary)
+                    else:
+                        completed += 1
+                        if status == "all" or status == "completed":
+                            processes.append(record.summary)
 
-            @apps.tool(
-                resource_uri=self.WIDGET.uri,
-                icons=[icon],
-                annotations=ToolAnnotations(
-                    read_only_hint=True,
-                    destructive_hint=False,
-                    idempotent_hint=True,
-                    open_world_hint=False,
-                ),
+            await ctx.report_progress(
+                len(records),
+                total=len(records),
+                message="Process state ready",
             )
-            async def processes_overview(
-                ctx: Context,
-                status: Literal["all", "running", "completed"] = "all",
-            ) -> ProcessOverview:
-                """Show current and completed external processes managed by ForgeMCP."""
-                records = tuple(self.records.values())
-                completed = 0
-                running = 0
-                processes: list[ProcessSummary] = []
-                for i, record in enumerate(records):
-                    await ctx.report_progress(i, total=len(records), message=f"Reading process state: {i}")
-                    async with record.lock:
-                        if record.status.current_status == "running":
-                            running += 1
-                            if status == "all" or status == "running":
-                                processes.append(record.summary)
-                        else:
-                            completed += 1
-                            if status == "all" or status == "completed":
-                                processes.append(record.summary)
+            return ProcessOverview(
+                running=running,
+                completed=completed,
+                processes=processes,
+            )
 
-                await ctx.report_progress(len(records), total=len(records), message="Process state ready")
-                return ProcessOverview(running=running, completed=completed, processes=processes)
+        apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
 
-            apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
+        @mcp.resource(self.RESOURCE_URI, mime_type="text/markdown", icons=[icon])
+        async def process_details(process_id: int) -> str:
+            """Read the retained state and transcript for one process."""
+            if process_id not in self.records:
+                raise ResourceNotFoundError()
 
-            @mcp.resource(self.RESOURCE_URI, mime_type="text/markdown", icons=[icon])
-            async def process_details(process_id: int) -> str:
-                """Read the retained state and transcript for one process."""
-                if process_id not in self.records:
-                    raise ResourceNotFoundError()
+            record = self.records[process_id]
+            async with record.lock:
+                document = markdown.Document()
 
-                record = self.records[process_id]
-                async with record.lock:
-                    document = markdown.Document()
+                document.add(markdown.Heading(record.summary.executable))
+                document.add(markdown.Paragraph("arguments"))
+                document.add(markdown.OrderedList(record.summary.arguments))
 
-                    document.add(markdown.Heading(record.summary.executable))
-                    document.add(markdown.Paragraph("arguments"))
-                    document.add(markdown.OrderedList(record.summary.arguments))
+                table = markdown.Table(["Settings", "Values"])
+                table.add(["id", str(record.summary.process_id)])
+                table.add(["state", str(record.status.current_status)])
+                table.add(["encoding", record.summary.encoding])
+                document.add(table)
 
-                    table = markdown.Table(["Settings", "Values"])
-                    table.add(["id", str(record.summary.process_id)])
-                    table.add(["state", str(record.status.current_status)])
-                    table.add(["encoding", record.summary.encoding])
-                    document.add(table)
+                document.add(markdown.Heading("process log", level=2))
+                table = markdown.Table(["timestamp", "direction", "text"])
+                for log_entry in record.status.transcript:
+                    table.add(
+                        [
+                            log_entry.timestamp.isoformat(),
+                            log_entry.stream,
+                            log_entry.text,
+                        ]
+                    )
+                document.add(table)
 
-                    document.add(markdown.Heading("process log", level=2))
-                    table = markdown.Table(["timestamp", "direction", "text"])
-                    for log_entry in record.status.transcript:
-                        table.add([log_entry.timestamp.isoformat(), log_entry.stream, log_entry.text])
-                    document.add(table)
+            return document.render()
 
-                return document.render()
+        async def process_completion(
+            ref: PromptReference | ResourceTemplateReference,
+            argument: CompletionArgument,
+            context: CompletionContext | None,
+        ) -> Completion | None:
+            if (
+                not isinstance(ref, ResourceTemplateReference)
+                or ref.uri != self.RESOURCE_URI
+                or argument.name != "process_id"
+            ):
+                return None
+            values = [
+                str(process_id)
+                for process_id in self.records
+                if str(process_id).startswith(argument.value)
+            ]
+            return Completion(
+                values=values[:100],
+                total=len(values),
+                has_more=len(values) > 100,
+            )
 
-            async def process_completion(
-                ref: PromptReference | ResourceTemplateReference,
-                argument: CompletionArgument,
-                context: CompletionContext | None,
-            ) -> Completion | None:
-                if (not isinstance(ref, ResourceTemplateReference)
-                        or ref.uri != self.RESOURCE_URI or argument.name != "process_id"):
-                    return None
-                values = [str(process_id) for process_id in self.records
-                          if str(process_id).startswith(argument.value)]
-                return Completion(values=values[:100], total=len(values), has_more=len(values) > 100)
-
-            complete.add_completion(process_completion)
+        complete.add_completion(process_completion)
 
 
 @dataclass
 class ProcessSession:
     """Own one process and its stream tasks for an async context."""
+
     process: Process
     record: ProcessRecord
     stdin: asyncio.Queue[str | None]
@@ -450,14 +517,18 @@ class ProcessSession:
     def returncode(self) -> int | None:
         return self.process.returncode
 
-
     async def __aenter__(self) -> ProcessSession:
         if self.entered or self.stopping.is_set():
             raise ProcessStreamError("A process session can only be entered once.")
         self.entered = True
         return self
 
-    async def __aexit__(self, exception_type: Any, exception: Any, traceback: Any) -> None:
+    async def __aexit__(
+        self,
+        exception_type: Any,
+        exception: Any,
+        traceback: Any,
+    ) -> None:
         await self.close()
         if exception is None and self.failure is not None:
             raise self.failure
@@ -471,20 +542,30 @@ class ProcessSession:
             async with asyncio.TaskGroup() as group:
                 group.create_task(
                     self.record.read_stream(
-                        "stdout", stdout, self.stdout_decoder, self.output_queue,
+                        "stdout",
+                        stdout,
+                        self.stdout_decoder,
+                        self.output_queue,
                     )
                 )
                 group.create_task(
                     self.record.read_stream(
-                        "stderr", stderr, self.stderr_decoder, self.output_queue,
+                        "stderr",
+                        stderr,
+                        self.stderr_decoder,
+                        self.output_queue,
                     )
                 )
                 writer = group.create_task(
                     self.record.write_stream(
-                        cast(asyncio.StreamWriter, self.process.stdin), self.stdin_encoder, self.stdin,
+                        cast(asyncio.StreamWriter, self.process.stdin),
+                        self.stdin_encoder,
+                        self.stdin,
                     )
                 )
-                monitor = group.create_task(self.record.monitor(self.process, self.stopping))
+                monitor = group.create_task(
+                    self.record.monitor(self.process, self.stopping)
+                )
                 await monitor
                 writer.cancel()
         except Exception as error:
@@ -495,7 +576,11 @@ class ProcessSession:
             self.stdin_closed = True
             # Workers have finished before cleanup reads the same pipes.
             try:
-                if self.process.returncode is None or not stdout.at_eof() or not stderr.at_eof():
+                if (
+                    self.process.returncode is None
+                    or not stdout.at_eof()
+                    or not stderr.at_eof()
+                ):
                     async with asyncio.TaskGroup() as cleanup:
                         cleanup.create_task(self.record.drain_stream(stdout))
                         cleanup.create_task(self.record.drain_stream(stderr))
@@ -507,10 +592,13 @@ class ProcessSession:
                 async with self.record.lock:
                     if self.record.status.current_status == "running":
                         self.record.status.current_status = (
-                            "interrupted" if self.stopping.is_set() or self.failure is not None
+                            "interrupted"
+                            if self.stopping.is_set() or self.failure is not None
                             else cast(int, self.process.returncode)
                         )
-                    self.record.status.work_time = asyncio.get_running_loop().time() - self.record.start
+                    self.record.status.work_time = (
+                        asyncio.get_running_loop().time() - self.record.start
+                    )
                 # Wake output() even when a reader failed without reaching EOF.
                 self.output_queue.put_nowait(None)
 
@@ -549,7 +637,11 @@ class ProcessSession:
 
     async def write_stdin(self, text: str) -> None:
         """Queue text for the stdin writer without waiting for transport drain."""
-        if self.process.returncode is not None or self.stopping.is_set() or self.stdin_closed:
+        if (
+            self.process.returncode is not None
+            or self.stopping.is_set()
+            or self.stdin_closed
+        ):
             raise ProcessExitedError("Process stdin is closed.")
         await self.stdin.put(text)
 

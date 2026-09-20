@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
 import { createResultView } from "../src/shared/result-view.js";
-import { jsonTokens, timestamp, statusTone, workspacePresentation, processPresentation, toolsetPresentation } from "../src/shared/presentation.js";
+import { jsonTokens, timestamp, statusTone, processPresentation, toolsetPresentation } from "../src/shared/presentation.js";
+import { workspacePresentation } from "../src/workspace-view.js";
 
 function mount(t, describe, data) {
   const dom = new JSDOM('<main id="widget"></main>');
@@ -43,15 +44,15 @@ test("every copy button has inline SVG geometry without loading an image or requ
   }
 });
 
-test("workspace displays every field, extension count, and scan warning", (t) => {
-  const data = { name: "Workspace", source_files: 9, header_files: 4,
-    files_by_extension: { ".cpp": 9, ".h": 4 }, has_cmake_lists: true,
-    has_cmake_presets: false, scan_truncated: true, future_field: "also visible" };
+test("workspace metadata displays every field and unknown fields", (t) => {
+  const data = { root: "project", path: "src/math.cpp", size_bytes: 903,
+    created_at: null, modified_at: "2026-09-19T10:00:00Z", owner: "user",
+    future_field: "also visible" };
   const { root, content } = mount(t, workspacePresentation, data);
   assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), Object.keys(data));
-  assert.match(content.textContent, /\.cpp: 9/);
+  assert.match(content.textContent, /903/);
   assert.match(content.textContent, /also visible/);
-  assert.equal(content.querySelector(".fm-warning").textContent, "true");
+  assert.equal(content.querySelector(".fm-null").textContent, "null");
 });
 
 test("process rows preserve long paths, arguments and decoding flag as separate cells", (t) => {

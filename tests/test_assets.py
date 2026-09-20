@@ -3,9 +3,9 @@ from forgemcp.toolchain.service import ToolchainService
 
 
 def test_widget_reads_package_relative_html() -> None:
-    widget = Widget("assets/workspace-overview.html")
+    widget = Widget("assets/workspace-tree.html")
 
-    assert widget.uri == "ui://forgemcp/workspace-overview.html"
+    assert widget.uri == "ui://forgemcp/workspace-tree.html"
     assert "<!doctype html>" in widget.content
 
 

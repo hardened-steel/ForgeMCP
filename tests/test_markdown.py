@@ -69,6 +69,13 @@ def test_code_block() -> None:
     )
 
 
+def test_code_block_keeps_embedded_fences_as_data() -> None:
+    assert (
+        CodeBlock("```\n<script>x</script>\n```").render()
+        == "````\n```\n<script>x</script>\n```\n````"
+    )
+
+
 def test_blockquote() -> None:
     assert render_one(Blockquote("First line\nSecond line")) == (
         "> First line\n> Second line\n"
@@ -109,10 +116,7 @@ def test_table_from_rows() -> None:
     table = Table(["Name", "Value"], [["A", "1"], ["B", "2"]])
 
     assert render_one(table) == (
-        "| Name | Value |\n"
-        "| --- | --- |\n"
-        "| A | 1 |\n"
-        "| B | 2 |\n"
+        "| Name | Value |\n" "| --- | --- |\n" "| A | 1 |\n" "| B | 2 |\n"
     )
 
 
@@ -120,11 +124,7 @@ def test_table_add() -> None:
     table = Table(["Name", "Value"])
     table.add(["A", "1"])
 
-    assert render_one(table) == (
-        "| Name | Value |\n"
-        "| --- | --- |\n"
-        "| A | 1 |\n"
-    )
+    assert render_one(table) == ("| Name | Value |\n" "| --- | --- |\n" "| A | 1 |\n")
 
 
 def test_document_with_every_element() -> None:

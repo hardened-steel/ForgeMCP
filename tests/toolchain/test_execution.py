@@ -14,7 +14,12 @@ from forgemcp.toolchain.tools import cmake
 async def test_ready_spec_environment_and_no_result_cache(scripted_processes):
     processes = scripted_processes
     processes.code = "import os; print('cmake version '+os.environ['TOOLCHAIN_TEST'])"
-    tool = cmake.INFO.create_spec(Path(sys.executable), processes, {"TOOLCHAIN_TEST": "12.34"}, False)
+    tool = cmake.INFO.create_spec(
+        Path(sys.executable),
+        processes,
+        {"TOOLCHAIN_TEST": "12.34"},
+        False,
+    )
     assert not processes.records
     with pytest.raises(FrozenInstanceError):
         tool.path = Path("changed")
@@ -31,14 +36,23 @@ async def test_ready_spec_environment_and_no_result_cache(scripted_processes):
 async def test_failures_do_not_expose_transcript(scripted_processes, failure):
     processes = scripted_processes
     processes.code = "import sys,time; print('PRIVATE_TRANSCRIPT',flush=True); "
-    processes.code += {"exit": "sys.exit(4)", "parser": "pass", "timeout": "time.sleep(30)"}[failure]
+    processes.code += {
+        "exit": "sys.exit(4)",
+        "parser": "pass",
+        "timeout": "time.sleep(30)",
+    }[failure]
     if failure == "timeout":
-        processes.timeout = ProcessTimeout(total=.1)
+        processes.timeout = ProcessTimeout(total=0.1)
     tool = cmake.create_spec(Path(sys.executable), processes)
-    with pytest.raises(ToolParserError if failure == "parser" else ToolCommandError) as error:
+    with pytest.raises(
+        ToolParserError if failure == "parser" else ToolCommandError
+    ) as error:
         await tool.methods["version"]()
     assert "PRIVATE_TRANSCRIPT" not in str(error.value)
-    assert all(record.status.current_status != "running" for record in processes.records.values())
+    assert all(
+        record.status.current_status != "running"
+        for record in processes.records.values()
+    )
 
 
 @pytest.mark.anyio
@@ -56,7 +70,14 @@ async def test_version_drains_both_pipes(scripted_processes):
     assert await tool.methods["version"]() == "4.1.2"
     record = next(iter(scripted_processes.records.values()))
     assert record.status.current_status == 0
-    assert sum(len(item.text) for item in record.status.transcript if item.stream == "stderr") == 200000
+    assert (
+        sum(
+            len(item.text)
+            for item in record.status.transcript
+            if item.stream == "stderr"
+        )
+        == 200000
+    )
 
 
 @pytest.mark.anyio
@@ -68,4 +89,7 @@ async def test_cancellation_exits_process_context(scripted_processes):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert all(record.status.current_status == "interrupted" for record in scripted_processes.records.values())
+    assert all(
+        record.status.current_status == "interrupted"
+        for record in scripted_processes.records.values()
+    )

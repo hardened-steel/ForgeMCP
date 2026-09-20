@@ -4,7 +4,10 @@ import { defineConfig } from "vite";
 import { viteSingleFile } from "vite-plugin-singlefile";
 
 const widgets = {
-  workspace: "workspace-overview",
+  workspace: "workspace-tree",
+  file: "workspace-file",
+  search: "workspace-search",
+  result: "workspace-result",
   process: "process-overview",
   toolsets: "toolsets",
 };

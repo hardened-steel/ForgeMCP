@@ -11,7 +11,8 @@ from .spec import Toolset
 
 
 async def discover(
-    processes: ProcessService, definitions: Sequence[Sequence[str]] = (),
+    processes: ProcessService,
+    definitions: Sequence[Sequence[str]] = (),
 ) -> tuple[Toolset, ...]:
     specs = load_tools()
     # Validate all explicit configuration before launching discovery processes.

@@ -10,8 +10,12 @@ from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import (
-    Completion, CompletionArgument, CompletionContext, PromptReference,
-    ResourceTemplateReference, ToolAnnotations,
+    Completion,
+    CompletionArgument,
+    CompletionContext,
+    PromptReference,
+    ResourceTemplateReference,
+    ToolAnnotations,
 )
 from pydantic import BaseModel
 
@@ -57,7 +61,9 @@ class ToolchainService:
     DETAILS_URI = "forgemcp://toolsets/{toolset_id}"
 
     def __init__(
-        self, processes: ProcessService, definitions: Sequence[Sequence[str]] = (),
+        self,
+        processes: ProcessService,
+        definitions: Sequence[Sequence[str]] = (),
     ) -> None:
         self.processes = processes
         self.definitions = tuple(tuple(group) for group in definitions)
@@ -84,14 +90,22 @@ class ToolchainService:
 
     def get_tool(self, toolset_id: str, tool_name: str) -> ToolSpec | None:
         return next(
-            (tool for tool in self.get_toolset(toolset_id).tools if tool.name == tool_name),
+            (
+                tool
+                for tool in self.get_toolset(toolset_id).tools
+                if tool.name == tool_name
+            ),
             None,
         )
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         icon = self.ICON.icon
-        annotations = ToolAnnotations(read_only_hint=True, destructive_hint=False,
-                                      idempotent_hint=True, open_world_hint=False)
+        annotations = ToolAnnotations(
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        )
 
         async def read_tool(tool: ToolSpec) -> ToolDetails:
             # Versions belong only to the current MCP response, never the spec.
@@ -101,14 +115,25 @@ class ToolchainService:
                     version = await tool.methods["version"]()
                 except (ToolCommandError, ToolParserError):
                     pass
-            return ToolDetails(name=tool.name, kind=tool.kind, path=str(tool.path), version=version)
+            return ToolDetails(
+                name=tool.name,
+                kind=tool.kind,
+                path=str(tool.path),
+                version=version,
+            )
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
         async def toolsets_list(ctx: Context) -> list[ToolsetSummary]:
             """List all discovered toolsets and the tools available in each."""
             await ctx.report_progress(0, total=1, message="Reading toolsets")
-            result = [ToolsetSummary(id=item.id, name=item.name, tools=[tool.name for tool in item.tools])
-                      for item in self.list_toolsets()]
+            result = [
+                ToolsetSummary(
+                    id=item.id,
+                    name=item.name,
+                    tools=[tool.name for tool in item.tools],
+                )
+                for item in self.list_toolsets()
+            ]
             await ctx.report_progress(1, total=1, message="Toolsets ready")
             return result
 
@@ -124,7 +149,11 @@ class ToolchainService:
             details = []
             for index, tool in enumerate(toolset.tools, start=1):
                 details.append(await read_tool(tool))
-                await ctx.report_progress(index, total=total, message=f"Read {tool.name}")
+                await ctx.report_progress(
+                    index,
+                    total=total,
+                    message=f"Read {tool.name}",
+                )
             return ToolsetDetails(id=toolset.id, name=toolset.name, tools=details)
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
@@ -134,7 +163,9 @@ class ToolchainService:
             """Read a markdown summary of all discovered toolsets."""
             table = markdown.Table(["ID", "Name", "Tools"])
             for item in self.list_toolsets():
-                table.add([item.id, item.name, ", ".join(tool.name for tool in item.tools)])
+                table.add(
+                    [item.id, item.name, ", ".join(tool.name for tool in item.tools)]
+                )
             return markdown.Document([markdown.Heading("Toolsets"), table]).render()
 
         @mcp.resource(self.DETAILS_URI, mime_type="text/markdown", icons=[icon])
@@ -147,19 +178,40 @@ class ToolchainService:
             table = markdown.Table(["Tool", "Kind", "Absolute path", "Version"])
             for tool in toolset.tools:
                 detail = await read_tool(tool)
-                table.add([detail.name, detail.kind.value, detail.path, detail.version or "Unknown"])
-            return markdown.Document([
-                markdown.Heading(toolset.name), markdown.Paragraph(f"ID: {toolset.id}"), table,
-            ]).render()
+                table.add(
+                    [
+                        detail.name,
+                        detail.kind.value,
+                        detail.path,
+                        detail.version or "Unknown",
+                    ]
+                )
+            return markdown.Document(
+                [
+                    markdown.Heading(toolset.name),
+                    markdown.Paragraph(f"ID: {toolset.id}"),
+                    table,
+                ]
+            ).render()
 
         async def toolset_completion(
             ref: PromptReference | ResourceTemplateReference,
-            argument: CompletionArgument, context: CompletionContext | None,
+            argument: CompletionArgument,
+            context: CompletionContext | None,
         ) -> Completion | None:
-            if (not isinstance(ref, ResourceTemplateReference) or ref.uri != self.DETAILS_URI
-                    or argument.name != "toolset_id"):
+            if (
+                not isinstance(ref, ResourceTemplateReference)
+                or ref.uri != self.DETAILS_URI
+                or argument.name != "toolset_id"
+            ):
                 return None
-            values = [item.id for item in self.toolsets if item.id.startswith(argument.value)]
-            return Completion(values=values[:100], total=len(values), has_more=len(values) > 100)
+            values = [
+                item.id for item in self.toolsets if item.id.startswith(argument.value)
+            ]
+            return Completion(
+                values=values[:100],
+                total=len(values),
+                has_more=len(values) > 100,
+            )
 
         complete.add_completion(toolset_completion)

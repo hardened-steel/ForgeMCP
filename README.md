@@ -6,12 +6,13 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
 
 ## Current MCP surface
 
-- Tool `workspace_overview` returns a typed, bounded summary of the configured
-  workspace, reports progress, carries a packaged icon, and opens an MCP App widget.
-- Resource template `forgemcp://workspace/files/{extension}` lists bounded,
-  workspace-relative C/C++ file paths.
-- Prompt `inspect_cpp_workspace` starts a focused, read-only project inspection.
-- Completions suggest supported resource extensions and prompt focus values.
+- Workspace tools browse directory trees, find files, read UTF-8 text and file
+  metadata, search literal text or regex, write/edit/move/delete files, and create
+  directories. Each tool reports progress and has a packaged MCP App and icon.
+- Workspace resources mirror UTF-8 text and raw bytes, and expose directory trees,
+  file lists, metadata, and search results as Markdown. Resource parameters have
+  completions for roots, paths, extensions, depth, and boolean options.
+- No prompts are currently registered.
 - Tool `processes_overview` shows running and completed external development tools.
 - Resource template `forgemcp://processes/{process_id}` exposes the retained state and
   text transcript of one process.
@@ -80,6 +81,66 @@ In VS Code, the `ForgeMCP: server` launch configuration is the one-button path: 
 builds the wheel first and then starts the server for this repository.
 
 All MCP traffic uses stdout. Operational logs must go to stderr.
+
+## Workspace files and storage
+
+All file tools accept `root="project"` (default) or `root="storage"`; their paths
+are relative to that root. Storage defaults to `.<project-name>.forgemcp` beside the
+project. Set its location explicitly when needed:
+
+```powershell
+forgemcp --workspace C:\Projects\Example --workspace-storage D:\ForgeMCP\Example
+```
+
+Storage is created on first use. Its persistent directories survive restarts;
+internal temporary-directory contexts clean up their own folders on exit. The
+process service permits working directories inside either configured root. This is
+a working-directory check, not an operating-system sandbox.
+
+| Tool | Operation |
+| --- | --- |
+| `workspace_list(path=".", depth=1)` | Directory tree; `depth=null` expands the whole tree; a file path is an error |
+| `workspace_find_files(pattern="*", path=".", extensions=null)` | Recursive filename/path glob search |
+| `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
+| `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
+| `workspace_search(query, path=".", regex=false, extensions=null, case_sensitive=true)` | Matching lines and skipped binary/non-UTF-8 files |
+| `workspace_write_file(path, text)` | Create or overwrite; return removed/added line counts |
+| `workspace_edit_file(path, old_text, new_text, replace_all=false)` | Exact replacement; zero or ambiguous matches fail without modifying the file |
+| `workspace_move(source, destination)` | Move a file or directory; destination must not exist |
+| `workspace_delete(path)` | Delete a file or empty directory |
+| `workspace_mkdir(path)` | Create a directory and missing parents |
+
+Text is UTF-8; writes use a sibling temporary file and `os.replace`. There are no
+revision/hash parameters. Edits preserve text outside the replacement, including
+line endings. Parents must already exist for file writes and moves.
+
+Searches skip directories beginning with a dot and do not follow links. Ordinary
+`build` directories and dot-prefixed files are searchable. Explicit file reads may
+access hidden directories and in-root links. Mutations cannot traverse links;
+moving/removing a whole tree containing links is rejected. Dependent modules may
+register protected paths, which remain readable but cannot be changed through the
+workspace API. Searches intentionally have no application-level timeout, result
+limit, or pagination in this iteration.
+
+Resource templates (the URI root is always explicit):
+
+```text
+forgemcp://workspace/{root}/file{/path*}
+forgemcp://workspace/{root}/raw{/path*}
+forgemcp://workspace/{root}/list{?path,depth}
+forgemcp://workspace/{root}/find-files{?pattern,path,extensions}
+forgemcp://workspace/{root}/file-info{?path}
+forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
+```
+
+Examples: `forgemcp://workspace/project/file/src/main.cpp`,
+`forgemcp://workspace/storage/raw/build/debug/app.exe`, and
+`forgemcp://workspace/project/search?query=TODO&extensions=cpp,hpp`.
+Use `depth=all` for a full resource tree. Extensions are comma-separated;
+an omitted parameter means any extension and `extensions=` means extensionless
+files. Encode query values using percent encoding (spaces as `%20`, not `+`);
+regex is supported. Text mirrors return the original text, raw mirrors return MCP
+binary content, and the other four resources return `text/markdown`.
 
 ## Toolchain discovery
 

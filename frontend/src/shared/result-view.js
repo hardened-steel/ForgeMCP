@@ -2,7 +2,7 @@ import { copyText, isObject, jsonTokens, statusTone, timestamp } from "./present
 import { createCopyIcon } from "./copy-icon.js";
 
 /** Shared local-only view of one result. The App/transport is deliberately not passed here. */
-export function createResultView(root, { toolName, describe }) {
+export function createResultView(root, { toolName, describe, renderValue }) {
   const doc = root.ownerDocument;
   const win = doc.defaultView;
   const element = (tag, className = "", text) => {
@@ -129,7 +129,9 @@ export function createResultView(root, { toolName, describe }) {
   }
 
   function valueNode(value, key = "", record) {
-    const date = (key === "started_at" || key === "finished_at") ? timestamp(value) : null;
+    const custom = renderValue?.(value, key, record, { doc, valueNode });
+    if (custom) return custom;
+    const date = ["started_at", "finished_at", "created_at", "modified_at"].includes(key) ? timestamp(value) : null;
     if (date) {
       const output = element("span", "fm-value");
       const time = element("time", "", date.readable);
@@ -172,6 +174,7 @@ export function createResultView(root, { toolName, describe }) {
       const row = element("div", "fm-field");
       const description = element("dd", "fm-value");
       description.append(valueNode(item, key, value));
+      if (description.querySelector(".fm-source, .fm-tree")) row.classList.add("fm-wide-field");
       const copyField = button(undefined, "fm-copy");
       copyField.setAttribute("aria-label", `Copy ${key}`);
       copyField.append(icon());

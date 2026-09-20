@@ -18,7 +18,9 @@ def package_file(relative_path: str) -> Traversable:
     """Resolve a safe path relative to the ForgeMCP package."""
     path = PurePosixPath(relative_path.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"Package path must be relative and cannot contain '..': {relative_path}")
+        raise ValueError(
+            f"Package path must be relative and cannot contain '..': {relative_path}"
+        )
 
     resource = files(PACKAGE)
     for part in path.parts:

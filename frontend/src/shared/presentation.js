@@ -57,10 +57,6 @@ function collection(data, key, toolName, titleKey, categoryKey = null) {
   };
 }
 
-export function workspacePresentation(data) {
-  return { toolName: "workspace_overview", summary: data, records: null };
-}
-
 export function processPresentation(data) {
   return collection(data, "processes", "processes_overview", "status", "status");
 }
