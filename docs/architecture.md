@@ -123,16 +123,28 @@ literal/regex searching, mutations, and storage directories. The ten tools are
 `workspace_delete`, and `workspace_mkdir`. The former overview, file-extension
 resource, and inspection prompt are removed. There are no workspace prompts.
 
-Business methods are synchronous and return small Pydantic models; async tool
-entrypoints run them off the event loop and report the start/completion of one
-operation. The SDK derives structured output and useful JSON text fallback.
+Tree and search operations live in async handlers inside `register`, reused by
+Markdown resources. They yield during traversal and report visited entries/files
+without an invented total. Each tool invocation has its own progress throttle,
+using a monotonic clock and `WorkspaceService(progress_interval=1.0)`. The CLI
+option is `--workspace-progress-interval`; zero disables throttling. All progress
+notifications, including start/completion, obey the minimum interval. The first
+notification is immediate, skipped updates are not queued, and counters still
+advance for every work unit. No timer, delayed send, or operation wrapper is used.
+The tool response signals completion. File reading reports bytes as chunks are read. Small
+reusable filesystem operations remain service methods; their tool handlers report
+completion of one operation. No generic runner or thread offloading is used.
+Individual filesystem calls are synchronous; traversal yields cooperatively between
+work units. Results remain small Pydantic models. The SDK derives structured output and useful JSON text fallback.
 Expected `WorkspaceError` failures become `ToolError` or `ResourceError` at the
-corresponding boundary. Platform-specific file ownership is isolated in
+corresponding boundary. OS errors retain the system-provided `strerror`, which may be localized. Resource roots are explicitly checked before filesystem access,
+including mirrors without a path, to avoid opaque SDK validation errors. Platform-specific file ownership is isolated in
 `workspace/metadata.py`; unavailable owner or creation time is null.
 
 Every public path is relative to `root=project` or `root=storage`. Path traversal,
 absolute paths, and resolutions outside the selected root are rejected. Trees
-display symlinks/junctions without descending into them. Explicit reads may follow
+display symlinks/junctions without descending into them. Trees hide dot-prefixed
+directories by default (`include_hidden=true` includes them); dot files stay visible. Explicit reads may follow
 in-root links; mutations reject linked path components. Moving or recursively
 removing a directory containing links is rejected. Workspace roots cannot be
 mutated. `protect_path(path, root=...)` lets dependent modules protect files or
@@ -152,8 +164,10 @@ Delete supports files and empty directories. Mkdir creates missing parents.
 Filename searches use a basename glob unless the pattern contains `/`, in which
 case it matches a path relative to the search directory; `**` supports nested
 directories. Text search uses the `regex` package, is line-oriented, and returns
-one result per matching line. Both searches skip dot directories and links but
-include ordinary build directories and dot files. Extension filters accept a
+one result per matching line, with `spans` containing zero-based Unicode-code-point
+[start, end) pairs produced by the same regex engine, including zero-width matches. Both searches skip dot directories and links but
+include ordinary build directories and dot files. Only text search has an extension
+filter; filename search uses its glob alone. Extension filters accept a
 leading dot and compare case-insensitively. Binary/non-UTF-8 files are reported in
 `skipped_files`. By explicit design, workspace scans currently have no application
 timeout, output cap, index, or pagination.
@@ -183,8 +197,8 @@ Six templates are registered, with an explicit `project` or `storage` root:
 ```text
 forgemcp://workspace/{root}/file{/path*}
 forgemcp://workspace/{root}/raw{/path*}
-forgemcp://workspace/{root}/list{?path,depth}
-forgemcp://workspace/{root}/find-files{?pattern,path,extensions}
+forgemcp://workspace/{root}/list{?path,depth,include_hidden}
+forgemcp://workspace/{root}/find-files{?pattern,path}
 forgemcp://workspace/{root}/file-info{?path}
 forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
 ```
@@ -193,10 +207,11 @@ Text mirrors return complete UTF-8 text with `text/plain`; raw mirrors return ex
 bytes with `application/octet-stream`. The other four render the same business
 results as `text/markdown` through the shared Markdown helpers. Embedded code fences
 are escaped by choosing a longer fence. No per-file resource registration or cache
-is needed. Resource access reads current files and does not obey search exclusions.
+is needed. Mirrors read current files regardless of search exclusions; tree and search
+resources use the same filtering policy as their tools.
 
 Query parameters use RFC 6570 percent encoding, including `%20` for spaces; `+`
-remains a literal plus. Resource depth `all` maps to tool depth null. Extensions use
+remains a literal plus. Resource depth `all` maps to tool depth null. Text-search extensions use
 a comma-separated string; an omitted value means any extension, an empty value
 means extensionless files. Regex works in URI parameters. SDK path-security checks
 are exempted only for `query`/`pattern`, which are data; actual paths still pass SDK

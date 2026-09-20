@@ -27,10 +27,15 @@ def create_server(
     *,
     toolsets: list[list[str]] | None = None,
     storage_root: Path | None = None,
+    workspace_progress_interval: float = 1.0,
 ) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
     root = workspace_root or Path.cwd()
-    workspace = WorkspaceService(root, storage_root)
+    workspace = WorkspaceService(
+        root,
+        storage_root,
+        progress_interval=workspace_progress_interval,
+    )
     processes = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
     toolchains = ToolchainService(processes, toolsets or ())
     services = (workspace, processes, toolchains)
@@ -98,6 +103,12 @@ def argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Service storage directory (defaults to .<project>.forgemcp beside the project).",
     )
+    parser.add_argument(
+        "--workspace-progress-interval",
+        type=float,
+        default=1.0,
+        help="Minimum seconds between workspace progress notifications (default: 1; 0 disables throttling).",
+    )
     return parser
 
 
@@ -111,6 +122,7 @@ def main() -> None:
             arguments.workspace,
             toolsets=arguments.toolset,
             storage_root=arguments.workspace_storage,
+            workspace_progress_interval=arguments.workspace_progress_interval,
         )
     except (ToolchainError, WorkspaceError) as error:
         parser.error(str(error))

@@ -211,6 +211,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     }
     const query = search.value.toLocaleLowerCase();
     const matches = (item) => JSON.stringify(item).toLocaleLowerCase().includes(query);
+    if (presentation.render) {
+      content.append(presentation.render(doc, query, content.clientWidth));
+      count.textContent = presentation.count;
+      return;
+    }
     if (presentation.records !== null) {
       if (!isObject(presentation.summary) || Object.keys(presentation.summary).length) {
         const summary = element("div", "fm-summary");
@@ -291,12 +296,19 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   search.addEventListener("input", render);
   categories.addEventListener("change", render);
   copyAll.addEventListener("click", () => { if (presentation) void copy(JSON.stringify(raw, null, 2)); });
+  let previousWidth = content.clientWidth;
+  const observer = win.ResizeObserver ? new win.ResizeObserver(() => {
+    if (content.clientWidth === previousWidth) return;
+    previousWidth = content.clientWidth;
+    if (presentation?.render && mode === "fields") render();
+  }) : null;
+  observer?.observe(content);
   clear("Waiting for tool result…");
   return {
     receive,
     pending: () => { if (!disposed) clear("Waiting for tool result…"); },
     cancelled: () => { if (!disposed) clear("Tool invocation cancelled."); },
     unavailable: () => { if (!disposed) clear("Unable to connect to the host."); },
-    dispose: () => { disposed = true; clear(""); root.replaceChildren(); },
+    dispose: () => { disposed = true; observer?.disconnect(); clear(""); root.replaceChildren(); },
   };
 }

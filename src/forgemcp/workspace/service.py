@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import math
 import os
 import shutil
 import stat
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from time import monotonic
 from typing import Generator, Literal
 from urllib.parse import quote
 
@@ -29,7 +30,7 @@ from mcp.types import (
     ResourceTemplateReference,
     ToolAnnotations,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
@@ -78,6 +79,9 @@ class SearchMatch(BaseModel):
     path: str
     line: int
     text: str
+    spans: list[tuple[int, int]] = Field(
+        description="Match ranges as zero-based Unicode code point [start, end) pairs.",
+    )
 
 
 class SearchResult(BaseModel):
@@ -164,12 +168,21 @@ class WorkspaceService:
     EDIT_ICON = IconFile("icons/workspace-edit.svg")
     FILE_URI = "forgemcp://workspace/{root}/file{/path*}"
     RAW_URI = "forgemcp://workspace/{root}/raw{/path*}"
-    LIST_URI = "forgemcp://workspace/{root}/list{?path,depth}"
-    FIND_URI = "forgemcp://workspace/{root}/find-files{?pattern,path,extensions}"
+    LIST_URI = "forgemcp://workspace/{root}/list{?path,depth,include_hidden}"
+    FIND_URI = "forgemcp://workspace/{root}/find-files{?pattern,path}"
     INFO_URI = "forgemcp://workspace/{root}/file-info{?path}"
     SEARCH_URI = "forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}"
 
-    def __init__(self, workspace_root: Path, storage_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        storage_root: Path | None = None,
+        *,
+        progress_interval: float = 1.0,
+    ) -> None:
+        if not math.isfinite(progress_interval) or progress_interval < 0:
+            raise WorkspaceError("Progress interval must be finite and nonnegative.")
+        self.progress_interval = progress_interval
         with filesystem_errors("project"):
             self.root = workspace_root.resolve()
             if not self.root.is_dir():
@@ -278,59 +291,10 @@ class WorkspaceService:
             raise WorkspaceError(f"{path}: expected an existing regular file.")
         return candidate
 
-    def list_directory(
-        self,
-        path: str = ".",
-        *,
-        depth: int | None = 1,
-        root: WorkspaceRoot = "project",
-    ) -> DirectoryTree:
-        if depth is not None and depth < 1:
-            raise WorkspaceError(
-                "Depth must be positive or null for the complete tree."
-            )
-        directory = self.resolve_path(path, root=root)
-        self.check_path_links(directory, root)
-        if not directory.is_dir():
-            raise WorkspaceError(f"{path}: expected an existing directory.")
-
-        def entries(parent: Path, remaining: int | None) -> list[TreeEntry]:
-            result = []
-            for child in sorted(parent.iterdir(), key=lambda item: item.name):
-                children = None
-                if self.is_link(child):
-                    kind = "symlink"
-                elif child.is_dir():
-                    kind = "directory"
-                    if remaining is None or remaining > 1:
-                        children = entries(
-                            child,
-                            None if remaining is None else remaining - 1,
-                        )
-                elif child.is_file():
-                    kind = "file"
-                else:
-                    kind = "other"
-                result.append(
-                    TreeEntry(
-                        path=child.relative_to(self.root_path(root)).as_posix(),
-                        kind=kind,
-                        children=children,
-                    )
-                )
-            return result
-
-        with filesystem_errors(path):
-            return DirectoryTree(
-                root=root,
-                path=self.relative_path(directory, root=root),
-                entries=entries(directory, depth),
-            )
-
     def raise_walk_error(self, error: OSError) -> None:
         raise error
 
-    def iter_files(self, path: str, root: WorkspaceRoot) -> Iterator[Path]:
+    async def iter_files(self, path: str, root: WorkspaceRoot) -> AsyncIterator[Path]:
         start = self.resolve_path(path, root=root)
         self.check_path_links(start, root)
         relative = start.relative_to(self.root_path(root))
@@ -347,6 +311,7 @@ class WorkspaceService:
             followlinks=False,
             onerror=self.raise_walk_error,
         ):
+            await asyncio.sleep(0)
             parent = Path(directory)
             dirs[:] = sorted(
                 name
@@ -357,36 +322,12 @@ class WorkspaceService:
                 child = parent / name
                 if not self.is_link(child) and child.is_file():
                     yield child
+                    await asyncio.sleep(0)
 
     def extension_matches(self, path: Path, extensions: Sequence[str] | None) -> bool:
         return extensions is None or path.suffix.removeprefix(".").lower() in {
             extension.removeprefix(".").lower() for extension in extensions
         }
-
-    def find_files(
-        self,
-        pattern: str = "*",
-        *,
-        path: str = ".",
-        extensions: Sequence[str] | None = None,
-        root: WorkspaceRoot = "project",
-    ) -> FilePaths:
-        start = self.resolve_path(path, root=root)
-        base = start if start.is_dir() else start.parent
-        if not pattern:
-            raise WorkspaceError("File pattern must not be empty.")
-        paths = []
-        with filesystem_errors(path):
-            for candidate in self.iter_files(path, root):
-                target = candidate.relative_to(base).as_posix()
-                matches = (
-                    PurePosixPath(target).full_match(pattern, case_sensitive=True)
-                    if "/" in pattern
-                    else fnmatch.fnmatchcase(candidate.name, pattern)
-                )
-                if matches and self.extension_matches(candidate, extensions):
-                    paths.append(self.relative_path(candidate, root=root))
-        return FilePaths(root=root, paths=sorted(paths))
 
     def read_bytes(self, path: str, *, root: WorkspaceRoot = "project") -> bytes:
         with filesystem_errors(path):
@@ -430,52 +371,6 @@ class WorkspaceService:
                 size_bytes=metadata.st_size,
                 owner=file_owner(candidate),
             )
-
-    def search(
-        self,
-        query: str,
-        *,
-        path: str = ".",
-        regex: bool = False,
-        extensions: Sequence[str] | None = None,
-        case_sensitive: bool = True,
-        root: WorkspaceRoot = "project",
-    ) -> SearchResult:
-        if not query:
-            raise WorkspaceError("Search query must not be empty.")
-        try:
-            expression = regex_engine.compile(
-                query if regex else regex_engine.escape(query),
-                flags=regex_engine.VERSION1
-                | (0 if case_sensitive else regex_engine.IGNORECASE),
-            )
-        except regex_engine.error as error:
-            raise WorkspaceError(f"Invalid regular expression: {error}") from error
-        matches, skipped = [], []
-        with filesystem_errors(path):
-            for candidate in self.iter_files(path, root):
-                if not self.extension_matches(candidate, extensions):
-                    continue
-                relative = self.relative_path(candidate, root=root)
-                data = candidate.read_bytes()
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    skipped.append(relative)
-                    continue
-                if "\0" in text:
-                    skipped.append(relative)
-                    continue
-                for line, value in enumerate(text.splitlines(), 1):
-                    if expression.search(value):
-                        matches.append(
-                            SearchMatch(path=relative, line=line, text=value)
-                        )
-        return SearchResult(
-            root=root,
-            matches=sorted(matches, key=lambda item: (item.path, item.line)),
-            skipped_files=sorted(skipped),
-        )
 
     def replace_text(self, path: Path, text: str) -> None:
         """Write UTF-8 without newline translation, then replace the destination."""
@@ -617,7 +512,7 @@ class WorkspaceService:
         return StorageDirectory(self, self.storage_root / key)
 
     @contextmanager
-    def temporary_directory(self, prefix: str = "tmp") -> Iterator[StorageDirectory]:
+    def temporary_directory(self, prefix: str = "tmp") -> Generator[StorageDirectory]:
         self.validate_directory_key(prefix)
         parent = self.storage_directory("tmp")
         with filesystem_errors("tmp"):
@@ -705,6 +600,23 @@ class WorkspaceService:
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register file tools, mirrors, Markdown resources, and completions."""
+        def progress(ctx: Context) -> Callable[..., Awaitable[None]]:
+            last_sent: float | None = None
+
+            async def report(
+                value: float,
+                total: float | None = None,
+                message: str | None = None,
+            ) -> None:
+                nonlocal last_sent
+                now = monotonic()
+                if last_sent is not None and now - last_sent < self.progress_interval:
+                    return
+                last_sent = now
+                await ctx.report_progress(value, total=total, message=message)
+
+            return report
+
         read_only = ToolAnnotations(
             read_only_hint=True,
             destructive_hint=False,
@@ -716,27 +628,6 @@ class WorkspaceService:
             open_world_hint=False,
         )
 
-        async def run[T](
-            ctx: Context,
-            operation: Callable[..., T],
-            **kwargs: object,
-        ) -> T:
-            await ctx.report_progress(
-                0,
-                total=1,
-                message="Working with workspace files",
-            )
-            try:
-                result = await asyncio.to_thread(partial(operation, **kwargs))
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
-            await ctx.report_progress(
-                1,
-                total=1,
-                message="Workspace operation complete",
-            )
-            return result
-
         @apps.tool(
             resource_uri=self.TREE_WIDGET.uri,
             icons=[self.ICON.icon],
@@ -746,16 +637,69 @@ class WorkspaceService:
             ctx: Context,
             path: str = ".",
             depth: int | None = 1,
+            include_hidden: bool = False,
             root: WorkspaceRoot = "project",
         ) -> DirectoryTree:
             """Show a directory tree; null depth expands every directory. File paths are errors."""
-            return await run(
-                ctx,
-                self.list_directory,
-                path=path,
-                depth=depth,
-                root=root,
-            )
+            report_progress = progress(ctx)
+            try:
+                visited = 0
+                await report_progress(0, message="Starting directory scan")
+                if depth is not None and depth < 1:
+                    raise WorkspaceError(
+                        "Depth must be positive or null for the complete tree."
+                    )
+                directory = self.resolve_path(path, root=root)
+                self.check_path_links(directory, root)
+                if not directory.is_dir():
+                    raise WorkspaceError(f"{path}: expected an existing directory.")
+
+                async def entries(
+                    parent: Path,
+                    remaining: int | None,
+                ) -> list[TreeEntry]:
+                    nonlocal visited
+                    result: list[TreeEntry] = []
+                    for child in sorted(parent.iterdir(), key=lambda item: item.name):
+                        if (
+                            not include_hidden
+                            and child.name.startswith(".")
+                            and child.is_dir()
+                        ):
+                            continue
+                        children = None
+                        if self.is_link(child):
+                            kind = "symlink"
+                        elif child.is_dir():
+                            kind = "directory"
+                            if remaining is None or remaining > 1:
+                                children = await entries(
+                                    child,
+                                    None if remaining is None else remaining - 1,
+                                )
+                        elif child.is_file():
+                            kind = "file"
+                        else:
+                            kind = "other"
+                        entry = TreeEntry(
+                            path=child.relative_to(self.root_path(root)).as_posix(),
+                            kind=kind,
+                            children=children,
+                        )
+                        result.append(entry)
+                        visited += 1
+                        await report_progress(visited, message=f"process {entry.path}")
+                        await asyncio.sleep(0)
+                    return result
+
+                with filesystem_errors(path):
+                    return DirectoryTree(
+                        root=root,
+                        path=self.relative_path(directory, root=root),
+                        entries=await entries(directory, depth),
+                    )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
 
         @apps.tool(
             resource_uri=self.TREE_WIDGET.uri,
@@ -766,18 +710,36 @@ class WorkspaceService:
             ctx: Context,
             pattern: str = "*",
             path: str = ".",
-            extensions: list[str] | None = None,
             root: WorkspaceRoot = "project",
         ) -> FilePaths:
-            """Find file paths by glob and optional extensions, skipping dot directories and links."""
-            return await run(
-                ctx,
-                self.find_files,
-                pattern=pattern,
-                path=path,
-                extensions=extensions,
-                root=root,
-            )
+            """Find file paths by glob, skipping dot directories and links."""
+            report_progress = progress(ctx)
+            try:
+                visited = 0
+                await report_progress(0, message="Files visited")
+                start = self.resolve_path(path, root=root)
+                base = start if start.is_dir() else start.parent
+                if not pattern:
+                    raise WorkspaceError("File pattern must not be empty.")
+                paths = []
+                with filesystem_errors(path):
+                    async for candidate in self.iter_files(path, root):
+                        visited += 1
+                        await report_progress(visited, message="Files visited")
+                        target = candidate.relative_to(base).as_posix()
+                        matches = (
+                            PurePosixPath(target).full_match(
+                                pattern,
+                                case_sensitive=True,
+                            )
+                            if "/" in pattern
+                            else fnmatch.fnmatchcase(candidate.name, pattern)
+                        )
+                        if matches:
+                            paths.append(self.relative_path(candidate, root=root))
+                return FilePaths(root=root, paths=sorted(paths))
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -790,7 +752,17 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileInfo:
             """Read creation/modification times, byte size, and owner of one file."""
-            return await run(ctx, self.file_info, path=path, root=root)
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting file info")
+            try:
+                result = self.file_info(
+                    path=path,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed file info")
+            return result
 
         @apps.tool(
             resource_uri=self.FILE_WIDGET.uri,
@@ -805,14 +777,36 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileContent:
             """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
-            return await run(
-                ctx,
-                self.read_file,
-                path=path,
-                start_line=start_line,
-                end_line=end_line,
-                root=root,
-            )
+            report_progress = progress(ctx)
+            try:
+                if start_line < 1 or (end_line is not None and end_line < start_line):
+                    raise WorkspaceError(
+                        "Line range must start at 1 or later and end at or after its start."
+                    )
+                with filesystem_errors(path):
+                    candidate = self.require_file(path, root)
+                    text = bytearray()
+                    await report_progress(0, message="Bytes read")
+                    with candidate.open("rb") as stream:
+                        while chunk := stream.read(64 * 1024):
+                            text.extend(chunk)
+                            await report_progress(len(text), message="Bytes read")
+                            await asyncio.sleep(0)
+                    decoded = text.decode("utf-8")
+                    if "\0" in decoded:
+                        raise WorkspaceError(
+                            f"{path}: binary file; use the raw resource."
+                        )
+                    return FileContent(
+                        root=root,
+                        path=self.relative_path(candidate, root=root),
+                        text="".join(
+                            decoded.splitlines(keepends=True)[start_line - 1 : end_line]
+                        ),
+                        start_line=start_line,
+                    )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
 
         @apps.tool(
             resource_uri=self.SEARCH_WIDGET.uri,
@@ -829,16 +823,61 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> SearchResult:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files."""
-            return await run(
-                ctx,
-                self.search,
-                query=query,
-                path=path,
-                regex=regex,
-                extensions=extensions,
-                case_sensitive=case_sensitive,
-                root=root,
-            )
+            report_progress = progress(ctx)
+            try:
+                visited = 0
+                await report_progress(0, message="Files visited")
+                if not query:
+                    raise WorkspaceError("Search query must not be empty.")
+                try:
+                    expression = regex_engine.compile(
+                        query if regex else regex_engine.escape(query),
+                        flags=regex_engine.VERSION1
+                        | (0 if case_sensitive else regex_engine.IGNORECASE),
+                    )
+                except regex_engine.error as error:
+                    raise WorkspaceError(
+                        f"Invalid regular expression: {error}"
+                    ) from error
+                matches, skipped = [], []
+                with filesystem_errors(path):
+                    async for candidate in self.iter_files(path, root):
+                        visited += 1
+                        await report_progress(visited, message="Files visited")
+                        if not self.extension_matches(candidate, extensions):
+                            continue
+                        relative = self.relative_path(candidate, root=root)
+                        data = candidate.read_bytes()
+                        try:
+                            text = data.decode("utf-8")
+                        except UnicodeDecodeError:
+                            skipped.append(relative)
+                            continue
+                        if "\0" in text:
+                            skipped.append(relative)
+                            continue
+                        for line, value in enumerate(text.splitlines(), 1):
+                            if line % 256 == 0:
+                                await asyncio.sleep(0)
+                            spans = [
+                                match.span() for match in expression.finditer(value)
+                            ]
+                            if spans:
+                                matches.append(
+                                    SearchMatch(
+                                        path=relative,
+                                        line=line,
+                                        text=value,
+                                        spans=spans,
+                                    )
+                                )
+                return SearchResult(
+                    root=root,
+                    matches=sorted(matches, key=lambda item: (item.path, item.line)),
+                    skipped_files=sorted(skipped),
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -852,7 +891,18 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileWriteResult:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
-            return await run(ctx, self.write_file, path=path, text=text, root=root)
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting write file")
+            try:
+                result = self.write_file(
+                    path=path,
+                    text=text,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed write file")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -868,15 +918,20 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileEditResult:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
-            return await run(
-                ctx,
-                self.edit_file,
-                path=path,
-                old_text=old_text,
-                new_text=new_text,
-                replace_all=replace_all,
-                root=root,
-            )
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting edit file")
+            try:
+                result = self.edit_file(
+                    path=path,
+                    old_text=old_text,
+                    new_text=new_text,
+                    replace_all=replace_all,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed edit file")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -890,13 +945,18 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Move a file or directory inside one root; the destination must not exist."""
-            return await run(
-                ctx,
-                self.move,
-                source=source,
-                destination=destination,
-                root=root,
-            )
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting move")
+            try:
+                result = self.move(
+                    source=source,
+                    destination=destination,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed move")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -909,7 +969,17 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Delete a file or empty directory; protected paths and roots cannot be deleted."""
-            return await run(ctx, self.delete, path=path, root=root)
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting delete")
+            try:
+                result = self.delete(
+                    path=path,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed delete")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -927,7 +997,17 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Create a directory and missing parents, or report that it already exists."""
-            return await run(ctx, self.mkdir, path=path, root=root)
+            report_progress = progress(ctx)
+            await report_progress(0, total=1, message="Starting mkdir")
+            try:
+                result = self.mkdir(
+                    path=path,
+                    root=root,
+                )
+            except WorkspaceError as error:
+                raise ToolError(str(error)) from error
+            await report_progress(1, total=1, message="Completed mkdir")
+            return result
 
         for widget in (
             self.TREE_WIDGET,
@@ -940,7 +1020,7 @@ class WorkspaceService:
         def resource[T](operation: Callable[..., T], **kwargs: object) -> T:
             try:
                 return operation(**kwargs)
-            except WorkspaceError as error:
+            except (WorkspaceError, ToolError) as error:
                 raise ResourceError(str(error)) from error
 
         @mcp.resource(
@@ -948,34 +1028,48 @@ class WorkspaceService:
             mime_type="text/plain",
             icons=[self.FILE_ICON.icon],
         )
-        def workspace_file_resource(root: WorkspaceRoot, path: list[str]) -> str:
+        async def workspace_file_resource(
+            root: str,
+            path: list[str] | None = None,
+        ) -> str:
             """Read the complete UTF-8 file without formatting or metadata."""
-            return resource(self.read_file, path="/".join(path), root=root).text
+            resource(self.root_path, root=root)
+            return resource(self.read_file, path="/".join(path or []), root=root).text
 
         @mcp.resource(
             self.RAW_URI,
             mime_type="application/octet-stream",
             icons=[self.FILE_ICON.icon],
         )
-        def workspace_raw_resource(root: WorkspaceRoot, path: list[str]) -> bytes:
+        async def workspace_raw_resource(
+            root: str,
+            path: list[str] | None = None,
+        ) -> bytes:
             """Read the exact bytes of any file."""
-            return resource(self.read_bytes, path="/".join(path), root=root)
+            resource(self.root_path, root=root)
+            return resource(self.read_bytes, path="/".join(path or []), root=root)
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
-        def workspace_list_resource(
-            root: WorkspaceRoot,
+        async def workspace_list_resource(
+            root: str,
+            ctx: Context,
             path: str = ".",
             depth: int | Literal["all"] = 1,
+            include_hidden: bool = False,
         ) -> str:
             """Read a directory tree as Markdown; depth=all expands the whole tree."""
-            return self.render_markdown(
-                resource(
-                    self.list_directory,
+            try:
+                self.root_path(root)
+                result = await workspace_list(
+                    ctx=ctx,
                     root=root,
                     path=path,
                     depth=None if depth == "all" else depth,
+                    include_hidden=include_hidden,
                 )
-            )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
 
         @mcp.resource(
             self.FIND_URI,
@@ -983,30 +1077,33 @@ class WorkspaceService:
             icons=[self.ICON.icon],
             security=ResourceSecurity(exempt_params={"pattern"}),
         )
-        def workspace_find_files_resource(
-            root: WorkspaceRoot,
+        async def workspace_find_files_resource(
+            root: str,
+            ctx: Context,
             pattern: str = "*",
             path: str = ".",
-            extensions: str | None = None,
         ) -> str:
-            """Read matching file links as Markdown; extensions is a comma-separated list."""
-            return self.render_markdown(
-                resource(
-                    self.find_files,
+            """Read matching file links as Markdown."""
+            try:
+                self.root_path(root)
+                result = await workspace_find_files(
+                    ctx=ctx,
                     root=root,
                     pattern=pattern,
                     path=path,
-                    extensions=None if extensions is None else extensions.split(","),
                 )
-            )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
 
         @mcp.resource(
             self.INFO_URI,
             mime_type="text/markdown",
             icons=[self.FILE_ICON.icon],
         )
-        def workspace_file_info_resource(root: WorkspaceRoot, path: str = "") -> str:
+        async def workspace_file_info_resource(root: str, path: str = "") -> str:
             """Read one file's metadata as a Markdown table; path is required."""
+            resource(self.root_path, root=root)
             return self.render_markdown(resource(self.file_info, root=root, path=path))
 
         @mcp.resource(
@@ -1015,8 +1112,9 @@ class WorkspaceService:
             icons=[self.SEARCH_ICON.icon],
             security=ResourceSecurity(exempt_params={"query"}),
         )
-        def workspace_search_resource(
-            root: WorkspaceRoot,
+        async def workspace_search_resource(
+            root: str,
+            ctx: Context,
             query: str = "",
             path: str = ".",
             regex: bool = False,
@@ -1024,9 +1122,10 @@ class WorkspaceService:
             case_sensitive: bool = True,
         ) -> str:
             """Read text/regex matches and skipped files as Markdown; query is required."""
-            return self.render_markdown(
-                resource(
-                    self.search,
+            try:
+                self.root_path(root)
+                result = await workspace_search(
+                    ctx=ctx,
                     root=root,
                     query=query,
                     path=path,
@@ -1034,7 +1133,9 @@ class WorkspaceService:
                     extensions=None if extensions is None else extensions.split(","),
                     case_sensitive=case_sensitive,
                 )
-            )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
 
         async def workspace_completion(
             ref: ResourceTemplateReference,
@@ -1054,7 +1155,7 @@ class WorkspaceService:
             values: list[str] = []
             if argument.name == "root":
                 values = ["project", "storage"]
-            elif argument.name in ("regex", "case_sensitive"):
+            elif argument.name in ("regex", "case_sensitive", "include_hidden"):
                 values = ["false", "true"]
             elif argument.name == "depth":
                 values = ["1", "2", "3", "all"]
@@ -1065,12 +1166,13 @@ class WorkspaceService:
                     else "project"
                 )
                 try:
+                    if argument.name == "extensions" and ref.uri != self.SEARCH_URI:
+                        return Completion(values=[])
                     if argument.name == "extensions":
-                        paths = await asyncio.to_thread(self.find_files, root=selected)
                         extensions = sorted(
                             {
-                                PurePosixPath(path).suffix.removeprefix(".")
-                                for path in paths.paths
+                                candidate.suffix.removeprefix(".")
+                                async for candidate in self.iter_files(".", selected)
                             }
                         )
                         prefix, separator, tail = argument.value.rpartition(",")
@@ -1083,18 +1185,22 @@ class WorkspaceService:
                         parent = (
                             argument.value.replace("\\", "/").rpartition("/")[0] or "."
                         )
-                        tree = await asyncio.to_thread(
-                            self.list_directory,
-                            parent,
-                            root=selected,
-                        )
-                        values = [
-                            entry.path + ("/" if entry.kind == "directory" else "")
-                            for entry in tree.entries
-                            if entry.kind in ("file", "directory")
-                            and (ref.uri != self.LIST_URI or entry.kind == "directory")
-                        ]
-                except WorkspaceError:
+                        directory = self.resolve_path(parent, root=selected)
+                        self.check_path_links(directory, selected)
+                        with filesystem_errors(parent):
+                            for child in sorted(directory.iterdir()):
+                                await asyncio.sleep(0)
+                                if self.is_link(child):
+                                    continue
+                                is_directory = child.is_dir()
+                                if ref.uri == self.LIST_URI and not is_directory:
+                                    continue
+                                if is_directory or child.is_file():
+                                    values.append(
+                                        self.relative_path(child, root=selected)
+                                        + ("/" if is_directory else "")
+                                    )
+                except (WorkspaceError, ToolError):
                     values = []
             matches = [value for value in values if value.startswith(argument.value)]
             return Completion(

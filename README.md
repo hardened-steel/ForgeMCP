@@ -27,6 +27,9 @@ serializes their typed results into both text `content` and `structuredContent`.
 
 All widgets share a compact console style with a fixed 420px height and adapt to the
 host width. Long values wrap and remain selectable; overflow scrolls vertically.
+File views separate line numbers and offer a wrap toggle with horizontal scrolling.
+Search groups matching lines by collapsible file, highlights matches, expands clipped
+context on click, and keeps skipped files in a separate tab.
 Fields, local filters, copy icons and syntax-highlighted JSON show the supplied result
 without making additional tool calls. Process times are readable to seconds; JSON and
 copying preserve the original precision. A toolsets list shows summaries, while a
@@ -92,6 +95,12 @@ project. Set its location explicitly when needed:
 forgemcp --workspace C:\Projects\Example --workspace-storage D:\ForgeMCP\Example
 ```
 
+Workspace progress notifications are limited to one per second per invocation by
+default. Configure this with `--workspace-progress-interval 2.5` (seconds), or use
+`0` to disable throttling. The first notification is immediate; intervening updates
+are dropped, not queued. Tool results signal completion even when its progress
+notification is suppressed. The interval must be finite and nonnegative.
+
 Storage is created on first use. Its persistent directories survive restarts;
 internal temporary-directory contexts clean up their own folders on exit. The
 process service permits working directories inside either configured root. This is
@@ -99,8 +108,8 @@ a working-directory check, not an operating-system sandbox.
 
 | Tool | Operation |
 | --- | --- |
-| `workspace_list(path=".", depth=1)` | Directory tree; `depth=null` expands the whole tree; a file path is an error |
-| `workspace_find_files(pattern="*", path=".", extensions=null)` | Recursive filename/path glob search |
+| `workspace_list(path=".", depth=1, include_hidden=false)` | Directory tree; `depth=null` expands the whole tree; a file path is an error |
+| `workspace_find_files(pattern="*", path=".")` | Recursive filename/path glob search |
 | `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
 | `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
 | `workspace_search(query, path=".", regex=false, extensions=null, case_sensitive=true)` | Matching lines and skipped binary/non-UTF-8 files |
@@ -114,7 +123,8 @@ Text is UTF-8; writes use a sibling temporary file and `os.replace`. There are n
 revision/hash parameters. Edits preserve text outside the replacement, including
 line endings. Parents must already exist for file writes and moves.
 
-Searches skip directories beginning with a dot and do not follow links. Ordinary
+Directory trees hide dot-prefixed directories unless `include_hidden=true`;
+dot-prefixed files remain visible. Searches skip directories beginning with a dot and do not follow links. Ordinary
 `build` directories and dot-prefixed files are searchable. Explicit file reads may
 access hidden directories and in-root links. Mutations cannot traverse links;
 moving/removing a whole tree containing links is rejected. Dependent modules may
@@ -127,8 +137,8 @@ Resource templates (the URI root is always explicit):
 ```text
 forgemcp://workspace/{root}/file{/path*}
 forgemcp://workspace/{root}/raw{/path*}
-forgemcp://workspace/{root}/list{?path,depth}
-forgemcp://workspace/{root}/find-files{?pattern,path,extensions}
+forgemcp://workspace/{root}/list{?path,depth,include_hidden}
+forgemcp://workspace/{root}/find-files{?pattern,path}
 forgemcp://workspace/{root}/file-info{?path}
 forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
 ```
@@ -136,7 +146,8 @@ forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
 Examples: `forgemcp://workspace/project/file/src/main.cpp`,
 `forgemcp://workspace/storage/raw/build/debug/app.exe`, and
 `forgemcp://workspace/project/search?query=TODO&extensions=cpp,hpp`.
-Use `depth=all` for a full resource tree. Extensions are comma-separated;
+Use `depth=all` for a full resource tree and `include_hidden=true` to include
+dot-prefixed directories. Text-search extensions are comma-separated;
 an omitted parameter means any extension and `extensions=` means extensionless
 files. Encode query values using percent encoding (spaces as `%20`, not `+`);
 regex is supported. Text mirrors return the original text, raw mirrors return MCP
