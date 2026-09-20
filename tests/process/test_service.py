@@ -309,3 +309,27 @@ async def test_launch_cancellation_delegates_to_asyncio(processes, monkeypatch):
         await task
     assert cancelled.is_set()
     assert not processes.records
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("interval", [0, 1])
+async def test_process_overview_uses_shared_progress(processes, monkeypatch, interval):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from mcp.server import MCPServer
+    from mcp.server.apps import Apps
+    from forgemcp.completion import Complete
+
+    processes.progress_interval = interval
+    monkeypatch.setattr("forgemcp.progress.monotonic", lambda: 0)
+    async with await processes.launch(sys.executable, ["-c", "pass"]) as session:
+        await session.wait()
+    apps = Apps()
+    processes.register(MCPServer("test", extensions=[apps]), apps, Complete())
+    handler = apps.tools()[0].fn
+    for _ in range(2):
+        ctx = SimpleNamespace(report_progress=AsyncMock())
+        result = await handler(ctx=ctx)
+        assert result.completed == 1
+        values = [call.args[0] for call in ctx.report_progress.await_args_list]
+        assert values == ([0, 1] if interval == 0 else [0])

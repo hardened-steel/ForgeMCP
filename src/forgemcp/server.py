@@ -14,6 +14,7 @@ from mcp.server.apps import Apps
 from forgemcp import __version__
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
+from forgemcp.progress import validate_progress_interval
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.loader import load_tools
 from forgemcp.toolchain.providers.user import parse_toolsets
@@ -27,17 +28,26 @@ def create_server(
     *,
     toolsets: list[list[str]] | None = None,
     storage_root: Path | None = None,
-    workspace_progress_interval: float = 1.0,
+    progress_interval: float = 1.0,
 ) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
+    validate_progress_interval(progress_interval)
     root = workspace_root or Path.cwd()
     workspace = WorkspaceService(
         root,
         storage_root,
-        progress_interval=workspace_progress_interval,
+        progress_interval=progress_interval,
     )
-    processes = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
-    toolchains = ToolchainService(processes, toolsets or ())
+    processes = ProcessService(
+        workspace.root,
+        allowed_roots=(workspace.storage_root,),
+        progress_interval=progress_interval,
+    )
+    toolchains = ToolchainService(
+        processes,
+        toolsets or (),
+        progress_interval=progress_interval,
+    )
     services = (workspace, processes, toolchains)
     apps = Apps()
     complete = Complete()
@@ -104,10 +114,11 @@ def argument_parser() -> argparse.ArgumentParser:
         help="Service storage directory (defaults to .<project>.forgemcp beside the project).",
     )
     parser.add_argument(
-        "--workspace-progress-interval",
+        "--progress-interval",
+        dest="progress_interval",
         type=float,
         default=1.0,
-        help="Minimum seconds between workspace progress notifications (default: 1; 0 disables throttling).",
+        help="Minimum seconds between progress notifications (default: 1; 0 disables throttling).",
     )
     return parser
 
@@ -122,9 +133,9 @@ def main() -> None:
             arguments.workspace,
             toolsets=arguments.toolset,
             storage_root=arguments.workspace_storage,
-            workspace_progress_interval=arguments.workspace_progress_interval,
+            progress_interval=arguments.progress_interval,
         )
-    except (ToolchainError, WorkspaceError) as error:
+    except (ToolchainError, WorkspaceError, ValueError) as error:
         parser.error(str(error))
     server.run(transport="stdio")
 

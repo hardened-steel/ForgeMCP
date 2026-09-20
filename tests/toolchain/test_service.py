@@ -265,9 +265,11 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("interval", [0, 1])
 async def test_mcp_tools_resources_progress_completions_and_transcripts(
     cpp_acceptance_project,
     monkeypatch,
+    interval,
 ):
     monkeypatch.setattr(discovery, "load_tools", lambda: (python_info(),))
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
@@ -278,13 +280,14 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
     monkeypatch.setattr(visual_studio, "discover", no_vs)
     from forgemcp.server import create_server
 
+    monkeypatch.setattr("forgemcp.progress.monotonic", lambda: 0)
     progress = []
 
     async def collect(value, total, message):
         progress.append(value)
 
     async with Client(
-        create_server(cpp_acceptance_project),
+        create_server(cpp_acceptance_project, progress_interval=interval),
         raise_exceptions=True,
     ) as client:
         tools = (await client.list_tools()).tools
@@ -298,14 +301,14 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
         assert result.structured_content == {
             "result": [{"id": "system", "name": "System", "tools": ["python"]}]
         }
-        assert result.content and progress == [0.0, 1.0]
+        assert result.content and progress == ([0.0, 1.0] if interval == 0 else [0.0])
         progress.clear()
         result = await client.call_tool(
             "toolset_get",
             {"toolset_id": "system"},
             progress_callback=collect,
         )
-        assert progress == [0.0, 1.0]
+        assert progress == ([0.0, 1.0] if interval == 0 else [0.0])
         tool_info = result.structured_content["tools"][0]
         assert Path(tool_info["path"]) == Path(sys.executable).resolve()
         assert tool_info == dict(

@@ -12,7 +12,6 @@ from mcp.shared.exceptions import MCPError
 
 from forgemcp.server import argument_parser, create_server
 from forgemcp.workspace.service import WorkspaceService
-from forgemcp.workspace.errors import WorkspaceError
 
 
 @pytest.fixture
@@ -37,7 +36,7 @@ def isolate_host_discovery(monkeypatch):
 async def test_workspace_tools_have_apps_schemas_icons_and_progress(
     cpp_acceptance_project,
 ):
-    server = create_server(cpp_acceptance_project, workspace_progress_interval=0)
+    server = create_server(cpp_acceptance_project, progress_interval=0)
     progress = []
 
     async def collect(value, total, message):
@@ -284,7 +283,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
     async def collect(value, total, message):
         progress.append((value, total, message))
 
-    async with Client(create_server(cpp_acceptance_project, workspace_progress_interval=0)) as client:
+    async with Client(create_server(cpp_acceptance_project, progress_interval=0)) as client:
         for tool, arguments in (
             ("workspace_list", {"depth": None}),
             ("workspace_find_files", {}),
@@ -314,9 +313,22 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
                 ]
 
 
-def test_workspace_progress_interval_cli(cpp_acceptance_project):
-    assert argument_parser().parse_args([]).workspace_progress_interval == 1.0
-    options = argument_parser().parse_args(["--workspace-progress-interval", "2.5"])
-    assert options.workspace_progress_interval == 2.5
-    with pytest.raises(WorkspaceError, match="Progress interval"):
-        create_server(cpp_acceptance_project, workspace_progress_interval=-1)
+def test_progress_interval_cli(cpp_acceptance_project):
+    assert argument_parser().parse_args([]).progress_interval == 1.0
+    options = argument_parser().parse_args(["--progress-interval", "2.5"])
+    assert options.progress_interval == 2.5
+    assert argument_parser().parse_args(["--progress-interval", "0"]).progress_interval == 0
+
+
+@pytest.mark.parametrize("interval", [-1, float("nan"), float("inf")])
+def test_invalid_progress_interval_is_rejected_before_service_creation(
+    cpp_acceptance_project,
+    monkeypatch,
+    interval,
+):
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("Configuration must be validated before constructing services")
+
+    monkeypatch.setattr("forgemcp.server.WorkspaceService", unexpected_service)
+    with pytest.raises(ValueError, match="Progress interval"):
+        create_server(cpp_acceptance_project, progress_interval=interval)

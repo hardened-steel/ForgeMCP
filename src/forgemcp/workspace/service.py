@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import math
 import os
 import shutil
 import stat
 import tempfile
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from time import monotonic
 from typing import Generator, Literal
 from urllib.parse import quote
 
@@ -35,6 +33,7 @@ from pydantic import BaseModel, Field
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.progress import progress
 
 from .errors import WorkspaceError
 from .metadata import file_owner
@@ -180,8 +179,6 @@ class WorkspaceService:
         *,
         progress_interval: float = 1.0,
     ) -> None:
-        if not math.isfinite(progress_interval) or progress_interval < 0:
-            raise WorkspaceError("Progress interval must be finite and nonnegative.")
         self.progress_interval = progress_interval
         with filesystem_errors("project"):
             self.root = workspace_root.resolve()
@@ -600,23 +597,6 @@ class WorkspaceService:
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register file tools, mirrors, Markdown resources, and completions."""
-        def progress(ctx: Context) -> Callable[..., Awaitable[None]]:
-            last_sent: float | None = None
-
-            async def report(
-                value: float,
-                total: float | None = None,
-                message: str | None = None,
-            ) -> None:
-                nonlocal last_sent
-                now = monotonic()
-                if last_sent is not None and now - last_sent < self.progress_interval:
-                    return
-                last_sent = now
-                await ctx.report_progress(value, total=total, message=message)
-
-            return report
-
         read_only = ToolAnnotations(
             read_only_hint=True,
             destructive_hint=False,
@@ -641,7 +621,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> DirectoryTree:
             """Show a directory tree; null depth expands every directory. File paths are errors."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 visited = 0
                 await report_progress(0, message="Starting directory scan")
@@ -713,7 +693,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FilePaths:
             """Find file paths by glob, skipping dot directories and links."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 visited = 0
                 await report_progress(0, message="Files visited")
@@ -752,7 +732,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileInfo:
             """Read creation/modification times, byte size, and owner of one file."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting file info")
             try:
                 result = self.file_info(
@@ -777,7 +757,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileContent:
             """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 if start_line < 1 or (end_line is not None and end_line < start_line):
                     raise WorkspaceError(
@@ -823,7 +803,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> SearchResult:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 visited = 0
                 await report_progress(0, message="Files visited")
@@ -891,7 +871,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileWriteResult:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting write file")
             try:
                 result = self.write_file(
@@ -918,7 +898,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> FileEditResult:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting edit file")
             try:
                 result = self.edit_file(
@@ -945,7 +925,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Move a file or directory inside one root; the destination must not exist."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting move")
             try:
                 result = self.move(
@@ -969,7 +949,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Delete a file or empty directory; protected paths and roots cannot be deleted."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting delete")
             try:
                 result = self.delete(
@@ -997,7 +977,7 @@ class WorkspaceService:
             root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Create a directory and missing parents, or report that it already exists."""
-            report_progress = progress(ctx)
+            report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting mkdir")
             try:
                 result = self.mkdir(

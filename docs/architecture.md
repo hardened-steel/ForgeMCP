@@ -125,9 +125,11 @@ resource, and inspection prompt are removed. There are no workspace prompts.
 
 Tree and search operations live in async handlers inside `register`, reused by
 Markdown resources. They yield during traversal and report visited entries/files
-without an invented total. Each tool invocation has its own progress throttle,
-using a monotonic clock and `WorkspaceService(progress_interval=1.0)`. The CLI
-option is `--workspace-progress-interval`; zero disables throttling. All progress
+without an invented total. Workspace, process, and toolchain use the same progress helper. Each tool
+invocation has its own progress throttle,
+using a monotonic clock and the shared `forgemcp.progress.progress(ctx, interval=1.0)` helper. The CLI
+option is `--progress-interval`; zero disables throttling. `create_server` validates the interval once before constructing services, then
+injects it into all three. Services and reporters use the validated setting directly. All progress
 notifications, including start/completion, obey the minimum interval. The first
 notification is immediate, skipped updates are not queued, and counters still
 advance for every work unit. No timer, delayed send, or operation wrapper is used.

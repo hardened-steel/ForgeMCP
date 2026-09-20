@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.progress import progress
 from forgemcp.process.service import ProcessService
 
 from . import discovery
@@ -64,7 +65,10 @@ class ToolchainService:
         self,
         processes: ProcessService,
         definitions: Sequence[Sequence[str]] = (),
+        *,
+        progress_interval: float = 1.0,
     ) -> None:
+        self.progress_interval = progress_interval
         self.processes = processes
         self.definitions = tuple(tuple(group) for group in definitions)
         self.toolsets: tuple[Toolset, ...] = ()
@@ -125,7 +129,8 @@ class ToolchainService:
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
         async def toolsets_list(ctx: Context) -> list[ToolsetSummary]:
             """List all discovered toolsets and the tools available in each."""
-            await ctx.report_progress(0, total=1, message="Reading toolsets")
+            report_progress = progress(ctx, interval=self.progress_interval)
+            await report_progress(0, total=1, message="Reading toolsets")
             result = [
                 ToolsetSummary(
                     id=item.id,
@@ -134,22 +139,23 @@ class ToolchainService:
                 )
                 for item in self.list_toolsets()
             ]
-            await ctx.report_progress(1, total=1, message="Toolsets ready")
+            await report_progress(1, total=1, message="Toolsets ready")
             return result
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
         async def toolset_get(toolset_id: str, ctx: Context) -> ToolsetDetails:
             """Read tool paths and kinds, querying available versions for this request."""
+            report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 toolset = self.get_toolset(toolset_id)
             except ToolsetNotFoundError as error:
                 raise ToolError(str(error)) from error
             total = len(toolset.tools)
-            await ctx.report_progress(0, total=total, message="Reading tool versions")
+            await report_progress(0, total=total, message="Reading tool versions")
             details = []
             for index, tool in enumerate(toolset.tools, start=1):
                 details.append(await read_tool(tool))
-                await ctx.report_progress(
+                await report_progress(
                     index,
                     total=total,
                     message=f"Read {tool.name}",

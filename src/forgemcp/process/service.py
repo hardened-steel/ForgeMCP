@@ -31,6 +31,7 @@ from mcp.types import (
 
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.progress import progress
 
 from .errors import (
     ProcessError,
@@ -279,7 +280,9 @@ class ProcessService:
         workspace_root: Path,
         *,
         allowed_roots: Sequence[Path] = (),
+        progress_interval: float = 1.0,
     ) -> None:
+        self.progress_interval = progress_interval
         self.id_counter = 0
         self.root = workspace_root.resolve()
         self.allowed_roots = (self.root, *(path.resolve() for path in allowed_roots))
@@ -399,12 +402,13 @@ class ProcessService:
             status: Literal["all", "running", "completed"] = "all",
         ) -> ProcessOverview:
             """Show current and completed external processes managed by ForgeMCP."""
+            report_progress = progress(ctx, interval=self.progress_interval)
             records = tuple(self.records.values())
             completed = 0
             running = 0
             processes: list[ProcessSummary] = []
             for i, record in enumerate(records):
-                await ctx.report_progress(
+                await report_progress(
                     i,
                     total=len(records),
                     message=f"Reading process state: {i}",
@@ -419,7 +423,7 @@ class ProcessService:
                         if status == "all" or status == "completed":
                             processes.append(record.summary)
 
-            await ctx.report_progress(
+            await report_progress(
                 len(records),
                 total=len(records),
                 message="Process state ready",

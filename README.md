@@ -95,8 +95,8 @@ project. Set its location explicitly when needed:
 forgemcp --workspace C:\Projects\Example --workspace-storage D:\ForgeMCP\Example
 ```
 
-Workspace progress notifications are limited to one per second per invocation by
-default. Configure this with `--workspace-progress-interval 2.5` (seconds), or use
+Progress notifications in workspace, process, and toolchain are limited to one per second per invocation by
+default. Configure this with `--progress-interval 2.5` (seconds), or use
 `0` to disable throttling. The first notification is immediate; intervening updates
 are dropped, not queued. Tool results signal completion even when its progress
 notification is suppressed. The interval must be finite and nonnegative.

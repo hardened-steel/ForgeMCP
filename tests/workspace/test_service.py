@@ -362,7 +362,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
     monkeypatch,
     interval,
 ):
-    import forgemcp.workspace.service as module
+    import forgemcp.progress as module
 
     workspace.progress_interval = interval
     workspace.write_file("large.txt", "needle\n" * 30000)
@@ -408,9 +408,3 @@ def test_progress_throttles_per_invocation_without_losing_results(
             assert len(result.matches) == 30000
         if name == "workspace_mkdir":
             assert len(events) == (2 if interval == 0 else 1)
-
-
-@pytest.mark.parametrize("interval", [-1, float("nan"), float("inf")])
-def test_invalid_progress_interval_is_rejected(workspace, interval):
-    with pytest.raises(WorkspaceError, match="Progress interval"):
-        WorkspaceService(workspace.root, progress_interval=interval)
