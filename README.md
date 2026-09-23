@@ -11,7 +11,7 @@ Language-server, quality, and debugger modules are planned.
   directories. Each tool reports progress and has a packaged MCP App and icon.
 - Workspace resources mirror UTF-8 text and raw bytes, and expose directory trees,
   file lists, metadata, and search results as Markdown. Resource parameters have
-  completions for roots, paths, extensions, depth, and boolean options.
+  completions for qualified paths, extensions, depth, and boolean options.
 - No prompts are currently registered.
 - CMake tools list operator profiles, configure projects, build targets, and run
   CTest. This initial backend slice has structured/text results and icons; its
@@ -137,22 +137,22 @@ register protected paths, which remain readable but cannot be changed through th
 workspace API. Searches intentionally have no application-level timeout, result
 limit, or pagination in this iteration.
 
-File resource templates retain their existing URI shape (the URI root is always explicit):
+File resource templates use a single path including its project/ or storage/ prefix:
 
 ```text
-forgemcp://workspace/{root}/file{/path*}
-forgemcp://workspace/{root}/raw{/path*}
-forgemcp://workspace/{root}/list{?path,depth,include_hidden}
-forgemcp://workspace/{root}/find-files{?pattern,path}
-forgemcp://workspace/{root}/file-info{?path}
-forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
+forgemcp://workspace/file{/path*}
+forgemcp://workspace/raw{/path*}
+forgemcp://workspace/list{?path,depth,include_hidden}
+forgemcp://workspace/find-files{?pattern,path}
+forgemcp://workspace/file-info{?path}
+forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}
 forgemcp://workspace/results/{result_id}/{name}.json
 forgemcp://workspace/results/{result_id}/{name}.md
 ```
 
-Examples: `forgemcp://workspace/project/file/src/main.cpp`,
-`forgemcp://workspace/storage/raw/build/debug/app.exe`, and
-`forgemcp://workspace/project/search?query=TODO&extensions=cpp,hpp`.
+Examples: `forgemcp://workspace/file/project/src/main.cpp`,
+`forgemcp://workspace/raw/storage/build/debug/app.exe`, and
+`forgemcp://workspace/search?path=project/&query=TODO&extensions=cpp,hpp`.
 Use `depth=all` for a full resource tree and `include_hidden=true` to include
 dot-prefixed directories. Text-search extensions are comma-separated;
 an omitted parameter means any extension and `extensions=` means extensionless

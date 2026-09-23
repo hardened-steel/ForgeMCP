@@ -166,12 +166,12 @@ class WorkspaceService:
     FILE_ICON = IconFile("icons/workspace-file.svg")
     SEARCH_ICON = IconFile("icons/workspace-search.svg")
     EDIT_ICON = IconFile("icons/workspace-edit.svg")
-    FILE_URI = "forgemcp://workspace/{root}/file{/path*}"
-    RAW_URI = "forgemcp://workspace/{root}/raw{/path*}"
-    LIST_URI = "forgemcp://workspace/{root}/list{?path,depth,include_hidden}"
-    FIND_URI = "forgemcp://workspace/{root}/find-files{?pattern,path}"
-    INFO_URI = "forgemcp://workspace/{root}/file-info{?path}"
-    SEARCH_URI = "forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}"
+    FILE_URI = "forgemcp://workspace/file{/path*}"
+    RAW_URI = "forgemcp://workspace/raw{/path*}"
+    LIST_URI = "forgemcp://workspace/list{?path,depth,include_hidden}"
+    FIND_URI = "forgemcp://workspace/find-files{?pattern,path}"
+    INFO_URI = "forgemcp://workspace/file-info{?path}"
+    SEARCH_URI = "forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}"
     RESULT_JSON_URI = "forgemcp://workspace/results/{result_id}/{name}.json"
     RESULT_MARKDOWN_URI = "forgemcp://workspace/results/{result_id}/{name}.md"
 
@@ -681,7 +681,7 @@ class WorkspaceService:
             directory.remove()
 
     def file_uri(self, path: WorkspacePath) -> str:
-        return f"forgemcp://workspace/{path.area}/file/{quote(path.relative, safe='/')}"
+        return f"forgemcp://workspace/file/{quote(str(path), safe='/')}"
 
     def render_markdown(
         self,
@@ -1207,18 +1207,26 @@ class WorkspaceService:
             except WorkspaceError as error:
                 raise ResourceNotFoundError(str(error)) from error
 
+        def resource_path(value: str) -> WorkspacePath:
+            try:
+                # Directory completions end in '/', while WorkspacePath is canonical.
+                area, separator, relative = value.partition("/")
+                if not separator:
+                    raise WorkspaceError("Path must start with project/ or storage/.")
+                return self.qualified_path(area, relative.rstrip("/") or ".")
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
+
         @mcp.resource(
             self.FILE_URI,
             mime_type="text/plain",
             icons=[self.FILE_ICON.icon],
         )
         async def workspace_file_resource(
-            root: str,
             path: list[str] | None = None,
         ) -> str:
             """Read the complete UTF-8 file without formatting or metadata."""
-            resource(self.root_path, root=root)
-            selected = resource(self.qualified_path, root=root, path="/".join(path or []))
+            selected = resource_path("/".join(path or []))
             return resource(self.read_file, path=selected).text
 
         @mcp.resource(
@@ -1227,28 +1235,24 @@ class WorkspaceService:
             icons=[self.FILE_ICON.icon],
         )
         async def workspace_raw_resource(
-            root: str,
             path: list[str] | None = None,
         ) -> bytes:
             """Read the exact bytes of any file."""
-            resource(self.root_path, root=root)
-            selected = resource(self.qualified_path, root=root, path="/".join(path or []))
+            selected = resource_path("/".join(path or []))
             return resource(self.read_bytes, path=selected)
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
         async def workspace_list_resource(
-            root: str,
             ctx: Context,
-            path: str = ".",
+            path: str = "project/",
             depth: int | Literal["all"] = 1,
             include_hidden: bool = False,
         ) -> str:
             """Read a directory tree as Markdown; depth=all expands the whole tree."""
             try:
-                self.root_path(root)
                 result = await workspace_list(
                     ctx=ctx,
-                    path=self.qualified_path(root, path),
+                    path=resource_path(path),
                     depth=None if depth == "all" else depth,
                     include_hidden=include_hidden,
                 )
@@ -1263,18 +1267,16 @@ class WorkspaceService:
             security=ResourceSecurity(exempt_params={"pattern"}),
         )
         async def workspace_find_files_resource(
-            root: str,
             ctx: Context,
             pattern: str = "*",
-            path: str = ".",
+            path: str = "project/",
         ) -> str:
             """Read matching file links as Markdown."""
             try:
-                self.root_path(root)
                 result = await workspace_find_files(
                     ctx=ctx,
                     pattern=pattern,
-                    path=self.qualified_path(root, path),
+                    path=resource_path(path),
                 )
                 return self.render_markdown(result)
             except (WorkspaceError, ToolError) as error:
@@ -1285,10 +1287,9 @@ class WorkspaceService:
             mime_type="text/markdown",
             icons=[self.FILE_ICON.icon],
         )
-        async def workspace_file_info_resource(root: str, path: str = "") -> str:
+        async def workspace_file_info_resource(path: str = "") -> str:
             """Read one file's metadata as a Markdown table; path is required."""
-            resource(self.root_path, root=root)
-            selected = resource(self.qualified_path, root=root, path=path)
+            selected = resource_path(path)
             return self.render_markdown(resource(self.file_info, path=selected))
 
         @mcp.resource(
@@ -1298,21 +1299,19 @@ class WorkspaceService:
             security=ResourceSecurity(exempt_params={"query"}),
         )
         async def workspace_search_resource(
-            root: str,
             ctx: Context,
             query: str = "",
-            path: str = ".",
+            path: str = "project/",
             regex: bool = False,
             extensions: str | None = None,
             case_sensitive: bool = True,
         ) -> str:
             """Read text/regex matches and skipped files as Markdown; query is required."""
             try:
-                self.root_path(root)
                 result = await workspace_search(
                     ctx=ctx,
                     query=query,
-                    path=self.qualified_path(root, path),
+                    path=resource_path(path),
                     regex=regex,
                     extensions=None if extensions is None else extensions.split(","),
                     case_sensitive=case_sensitive,
@@ -1359,55 +1358,62 @@ class WorkspaceService:
             if not isinstance(ref, ResourceTemplateReference) or ref.uri not in uris:
                 return None
             values: list[str] = []
-            if argument.name == "root":
-                values = ["project", "storage"]
-            elif argument.name in ("regex", "case_sensitive", "include_hidden"):
+            if argument.name in ("regex", "case_sensitive", "include_hidden"):
                 values = ["false", "true"]
             elif argument.name == "depth":
                 values = ["1", "2", "3", "all"]
-            elif argument.name in ("path", "extensions"):
-                selected = (
-                    (context.arguments or {}).get("root", "project")
+            elif argument.name == "extensions" and ref.uri == self.SEARCH_URI:
+                selected_path = (
+                    (context.arguments or {}).get("path", "project/")
                     if context
-                    else "project"
+                    else "project/"
                 )
                 try:
-                    if argument.name == "extensions" and ref.uri != self.SEARCH_URI:
-                        return Completion(values=[])
-                    if argument.name == "extensions":
-                        extensions = sorted(
-                            {
-                                candidate.suffix.removeprefix(".")
-                                async for candidate in self.iter_files(".", selected)
-                            }
-                        )
-                        prefix, separator, tail = argument.value.rpartition(",")
-                        values = [
-                            prefix + separator + value
-                            for value in extensions
-                            if value.startswith(tail)
-                        ]
-                    else:
-                        parent = (
-                            argument.value.replace("\\", "/").rpartition("/")[0] or "."
-                        )
-                        directory = self.resolve_path(parent, root=selected)
-                        self.check_path_links(directory, selected)
+                    selected = resource_path(selected_path)
+                    extensions = sorted(
+                        {
+                            candidate.suffix.removeprefix(".")
+                            async for candidate in self.iter_files(selected.relative, selected.area)
+                        }
+                    )
+                    prefix, separator, tail = argument.value.rpartition(",")
+                    values = [
+                        prefix + separator + value
+                        for value in extensions
+                        if value.startswith(tail)
+                    ]
+                except (WorkspaceError, ResourceError):
+                    values = []
+            elif argument.name == "path":
+                if "/" not in argument.value:
+                    values = ["project/", "storage/"]
+                else:
+                    try:
+                        parent = argument.value.rpartition("/")[0]
+                        if parent in ("project", "storage"):
+                            parent += "/"
+                        selected = resource_path(parent)
+                        directory = self.resolve_workspace_path(selected)
+                        self.check_path_links(directory, selected.area)
                         with filesystem_errors(parent):
                             for child in sorted(directory.iterdir()):
                                 await asyncio.sleep(0)
                                 if self.is_link(child):
                                     continue
                                 is_directory = child.is_dir()
-                                if ref.uri == self.LIST_URI and not is_directory:
+                                if (
+                                    ref.uri in (self.LIST_URI, self.FIND_URI, self.SEARCH_URI)
+                                    and not is_directory
+                                ):
                                     continue
                                 if is_directory or child.is_file():
+                                    relative = self.relative_path(child, root=selected.area)
                                     values.append(
-                                        self.relative_path(child, root=selected)
+                                        str(self.qualified_path(selected.area, relative))
                                         + ("/" if is_directory else "")
                                     )
-                except (WorkspaceError, ToolError):
-                    values = []
+                    except (WorkspaceError, ResourceError):
+                        values = []
             matches = [value for value in values if value.startswith(argument.value)]
             return Completion(
                 values=matches[:100],

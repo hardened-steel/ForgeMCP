@@ -199,15 +199,15 @@ are deferred until those consumers are implemented.
 
 ### Workspace resources
 
-Six templates are registered, with an explicit `project` or `storage` root:
+Six file templates use one qualified `path`, including `project/` or `storage/`:
 
 ```text
-forgemcp://workspace/{root}/file{/path*}
-forgemcp://workspace/{root}/raw{/path*}
-forgemcp://workspace/{root}/list{?path,depth,include_hidden}
-forgemcp://workspace/{root}/find-files{?pattern,path}
-forgemcp://workspace/{root}/file-info{?path}
-forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
+forgemcp://workspace/file{/path*}
+forgemcp://workspace/raw{/path*}
+forgemcp://workspace/list{?path,depth,include_hidden}
+forgemcp://workspace/find-files{?pattern,path}
+forgemcp://workspace/file-info{?path}
+forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}
 ```
 
 Text mirrors return complete UTF-8 text with `text/plain`; raw mirrors return exact
@@ -222,7 +222,10 @@ remains a literal plus. Resource depth `all` maps to tool depth null. Text-searc
 a comma-separated string; an omitted value means any extension, an empty value
 means extensionless files. Regex works in URI parameters. SDK path-security checks
 are exempted only for `query`/`pattern`, which are data; actual paths still pass SDK
-and workspace checks. Completions cover roots, paths, extensions, depth, and booleans;
+and workspace checks. Path completions first suggest `project/` and `storage/`, then qualified child
+paths. Directory inputs suggest directories; file inputs also suggest files.
+Extension completions scan the directory selected by `path` in completion context.
+Completions also cover depth and booleans;
 only completion responses observe the protocol's 100-value cap.
 
 ### Workspace result extensions
