@@ -190,7 +190,7 @@ async def test_vsdevcmd_environment_preserves_values_and_transcript(
         assert len(environment["FORGEMCP_LONG"]) == 5000
         record = next(iter(processes.records.values()))
         assert "FORGEMCP_INSTANCE=instance-one" in "".join(
-            entry.text for entry in record.status.transcript
+            entry.text for entry in record.transcript
         )
     finally:
         await processes.close()
@@ -258,7 +258,7 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(
         record = next(iter(processes.records.values()))
         assert record.status.current_status == 0
         assert "installationPath" in "".join(
-            entry.text for entry in record.status.transcript
+            entry.text for entry in record.transcript
         )
     finally:
         await processes.close()
@@ -319,7 +319,7 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
         )
         overview = await client.call_tool("processes_overview", {})
         assert overview.structured_content["completed"] == 1
-        pid = overview.structured_content["processes"][0]["process_id"]
+        pid = overview.structured_content["processes"][0]["summary"]["process_id"]
         transcript = await client.read_resource(f"forgemcp://processes/{pid}")
         assert "12.3" in transcript.contents[0].text
         listing = await client.read_resource(ToolchainService.LIST_URI)
