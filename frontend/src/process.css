@@ -1,0 +1,19 @@
+.fm-process-summary { margin: 4px 0 9px; color: var(--fm-muted); }
+.fm-process-row { border-bottom: 1px solid var(--fm-border); padding: 5px 0; }
+.fm-process-row summary { cursor: pointer; overflow-wrap: anywhere; }
+.fm-process-row dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 7px 0 2px 12px; }
+.fm-process-row dt { color: var(--fm-muted); }
+.fm-process-row dd { margin: 0; overflow-wrap: anywhere; }
+.fm-process-meta { margin: 5px 10px; color: var(--fm-muted); overflow-wrap: anywhere; }
+.fm-process-info { padding: 0 10px 5px; border-bottom: 1px solid var(--fm-border); }
+.fm-process-info summary { cursor: pointer; color: var(--fm-accent); }
+.fm-process-info dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 5px 0; }
+.fm-process-info dt { color: var(--fm-muted); }
+.fm-process-info dd { margin: 0; overflow-wrap: anywhere; }
+.fm-process-tabs { display: flex; flex-wrap: wrap; gap: 3px; padding: 4px 8px; border-bottom: 1px solid var(--fm-border); }
+.fm-process-tabs button[aria-selected="true"] { color: var(--fm-accent); background: var(--fm-hover); border-color: var(--fm-border); }
+.fm-process-log { margin: 0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.fm-process-chunk { border-radius: 2px; box-decoration-break: clone; }
+.fm-process-chunk:hover, .fm-process-chunk:focus { background: var(--fm-hover); outline: none; }
+.fm-process-break { color: var(--fm-warning); user-select: none; }
+.fm-process-break::before { content: "⤶"; }

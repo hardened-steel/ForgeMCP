@@ -194,6 +194,14 @@ async def test_timeout_reaches_output_and_wait(processes, mode):
     assert session.returncode is not None
     assert session.task.done()
     assert processes.records[session.process_id].status.current_status == "interrupted"
+    assert (
+        processes.records[session.process_id].status.interruption_reason
+        == f"{mode} timeout"
+    )
+    snapshot = processes.records[session.process_id].snapshot()
+    assert snapshot.state == "interrupted"
+    assert snapshot.return_code is None
+    assert snapshot.outcome == f"Interrupted by {mode} timeout"
 
 
 @pytest.mark.anyio
@@ -333,3 +341,76 @@ async def test_process_overview_uses_shared_progress(processes, monkeypatch, int
         assert result.completed == 1
         values = [call.args[0] for call in ctx.report_progress.await_args_list]
         assert values == ([0, 1] if interval == 0 else [0])
+
+
+@pytest.mark.anyio
+async def test_process_inspection_tools_and_markdown_resources(processes):
+    from mcp import Client
+    from mcp.server import MCPServer
+    from mcp.server.apps import Apps
+    from forgemcp.completion import Complete
+
+    code = (
+        "import sys; "
+        "sys.stdout.write('\\x1b[31mred\\x1b[0m'); sys.stdout.flush(); "
+        "sys.stderr.write('warning\\n'); sys.stderr.flush()"
+    )
+    async with await processes.launch(sys.executable, ("-c", code)) as session:
+        await session.wait()
+    apps = Apps()
+    server = MCPServer("test", extensions=[apps])
+    processes.register(server, apps, Complete())
+    for tool in apps.tools():
+        server.add_tool(tool.fn, meta=tool.meta, **tool.kwargs)
+    for resource in apps.resources():
+        server.add_resource(resource.resource)
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        assert {"processes_overview", "process_get"} <= tools.keys()
+        assert all(
+            tools[name].icons and tools[name].meta["ui"]["resourceUri"]
+            for name in ("processes_overview", "process_get")
+        )
+        overview = await client.call_tool("processes_overview", {})
+        item = overview.structured_content["processes"][0]
+        assert item["process_id"] == session.process_id
+        assert item["state"] == "completed"
+        assert item["return_code"] == 0
+        assert item["outcome"] == "Completed successfully"
+        details = await client.call_tool("process_get", {"process_id": session.process_id})
+        assert not details.is_error and details.content
+        result = details.structured_content
+        assert result["process"] == item
+        assert result["transcript"]
+        assert "\x1b[31mred\x1b[0m" in "".join(
+            entry["text"] for entry in result["transcript"] if entry["stream"] == "stdout"
+        )
+        overview_md = (
+            await client.read_resource(processes.OVERVIEW_URI)
+        ).contents[0].text
+        details_md = (
+            await client.read_resource(f"forgemcp://processes/{session.process_id}")
+        ).contents[0].text
+        assert "Completed successfully" in overview_md
+        assert "Completed successfully" in details_md
+        assert "UTC" in details_md
+        assert "### stdout" in details_md and "### stderr" in details_md
+        assert (await client.call_tool("process_get", {"process_id": 99999})).is_error
+
+
+@pytest.mark.anyio
+async def test_process_snapshot_distinguishes_running_and_nonzero_exit(processes):
+    async with await processes.launch(
+        sys.executable,
+        ("-c", "import sys; sys.stdin.read(); sys.exit(7)"),
+    ) as session:
+        running = processes.records[session.process_id].snapshot()
+        assert (running.state, running.return_code, running.outcome) == (
+            "running", None, "Running"
+        )
+        await session.close_stdin()
+        assert await session.wait() == 7
+    completed = processes.records[session.process_id].snapshot()
+    assert (completed.state, completed.return_code, completed.outcome) == (
+        "completed", 7, "Exited with code 7"
+    )
