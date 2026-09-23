@@ -279,8 +279,11 @@ does not reconstruct a configure preset's environment. Plain profiles accept
 generator, compiler tool names, a WorkspacePath toolchain file, and cache definitions.
 Their source is always the project root and their build path passes workspace checks.
 Plain profiles default to Ninja; its executable is taken from the chosen toolset.
-Missing Ninja is an error, not a reason to change generators. Existing caches with
-a different generator require another build directory or an explicit generator.
+Missing Ninja is an error, not a reason to change generators. For a plain profile,
+changing the generator completely removes and recreates its build directory.
+Settings and cache ownership are checked first. Recursive deletion goes through
+`WorkspaceService.remove_directory`, also used by storage cleanup, with root,
+protected-subtree, and symlink checks before any removal. Native presets are unchanged.
 
 `cmake_profiles` lists the effective profiles. `cmake_configure`, `cmake_build`, and
 `cmake_test` run all profiles unless a subset is supplied. Operations run sequentially,
@@ -298,8 +301,13 @@ in `toolchain/tools/ctest.py`. Methods return typed parsed results, never sessio
 Each invocation defaults to a 600-second total timeout. Progress callbacks carry
 configure steps, build actions, and test case status; the MCP layer adds the profile
 name and applies the common throttle. Its monotonic counter counts status updates,
-without an invented percentage across multiple commands. Results contain exit
-status and the last 8192 output characters, without transcript links. CTest writes
+without an invented percentage across multiple commands. Each MCP operation returns
+a list of its own result model: `CMakeConfigureResult`, `CMakeBuildResult`, or
+`CMakeTestResult`. `error` is the sole outcome field (null on success); there is no
+batch status, repeated operation name, or separate exit-code field. Configure adds
+known build/compilation-database paths, build adds parsed step counts, and test adds
+JUnit cases. Results retain the last 8192 output characters, without transcript links.
+Low-level ToolSpec results retain exit codes for the service to interpret. CTest writes
 JUnit into a workspace temporary directory; parsed cases are returned before cleanup.
 
 This initial backend slice deliberately registers tools directly with MCP, with

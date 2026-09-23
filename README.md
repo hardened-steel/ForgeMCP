@@ -173,8 +173,11 @@ No syntax/diagnostic provider or frontend resource loading is included in this s
 operate on all profiles unless a nonempty `profiles` list selects a subset.
 Configuration must precede building, and building must precede testing. Profiles
 run sequentially; one failed execution does not suppress later executions.
-Results include each profile/preset, return code, failure explanation, and the
-last 8192 characters of process output. CTest also returns per-test JUnit results.
+Each tool returns its own list of per-profile/preset results. The sole outcome
+field is `error`: null means success, otherwise it explains the failure (including
+the exit code for a failed command). Each result retains the last 8192 output
+characters. Configure returns the build-directory and compilation-database paths
+when known; build returns parsed step counts when available; test returns JUnit cases.
 Full process transcripts remain in the process module; CMake results contain no
 transcript links. The default command timeout is 600 seconds per execution and
 can be overridden with the existing `ProcessTimeout` shape (`total`, `idle`).
@@ -205,8 +208,9 @@ Plain profiles default to the Ninja generator and enable compilation-database
 export. Ninja must exist in the selected toolset; there is no generator fallback.
 Without a compiler setting, CMake discovers the compiler in the toolset's
 environment. ForgeMCP does not select another toolset as a fallback.
-An existing build directory keeps its original generator: use a new
-`build-directory` when switching from Visual Studio to Ninja.
+When the generator changes, configure completely removes the existing build
+directory and recreates it before configuring. The cache must belong to this
+project, and workspace root, protected-path, and symlink checks still apply.
 
 Native preset profiles use repeatable `configure-preset`, `build-preset`, and
 `test-preset` settings; ForgeMCP does not infer links between them:

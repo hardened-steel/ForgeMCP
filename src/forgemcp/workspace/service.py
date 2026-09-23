@@ -147,12 +147,7 @@ class StorageDirectory:
 
     def remove(self) -> None:
         relative = self.workspace.relative_path(self.path, root="storage")
-        path = self.workspace.writable_path(relative, root="storage", subtree=True)
-        with filesystem_errors(relative):
-            if not path.exists():
-                return
-            self.workspace.check_tree_links(path)
-            shutil.rmtree(path)
+        self.workspace.remove_directory(self.workspace.qualified_path("storage", relative))
 
 
 class WorkspaceService:
@@ -637,6 +632,19 @@ class WorkspaceService:
                 path=path,
                 action="deleted",
             )
+
+    def remove_directory(self, path: WorkspacePath) -> None:
+        """Remove a whole directory after checking roots, protections, and links."""
+        with filesystem_errors(path):
+            candidate = self.writable_path(
+                path.relative,
+                root=path.area,
+                subtree=True,
+            )
+            if not candidate.exists():
+                return
+            self.check_tree_links(candidate)
+            shutil.rmtree(candidate)
 
     def mkdir(
         self,

@@ -41,22 +41,41 @@ class CMakeProfile(BaseModel):
     generator: str | None = None
 
 
-class CMakeRunResult(BaseModel):
+class CMakeConfigureResult(BaseModel):
+    profile: str
+    preset: str | None = None
+    build_directory: WorkspacePath | None = None
+    compilation_database: WorkspacePath | None = None
+    error: str | None = Field(
+        default=None,
+        description="Null on success; failure explanation otherwise.",
+    )
+    output_tail: str = ""
+
+
+class CMakeBuildResult(BaseModel):
     profile: str
     preset: str | None = None
     configuration: str | None = None
-    build_directory: WorkspacePath | None = None
-    status: Literal["succeeded", "failed"] = "failed"
-    return_code: int | None = None
-    error: str | None = None
+    completed_steps: int | None = None
+    total_steps: int | None = None
+    error: str | None = Field(
+        default=None,
+        description="Null on success; failure explanation otherwise.",
+    )
     output_tail: str = ""
+
+
+class CMakeTestResult(BaseModel):
+    profile: str
+    preset: str | None = None
+    configuration: str | None = None
     tests: list[ctest.TestCase] = Field(default_factory=list)
-
-
-class CMakeBatchResult(BaseModel):
-    operation: Literal["configure", "build", "test"]
-    succeeded: bool
-    results: list[CMakeRunResult]
+    error: str | None = Field(
+        default=None,
+        description="Null on success; failure explanation otherwise.",
+    )
+    output_tail: str = ""
 
 
 class CMakeService:
@@ -360,7 +379,7 @@ class CMakeService:
             ctx: Context,
             profiles: list[str] | None = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> CMakeBatchResult:
+        ) -> list[CMakeConfigureResult]:
             """Configure all operator profiles, or an explicitly selected subset."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing CMake configure")
@@ -368,7 +387,7 @@ class CMakeService:
                 definitions, catalogs = await self.selection(profiles)
             except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
-            results = []
+            results: list[CMakeConfigureResult] = []
             configured = {}
             updates = 0
 
@@ -385,17 +404,16 @@ class CMakeService:
                     methods = self.cmake_methods(profile.toolset_id)
                 except (CMakeError, WorkspaceError, ToolchainError) as error:
                     results.append(
-                        CMakeRunResult(
+                        CMakeConfigureResult(
                             profile=definition.name,
                             error=str(error),
                         )
                     )
                     continue
                 for preset in presets:
-                    result = CMakeRunResult(
+                    result = CMakeConfigureResult(
                         profile=profile.name,
                         preset=preset,
-                        configuration=profile.configuration,
                         build_directory=profile.build_directory,
                     )
                     results.append(result)
@@ -403,8 +421,6 @@ class CMakeService:
                         key = (profile.toolset_id, preset)
                         if preset is not None and key in configured:
                             prior = configured[key]
-                            result.status = prior.status
-                            result.return_code = prior.return_code
                             result.error = prior.error
                             result.output_tail = prior.output_tail
                             continue
@@ -413,15 +429,13 @@ class CMakeService:
                         if preset is None:
                             if profile.build_directory is None:
                                 raise CMakeError("Plain configure requires a build directory.")
+                            settings = self.configure_definitions(definition)
                             build_directory = self.build_path(profile.build_directory)
                             if (build_directory / "CMakeCache.txt").exists():
                                 cache = self.require_configured(profile)
                                 if cache.get("CMAKE_GENERATOR") != profile.generator:
-                                    raise CMakeError(
-                                        "Build directory uses another generator; choose a new "
-                                        "build-directory or explicitly select the existing generator."
-                                    )
-                            settings = self.configure_definitions(definition)
+                                    await report_status("Clearing build directory for generator change")
+                                    self.workspace.remove_directory(profile.build_directory)
                             self.prepare_file_api(profile.build_directory)
                         await report_status("Starting configure")
                         command = await methods["configure"](
@@ -433,21 +447,17 @@ class CMakeService:
                             timeout=timeout,
                             on_progress=report_status,
                         )
-                        result.return_code = command.return_code
                         result.output_tail = command.output_tail
-                        result.status = "succeeded" if result.return_code == 0 else "failed"
-                        if result.return_code != 0:
-                            result.error = f"CMake configure exited with {result.return_code}."
+                        if command.return_code != 0:
+                            result.error = f"CMake configure exited with {command.return_code}."
+                        if command.return_code == 0 and profile.build_directory is not None:
+                            result.compilation_database = self.compilation_database(profile.build_directory)
                         if preset is not None:
                             configured[key] = result
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                     await report_status(result.error or "Completed successfully")
-            return CMakeBatchResult(
-                operation="configure",
-                succeeded=all(item.status == "succeeded" for item in results),
-                results=results,
-            )
+            return results
 
         @mcp.tool(icons=[icon], annotations=changes_files)
         async def cmake_build(
@@ -456,7 +466,7 @@ class CMakeService:
             targets: list[str] | None = None,
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> CMakeBatchResult:
+        ) -> list[CMakeBuildResult]:
             """Build all selected profiles and their build presets after configuration."""
             if targets is not None and (not targets or any(not name for name in targets)):
                 raise ToolError("Targets must be a nonempty list of nonempty names.")
@@ -466,7 +476,7 @@ class CMakeService:
                 definitions, catalogs = await self.selection(profiles)
             except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
-            results = []
+            results: list[CMakeBuildResult] = []
             updates = 0
 
             async def report_status(message: str) -> None:
@@ -482,17 +492,16 @@ class CMakeService:
                     presets = self.operation_presets(profile, "build")
                 except (CMakeError, WorkspaceError, ToolchainError) as error:
                     results.append(
-                        CMakeRunResult(
+                        CMakeBuildResult(
                             profile=definition.name,
                             error=str(error),
                         )
                     )
                     continue
                 for preset in presets:
-                    result = CMakeRunResult(
+                    result = CMakeBuildResult(
                         profile=profile.name,
                         preset=preset,
-                        build_directory=profile.build_directory,
                     )
                     results.append(result)
                     try:
@@ -514,19 +523,15 @@ class CMakeService:
                             timeout=timeout,
                             on_progress=report_status,
                         )
-                        result.return_code = command.return_code
+                        result.completed_steps = command.completed_steps
+                        result.total_steps = command.total_steps
                         result.output_tail = command.output_tail
-                        result.status = "succeeded" if result.return_code == 0 else "failed"
-                        if result.return_code != 0:
-                            result.error = f"CMake build exited with {result.return_code}."
+                        if command.return_code != 0:
+                            result.error = f"CMake build exited with {command.return_code}."
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                     await report_status(result.error or "Completed successfully")
-            return CMakeBatchResult(
-                operation="build",
-                succeeded=all(item.status == "succeeded" for item in results),
-                results=results,
-            )
+            return results
 
         @mcp.tool(icons=[icon], annotations=changes_files)
         async def cmake_test(
@@ -535,7 +540,7 @@ class CMakeService:
             names: list[str] | None = None,
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> CMakeBatchResult:
+        ) -> list[CMakeTestResult]:
             """Run CTest for selected profiles and their test presets after building."""
             if names is not None and (not names or any(not name for name in names)):
                 raise ToolError("Test names must be a nonempty list of nonempty names.")
@@ -545,7 +550,7 @@ class CMakeService:
                 definitions, catalogs = await self.selection(profiles)
             except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
-            results = []
+            results: list[CMakeTestResult] = []
             updates = 0
 
             async def report_status(message: str) -> None:
@@ -561,17 +566,16 @@ class CMakeService:
                     presets = self.operation_presets(profile, "test")
                 except (CMakeError, WorkspaceError, ToolchainError) as error:
                     results.append(
-                        CMakeRunResult(
+                        CMakeTestResult(
                             profile=definition.name,
                             error=str(error),
                         )
                     )
                     continue
                 for preset in presets:
-                    result = CMakeRunResult(
+                    result = CMakeTestResult(
                         profile=profile.name,
                         preset=preset,
-                        build_directory=profile.build_directory,
                     )
                     results.append(result)
                     try:
@@ -596,21 +600,14 @@ class CMakeService:
                                 timeout=timeout,
                                 on_progress=report_status,
                             )
-                            result.return_code = command.return_code
                             result.output_tail = command.output_tail
                             result.tests = command.tests
                         failed = any(
                             test.status in ("failed", "not_run") for test in result.tests
                         )
-                        if result.return_code == 0 and not failed:
-                            result.status = "succeeded"
-                        else:
-                            result.error = f"CTest failed (exit {result.return_code})."
+                        if command.return_code != 0 or failed:
+                            result.error = f"CTest failed (exit {command.return_code})."
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                     await report_status(result.error or "Completed successfully")
-            return CMakeBatchResult(
-                operation="test",
-                succeeded=all(item.status == "succeeded" for item in results),
-                results=results,
-            )
+            return results
