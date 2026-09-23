@@ -10,9 +10,10 @@ Pytest copies this entire directory into a fresh temporary workspace through the
 
 The normal path is `cmake --preset ninja-debug`, followed by
 `cmake --build --preset build-ninja-debug` and `ctest --preset test-ninja-debug`.
-In ForgeMCP, select a discovered kit with `cmake__list_kits` /
-`cmake__select_kit`, then configure a disposable workspace copy.  A preset and
-a ForgeMCP kit are intentionally alternative workflows and must not be mixed.
+In ForgeMCP, point the server at a disposable workspace copy and select the
+toolset/profile through the operator CLI. Use `cmake_profiles`, then
+`cmake_configure`, `cmake_build`, and `cmake_test`. Presets execute natively in
+the selected toolset's environment.
 
 Successful targets are `fixture_core`, `fixture_good`, `fixture_warning`, and
 `fixture_debug`. `fixture_warning` intentionally reports a deprecation warning.

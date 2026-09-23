@@ -5,7 +5,8 @@
 ForgeMCP is intentionally at foundation stage. The `workspace` feature manages
 project files and a separate service-storage root. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
-surface before CMake, clangd, quality, and debugger behavior is added.
+surface for development commands. CMake now configures, builds, and tests operator
+profiles; clangd, quality, and debugger behavior remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
 
@@ -129,7 +130,7 @@ without an invented total. Workspace, process, and toolchain use the same progre
 invocation has its own progress throttle,
 using a monotonic clock and the shared `forgemcp.progress.progress(ctx, interval=1.0)` helper. The CLI
 option is `--progress-interval`; zero disables throttling. `create_server` validates the interval once before constructing services, then
-injects it into all three. Services and reporters use the validated setting directly. All progress
+injects it into all services. Services and reporters use the validated setting directly. All progress
 notifications, including start/completion, obey the minimum interval. The first
 notification is immediate, skipped updates are not queued, and counters still
 advance for every work unit. No timer, delayed send, or operation wrapper is used.
@@ -143,13 +144,17 @@ corresponding boundary. OS errors retain the system-provided `strerror`, which m
 including mirrors without a path, to avoid opaque SDK validation errors. Platform-specific file ownership is isolated in
 `workspace/metadata.py`; unavailable owner or creation time is null.
 
-Every public path is relative to `root=project` or `root=storage`. Path traversal,
+Project/storage paths shared between modules and in tool arguments/results use
+`WorkspacePath`, serialized as a string such as `project/src/main.cpp` or
+`storage/build/debug`. The roots themselves are `project/` and `storage/`.
+Executable locations and low-level filesystem APIs still use native `Path` values.
+There is no separate `root` tool argument. Path traversal,
 absolute paths, and resolutions outside the selected root are rejected. Trees
 display symlinks/junctions without descending into them. Trees hide dot-prefixed
 directories by default (`include_hidden=true` includes them); dot files stay visible. Explicit reads may follow
 in-root links; mutations reject linked path components. Moving or recursively
 removing a directory containing links is rejected. Workspace roots cannot be
-mutated. `protect_path(path, root=...)` lets dependent modules protect files or
+mutated. `protect_path(WorkspacePath(...))` lets dependent modules protect files or
 directories, including paths that do not exist yet. Protection also blocks moving
 or deleting their ancestors, and applies to storage cleanup. Read access remains
 available; there is no owner bypass or protection registry framework.
@@ -219,6 +224,88 @@ means extensionless files. Regex works in URI parameters. SDK path-security chec
 are exempted only for `query`/`pattern`, which are data; actual paths still pass SDK
 and workspace checks. Completions cover roots, paths, extensions, depth, and booleans;
 only completion responses observe the protocol's 100-value cap.
+
+### Workspace result extensions
+
+`register_extension(name, provider, kind=..., version=1)` registers an async
+provider. Each workspace tool supplies an `ExtensionContext` with its tool name,
+a copy of its result, qualified paths, and already-read full text when available.
+Providers may read files themselves; they must not change files. This is not a
+filesystem snapshot: independent reads can observe external changes.
+
+A provider returns `ExtensionOutput(data, resources=...)` or `None` when it has
+nothing to add. Workspace knows only JSON payloads and provider metadata, not
+syntax tokens, diagnostic schemas, or particular language servers. Optional
+`ExtensionResource` entries contain named JSON or Markdown text, for example
+`diagnostics.json` and `diagnostics.md`. Names must be unique within the result.
+Provider failures become sanitized extension errors without undoing a successful
+file operation; cancellation still propagates.
+
+Results expose `extensions_uri` and separate resource links. The main manifest
+contains every provider payload; separate resources let a model or user inspect
+diagnostics without loading unrelated token data. The templates are:
+
+```text
+forgemcp://workspace/results/{result_id}/{name}.json
+forgemcp://workspace/results/{result_id}/{name}.md
+```
+
+The manifest is named `extensions.json`. Published text is immutable and retained
+in memory until server shutdown; reads never rerun providers. Unknown IDs/names
+raise `ResourceNotFoundError`. No resource is created when no provider contributes.
+Persistent storage, concrete providers, and widget consumption are deferred.
+
+## CMake profiles and operations
+
+`CMakeService` receives `WorkspaceService` and `ToolchainService`. Operator profiles
+are parsed from repeated `--cmake-profile NAME KEY=VALUE ...` arguments; the default
+toolset is selected by `--cmake-toolset`. There is no environment-based profile
+configuration, persistent profile registry, or directory lock.
+
+Without explicit profiles, projects with a presets file receive one `presets`
+profile containing all available configure/build/test presets. Names come from
+the selected CMake's `--list-presets=all`; CMake handles hidden presets, conditions,
+includes, inheritance, macros, and environment settings. ForgeMCP only reads its
+textual name listing. Without presets files, Debug and Release profiles use
+separate directories under `storage/build/`.
+
+Explicit profiles bind a toolset and either native preset names or ordinary
+configure settings. Native configure uses `cmake --preset`, build uses
+`cmake --build --preset`, and test uses `ctest --preset`. ForgeMCP does not resolve
+or constrain native `binaryDir`. The bound toolset environment is supplied to
+CMake/CTest, which then applies preset environment rules. A missing build/test
+preset requires an explicit `build-directory` for that operation; this fallback
+does not reconstruct a configure preset's environment. Plain profiles accept
+generator, compiler tool names, a WorkspacePath toolchain file, and cache definitions.
+Their source is always the project root and their build path passes workspace checks.
+Plain profiles default to Ninja; its executable is taken from the chosen toolset.
+Missing Ninja is an error, not a reason to change generators. Existing caches with
+a different generator require another build directory or an explicit generator.
+
+`cmake_profiles` lists the effective profiles. `cmake_configure`, `cmake_build`, and
+`cmake_test` run all profiles unless a subset is supplied. Operations run sequentially,
+report failures per profile/preset, and continue other profiles. Repeated native
+configure presets within one call are configured once. Existing plain build caches
+must belong to this project, and build/test configurations must match their cache.
+Known plain build directories receive CMake File API queries and request a compilation
+database. Native presets retain control over these settings and directories.
+
+Commands are typed methods on bound CMake/CTest ToolSpecs and launch only through
+ProcessService. Callable protocols preserve their positional and keyword signatures.
+Tool files own process consumption and parsing: CMake presets/cache/configure/build
+output lives in `toolchain/tools/cmake.py`, and CTest progress/JUnit parsing lives
+in `toolchain/tools/ctest.py`. Methods return typed parsed results, never sessions.
+Each invocation defaults to a 600-second total timeout. Progress callbacks carry
+configure steps, build actions, and test case status; the MCP layer adds the profile
+name and applies the common throttle. Its monotonic counter counts status updates,
+without an invented percentage across multiple commands. Results contain exit
+status and the last 8192 output characters, without transcript links. CTest writes
+JUnit into a workspace temporary directory; parsed cases are returned before cleanup.
+
+This initial backend slice deliberately registers tools directly with MCP, with
+icons and structured/text results but no widgets. CMake highlighting and automated
+tests are deferred by explicit request. Existing workspace widgets and tests have
+not yet been adapted or verified against the new WorkspacePath/extension contract.
 
 ## External process execution
 
@@ -470,16 +557,19 @@ These requirements apply to all existing and future widgets:
   unavailable, try the local selection fallback; if that also fails, select the
   complete original value for manual copying and explain the keyboard shortcut.
   Never claim a copy succeeded when it did not.
-- **Snapshot only:** widgets display one particular tool invocation's
-  `structuredContent`. They must not call tools, read resources, fetch data,
-  poll, refresh, or offer refresh buttons. The shared renderer receives no App or
+- **One invocation:** widgets display one particular tool invocation's
+  `structuredContent`. They may repeatedly read immutable resources linked by that
+  result under `forgemcp://workspace/results/*`. Other resource reads, tool calls,
+  external fetches, polling, and refresh buttons are not allowed. Resource loading
+  belongs in the App connection code, which passes decoded data to rendering code.
+  The shared renderer receives no App or
   transport object. A `toolsets_list` result contains summaries only; detailed
   fields appear only when `toolset_get` itself supplies them. Interactivity does
-  not authorize additional MCP calls.
+  not authorize additional MCP calls beyond these result-resource reads.
 - **Lifecycle and accessibility:** register handlers before `app.connect()`,
   apply initial and changed host theme, fonts, style variables and safe-area insets.
-  Clear previous data and filters when another invocation starts or fails, and
-  ignore late clipboard completion after replacement/teardown. Show useful waiting,
+  A widget remains bound to its original invocation; it is not reused for a later
+  call. Ignore late clipboard completion after teardown. Show useful waiting,
   empty, error and missing-structured-data states; do not parse text fallback into
   invented structured data. Use semantic controls, visible focus, accessible icon
   labels and copy/status feedback. Load no external assets; host fonts are applied
@@ -488,7 +578,7 @@ These requirements apply to all existing and future widgets:
 When adding a widget, wire its source into the Vite build and Python `Widget` binding,
 add representative DOM tests, and verify its generated HTML and icon are packaged.
 Tests should cover full values, extra fields, long paths, local filtering without
-data loss, JSON escaping, copying, empty/error states and replacement of results.
+data loss, JSON escaping, copying, empty/error states and teardown.
 Run `npm test --prefix frontend` and `npm run build --prefix frontend`; these use
 Node/jsdom and Vite without launching a browser. DOM tests do not prove pixel layout;
 visual review remains a separate step.

@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
+import logging
 import os
 import shutil
 import stat
 import tempfile
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Generator, Literal
+from types import MappingProxyType
 from urllib.parse import quote
+from uuid import uuid4
 
 import regex as regex_engine
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
-from mcp.server.mcpserver.exceptions import ResourceError, ToolError
+from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.mcpserver.resources.templates import ResourceSecurity
 from mcp.types import (
     Completion,
@@ -36,38 +40,44 @@ from forgemcp.completion import Complete
 from forgemcp.progress import progress
 
 from .errors import WorkspaceError
+from .extensions import (
+    ExtensionContext,
+    ExtensionOutput,
+    ExtensionProvider,
+    ResultExtension,
+    ResultExtensions,
+    ResultResource,
+    ResultResources,
+)
 from .metadata import file_owner
+from .path import WorkspacePath
 
 WorkspaceRoot = Literal["project", "storage"]
 
 
 class TreeEntry(BaseModel):
-    path: str
+    path: WorkspacePath
     kind: Literal["file", "directory", "symlink", "other"]
     children: list[TreeEntry] | None = None
 
 
-class DirectoryTree(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class DirectoryTree(ResultResources):
+    path: WorkspacePath
     entries: list[TreeEntry]
 
 
-class FilePaths(BaseModel):
-    root: WorkspaceRoot
-    paths: list[str]
+class FilePaths(ResultResources):
+    paths: list[WorkspacePath]
 
 
-class FileContent(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class FileContent(ResultResources):
+    path: WorkspacePath
     text: str
     start_line: int
 
 
-class FileInfo(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class FileInfo(ResultResources):
+    path: WorkspacePath
     created_at: datetime | None
     modified_at: datetime
     size_bytes: int
@@ -75,7 +85,7 @@ class FileInfo(BaseModel):
 
 
 class SearchMatch(BaseModel):
-    path: str
+    path: WorkspacePath
     line: int
     text: str
     spans: list[tuple[int, int]] = Field(
@@ -83,35 +93,31 @@ class SearchMatch(BaseModel):
     )
 
 
-class SearchResult(BaseModel):
-    root: WorkspaceRoot
+class SearchResult(ResultResources):
     matches: list[SearchMatch]
-    skipped_files: list[str]
+    skipped_files: list[WorkspacePath]
 
 
-class FileWriteResult(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class FileWriteResult(ResultResources):
+    path: WorkspacePath
     action: Literal["created", "overwritten"]
     lines_removed: int
     lines_added: int
 
 
-class FileEditResult(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class FileEditResult(ResultResources):
+    path: WorkspacePath
     replacements: int
 
 
-class PathOperationResult(BaseModel):
-    root: WorkspaceRoot
-    path: str
+class PathOperationResult(ResultResources):
+    path: WorkspacePath
     action: Literal["moved", "deleted", "created", "already_exists"]
-    source: str | None = None
+    source: WorkspacePath | None = None
 
 
 @contextmanager
-def filesystem_errors(path: str) -> Generator[None]:
+def filesystem_errors(path: str | WorkspacePath) -> Generator[None]:
     """Translate expected failures without exposing absolute filesystem paths."""
     try:
         yield
@@ -136,7 +142,7 @@ class StorageDirectory:
     def subdirectory(self, key: str) -> StorageDirectory:
         self.workspace.validate_directory_key(key)
         relative = self.workspace.relative_path(self.path / key, root="storage")
-        self.workspace.mkdir(relative, root="storage")
+        self.workspace.mkdir(self.workspace.qualified_path("storage", relative))
         return StorageDirectory(self.workspace, self.path / key)
 
     def remove(self) -> None:
@@ -152,7 +158,7 @@ class StorageDirectory:
 class WorkspaceService:
     """Browse project/storage trees, search files, and read or change UTF-8 text.
 
-    Paths are relative to root=project or root=storage. Searches skip dot directories
+    Paths use project/... or storage/... strings. Searches skip dot directories
     and links. Read files before editing; edits replace one exact text occurrence
     unless replace_all is requested. File resources mirror text or raw bytes.
     """
@@ -171,6 +177,8 @@ class WorkspaceService:
     FIND_URI = "forgemcp://workspace/{root}/find-files{?pattern,path}"
     INFO_URI = "forgemcp://workspace/{root}/file-info{?path}"
     SEARCH_URI = "forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}"
+    RESULT_JSON_URI = "forgemcp://workspace/results/{result_id}/{name}.json"
+    RESULT_MARKDOWN_URI = "forgemcp://workspace/results/{result_id}/{name}.md"
 
     def __init__(
         self,
@@ -194,6 +202,134 @@ class WorkspaceService:
             if self.storage_root.exists() and not self.storage_root.is_dir():
                 raise WorkspaceError("Storage root must be a directory.")
         self.protected_paths: set[Path] = set()
+        self.extension_providers: dict[str, tuple[str, int, ExtensionProvider]] = {}
+        self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
+
+    def register_extension(
+        self,
+        name: str,
+        provider: ExtensionProvider,
+        *,
+        kind: str,
+        version: int = 1,
+    ) -> None:
+        """Register one uniquely named provider; workspace does not interpret its data."""
+        if not name or not kind or version < 1 or name in self.extension_providers:
+            raise WorkspaceError("Extension needs a unique name, kind and positive version.")
+        self.extension_providers[name] = (kind, version, provider)
+
+    async def create_result_extensions(
+        self,
+        context: ExtensionContext,
+    ) -> ResultResources:
+        """Freeze provider output once; subsequent resource reads only retrieve text."""
+        if not self.extension_providers:
+            return ResultResources()
+        result_id = uuid4().hex
+        base_uri = f"forgemcp://workspace/results/{result_id}/"
+        stored = {}
+        extensions = []
+        links = []
+        for name, (kind, version, provider) in tuple(self.extension_providers.items()):
+            entry = ResultExtension(name=name, kind=kind, version=version)
+            try:
+                # Every provider sees an independent result object and immutable text mapping.
+                output = await provider(
+                    ExtensionContext(
+                        tool_name=context.tool_name,
+                        result=context.result.model_copy(deep=True),
+                        paths=context.paths,
+                        texts=MappingProxyType(dict(context.texts)),
+                    )
+                )
+                if output is None:
+                    continue
+                if not isinstance(output, ExtensionOutput):
+                    raise WorkspaceError("Provider must return ExtensionOutput or None.")
+                pending = {}
+                for resource in output.resources:
+                    expected_mime = {
+                        ".json": "application/json",
+                        ".md": "text/markdown",
+                    }.get(Path(resource.name).suffix)
+                    if (
+                        not resource.name
+                        or not resource.name.isascii()
+                        or any(
+                            not (char.isalnum() or char in "._-")
+                            for char in resource.name
+                        )
+                        or ".." in resource.name
+                        or resource.name == "extensions.json"
+                        or resource.name in stored
+                        or resource.name in pending
+                        or expected_mime is None
+                        or resource.mime_type != expected_mime
+                        or not isinstance(resource.text, str)
+                    ):
+                        raise WorkspaceError(
+                            "Extension resources need unique .json/.md filenames and matching MIME types."
+                        )
+                    if resource.mime_type == "application/json":
+                        json.loads(resource.text)
+                    pending[resource.name] = (resource.mime_type, resource.text)
+                entry = ResultExtension(
+                    name=name,
+                    kind=kind,
+                    version=version,
+                    data=output.data,
+                )
+                # Detach mutable JSON supplied by the provider before another await.
+                entry = ResultExtension.model_validate_json(entry.model_dump_json())
+                stored.update(pending)
+                links.extend(
+                    ResultResource(uri=base_uri + filename, mime_type=mime_type)
+                    for filename, (mime_type, _) in pending.items()
+                )
+            except Exception:
+                logging.getLogger(__name__).warning("Workspace extension failed: %s", name)
+                entry = ResultExtension(
+                    name=name,
+                    kind=kind,
+                    version=version,
+                    error="Extension provider failed.",
+                )
+            extensions.append(entry)
+        if not extensions:
+            return ResultResources()
+        manifest = ResultExtensions(extensions=extensions, resources=links)
+        stored["extensions.json"] = ("application/json", manifest.model_dump_json())
+        self.result_resources[result_id] = stored
+        return ResultResources(
+            extensions_uri=base_uri + "extensions.json",
+            resources=links,
+        )
+
+    def read_result_resource(self, result_id: str, name: str) -> str:
+        """Return an immutable resource without invoking its provider again."""
+        try:
+            return self.result_resources[result_id][name][1]
+        except KeyError as error:
+            raise WorkspaceError("Workspace result resource does not exist.") from error
+
+    async def enrich_result[T: ResultResources](
+        self,
+        tool_name: str,
+        result: T,
+        paths: Sequence[WorkspacePath],
+        texts: Mapping[WorkspacePath, str] | None = None,
+    ) -> T:
+        references = await self.create_result_extensions(
+            ExtensionContext(
+                tool_name=tool_name,
+                result=result,
+                paths=tuple(dict.fromkeys(paths)),
+                texts=texts or {},
+            )
+        )
+        result.extensions_uri = references.extensions_uri
+        result.resources = references.resources
+        return result
 
     def root_path(self, root: WorkspaceRoot) -> Path:
         if root == "project":
@@ -258,8 +394,8 @@ class WorkspaceService:
                     "This operation cannot move or remove a tree containing links."
                 )
 
-    def protect_path(self, path: str, *, root: WorkspaceRoot = "project") -> None:
-        candidate = self.resolve_path(path, root=root)
+    def protect_path(self, path: WorkspacePath) -> None:
+        candidate = self.resolve_workspace_path(path)
         self.protected_paths.update((candidate, candidate.resolve()))
 
     def writable_path(
@@ -281,6 +417,29 @@ class WorkspaceService:
         if subtree and self.storage_root.is_relative_to(candidate):
             raise WorkspaceError("Cannot move or remove a parent of the storage root.")
         return candidate
+
+    def resolve_workspace_path(self, path: WorkspacePath) -> Path:
+        return self.resolve_path(path.relative, root=path.area)
+
+    def qualified_path(self, root: str, path: str) -> WorkspacePath:
+        """Adapt a resource URI's root/path pair to the shared path type."""
+        self.root_path(root)
+        if not path:
+            raise WorkspaceError("Path must not be empty.")
+        try:
+            return WorkspacePath(f"{root}/{'' if path == '.' else path}")
+        except ValueError as error:
+            raise WorkspaceError("Expected a canonical relative workspace path.") from error
+
+    def workspace_path(self, path: Path) -> WorkspacePath:
+        """Represent an absolute local path using one of the configured roots."""
+        candidate = path.absolute()
+        for area in ("storage", "project"):
+            base = self.root_path(area)
+            if candidate.is_relative_to(base):
+                relative = self.relative_path(candidate, root=area)
+                return WorkspacePath(f"{area}/{'' if relative == '.' else relative}")
+        raise WorkspaceError("Path is outside the project and storage roots.")
 
     def require_file(self, path: str, root: WorkspaceRoot) -> Path:
         candidate = self.resolve_path(path, root=root)
@@ -326,41 +485,38 @@ class WorkspaceService:
             extension.removeprefix(".").lower() for extension in extensions
         }
 
-    def read_bytes(self, path: str, *, root: WorkspaceRoot = "project") -> bytes:
+    def read_bytes(self, path: WorkspacePath) -> bytes:
         with filesystem_errors(path):
-            return self.require_file(path, root).read_bytes()
+            return self.require_file(path.relative, path.area).read_bytes()
 
     def read_file(
         self,
-        path: str,
+        path: WorkspacePath,
         *,
         start_line: int = 1,
         end_line: int | None = None,
-        root: WorkspaceRoot = "project",
     ) -> FileContent:
         if start_line < 1 or (end_line is not None and end_line < start_line):
             raise WorkspaceError(
                 "Line range must start at 1 or later and end at or after its start."
             )
         with filesystem_errors(path):
-            text = self.read_bytes(path, root=root).decode("utf-8")
+            text = self.read_bytes(path).decode("utf-8")
             if "\0" in text:
                 raise WorkspaceError(f"{path}: binary file; use the raw resource.")
         return FileContent(
-            root=root,
-            path=self.relative_path(self.resolve_path(path, root=root), root=root),
+            path=path,
             text="".join(text.splitlines(keepends=True)[start_line - 1 : end_line]),
             start_line=start_line,
         )
 
-    def file_info(self, path: str, *, root: WorkspaceRoot = "project") -> FileInfo:
+    def file_info(self, path: WorkspacePath) -> FileInfo:
         with filesystem_errors(path):
-            candidate = self.require_file(path, root)
+            candidate = self.require_file(path.relative, path.area)
             metadata = candidate.stat()
             birth = getattr(metadata, "st_birthtime", None)
             return FileInfo(
-                root=root,
-                path=self.relative_path(candidate, root=root),
+                path=path,
                 created_at=(
                     datetime.fromtimestamp(birth, UTC) if birth is not None else None
                 ),
@@ -391,19 +547,16 @@ class WorkspaceService:
 
     def write_file(
         self,
-        path: str,
+        path: WorkspacePath,
         text: str,
-        *,
-        root: WorkspaceRoot = "project",
     ) -> FileWriteResult:
         with filesystem_errors(path):
-            candidate = self.writable_path(path, root=root)
+            candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.exists()
-            previous = self.read_file(path, root=root).text if existed else ""
+            previous = self.read_file(path).text if existed else ""
             self.replace_text(candidate, text)
             return FileWriteResult(
-                root=root,
-                path=self.relative_path(candidate, root=root),
+                path=path,
                 action="overwritten" if existed else "created",
                 lines_removed=len(previous.splitlines()),
                 lines_added=len(text.splitlines()),
@@ -411,18 +564,17 @@ class WorkspaceService:
 
     def edit_file(
         self,
-        path: str,
+        path: WorkspacePath,
         old_text: str,
         new_text: str,
         *,
         replace_all: bool = False,
-        root: WorkspaceRoot = "project",
     ) -> FileEditResult:
         if not old_text:
             raise WorkspaceError("old_text must not be empty.")
         with filesystem_errors(path):
-            candidate = self.writable_path(path, root=root)
-            text = self.read_file(path, root=root).text
+            candidate = self.writable_path(path.relative, root=path.area)
+            text = self.read_file(path).text
             count = text.count(old_text)
             if count == 0:
                 raise WorkspaceError(
@@ -434,21 +586,28 @@ class WorkspaceService:
                 )
             self.replace_text(candidate, text.replace(old_text, new_text))
             return FileEditResult(
-                root=root,
-                path=self.relative_path(candidate, root=root),
+                path=path,
                 replacements=count,
             )
 
     def move(
         self,
-        source: str,
-        destination: str,
-        *,
-        root: WorkspaceRoot = "project",
+        source: WorkspacePath,
+        destination: WorkspacePath,
     ) -> PathOperationResult:
+        if source.area != destination.area:
+            raise WorkspaceError("Move source and destination must use the same root.")
         with filesystem_errors(source):
-            origin = self.writable_path(source, root=root, subtree=True)
-            target = self.writable_path(destination, root=root, subtree=True)
+            origin = self.writable_path(
+                source.relative,
+                root=source.area,
+                subtree=True,
+            )
+            target = self.writable_path(
+                destination.relative,
+                root=destination.area,
+                subtree=True,
+            )
             if not origin.exists():
                 raise WorkspaceError(f"{source}: path does not exist.")
             if target.exists() or target.is_symlink():
@@ -459,43 +618,36 @@ class WorkspaceService:
                 self.check_tree_links(origin)
             origin.rename(target)
             return PathOperationResult(
-                root=root,
-                path=self.relative_path(target, root=root),
+                path=destination,
                 action="moved",
-                source=self.relative_path(origin, root=root),
+                source=source,
             )
 
     def delete(
         self,
-        path: str,
-        *,
-        root: WorkspaceRoot = "project",
+        path: WorkspacePath,
     ) -> PathOperationResult:
         with filesystem_errors(path):
-            candidate = self.writable_path(path, root=root, subtree=True)
+            candidate = self.writable_path(path.relative, root=path.area, subtree=True)
             if candidate.is_dir():
                 candidate.rmdir()
             else:
-                self.require_file(path, root).unlink()
+                self.require_file(path.relative, path.area).unlink()
             return PathOperationResult(
-                root=root,
-                path=self.relative_path(candidate, root=root),
+                path=path,
                 action="deleted",
             )
 
     def mkdir(
         self,
-        path: str,
-        *,
-        root: WorkspaceRoot = "project",
+        path: WorkspacePath,
     ) -> PathOperationResult:
         with filesystem_errors(path):
-            candidate = self.writable_path(path, root=root)
+            candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.is_dir()
             candidate.mkdir(parents=True, exist_ok=True)
             return PathOperationResult(
-                root=root,
-                path=self.relative_path(candidate, root=root),
+                path=path,
                 action="already_exists" if existed else "created",
             )
 
@@ -505,7 +657,7 @@ class WorkspaceService:
 
     def storage_directory(self, key: str) -> StorageDirectory:
         self.validate_directory_key(key)
-        self.mkdir(key, root="storage")
+        self.mkdir(self.qualified_path("storage", key))
         return StorageDirectory(self, self.storage_root / key)
 
     @contextmanager
@@ -520,8 +672,8 @@ class WorkspaceService:
         finally:
             directory.remove()
 
-    def file_uri(self, root: WorkspaceRoot, path: str) -> str:
-        return f"forgemcp://workspace/{root}/file/{quote(path, safe='/')}"
+    def file_uri(self, path: WorkspacePath) -> str:
+        return f"forgemcp://workspace/{path.area}/file/{quote(path.relative, safe='/')}"
 
     def render_markdown(
         self,
@@ -530,7 +682,7 @@ class WorkspaceService:
         """Render the same business results served by tools as Markdown resources."""
         nodes: list[markdown.Node] = []
         if isinstance(result, DirectoryTree):
-            lines = [result.path]
+            lines = [str(result.path)]
 
             def visit(entries: list[TreeEntry], prefix: str = "") -> None:
                 for index, entry in enumerate(entries):
@@ -541,7 +693,7 @@ class WorkspaceService:
                         else " @" if entry.kind == "symlink" else ""
                     )
                     lines.append(
-                        f"{prefix}{'└── ' if last else '├── '}{PurePosixPath(entry.path).name}{suffix}"
+                        f"{prefix}{'└── ' if last else '├── '}{PurePosixPath(entry.path.relative).name}{suffix}"
                     )
                     if entry.children is not None:
                         visit(entry.children, prefix + ("    " if last else "│   "))
@@ -558,7 +710,7 @@ class WorkspaceService:
                 [
                     markdown.Heading("Files"),
                     markdown.UnorderedList(
-                        markdown.Link(path, self.file_uri(result.root, path))
+                        markdown.Link(str(path), self.file_uri(path))
                         for path in result.paths
                     ),
                 ]
@@ -580,7 +732,7 @@ class WorkspaceService:
                 nodes.extend(
                     [
                         markdown.Paragraph(
-                            f"{markdown.Link(match.path, self.file_uri(result.root, match.path))}, line {match.line}"
+                            f"{markdown.Link(str(match.path), self.file_uri(match.path))}, line {match.line}"
                         ),
                         markdown.CodeBlock(match.text),
                     ]
@@ -590,7 +742,7 @@ class WorkspaceService:
             nodes.extend(
                 [
                     markdown.Heading("Skipped files", level=2),
-                    markdown.UnorderedList(result.skipped_files),
+                    markdown.UnorderedList(str(path) for path in result.skipped_files),
                 ]
             )
         return markdown.Document(nodes).render()
@@ -615,10 +767,9 @@ class WorkspaceService:
         )
         async def workspace_list(
             ctx: Context,
-            path: str = ".",
+            path: WorkspacePath = WorkspacePath("project/"),
             depth: int | None = 1,
             include_hidden: bool = False,
-            root: WorkspaceRoot = "project",
         ) -> DirectoryTree:
             """Show a directory tree; null depth expands every directory. File paths are errors."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -629,10 +780,11 @@ class WorkspaceService:
                     raise WorkspaceError(
                         "Depth must be positive or null for the complete tree."
                     )
-                directory = self.resolve_path(path, root=root)
-                self.check_path_links(directory, root)
+                directory = self.resolve_workspace_path(path)
+                self.check_path_links(directory, path.area)
                 if not directory.is_dir():
                     raise WorkspaceError(f"{path}: expected an existing directory.")
+                listed_paths = [path]
 
                 async def entries(
                     parent: Path,
@@ -662,22 +814,26 @@ class WorkspaceService:
                         else:
                             kind = "other"
                         entry = TreeEntry(
-                            path=child.relative_to(self.root_path(root)).as_posix(),
+                            path=self.qualified_path(
+                                path.area,
+                                child.relative_to(self.root_path(path.area)).as_posix(),
+                            ),
                             kind=kind,
                             children=children,
                         )
                         result.append(entry)
+                        listed_paths.append(entry.path)
                         visited += 1
                         await report_progress(visited, message=f"process {entry.path}")
                         await asyncio.sleep(0)
                     return result
 
                 with filesystem_errors(path):
-                    return DirectoryTree(
-                        root=root,
-                        path=self.relative_path(directory, root=root),
+                    result = DirectoryTree(
+                        path=path,
                         entries=await entries(directory, depth),
                     )
+                return await self.enrich_result("workspace_list", result, listed_paths)
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
 
@@ -689,21 +845,20 @@ class WorkspaceService:
         async def workspace_find_files(
             ctx: Context,
             pattern: str = "*",
-            path: str = ".",
-            root: WorkspaceRoot = "project",
+            path: WorkspacePath = WorkspacePath("project/"),
         ) -> FilePaths:
             """Find file paths by glob, skipping dot directories and links."""
             report_progress = progress(ctx, interval=self.progress_interval)
             try:
                 visited = 0
                 await report_progress(0, message="Files visited")
-                start = self.resolve_path(path, root=root)
+                start = self.resolve_workspace_path(path)
                 base = start if start.is_dir() else start.parent
                 if not pattern:
                     raise WorkspaceError("File pattern must not be empty.")
                 paths = []
                 with filesystem_errors(path):
-                    async for candidate in self.iter_files(path, root):
+                    async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
                         await report_progress(visited, message="Files visited")
                         target = candidate.relative_to(base).as_posix()
@@ -716,8 +871,14 @@ class WorkspaceService:
                             else fnmatch.fnmatchcase(candidate.name, pattern)
                         )
                         if matches:
-                            paths.append(self.relative_path(candidate, root=root))
-                return FilePaths(root=root, paths=sorted(paths))
+                            paths.append(
+                                self.qualified_path(
+                                    path.area,
+                                    self.relative_path(candidate, root=path.area),
+                                )
+                            )
+                result = FilePaths(paths=sorted(paths, key=str))
+                return await self.enrich_result("workspace_find_files", result, paths)
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
 
@@ -727,9 +888,8 @@ class WorkspaceService:
             annotations=read_only,
         )
         async def workspace_file_info(
-            path: str,
+            path: WorkspacePath,
             ctx: Context,
-            root: WorkspaceRoot = "project",
         ) -> FileInfo:
             """Read creation/modification times, byte size, and owner of one file."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -737,12 +897,11 @@ class WorkspaceService:
             try:
                 result = self.file_info(
                     path=path,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed file info")
-            return result
+            return await self.enrich_result("workspace_file_info", result, [path])
 
         @apps.tool(
             resource_uri=self.FILE_WIDGET.uri,
@@ -750,11 +909,10 @@ class WorkspaceService:
             annotations=read_only,
         )
         async def workspace_read_file(
-            path: str,
+            path: WorkspacePath,
             ctx: Context,
             start_line: int = 1,
             end_line: int | None = None,
-            root: WorkspaceRoot = "project",
         ) -> FileContent:
             """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -764,7 +922,7 @@ class WorkspaceService:
                         "Line range must start at 1 or later and end at or after its start."
                     )
                 with filesystem_errors(path):
-                    candidate = self.require_file(path, root)
+                    candidate = self.require_file(path.relative, path.area)
                     text = bytearray()
                     await report_progress(0, message="Bytes read")
                     with candidate.open("rb") as stream:
@@ -777,14 +935,19 @@ class WorkspaceService:
                         raise WorkspaceError(
                             f"{path}: binary file; use the raw resource."
                         )
-                    return FileContent(
-                        root=root,
-                        path=self.relative_path(candidate, root=root),
+                    result = FileContent(
+                        path=path,
                         text="".join(
                             decoded.splitlines(keepends=True)[start_line - 1 : end_line]
                         ),
                         start_line=start_line,
                     )
+                return await self.enrich_result(
+                    "workspace_read_file",
+                    result,
+                    [path],
+                    {path: decoded},
+                )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
 
@@ -796,11 +959,10 @@ class WorkspaceService:
         async def workspace_search(
             query: str,
             ctx: Context,
-            path: str = ".",
+            path: WorkspacePath = WorkspacePath("project/"),
             regex: bool = False,
             extensions: list[str] | None = None,
             case_sensitive: bool = True,
-            root: WorkspaceRoot = "project",
         ) -> SearchResult:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -820,13 +982,17 @@ class WorkspaceService:
                         f"Invalid regular expression: {error}"
                     ) from error
                 matches, skipped = [], []
+                texts: dict[WorkspacePath, str] = {}
                 with filesystem_errors(path):
-                    async for candidate in self.iter_files(path, root):
+                    async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
                         await report_progress(visited, message="Files visited")
                         if not self.extension_matches(candidate, extensions):
                             continue
-                        relative = self.relative_path(candidate, root=root)
+                        relative = self.qualified_path(
+                            path.area,
+                            self.relative_path(candidate, root=path.area),
+                        )
                         data = candidate.read_bytes()
                         try:
                             text = data.decode("utf-8")
@@ -843,6 +1009,8 @@ class WorkspaceService:
                                 match.span() for match in expression.finditer(value)
                             ]
                             if spans:
+                                if self.extension_providers:
+                                    texts[relative] = text
                                 matches.append(
                                     SearchMatch(
                                         path=relative,
@@ -851,10 +1019,15 @@ class WorkspaceService:
                                         spans=spans,
                                     )
                                 )
-                return SearchResult(
-                    root=root,
-                    matches=sorted(matches, key=lambda item: (item.path, item.line)),
-                    skipped_files=sorted(skipped),
+                result = SearchResult(
+                    matches=sorted(matches, key=lambda item: (str(item.path), item.line)),
+                    skipped_files=sorted(skipped, key=str),
+                )
+                return await self.enrich_result(
+                    "workspace_search",
+                    result,
+                    [*(match.path for match in result.matches), *result.skipped_files],
+                    texts,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
@@ -865,10 +1038,9 @@ class WorkspaceService:
             annotations=modifying,
         )
         async def workspace_write_file(
-            path: str,
+            path: WorkspacePath,
             text: str,
             ctx: Context,
-            root: WorkspaceRoot = "project",
         ) -> FileWriteResult:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -877,12 +1049,16 @@ class WorkspaceService:
                 result = self.write_file(
                     path=path,
                     text=text,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed write file")
-            return result
+            return await self.enrich_result(
+                "workspace_write_file",
+                result,
+                [path],
+                {path: text},
+            )
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -890,12 +1066,11 @@ class WorkspaceService:
             annotations=modifying,
         )
         async def workspace_edit_file(
-            path: str,
+            path: WorkspacePath,
             old_text: str,
             new_text: str,
             ctx: Context,
             replace_all: bool = False,
-            root: WorkspaceRoot = "project",
         ) -> FileEditResult:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -906,12 +1081,11 @@ class WorkspaceService:
                     old_text=old_text,
                     new_text=new_text,
                     replace_all=replace_all,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed edit file")
-            return result
+            return await self.enrich_result("workspace_edit_file", result, [path])
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -919,10 +1093,9 @@ class WorkspaceService:
             annotations=modifying,
         )
         async def workspace_move(
-            source: str,
-            destination: str,
+            source: WorkspacePath,
+            destination: WorkspacePath,
             ctx: Context,
-            root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Move a file or directory inside one root; the destination must not exist."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -931,12 +1104,15 @@ class WorkspaceService:
                 result = self.move(
                     source=source,
                     destination=destination,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed move")
-            return result
+            return await self.enrich_result(
+                "workspace_move",
+                result,
+                [source, destination],
+            )
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -944,9 +1120,8 @@ class WorkspaceService:
             annotations=modifying,
         )
         async def workspace_delete(
-            path: str,
+            path: WorkspacePath,
             ctx: Context,
-            root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Delete a file or empty directory; protected paths and roots cannot be deleted."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -954,12 +1129,11 @@ class WorkspaceService:
             try:
                 result = self.delete(
                     path=path,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed delete")
-            return result
+            return await self.enrich_result("workspace_delete", result, [path])
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -972,9 +1146,8 @@ class WorkspaceService:
             ),
         )
         async def workspace_mkdir(
-            path: str,
+            path: WorkspacePath,
             ctx: Context,
-            root: WorkspaceRoot = "project",
         ) -> PathOperationResult:
             """Create a directory and missing parents, or report that it already exists."""
             report_progress = progress(ctx, interval=self.progress_interval)
@@ -982,12 +1155,11 @@ class WorkspaceService:
             try:
                 result = self.mkdir(
                     path=path,
-                    root=root,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed mkdir")
-            return result
+            return await self.enrich_result("workspace_mkdir", result, [path])
 
         for widget in (
             self.TREE_WIDGET,
@@ -1004,6 +1176,30 @@ class WorkspaceService:
                 raise ResourceError(str(error)) from error
 
         @mcp.resource(
+            self.RESULT_JSON_URI,
+            mime_type="application/json",
+            icons=[self.FILE_ICON.icon],
+        )
+        async def workspace_result_json(result_id: str, name: str) -> str:
+            """Read immutable result extensions or provider JSON from one tool invocation."""
+            try:
+                return self.read_result_resource(result_id, name + ".json")
+            except WorkspaceError as error:
+                raise ResourceNotFoundError(str(error)) from error
+
+        @mcp.resource(
+            self.RESULT_MARKDOWN_URI,
+            mime_type="text/markdown",
+            icons=[self.FILE_ICON.icon],
+        )
+        async def workspace_result_markdown(result_id: str, name: str) -> str:
+            """Read a provider's immutable Markdown, independently of syntax token data."""
+            try:
+                return self.read_result_resource(result_id, name + ".md")
+            except WorkspaceError as error:
+                raise ResourceNotFoundError(str(error)) from error
+
+        @mcp.resource(
             self.FILE_URI,
             mime_type="text/plain",
             icons=[self.FILE_ICON.icon],
@@ -1014,7 +1210,8 @@ class WorkspaceService:
         ) -> str:
             """Read the complete UTF-8 file without formatting or metadata."""
             resource(self.root_path, root=root)
-            return resource(self.read_file, path="/".join(path or []), root=root).text
+            selected = resource(self.qualified_path, root=root, path="/".join(path or []))
+            return resource(self.read_file, path=selected).text
 
         @mcp.resource(
             self.RAW_URI,
@@ -1027,7 +1224,8 @@ class WorkspaceService:
         ) -> bytes:
             """Read the exact bytes of any file."""
             resource(self.root_path, root=root)
-            return resource(self.read_bytes, path="/".join(path or []), root=root)
+            selected = resource(self.qualified_path, root=root, path="/".join(path or []))
+            return resource(self.read_bytes, path=selected)
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
         async def workspace_list_resource(
@@ -1042,8 +1240,7 @@ class WorkspaceService:
                 self.root_path(root)
                 result = await workspace_list(
                     ctx=ctx,
-                    root=root,
-                    path=path,
+                    path=self.qualified_path(root, path),
                     depth=None if depth == "all" else depth,
                     include_hidden=include_hidden,
                 )
@@ -1068,9 +1265,8 @@ class WorkspaceService:
                 self.root_path(root)
                 result = await workspace_find_files(
                     ctx=ctx,
-                    root=root,
                     pattern=pattern,
-                    path=path,
+                    path=self.qualified_path(root, path),
                 )
                 return self.render_markdown(result)
             except (WorkspaceError, ToolError) as error:
@@ -1084,7 +1280,8 @@ class WorkspaceService:
         async def workspace_file_info_resource(root: str, path: str = "") -> str:
             """Read one file's metadata as a Markdown table; path is required."""
             resource(self.root_path, root=root)
-            return self.render_markdown(resource(self.file_info, root=root, path=path))
+            selected = resource(self.qualified_path, root=root, path=path)
+            return self.render_markdown(resource(self.file_info, path=selected))
 
         @mcp.resource(
             self.SEARCH_URI,
@@ -1106,9 +1303,8 @@ class WorkspaceService:
                 self.root_path(root)
                 result = await workspace_search(
                     ctx=ctx,
-                    root=root,
                     query=query,
-                    path=path,
+                    path=self.qualified_path(root, path),
                     regex=regex,
                     extensions=None if extensions is None else extensions.split(","),
                     case_sensitive=case_sensitive,
@@ -1122,6 +1318,28 @@ class WorkspaceService:
             argument: CompletionArgument,
             context: CompletionContext | None,
         ) -> Completion | None:
+            if isinstance(ref, ResourceTemplateReference) and ref.uri in (
+                self.RESULT_JSON_URI,
+                self.RESULT_MARKDOWN_URI,
+            ):
+                if argument.name == "result_id":
+                    values = list(self.result_resources)
+                elif argument.name == "name":
+                    result_id = (context.arguments or {}).get("result_id", "") if context else ""
+                    suffix = ".json" if ref.uri == self.RESULT_JSON_URI else ".md"
+                    values = [
+                        name.removesuffix(suffix)
+                        for name in self.result_resources.get(result_id, {})
+                        if name.endswith(suffix)
+                    ]
+                else:
+                    values = []
+                matches = [value for value in values if value.startswith(argument.value)]
+                return Completion(
+                    values=matches[:100],
+                    total=len(matches),
+                    has_more=len(matches) > 100,
+                )
             uris = (
                 self.FILE_URI,
                 self.RAW_URI,

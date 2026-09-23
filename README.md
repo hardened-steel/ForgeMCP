@@ -1,8 +1,8 @@
 # ForgeMCP
 
 ForgeMCP is a Python MCP server for structured C and C++ development workflows.
-The repository currently contains a deliberately small vertical slice that establishes
-the conventions for future workspace, CMake, clangd, quality, and debugger modules.
+The repository contains workspace, process, toolchain, and initial CMake services.
+Language-server, quality, and debugger modules are planned.
 
 ## Current MCP surface
 
@@ -13,6 +13,9 @@ the conventions for future workspace, CMake, clangd, quality, and debugger modul
   file lists, metadata, and search results as Markdown. Resource parameters have
   completions for roots, paths, extensions, depth, and boolean options.
 - No prompts are currently registered.
+- CMake tools list operator profiles, configure projects, build targets, and run
+  CTest. This initial backend slice has structured/text results and icons; its
+  widgets and syntax highlighting are not implemented yet.
 - Tool `processes_overview` shows running and completed external development tools.
 - Resource template `forgemcp://processes/{process_id}` exposes the retained state and
   text transcript of one process.
@@ -87,8 +90,10 @@ All MCP traffic uses stdout. Operational logs must go to stderr.
 
 ## Workspace files and storage
 
-All file tools accept `root="project"` (default) or `root="storage"`; their paths
-are relative to that root. Storage defaults to `.<project-name>.forgemcp` beside the
+All file tools use string paths such as `project/src/main.cpp` and
+`storage/build/debug`. Directory tools default to `project/`; the separate tool
+argument `root` has been removed. Python consumers use the shared `WorkspacePath`
+type, which serializes as the same string. Storage defaults to `.<project-name>.forgemcp` beside the
 project. Set its location explicitly when needed:
 
 ```powershell
@@ -108,11 +113,11 @@ a working-directory check, not an operating-system sandbox.
 
 | Tool | Operation |
 | --- | --- |
-| `workspace_list(path=".", depth=1, include_hidden=false)` | Directory tree; `depth=null` expands the whole tree; a file path is an error |
-| `workspace_find_files(pattern="*", path=".")` | Recursive filename/path glob search |
+| `workspace_list(path="project/", depth=1, include_hidden=false)` | Directory tree; `depth=null` expands the whole tree; a file path is an error |
+| `workspace_find_files(pattern="*", path="project/")` | Recursive filename/path glob search |
 | `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
 | `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
-| `workspace_search(query, path=".", regex=false, extensions=null, case_sensitive=true)` | Matching lines and skipped binary/non-UTF-8 files |
+| `workspace_search(query, path="project/", regex=false, extensions=null, case_sensitive=true)` | Matching lines and skipped binary/non-UTF-8 files |
 | `workspace_write_file(path, text)` | Create or overwrite; return removed/added line counts |
 | `workspace_edit_file(path, old_text, new_text, replace_all=false)` | Exact replacement; zero or ambiguous matches fail without modifying the file |
 | `workspace_move(source, destination)` | Move a file or directory; destination must not exist |
@@ -132,7 +137,7 @@ register protected paths, which remain readable but cannot be changed through th
 workspace API. Searches intentionally have no application-level timeout, result
 limit, or pagination in this iteration.
 
-Resource templates (the URI root is always explicit):
+File resource templates retain their existing URI shape (the URI root is always explicit):
 
 ```text
 forgemcp://workspace/{root}/file{/path*}
@@ -141,6 +146,8 @@ forgemcp://workspace/{root}/list{?path,depth,include_hidden}
 forgemcp://workspace/{root}/find-files{?pattern,path}
 forgemcp://workspace/{root}/file-info{?path}
 forgemcp://workspace/{root}/search{?query,path,regex,extensions,case_sensitive}
+forgemcp://workspace/results/{result_id}/{name}.json
+forgemcp://workspace/results/{result_id}/{name}.md
 ```
 
 Examples: `forgemcp://workspace/project/file/src/main.cpp`,
@@ -152,6 +159,81 @@ an omitted parameter means any extension and `extensions=` means extensionless
 files. Encode query values using percent encoding (spaces as `%20`, not `+`);
 regex is supported. Text mirrors return the original text, raw mirrors return MCP
 binary content, and the other four resources return `text/markdown`.
+
+Dependent modules may register workspace result extensions. Tool results include
+`extensions_uri` and separate `resources` links when providers supply data.
+`extensions.json` contains the complete extension data; optional files such as
+`diagnostics.json` and `diagnostics.md` can be read without syntax token data.
+All result resources are immutable, held in memory, and disappear on restart.
+No syntax/diagnostic provider or frontend resource loading is included in this slice.
+
+## CMake profiles
+
+`cmake_profiles` lists profiles. `cmake_configure`, `cmake_build`, and `cmake_test`
+operate on all profiles unless a nonempty `profiles` list selects a subset.
+Configuration must precede building, and building must precede testing. Profiles
+run sequentially; one failed execution does not suppress later executions.
+Results include each profile/preset, return code, failure explanation, and the
+last 8192 characters of process output. CTest also returns per-test JUnit results.
+Full process transcripts remain in the process module; CMake results contain no
+transcript links. The default command timeout is 600 seconds per execution and
+can be overridden with the existing `ProcessTimeout` shape (`total`, `idle`).
+
+With no explicit profiles:
+
+- If `CMakePresets.json` or `CMakeUserPresets.json` exists, the automatic `presets`
+  profile runs all available configure, build, or test presets for that operation.
+  Names come from the selected CMake's `--list-presets=all`; ForgeMCP does not parse
+  preset JSON, inheritance, conditions, macros, or associations.
+- Otherwise, `Debug` and `Release` profiles use separate
+  `storage/build/cmake-Debug` and `storage/build/cmake-Release` directories.
+
+`--cmake-toolset ID_OR_NAME` selects the automatic profiles' toolset (default:
+`system`). Repeated `--cmake-profile NAME KEY=VALUE ...` replaces automatic profiles:
+
+```powershell
+forgemcp --workspace C:\Projects\Example `
+  --cmake-profile debug toolset=system configuration=Debug generator=Ninja `
+  --cmake-profile release toolset=system configuration=Release generator=Ninja
+```
+
+Profile settings are `toolset`, `configuration`, `generator`, `build-directory`,
+`c-compiler`, `cxx-compiler`, `toolchain-file`, and repeatable
+`define=CMAKE_VARIABLE=value`. Compiler names refer to tools in the selected
+toolset. Build directories and toolchain files use `project/...` or `storage/...`.
+Plain profiles default to the Ninja generator and enable compilation-database
+export. Ninja must exist in the selected toolset; there is no generator fallback.
+Without a compiler setting, CMake discovers the compiler in the toolset's
+environment. ForgeMCP does not select another toolset as a fallback.
+An existing build directory keeps its original generator: use a new
+`build-directory` when switching from Visual Studio to Ninja.
+
+Native preset profiles use repeatable `configure-preset`, `build-preset`, and
+`test-preset` settings; ForgeMCP does not infer links between them:
+
+```powershell
+forgemcp --workspace C:\Projects\Example `
+  --cmake-profile native toolset=system `
+    configure-preset=ninja-debug `
+    build-preset=build-ninja-debug `
+    test-preset=test-ninja-debug
+```
+
+Preset execution delegates directories, toolchains, and environments to CMake/CTest;
+ForgeMCP neither resolves nor prevalidates `binaryDir`. A profile may supply
+`build-directory` for ordinary build/test commands when corresponding presets are
+absent. This must identify the preset's actual build directory inside project/storage.
+Such ordinary commands use the toolset environment, not a replay of configure-preset
+environment variables; use build/test presets when their inherited environment is needed.
+Preset configure settings cannot be mixed with manual generator/compiler/cache settings.
+No profile settings are read from environment variables or persisted by ForgeMCP.
+Progress messages identify the profile and current configure step, build action,
+or CTest case, with the common notification throttle. Preset generators are not
+overridden; their compilation-database settings remain controlled by the preset.
+
+The initial CMake slice does not yet include clean/project-inspection tools,
+widgets, syntax highlighting, or automated tests. Existing workspace tests and
+widgets have not been migrated or validated against the new path contract yet.
 
 ## Toolchain discovery
 

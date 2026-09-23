@@ -29,6 +29,9 @@ Before designing or changing a module, read:
   `service.py` harder to understand or test.
 - Keep public result models beside the service until their number or reuse justifies
   `models.py`.
+- Use `WorkspacePath` for project/storage paths shared between modules and in tool
+  arguments/results. It serializes as `project/...` or `storage/...`; native
+  executable locations and low-level filesystem operations still use `Path`.
 - Feature services launch external programs only through the injected
   `ProcessService`; do not call `asyncio.create_subprocess_exec` directly outside the
   process module.
@@ -71,6 +74,10 @@ Before designing or changing a module, read:
   in Python modules.
 - Widgets register all event/request handlers before `app.connect()`, use host theme,
   font, style, and safe-area context, and load no undeclared external resources.
+- A widget is bound to one tool invocation. It may repeatedly read immutable
+  resources linked by that result under `forgemcp://workspace/results/*`; it must
+  not call tools or read other resources. Keep resource loading in the App bridge
+  and pass decoded data to rendering code.
 - A tool's `content` must remain useful to the model and to text-only clients; a
   widget is an enhancement, not the only result.
 

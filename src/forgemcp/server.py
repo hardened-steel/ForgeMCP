@@ -12,6 +12,9 @@ from mcp.server import MCPServer
 from mcp.server.apps import Apps
 
 from forgemcp import __version__
+from forgemcp.cmake.errors import CMakeError
+from forgemcp.cmake.profiles import parse_profiles
+from forgemcp.cmake.service import CMakeService
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
 from forgemcp.progress import validate_progress_interval
@@ -29,9 +32,12 @@ def create_server(
     toolsets: list[list[str]] | None = None,
     storage_root: Path | None = None,
     progress_interval: float = 1.0,
+    cmake_profiles: list[list[str]] | None = None,
+    cmake_toolset: str = "system",
 ) -> MCPServer:
     """Compose dependencies explicitly and return a ready MCP server."""
     validate_progress_interval(progress_interval)
+    profiles = parse_profiles(cmake_profiles or (), cmake_toolset)
     root = workspace_root or Path.cwd()
     workspace = WorkspaceService(
         root,
@@ -48,7 +54,14 @@ def create_server(
         toolsets or (),
         progress_interval=progress_interval,
     )
-    services = (workspace, processes, toolchains)
+    builds = CMakeService(
+        workspace,
+        toolchains,
+        profiles,
+        default_toolset=cmake_toolset,
+        progress_interval=progress_interval,
+    )
+    services = (workspace, processes, toolchains, builds)
     apps = Apps()
     complete = Complete()
 
@@ -114,6 +127,19 @@ def argument_parser() -> argparse.ArgumentParser:
         help="Service storage directory (defaults to .<project>.forgemcp beside the project).",
     )
     parser.add_argument(
+        "--cmake-toolset",
+        default="system",
+        help="Toolset ID or exact name for automatic CMake profiles (default: system).",
+    )
+    parser.add_argument(
+        "--cmake-profile",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="NAME_OR_KEY=VALUE",
+        help="NAME [KEY=VALUE ...]; repeat for each operator-selected CMake profile.",
+    )
+    parser.add_argument(
         "--progress-interval",
         dest="progress_interval",
         type=float,
@@ -134,8 +160,10 @@ def main() -> None:
             toolsets=arguments.toolset,
             storage_root=arguments.workspace_storage,
             progress_interval=arguments.progress_interval,
+            cmake_profiles=arguments.cmake_profile,
+            cmake_toolset=arguments.cmake_toolset,
         )
-    except (ToolchainError, WorkspaceError, ValueError) as error:
+    except (CMakeError, ToolchainError, WorkspaceError, ValueError) as error:
         parser.error(str(error))
     server.run(transport="stdio")
 
