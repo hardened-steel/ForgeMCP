@@ -25,6 +25,7 @@ class CustomBuildHook(BuildHookInterface):
                 for kind in ("tree", "file", "search", "result")
             ),
             Path(self.root) / "src" / "forgemcp" / "assets" / "process-overview.html",
+            Path(self.root) / "src" / "forgemcp" / "assets" / "process-details.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "toolsets.html",
         ]
         artifacts = build_data.setdefault("artifacts", [])

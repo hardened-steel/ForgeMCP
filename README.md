@@ -16,9 +16,11 @@ Language-server, quality, and debugger modules are planned.
 - CMake tools list operator profiles, configure projects, build targets, and run
   CTest. This initial backend slice has structured/text results and icons; its
   widgets and syntax highlighting are not implemented yet.
-- Tool `processes_overview` shows running and completed external development tools.
-- Resource template `forgemcp://processes/{process_id}` exposes the retained state and
-  text transcript of one process.
+- Tool `processes_overview` shows running and completed external development tools,
+  including exit codes and timeout interruptions. `process_get(process_id)` returns
+  one process with its ordered stdin/stdout/stderr transcript.
+- Resources `forgemcp://processes` and `forgemcp://processes/{process_id}` expose
+  Markdown snapshots of the list and one process.
 - Tool `toolsets_list` lists every discovered toolset; `toolset_get(toolset_id)` returns
   its absolute executable paths, kinds, and versions. Both open the toolsets widget.
 - Resources `forgemcp://toolsets` and `forgemcp://toolsets/{toolset_id}` expose the

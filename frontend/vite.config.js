@@ -9,6 +9,7 @@ const widgets = {
   search: "workspace-search",
   result: "workspace-result",
   process: "process-overview",
+  "process-details": "process-details",
   toolsets: "toolsets",
 };
 

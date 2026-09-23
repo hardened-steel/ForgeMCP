@@ -11,6 +11,7 @@ import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -19,7 +20,7 @@ from forgemcp import markdown
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
-from mcp.server.mcpserver.exceptions import ResourceNotFoundError
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import (
     Completion,
     CompletionArgument,
@@ -45,9 +46,10 @@ from .models import (
     ProcessOverview,
     ProcessEncoding,
     ProcessStatus,
-    ProcessStream,
     ProcessOutput,
     ProcessSummary,
+    ProcessInfo,
+    ProcessDetails,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,36 @@ class ProcessRecord:
     status: ProcessStatus
     start: float = field(init=False, default=0)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def snapshot(self) -> ProcessInfo:
+        """Copy the small process state while the caller holds the record lock."""
+        result = self.status.current_status
+        reason = self.status.interruption_reason
+        if result == "running":
+            state, code, outcome = "running", None, "Running"
+        elif result == "interrupted":
+            state, code = "interrupted", None
+            outcome = f"Interrupted by {reason}" if reason else "Interrupted"
+        else:
+            state, code = "completed", result
+            outcome = (
+                "Completed successfully" if code == 0 else f"Exited with code {code}"
+            )
+        return ProcessInfo(
+            process_id=self.summary.process_id,
+            executable=self.summary.executable,
+            arguments=list(self.summary.arguments),
+            cwd=self.summary.cwd,
+            encoding=self.summary.encoding,
+            timeout=self.summary.timeout,
+            pid=self.status.pid,
+            started=self.status.started,
+            work_time=self.status.work_time,
+            state=state,
+            return_code=code,
+            interruption_reason=reason,
+            outcome=outcome,
+        )
 
     async def terminate(self, process: Process) -> None:
         try:
@@ -86,6 +118,7 @@ class ProcessRecord:
             while True:
                 finished = False
                 timed_out = False
+                interruption_reason = None
                 message: str
                 result: Literal["interrupted", "running"] | int
 
@@ -104,6 +137,7 @@ class ProcessRecord:
                         await self.terminate(process)
                         finished = True
                         result = "interrupted"
+                        interruption_reason = "stopped"
                         message = f"Process {summary.process_id} stopped"
                     elif timeout.total is not None:
                         finished = duration > timeout.total
@@ -111,6 +145,7 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
+                            interruption_reason = "total timeout"
                             message = f"Process {summary.process_id} interrupted by timeout {timeout.total}"
 
                     if not finished and timeout.idle is not None:
@@ -128,12 +163,14 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
+                            interruption_reason = "idle timeout"
                             message = f"Process {summary.process_id} interrupted by idle {timeout.idle}"
 
                 if finished:
                     async with self.lock:
                         self.status.work_time = duration
                         self.status.current_status = result
+                        self.status.interruption_reason = interruption_reason
                     logger.info(message)
                     if timed_out:
                         raise ProcessError(message)
@@ -272,8 +309,15 @@ class ProcessService:
     """Run external development tools and expose their state without allowing arbitrary execution."""
 
     WIDGET = Widget("assets/process-overview.html")
+    DETAILS_WIDGET = Widget("assets/process-details.html")
     ICON = IconFile("icons/process.svg")
     RESOURCE_URI = "forgemcp://processes/{process_id}"
+    OVERVIEW_URI = "forgemcp://processes"
+
+    @staticmethod
+    def format_timestamp(value: datetime) -> str:
+        """Render a process timestamp to readable UTC seconds."""
+        return value.astimezone(timezone.utc).strftime("%d %b %Y, %H:%M:%S UTC")
 
     def __init__(
         self,
@@ -373,20 +417,6 @@ class ProcessService:
         """Register read-only process inspection entrypoints."""
         icon = self.ICON.icon
 
-        async def get_stream_content(
-            self,
-            process_id: int,
-            stream: ProcessStream,
-        ) -> str:
-            """Get process stream content"""
-            record = self.records[process_id]
-            result = ""
-            async with record.lock:
-                for log_entry in record.status.transcript:
-                    if log_entry.stream == stream:
-                        result += log_entry.text
-            return result
-
         @apps.tool(
             resource_uri=self.WIDGET.uri,
             icons=[icon],
@@ -406,7 +436,7 @@ class ProcessService:
             records = tuple(self.records.values())
             completed = 0
             running = 0
-            processes: list[ProcessSummary] = []
+            processes: list[ProcessInfo] = []
             for i, record in enumerate(records):
                 await report_progress(
                     i,
@@ -414,14 +444,15 @@ class ProcessService:
                     message=f"Reading process state: {i}",
                 )
                 async with record.lock:
-                    if record.status.current_status == "running":
+                    snapshot = record.snapshot()
+                    if snapshot.state == "running":
                         running += 1
                         if status == "all" or status == "running":
-                            processes.append(record.summary)
+                            processes.append(snapshot)
                     else:
                         completed += 1
                         if status == "all" or status == "completed":
-                            processes.append(record.summary)
+                            processes.append(snapshot)
 
             await report_progress(
                 len(records),
@@ -434,7 +465,58 @@ class ProcessService:
                 processes=processes,
             )
 
+        @apps.tool(
+            resource_uri=self.DETAILS_WIDGET.uri,
+            icons=[icon],
+            annotations=ToolAnnotations(
+                read_only_hint=True,
+                destructive_hint=False,
+                idempotent_hint=True,
+                open_world_hint=False,
+            ),
+        )
+        async def process_get(ctx: Context, process_id: int) -> ProcessDetails:
+            """Show one retained process and its ordered stdin/stdout/stderr transcript."""
+            report_progress = progress(ctx, interval=self.progress_interval)
+            await report_progress(0, total=1, message="Reading process transcript")
+            record = self.records.get(process_id)
+            if record is None:
+                raise ToolError(f"Process {process_id} is not retained.")
+            async with record.lock:
+                details = ProcessDetails(
+                    process=record.snapshot(),
+                    transcript=list(record.status.transcript),
+                )
+            await report_progress(1, total=1, message="Process transcript ready")
+            return details
+
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
+        apps.add_html_resource(self.DETAILS_WIDGET.uri, self.DETAILS_WIDGET.content)
+
+        @mcp.resource(self.OVERVIEW_URI, mime_type="text/markdown", icons=[icon])
+        async def processes_list() -> str:
+            """Read the current retained process list as Markdown."""
+            document = markdown.Document([markdown.Heading("Processes")])
+            table = markdown.Table(
+                ["ID", "Executable", "PID", "Started (UTC)", "Outcome"]
+            )
+            for record in tuple(self.records.values()):
+                async with record.lock:
+                    item = record.snapshot()
+                table.add(
+                    [
+                        markdown.Link(
+                            str(item.process_id),
+                            f"forgemcp://processes/{item.process_id}",
+                        ),
+                        item.executable,
+                        str(item.pid),
+                        self.format_timestamp(item.started),
+                        item.outcome,
+                    ]
+                )
+            document.add(table)
+            return document.render()
 
         @mcp.resource(self.RESOURCE_URI, mime_type="text/markdown", icons=[icon])
         async def process_details(process_id: int) -> str:
@@ -444,30 +526,38 @@ class ProcessService:
 
             record = self.records[process_id]
             async with record.lock:
-                document = markdown.Document()
-
-                document.add(markdown.Heading(record.summary.executable))
-                document.add(markdown.Paragraph("arguments"))
-                document.add(markdown.OrderedList(record.summary.arguments))
-
-                table = markdown.Table(["Settings", "Values"])
-                table.add(["id", str(record.summary.process_id)])
-                table.add(["state", str(record.status.current_status)])
-                table.add(["encoding", record.summary.encoding])
-                document.add(table)
-
-                document.add(markdown.Heading("process log", level=2))
-                table = markdown.Table(["timestamp", "direction", "text"])
-                for log_entry in record.status.transcript:
-                    table.add(
-                        [
-                            log_entry.timestamp.isoformat(),
-                            log_entry.stream,
-                            log_entry.text,
-                        ]
+                item = record.snapshot()
+                transcript = list(record.status.transcript)
+            document = markdown.Document(
+                [markdown.Heading(f"Process {item.process_id}: {item.executable}")]
+            )
+            table = markdown.Table(["Property", "Value"])
+            table.add(["Outcome", item.outcome])
+            table.add(["PID", str(item.pid)])
+            table.add(["Started (UTC)", self.format_timestamp(item.started)])
+            table.add(["Work time", f"{item.work_time:.2f} s"])
+            table.add(["Working directory", item.cwd])
+            table.add(["Encoding", item.encoding])
+            table.add(["Total timeout", f"{item.timeout.total} s" if item.timeout.total is not None else "None"])
+            table.add(["Idle timeout", f"{item.timeout.idle} s" if item.timeout.idle is not None else "None"])
+            document.add(table)
+            document.add(markdown.Heading("Arguments", level=2))
+            document.add(
+                markdown.OrderedList(item.arguments)
+                if item.arguments
+                else markdown.Paragraph("None")
+            )
+            document.add(markdown.Heading("Transcript", level=2))
+            if not transcript:
+                document.add(markdown.Paragraph("No stream chunks recorded."))
+            for entry in transcript:
+                document.add(
+                    markdown.Heading(
+                        f"{entry.stream} · {self.format_timestamp(entry.timestamp)}",
+                        level=3,
                     )
-                document.add(table)
-
+                )
+                document.add(markdown.CodeBlock(entry.text))
             return document.render()
 
         async def process_completion(
@@ -600,6 +690,10 @@ class ProcessSession:
                             if self.stopping.is_set() or self.failure is not None
                             else cast(int, self.process.returncode)
                         )
+                        if self.record.status.current_status == "interrupted":
+                            self.record.status.interruption_reason = (
+                                "stream failure" if self.failure is not None else "stopped"
+                            )
                     self.record.status.work_time = (
                         asyncio.get_running_loop().time() - self.record.start
                     )

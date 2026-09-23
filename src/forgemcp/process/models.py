@@ -82,10 +82,31 @@ class ProcessStatus(BaseModel):
     current_status: Literal["interrupted", "running"] | int = Field(
         description="Exit status or process status."
     )
+    interruption_reason: Literal[
+        "total timeout", "idle timeout", "stopped", "stream failure"
+    ] | None = None
     transcript: list[ProcessLogEntry] = Field(
         description="Process log. All communications will be saved here.",
         default_factory=list,
     )
+
+
+class ProcessInfo(BaseModel):
+    """Command and lifecycle snapshot without the potentially large transcript."""
+
+    process_id: int
+    executable: str
+    arguments: list[str]
+    cwd: str
+    encoding: str
+    timeout: ProcessTimeout
+    pid: int
+    started: datetime
+    work_time: float
+    state: Literal["running", "completed", "interrupted"]
+    return_code: int | None
+    interruption_reason: str | None
+    outcome: str
 
 
 class ProcessOverview(BaseModel):
@@ -95,6 +116,13 @@ class ProcessOverview(BaseModel):
         description="Number of processes currently running or starting."
     )
     completed: int = Field(description="Number of processes in a terminal state.")
-    processes: list[ProcessSummary] = Field(
+    processes: list[ProcessInfo] = Field(
         description="Processes matching the requested filter."
     )
+
+
+class ProcessDetails(BaseModel):
+    """One immutable point-in-time view of a process and its ordered transcript."""
+
+    process: ProcessInfo
+    transcript: list[ProcessLogEntry]
