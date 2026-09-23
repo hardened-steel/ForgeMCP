@@ -73,7 +73,7 @@ async def test_version_drains_both_pipes(scripted_processes):
     assert (
         sum(
             len(item.text)
-            for item in record.status.transcript
+            for item in record.transcript
             if item.stream == "stderr"
         )
         == 200000
@@ -90,6 +90,6 @@ async def test_cancellation_exits_process_context(scripted_processes):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert all(
-        record.status.current_status == "interrupted"
+        record.status.current_status == "stopped"
         for record in scripted_processes.records.values()
     )

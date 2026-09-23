@@ -119,7 +119,7 @@ async def test_stdin_fifo_eof_both_outputs_and_repeat_wait(processes):
     assert record.status.current_status == 0
     assert (
         "".join(
-            entry.text for entry in record.status.transcript if entry.stream == "stdin"
+            entry.text for entry in record.transcript if entry.stream == "stdin"
         )
         == "firstsecond"
     )
@@ -194,14 +194,9 @@ async def test_timeout_reaches_output_and_wait(processes, mode):
     assert session.returncode is not None
     assert session.task.done()
     assert processes.records[session.process_id].status.current_status == "interrupted"
-    assert (
-        processes.records[session.process_id].status.interruption_reason
-        == f"{mode} timeout"
-    )
     snapshot = processes.records[session.process_id].snapshot()
-    assert snapshot.state == "interrupted"
-    assert snapshot.return_code is None
-    assert snapshot.outcome == f"Interrupted by {mode} timeout"
+    assert snapshot.status.current_status == "interrupted"
+    assert not hasattr(snapshot.status, "transcript")
 
 
 @pytest.mark.anyio
@@ -215,6 +210,7 @@ async def test_decode_failure_is_not_eof(processes):
             async for _ in session.output():
                 pass
     assert session.returncode is not None
+    assert processes.records[session.process_id].status.current_status == "stream_failure"
     with pytest.raises(ProcessStreamError):
         await session.wait()
 
@@ -373,15 +369,22 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
         )
         overview = await client.call_tool("processes_overview", {})
         item = overview.structured_content["processes"][0]
-        assert item["process_id"] == session.process_id
-        assert item["state"] == "completed"
-        assert item["return_code"] == 0
-        assert item["outcome"] == "Completed successfully"
+        assert item["summary"]["process_id"] == session.process_id
+        assert item["status"]["current_status"] == 0
+        assert "outcome" not in item
+        assert "transcript" not in item["status"]
         details = await client.call_tool("process_get", {"process_id": session.process_id})
         assert not details.is_error and details.content
         result = details.structured_content
         assert result["process"] == item
         assert result["transcript"]
+        assert [
+            (entry["stream"], entry["text"]) for entry in result["transcript"]
+        ] == [
+            (entry.stream, entry.text)
+            for entry in processes.records[session.process_id].transcript
+        ]
+        assert all("elapsed_seconds" not in entry for entry in result["transcript"])
         assert "\x1b[31mred\x1b[0m" in "".join(
             entry["text"] for entry in result["transcript"] if entry["stream"] == "stdout"
         )
@@ -394,6 +397,8 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
         assert "Completed successfully" in overview_md
         assert "Completed successfully" in details_md
         assert "UTC" in details_md
+        assert " · +" in details_md
+        assert " s" in details_md
         assert "### stdout" in details_md and "### stderr" in details_md
         assert (await client.call_tool("process_get", {"process_id": 99999})).is_error
 
@@ -405,12 +410,8 @@ async def test_process_snapshot_distinguishes_running_and_nonzero_exit(processes
         ("-c", "import sys; sys.stdin.read(); sys.exit(7)"),
     ) as session:
         running = processes.records[session.process_id].snapshot()
-        assert (running.state, running.return_code, running.outcome) == (
-            "running", None, "Running"
-        )
+        assert running.status.current_status == "running"
         await session.close_stdin()
         assert await session.wait() == 7
     completed = processes.records[session.process_id].snapshot()
-    assert (completed.state, completed.return_code, completed.outcome) == (
-        "completed", 7, "Exited with code 7"
-    )
+    assert completed.status.current_status == 7

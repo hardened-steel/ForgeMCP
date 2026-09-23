@@ -62,36 +62,14 @@ class ProcessRecord:
     summary: ProcessSummary
     status: ProcessStatus
     start: float = field(init=False, default=0)
+    transcript: list[ProcessLogEntry] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def snapshot(self) -> ProcessInfo:
         """Copy the small process state while the caller holds the record lock."""
-        result = self.status.current_status
-        reason = self.status.interruption_reason
-        if result == "running":
-            state, code, outcome = "running", None, "Running"
-        elif result == "interrupted":
-            state, code = "interrupted", None
-            outcome = f"Interrupted by {reason}" if reason else "Interrupted"
-        else:
-            state, code = "completed", result
-            outcome = (
-                "Completed successfully" if code == 0 else f"Exited with code {code}"
-            )
         return ProcessInfo(
-            process_id=self.summary.process_id,
-            executable=self.summary.executable,
-            arguments=list(self.summary.arguments),
-            cwd=self.summary.cwd,
-            encoding=self.summary.encoding,
-            timeout=self.summary.timeout,
-            pid=self.status.pid,
-            started=self.status.started,
-            work_time=self.status.work_time,
-            state=state,
-            return_code=code,
-            interruption_reason=reason,
-            outcome=outcome,
+            summary=self.summary,
+            status=self.status.model_copy(),
         )
 
     async def terminate(self, process: Process) -> None:
@@ -108,9 +86,7 @@ class ProcessRecord:
 
     async def monitor(self, process: Process, stopping: asyncio.Event) -> None:
         loop = asyncio.get_running_loop()
-        self.start = loop.time()
 
-        status = self.status
         summary = self.summary
         timeout = summary.timeout
         task = asyncio.create_task(process.wait())
@@ -118,9 +94,8 @@ class ProcessRecord:
             while True:
                 finished = False
                 timed_out = False
-                interruption_reason = None
                 message: str
-                result: Literal["interrupted", "running"] | int
+                result: Literal["interrupted", "running", "stopped"] | int
 
                 try:
                     result = await asyncio.wait_for(asyncio.shield(task), 0.250)
@@ -136,8 +111,7 @@ class ProcessRecord:
                     if stopping.is_set():
                         await self.terminate(process)
                         finished = True
-                        result = "interrupted"
-                        interruption_reason = "stopped"
+                        result = "stopped"
                         message = f"Process {summary.process_id} stopped"
                     elif timeout.total is not None:
                         finished = duration > timeout.total
@@ -145,7 +119,6 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            interruption_reason = "total timeout"
                             message = f"Process {summary.process_id} interrupted by timeout {timeout.total}"
 
                     if not finished and timeout.idle is not None:
@@ -153,8 +126,8 @@ class ProcessRecord:
                             finished = (
                                 now
                                 - (
-                                    status.transcript[-1].time
-                                    if len(status.transcript)
+                                    self.transcript[-1].time
+                                    if self.transcript
                                     else self.start
                                 )
                                 > timeout.idle
@@ -163,14 +136,12 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            interruption_reason = "idle timeout"
                             message = f"Process {summary.process_id} interrupted by idle {timeout.idle}"
 
                 if finished:
                     async with self.lock:
                         self.status.work_time = duration
                         self.status.current_status = result
-                        self.status.interruption_reason = interruption_reason
                     logger.info(message)
                     if timed_out:
                         raise ProcessError(message)
@@ -202,14 +173,24 @@ class ProcessRecord:
                 text = decoder.decode(chunk)
                 await queue.put(ProcessOutput(stream=stream, text=text))
                 async with self.lock:
-                    self.status.transcript.append(
-                        ProcessLogEntry(time=loop.time(), stream=stream, text=text)
+                    now = loop.time()
+                    self.transcript.append(
+                        ProcessLogEntry(
+                            time=now,
+                            stream=stream,
+                            text=text,
+                        )
                     )
 
             if text := decoder.final():
                 async with self.lock:
-                    self.status.transcript.append(
-                        ProcessLogEntry(time=loop.time(), stream=stream, text=text)
+                    now = loop.time()
+                    self.transcript.append(
+                        ProcessLogEntry(
+                            time=now,
+                            stream=stream,
+                            text=text,
+                        )
                     )
                 await queue.put(ProcessOutput(stream=stream, text=text))
 
@@ -245,8 +226,13 @@ class ProcessRecord:
 
                 writer.write(encoder.encode(text))
                 async with self.lock:
-                    self.status.transcript.append(
-                        ProcessLogEntry(time=loop.time(), stream="stdin", text=text)
+                    now = loop.time()
+                    self.transcript.append(
+                        ProcessLogEntry(
+                            time=now,
+                            stream="stdin",
+                            text=text,
+                        )
                     )
                 await writer.drain()
         except (OSError, UnicodeError) as error:
@@ -318,6 +304,20 @@ class ProcessService:
     def format_timestamp(value: datetime) -> str:
         """Render a process timestamp to readable UTC seconds."""
         return value.astimezone(timezone.utc).strftime("%d %b %Y, %H:%M:%S UTC")
+
+    @staticmethod
+    def describe_status(status: str | int) -> str:
+        """Render terminal state in Markdown resources."""
+        if isinstance(status, int):
+            return (
+                "Completed successfully" if status == 0 else f"Exited with code {status}"
+            )
+        return {
+            "running": "Running",
+            "interrupted": "Interrupted by timeout",
+            "stopped": "Stopped",
+            "stream_failure": "Stream failure",
+        }[status]
 
     def __init__(
         self,
@@ -445,7 +445,7 @@ class ProcessService:
                 )
                 async with record.lock:
                     snapshot = record.snapshot()
-                    if snapshot.state == "running":
+                    if snapshot.status.current_status == "running":
                         running += 1
                         if status == "all" or status == "running":
                             processes.append(snapshot)
@@ -485,7 +485,7 @@ class ProcessService:
             async with record.lock:
                 details = ProcessDetails(
                     process=record.snapshot(),
-                    transcript=list(record.status.transcript),
+                    transcript=list(record.transcript),
                 )
             await report_progress(1, total=1, message="Process transcript ready")
             return details
@@ -503,16 +503,18 @@ class ProcessService:
             for record in tuple(self.records.values()):
                 async with record.lock:
                     item = record.snapshot()
+                status = item.status.current_status
+                outcome = self.describe_status(status)
                 table.add(
                     [
                         markdown.Link(
-                            str(item.process_id),
-                            f"forgemcp://processes/{item.process_id}",
+                            str(item.summary.process_id),
+                            f"forgemcp://processes/{item.summary.process_id}",
                         ),
-                        item.executable,
-                        str(item.pid),
-                        self.format_timestamp(item.started),
-                        item.outcome,
+                        item.summary.executable,
+                        str(item.status.pid),
+                        self.format_timestamp(item.status.started),
+                        outcome,
                     ]
                 )
             document.add(table)
@@ -527,33 +529,51 @@ class ProcessService:
             record = self.records[process_id]
             async with record.lock:
                 item = record.snapshot()
-                transcript = list(record.status.transcript)
+                transcript = list(record.transcript)
             document = markdown.Document(
-                [markdown.Heading(f"Process {item.process_id}: {item.executable}")]
+                [markdown.Heading(f"Process {item.summary.process_id}: {item.summary.executable}")]
             )
             table = markdown.Table(["Property", "Value"])
-            table.add(["Outcome", item.outcome])
-            table.add(["PID", str(item.pid)])
-            table.add(["Started (UTC)", self.format_timestamp(item.started)])
-            table.add(["Work time", f"{item.work_time:.2f} s"])
-            table.add(["Working directory", item.cwd])
-            table.add(["Encoding", item.encoding])
-            table.add(["Total timeout", f"{item.timeout.total} s" if item.timeout.total is not None else "None"])
-            table.add(["Idle timeout", f"{item.timeout.idle} s" if item.timeout.idle is not None else "None"])
+            table.add(["Outcome", self.describe_status(item.status.current_status)])
+            table.add(["PID", str(item.status.pid)])
+            table.add(["Started (UTC)", self.format_timestamp(item.status.started)])
+            table.add(["Work time", f"{item.status.work_time:.2f} s"])
+            table.add(["Working directory", item.summary.cwd])
+            table.add(["Encoding", item.summary.encoding])
+            table.add(
+                [
+                    "Total timeout",
+                    f"{item.summary.timeout.total} s"
+                    if item.summary.timeout.total is not None
+                    else "None",
+                ]
+            )
+            table.add(
+                [
+                    "Idle timeout",
+                    f"{item.summary.timeout.idle} s"
+                    if item.summary.timeout.idle is not None
+                    else "None",
+                ]
+            )
             document.add(table)
             document.add(markdown.Heading("Arguments", level=2))
             document.add(
-                markdown.OrderedList(item.arguments)
-                if item.arguments
+                markdown.OrderedList(item.summary.arguments)
+                if item.summary.arguments
                 else markdown.Paragraph("None")
             )
             document.add(markdown.Heading("Transcript", level=2))
             if not transcript:
                 document.add(markdown.Paragraph("No stream chunks recorded."))
             for entry in transcript:
+                elapsed = max(
+                    0.0,
+                    (entry.timestamp - item.status.started).total_seconds(),
+                )
                 document.add(
                     markdown.Heading(
-                        f"{entry.stream} · {self.format_timestamp(entry.timestamp)}",
+                        f"{entry.stream} · {self.format_timestamp(entry.timestamp)} · +{elapsed:.3f} s",
                         level=3,
                     )
                 )
@@ -686,14 +706,12 @@ class ProcessSession:
                 async with self.record.lock:
                     if self.record.status.current_status == "running":
                         self.record.status.current_status = (
-                            "interrupted"
-                            if self.stopping.is_set() or self.failure is not None
+                            "stream_failure"
+                            if self.failure is not None
+                            else "stopped"
+                            if self.stopping.is_set()
                             else cast(int, self.process.returncode)
                         )
-                        if self.record.status.current_status == "interrupted":
-                            self.record.status.interruption_reason = (
-                                "stream failure" if self.failure is not None else "stopped"
-                            )
                     self.record.status.work_time = (
                         asyncio.get_running_loop().time() - self.record.start
                     )

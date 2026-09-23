@@ -1,5 +1,6 @@
 import { App, PostMessageTransport, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { timestamp } from "./shared/presentation.js";
+import { processStatus } from "./process-status.js";
 import "./shared/widget.css";
 import "./process.css";
 
@@ -101,14 +102,17 @@ function render() {
   info.replaceChildren(make("summary", "", "Process settings"));
   if (!details) return;
   const process = details.process;
-  meta.textContent = `#${process.process_id} · ${process.executable} · PID ${process.pid} · ${process.outcome} · ${timestamp(process.started)?.readable ?? process.started}`;
+  const command = process.summary;
+  const status = process.status;
+  const display = processStatus(status.current_status);
+  meta.textContent = `#${command.process_id} · ${command.executable} · PID ${status.pid} · ${display.label} · ${timestamp(status.started)?.readable ?? status.started}`;
   const settings = make("dl");
   for (const [key, value] of [
-    ["Arguments", process.arguments.join(" ") || "None"],
-    ["Working directory", process.cwd],
-    ["Encoding", process.encoding],
-    ["Work time", `${process.work_time.toFixed(2)} s`],
-    ["Timeout", JSON.stringify(process.timeout)],
+    ["Arguments", command.arguments.join(" ") || "None"],
+    ["Working directory", command.cwd],
+    ["Encoding", command.encoding],
+    ["Work time", `${status.work_time.toFixed(2)} s`],
+    ["Timeout", JSON.stringify(command.timeout)],
   ]) {
     settings.append(make("dt", "", key), make("dd", "", String(value)));
   }
@@ -131,7 +135,8 @@ function render() {
     const chunk = make("span", "fm-process-chunk");
     chunk.tabIndex = 0;
     const readable = timestamp(entry.timestamp)?.readable ?? entry.timestamp;
-    const hint = `${entry.stream} · ${readable}`;
+    const elapsed = Math.max(0, (Date.parse(entry.timestamp) - Date.parse(status.started)) / 1000);
+    const hint = `${entry.stream} · ${readable} · +${elapsed.toFixed(3)} s since start`;
     chunk.setAttribute("aria-label", hint);
     chunk.addEventListener("mouseenter", () => { footer.textContent = hint; });
     chunk.addEventListener("focus", () => { footer.textContent = hint; });
@@ -139,11 +144,12 @@ function render() {
     chunk.addEventListener("blur", () => { footer.textContent = `${transcript.length} chunks`; });
     appendColored(chunk, entry.text, state);
     log.append(chunk);
-    if (activeTab === "combined" && !entry.text.endsWith("\n")) {
+    const next = transcript[index + 1];
+    if (activeTab === "combined" && !entry.text.endsWith("\n") && (!next || next.stream !== entry.stream)) {
       const marker = make("span", "fm-process-break");
       marker.setAttribute("aria-label", "Chunk ended without a newline");
       log.append(marker);
-      if (index < transcript.length - 1) log.append("\n");
+      if (next) log.append("\n");
     }
   });
   if (!transcript.length) log.textContent = "No stream chunks recorded.";

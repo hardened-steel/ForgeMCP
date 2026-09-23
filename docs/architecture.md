@@ -382,11 +382,15 @@ groups and descendant-tree management are intentionally outside the current scop
 
 The read-only MCP surface consists of `processes_overview(status)`,
 `process_get(process_id)`, their widgets, `forgemcp://processes`, and
-`forgemcp://processes/{process_id}`. Overview snapshots include the terminal outcome,
-return code, and interruption reason without copying transcripts. The detail tool and
-resource expose a point-in-time state and complete ordered text transcript; neither
-starts or stops a process. The detail widget provides combined and per-stream views,
-with basic ANSI SGR color rendering. Completion suggests retained process IDs.
+`forgemcp://processes/{process_id}`. Overview entries pair `ProcessSummary` with a
+transcript-free `ProcessStatus`; `current_status` is a return code, `running`,
+`interrupted` (timeout), `stopped`, or `stream_failure`. The complete transcript stays
+on `ProcessRecord` and is returned only by the detail tool. The detail view derives
+elapsed seconds from each entry's timestamp and the process start timestamp. The
+detail tool and resource expose a point-in-time state and complete ordered text
+transcript; neither starts or stops a process. The detail widget provides combined
+and per-stream views, with basic ANSI SGR color
+rendering. Completion suggests retained process IDs.
 A well-formed URI whose process ID is not retained raises
 `ResourceNotFoundError`; other unexpected exceptions remain unwrapped so the SDK
 sanitizes them as resource crashes.
