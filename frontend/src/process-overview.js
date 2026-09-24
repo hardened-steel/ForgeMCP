@@ -5,6 +5,7 @@ import "./process.css";
 
 function describe(data) {
   let showAll = false;
+  let newestFirst = false;
   const presentation = {
     toolName: "processes_overview",
     summary: { running: data.running, completed: data.completed },
@@ -12,22 +13,34 @@ function describe(data) {
     count: `${data.processes.length} processes`,
     render(doc, query) {
       const container = doc.createElement("div");
+      const controls = doc.createElement("div");
+      controls.className = "fm-process-controls";
       const summary = doc.createElement("p");
       summary.className = "fm-process-summary";
       summary.textContent = `${data.running} running · ${data.completed} completed`;
-      container.append(summary);
-      const matches = data.processes.filter((item) => JSON.stringify(item).toLocaleLowerCase().includes(query));
       const expand = doc.createElement("button");
       expand.type = "button";
-      expand.className = "fm-process-expand";
+      expand.className = "fm-process-action";
       expand.textContent = showAll ? "Collapse list" : "Expand list";
       expand.setAttribute("aria-expanded", String(showAll));
       expand.addEventListener("click", () => {
         showAll = !showAll;
         container.replaceWith(presentation.render(doc, query));
       });
-      container.append(expand);
-      const visible = showAll ? matches : matches.slice(0, 10);
+      const order = doc.createElement("button");
+      order.type = "button";
+      order.className = "fm-process-action";
+      order.textContent = "Newest first";
+      order.setAttribute("aria-pressed", String(newestFirst));
+      order.addEventListener("click", () => {
+        newestFirst = !newestFirst;
+        container.replaceWith(presentation.render(doc, query));
+      });
+      controls.append(summary, expand, order);
+      container.append(controls);
+      const matches = data.processes.filter((item) => JSON.stringify(item).toLocaleLowerCase().includes(query));
+      const ordered = newestFirst ? [...matches].reverse() : matches;
+      const visible = showAll ? ordered : ordered.slice(0, 10);
       for (const item of visible) {
         const command = item.summary;
         const status = item.status;
