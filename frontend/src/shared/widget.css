@@ -24,6 +24,7 @@ body { margin: 0; background: transparent; }
   container-type: inline-size;
 }
 .fm-widget *, .fm-widget *::before, .fm-widget *::after { box-sizing: border-box; min-width: 0; }
+.fm-widget.fm-compact { height: 160px; }
 .fm-window { height: 100%; display: flex; flex-direction: column; border: 1px solid var(--fm-border); background: var(--fm-bg); overflow: hidden; }
 .fm-titlebar, .fm-toolbar, .fm-filters, .fm-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px; flex: none; }
 .fm-titlebar { padding: 5px 10px; background: var(--fm-bar); border-bottom: 1px solid var(--fm-border); }
@@ -94,6 +95,11 @@ body { margin: 0; background: transparent; }
 .fm-match-line code { font: inherit; white-space: pre; overflow: hidden; tab-size: 4; }
 .fm-match-expanded code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .fm-match-line mark { color: inherit; background: light-dark(#ffe69a, #685319); }
+.fm-match-line mark.fm-local-match, .fm-source-line mark.fm-local-match { color: inherit; background: light-dark(#b3e7ee, #20565e); }
+.fm-diff-add code { color: var(--fm-success); }
+.fm-diff-remove code { color: var(--fm-error); }
+.fm-file-sort { display: flex; gap: 6px; border-bottom: 1px solid var(--fm-border); padding: 3px 0; }
+.fm-file-path { padding: 3px 0; border-bottom: 1px solid var(--fm-border); overflow-wrap: anywhere; }
 .fm-zero-match::after { content: "│"; }
 .fm-skipped-path { overflow-wrap: anywhere; padding: 3px 0; }
 .fm-tree { list-style: none; padding: 0; margin: 3px 0; white-space: normal; }

@@ -22,7 +22,8 @@ test("tree distinguishes empty and unexpanded directories without null children"
   ] };
   const { root } = mount(t, data);
   assert.equal(root.querySelector("h1").textContent, "workspace_list");
-  for (const value of ["src/<script>.cpp", "empty directory", "visible", "symlink"]) assert.ok(root.textContent.includes(value));
+  for (const value of ["<script>.cpp", "empty directory", "visible", "symlink"]) assert.ok(root.textContent.includes(value));
+  assert.ok(!root.querySelector(".fm-tree").textContent.includes("src/<script>.cpp"));
   assert.equal(root.querySelector("script"), null);
   assert.ok(!root.textContent.includes("children:"));
   assert.equal(root.querySelectorAll(".fm-tree-path").length, 5);
@@ -114,11 +115,68 @@ test("file wrap toggle selects horizontal scrolling without changing text", (t) 
 test("find results expose every path with local filtering", (t) => {
   const data = { root: "project", paths: Array.from({ length: 150 }, (_, i) => `src/file-${i}.cpp`) };
   const { root, win } = mount(t, data);
-  assert.equal(root.querySelectorAll(".fm-record").length, 150);
+  assert.equal(root.querySelectorAll(".fm-file-path").length, 150);
   root.querySelector("input").value = "file-149";
   root.querySelector("input").dispatchEvent(new win.Event("input"));
-  assert.equal(root.querySelectorAll(".fm-record").length, 1);
+  assert.equal(root.querySelectorAll(".fm-file-path").length, 1);
   assert.ok(root.textContent.includes("src/file-149.cpp"));
+});
+
+test("find results sort by name, date, and size without repeating paths", (t) => {
+  const data = {
+    paths: ["project/a.cpp", "project/b.cpp", "project/c.cpp"],
+    files: [
+      { path: "project/a.cpp", modified_at: "2026-01-01T00:00:00Z", size_bytes: 2 },
+      { path: "project/b.cpp", modified_at: "2026-01-03T00:00:00Z", size_bytes: 1 },
+      { path: "project/c.cpp", modified_at: "2026-01-02T00:00:00Z", size_bytes: 3 },
+    ],
+  };
+  const { root } = mount(t, data);
+  const paths = () => [...root.querySelectorAll(".fm-file-path")].map((node) => node.textContent);
+  assert.deepEqual(paths(), data.paths);
+  assert.equal(root.querySelectorAll(".fm-file-path").length, 3);
+  root.querySelectorAll(".fm-file-sort button")[1].click();
+  assert.deepEqual(paths(), ["project/b.cpp", "project/c.cpp", "project/a.cpp"]);
+  root.querySelectorAll(".fm-file-sort button")[2].click();
+  assert.deepEqual(paths(), ["project/c.cpp", "project/a.cpp", "project/b.cpp"]);
+  root.querySelectorAll(".fm-file-sort button")[2].click();
+  assert.deepEqual(paths(), ["project/b.cpp", "project/a.cpp", "project/c.cpp"]);
+});
+
+test("read, write, and edit search only source lines while keeping original numbering", (t) => {
+  const { root, view, win } = mount(t, {
+    path: "project/a.cpp", text: "first\nneedle\nlast\nneedle again", start_line: 30,
+  });
+  const search = root.querySelector("input");
+  search.value = "needle";
+  search.dispatchEvent(new win.Event("input"));
+  assert.deepEqual([...root.querySelectorAll(".fm-source-line")].map((node) => node.dataset.line), ["31", "33"]);
+  assert.equal(root.querySelectorAll(".fm-local-match").length, 2);
+  assert.ok(![...root.querySelectorAll("dt")].some((node) => node.textContent === "start_line"));
+  view.receive({ structuredContent: { path: "project/a.cpp", action: "overwritten", lines_added: 1, lines_removed: 1, diff: "--- before\n+++ after\n@@ -4 +4 @@\n-old\n+needle\n" } });
+  root.querySelector("input").value = "needle";
+  root.querySelector("input").dispatchEvent(new win.Event("input"));
+  assert.deepEqual([...root.querySelectorAll(".fm-source-line")].map((node) => node.dataset.line), ["+4"]);
+  view.receive({ structuredContent: { path: "project/a.cpp", replacements: 1, changed_lines: ["-4 +4"], diff: "--- before\n+++ after\n@@ -4 +4 @@\n-old\n+needle\n" } });
+  assert.ok(root.textContent.includes("-4 +4"));
+});
+
+test("result resources have a separate tab and move/delete use compact fields", (t) => {
+  const data = {
+    path: "project/new.cpp", action: "moved", source: "project/old.cpp",
+    extensions_uri: "forgemcp://workspace/results/1/extensions.json",
+    resources: [{ uri: "forgemcp://workspace/results/1/info.md", mime_type: "text/markdown" }],
+  };
+  const { root, view } = mount(t, data);
+  assert.ok(root.classList.contains("fm-compact"));
+  assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["source", "destination"]);
+  assert.equal(root.querySelector(".fm-filters").hidden, true);
+  root.querySelector(".fm-views button:nth-child(2)").click();
+  assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["extensions_uri", "resources"]);
+  root.querySelector(".fm-views button:last-child").click();
+  assert.equal(root.querySelector("pre").textContent, JSON.stringify(data, null, 2));
+  view.receive({ structuredContent: { path: "project/new.cpp", action: "deleted" } });
+  assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["path"]);
 });
 
 test("mutation and metadata shapes select the correct tool without additional calls", (t) => {
@@ -134,7 +192,8 @@ test("mutation and metadata shapes select the correct tool without additional ca
     const data = { root: "project", path: "example", ...fields };
     const { root, view } = mount(t, data);
     assert.equal(root.querySelector("h1").textContent, name);
-    assert.equal(root.querySelectorAll("dt").length, Object.keys(data).length);
+    const visible = name === "workspace_move" ? 2 : name === "workspace_delete" ? 1 : Object.keys(data).length;
+    assert.equal(root.querySelectorAll("dt").length, visible);
     view.receive({ isError: true, content: [{ type: "text", text: "Expected one occurrence" }] });
     assert.ok(root.textContent.includes("Expected one occurrence"));
     assert.equal(root.querySelector("dl"), null);

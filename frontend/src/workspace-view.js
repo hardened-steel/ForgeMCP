@@ -102,13 +102,14 @@ function searchView(doc, data, query, width) {
           const left = Math.max(from, a, cursor);
           const right = Math.min(to, b);
           if (right < left) continue;
-          code.append(doc.createTextNode(points.slice(cursor, left).join("")));
-          const mark = node("mark", a === b ? "fm-zero-match" : "", points.slice(left, right).join(""));
+          appendHighlighted(doc, code, points.slice(cursor, left).join(""), query);
+          const mark = node("mark", a === b ? "fm-zero-match" : "");
+          appendHighlighted(doc, mark, points.slice(left, right).join(""), query);
           if (a === b) mark.setAttribute("aria-label", "Zero-width match");
           code.append(mark);
           cursor = right;
         }
-        code.append(doc.createTextNode(points.slice(cursor, to).join("")));
+        appendHighlighted(doc, code, points.slice(cursor, to).join(""), query);
         if (to < points.length) code.append(doc.createTextNode("…"));
       }
       if (truncated) row.addEventListener("click", () => {
@@ -131,15 +132,86 @@ function searchView(doc, data, query, width) {
   return view;
 }
 
+function appendHighlighted(doc, target, text, query) {
+  if (!query) { target.append(doc.createTextNode(text)); return; }
+  let cursor = 0;
+  const lower = text.toLocaleLowerCase();
+  while (cursor < text.length) {
+    const found = lower.indexOf(query, cursor);
+    if (found < 0) { target.append(doc.createTextNode(text.slice(cursor))); break; }
+    target.append(doc.createTextNode(text.slice(cursor, found)));
+    const mark = doc.createElement("mark");
+    mark.className = "fm-local-match";
+    mark.textContent = text.slice(found, found + query.length);
+    target.append(mark);
+    cursor = found + query.length;
+  }
+}
+
+function resources(data) {
+  return ["extensions_uri", "resources"].filter((key) => key in data);
+}
+
+function without(data, keys) {
+  return Object.fromEntries(Object.entries(data).filter(([key]) => !keys.includes(key)));
+}
+
+function findView(doc, data, query, state) {
+  const container = doc.createElement("div");
+  const controls = doc.createElement("div");
+  controls.className = "fm-file-sort";
+  for (const [key, label] of [["name", "Name"], ["modified_at", "Date"], ["size_bytes", "Size"]]) {
+    const control = doc.createElement("button");
+    control.type = "button";
+    control.textContent = label + (state.key === key ? (state.desc ? " ↓" : " ↑") : "");
+    control.setAttribute("aria-pressed", String(state.key === key));
+    control.addEventListener("click", () => {
+      state.desc = state.key === key ? !state.desc : key !== "name";
+      state.key = key;
+      container.replaceWith(findView(doc, data, query, state));
+    });
+    controls.append(control);
+  }
+  container.append(controls);
+  const metadata = new Map((data.files ?? []).map((file) => [file.path, file]));
+  const paths = data.paths.filter((path) => path.toLocaleLowerCase().includes(query));
+  paths.sort((left, right) => {
+    const a = state.key === "name" ? left : metadata.get(left)?.[state.key];
+    const b = state.key === "name" ? right : metadata.get(right)?.[state.key];
+    const compared = typeof a === "number" && typeof b === "number" ? a - b
+      : String(a ?? "").localeCompare(String(b ?? ""));
+    return (state.desc ? -compared : compared) || left.localeCompare(right);
+  });
+  for (const path of paths) {
+    const row = doc.createElement("div");
+    row.className = "fm-file-path";
+    row.textContent = path;
+    container.append(row);
+  }
+  if (!paths.length) {
+    const empty = doc.createElement("p");
+    empty.className = "fm-empty";
+    empty.textContent = "No matching files.";
+    container.append(empty);
+  }
+  return container;
+}
+
 export function workspacePresentation(data) {
   if (!isObject(data)) return { toolName: "Workspace result", summary: data, records: null };
   if (Array.isArray(data.paths)) {
-    const { paths, ...summary } = data;
-    return { toolName: "workspace_find_files", summary, records: paths.map((path) => ({ path })), titleKey: "path" };
+    const state = { key: "name", desc: false };
+    return {
+      toolName: "workspace_find_files", summary: data, records: null,
+      resourceFields: resources(data), filterPlaceholder: "Filter files",
+      render: (doc, query) => findView(doc, data, query, state),
+      count: `${data.paths.length} files`,
+    };
   }
   if (Array.isArray(data.matches)) {
     return {
       toolName: "workspace_search", summary: data, records: null,
+      resourceFields: resources(data), filterPlaceholder: "Search results",
       count: `${data.matches.length} matches · ${new Set(data.matches.map((match) => match.path)).size} files`,
       render: (doc, query, width) => searchView(doc, data, query, width),
     };
@@ -152,14 +224,40 @@ export function workspacePresentation(data) {
     : data.action === "moved" ? "workspace_move"
     : data.action === "deleted" ? "workspace_delete"
     : ["created", "already_exists"].includes(data.action) ? "workspace_mkdir" : "Workspace result";
-  return { toolName, summary: data, records: null };
+  const resourceFields = resources(data);
+  const hidden = [...resourceFields];
+  if (toolName === "workspace_read_file") hidden.push("start_line");
+  if (toolName === "workspace_edit_file") hidden.push("changed_lines");
+  if (toolName === "workspace_move" || toolName === "workspace_delete") {
+    const fields = toolName === "workspace_move" ? ["source", "path"] : ["path"];
+    return {
+      toolName, summary: data, records: null, resourceFields,
+      viewData: Object.fromEntries(fields.map((key) => [key === "path" && toolName === "workspace_move" ? "destination" : key, data[key]])),
+      fieldFilter: false, hideFilter: true, compact: true,
+    };
+  }
+  if (toolName === "workspace_list") {
+    return {
+      toolName, summary: data, records: null, resourceFields,
+      viewData: without(data, hidden), fieldFilter: false, filterPlaceholder: "Filter files",
+    };
+  }
+  if (["workspace_read_file", "workspace_write_file", "workspace_edit_file"].includes(toolName)) {
+    const display = without(data, hidden);
+    if (toolName === "workspace_edit_file") display.replacements = data.changed_lines?.join(", ") || "None";
+    return {
+      toolName, summary: data, records: null, resourceFields, viewData: display,
+      fieldFilter: false, filterPlaceholder: "Search lines",
+    };
+  }
+  return { toolName, summary: data, records: null, resourceFields, viewData: without(data, hidden) };
 }
 
-export function workspaceValue(value, key, record, { doc, valueNode }) {
-  if (key === "text" && typeof value === "string" && ("start_line" in record || "line" in record)) {
+export function workspaceValue(value, key, record, { doc, valueNode, query = "" }) {
+  if ((key === "text" || key === "diff") && typeof value === "string") {
     const source = doc.createElement("div");
     source.className = "fm-source";
-    source.setAttribute("aria-label", "File text with line numbers");
+    source.setAttribute("aria-label", key === "diff" ? "File diff with line numbers" : "File text with line numbers");
     if (!value) { source.textContent = "Empty string"; return source; }
     const wrap = doc.createElement("button");
     wrap.type = "button";
@@ -176,16 +274,47 @@ export function workspaceValue(value, key, record, { doc, valueNode }) {
     viewport.setAttribute("aria-label", "File contents");
     source.append(wrap, viewport);
     const lines = value.split(/(?<=\n)|(?<=\r)(?!\n)/);
+    let oldLine = 0;
+    let newLine = 0;
     lines.forEach((text, index) => {
       if (index === lines.length - 1 && text === "") return;
+      let number = String((record.start_line ?? record.line ?? 1) + index);
+      if (key === "diff") {
+        const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+        if (hunk) {
+          oldLine = Number(hunk[1]);
+          newLine = Number(hunk[2]);
+          number = "";
+        } else if (text.startsWith("---") || text.startsWith("+++")) {
+          number = "";
+        } else if (text.startsWith("-")) {
+          number = `-${oldLine++}`;
+        } else if (text.startsWith("+")) {
+          number = `+${newLine++}`;
+        } else if (oldLine && newLine) {
+          number = String(newLine++);
+          oldLine++;
+        }
+      }
+      if (query && !text.toLocaleLowerCase().includes(query)) return;
       const line = doc.createElement("div");
       line.className = "fm-source-line";
-      line.dataset.line = String((record.start_line ?? record.line) + index);
+      line.dataset.line = number;
+      if (key === "diff") {
+        if (text.startsWith("+")) line.classList.add("fm-diff-add");
+        if (text.startsWith("-")) line.classList.add("fm-diff-remove");
+      }
       const code = doc.createElement("code");
-      code.textContent = text;
+      appendHighlighted(doc, code, text, query);
       line.append(code);
       viewport.append(line);
     });
+    if (query && !viewport.children.length) {
+      const empty = doc.createElement("p");
+      empty.className = "fm-empty";
+      empty.textContent = "No matching lines.";
+      viewport.append(empty);
+    }
     return source;
   }
   if (key !== "entries" || !Array.isArray(value)) return undefined;
@@ -196,12 +325,26 @@ export function workspaceValue(value, key, record, { doc, valueNode }) {
     empty.textContent = "Empty list";
     tree.append(empty);
   }
-  for (const entry of value) {
+  const visible = (entry) => {
+    if (!query) return true;
+    if (entry?.kind === "directory") {
+      return entry.children?.some(visible) ?? false;
+    }
+    return String(entry?.path ?? "").toLocaleLowerCase().includes(query);
+  };
+  const shown = value.filter(visible);
+  if (query && !shown.length) {
+    const empty = doc.createElement("li");
+    empty.className = "fm-empty";
+    empty.textContent = "No matching files.";
+    tree.append(empty);
+  }
+  for (const entry of shown) {
     const item = doc.createElement("li");
     if (!isObject(entry)) { item.append(valueNode(entry)); tree.append(item); continue; }
     const label = doc.createElement("span");
     label.className = "fm-tree-path";
-    label.textContent = entry.path;
+    label.textContent = String(entry.path).split("/").at(-1);
     const kind = doc.createElement("span");
     kind.className = "fm-label";
     const empty = entry.kind === "directory" && Array.isArray(entry.children) && entry.children.length === 0;
@@ -211,7 +354,7 @@ export function workspaceValue(value, key, record, { doc, valueNode }) {
       if (["path", "kind"].includes(name)) continue;
       if (name === "children") {
         if (Array.isArray(field) && field.length) {
-          item.append(workspaceValue(field, "entries", entry, { doc, valueNode }));
+          item.append(workspaceValue(field, "entries", entry, { doc, valueNode, query }));
         }
       } else {
         const extra = doc.createElement("span");

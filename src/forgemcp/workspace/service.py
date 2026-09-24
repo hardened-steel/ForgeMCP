@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import fnmatch
 import json
 import logging
@@ -66,8 +67,15 @@ class DirectoryTree(ResultResources):
     entries: list[TreeEntry]
 
 
+class FoundFile(BaseModel):
+    path: WorkspacePath
+    modified_at: datetime
+    size_bytes: int
+
+
 class FilePaths(ResultResources):
     paths: list[WorkspacePath]
+    files: list[FoundFile] = Field(default_factory=list)
 
 
 class FileContent(ResultResources):
@@ -103,11 +111,14 @@ class FileWriteResult(ResultResources):
     action: Literal["created", "overwritten"]
     lines_removed: int
     lines_added: int
+    diff: str = ""
 
 
 class FileEditResult(ResultResources):
     path: WorkspacePath
     replacements: int
+    changed_lines: list[str] = Field(default_factory=list)
+    diff: str = ""
 
 
 class PathOperationResult(ResultResources):
@@ -540,6 +551,41 @@ class WorkspaceService:
                 temporary.chmod(temporary.stat().st_mode | stat.S_IWUSR)
                 temporary.unlink(missing_ok=True)
 
+    @staticmethod
+    def text_diff(before: str, after: str) -> tuple[str, list[str]]:
+        old_lines = before.splitlines(keepends=True)
+        new_lines = after.splitlines(keepends=True)
+        diff = "".join(
+            line if line.endswith(("\n", "\r")) else line + "\n"
+            for line in difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile="before",
+                tofile="after",
+            )
+        )
+        ranges = []
+        for operation, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+            None,
+            old_lines,
+            new_lines,
+            autojunk=False,
+        ).get_opcodes():
+            if operation == "equal":
+                continue
+            old = (
+                f"-{old_start + 1}" if old_end - old_start == 1
+                else f"-{old_start + 1}-{old_end}" if old_end > old_start
+                else ""
+            )
+            new = (
+                f"+{new_start + 1}" if new_end - new_start == 1
+                else f"+{new_start + 1}-{new_end}" if new_end > new_start
+                else ""
+            )
+            ranges.append(" ".join(part for part in (old, new) if part))
+        return diff, ranges
+
     def write_file(
         self,
         path: WorkspacePath,
@@ -549,12 +595,14 @@ class WorkspaceService:
             candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.exists()
             previous = self.read_file(path).text if existed else ""
+            diff, _ = self.text_diff(previous, text)
             self.replace_text(candidate, text)
             return FileWriteResult(
                 path=path,
                 action="overwritten" if existed else "created",
                 lines_removed=len(previous.splitlines()),
                 lines_added=len(text.splitlines()),
+                diff=diff,
             )
 
     def edit_file(
@@ -579,10 +627,14 @@ class WorkspaceService:
                 raise WorkspaceError(
                     f"Found {count} occurrences; use replace_all or a more specific old_text."
                 )
-            self.replace_text(candidate, text.replace(old_text, new_text))
+            updated = text.replace(old_text, new_text)
+            diff, changed_lines = self.text_diff(text, updated)
+            self.replace_text(candidate, updated)
             return FileEditResult(
                 path=path,
                 replacements=count,
+                changed_lines=changed_lines,
+                diff=diff,
             )
 
     def move(
@@ -865,6 +917,7 @@ class WorkspaceService:
                 if not pattern:
                     raise WorkspaceError("File pattern must not be empty.")
                 paths = []
+                files = []
                 with filesystem_errors(path):
                     async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
@@ -879,13 +932,23 @@ class WorkspaceService:
                             else fnmatch.fnmatchcase(candidate.name, pattern)
                         )
                         if matches:
-                            paths.append(
-                                self.qualified_path(
-                                    path.area,
-                                    self.relative_path(candidate, root=path.area),
+                            found = self.qualified_path(
+                                path.area,
+                                self.relative_path(candidate, root=path.area),
+                            )
+                            paths.append(found)
+                            metadata = candidate.stat()
+                            files.append(
+                                FoundFile(
+                                    path=found,
+                                    modified_at=datetime.fromtimestamp(metadata.st_mtime, UTC),
+                                    size_bytes=metadata.st_size,
                                 )
                             )
-                result = FilePaths(paths=sorted(paths, key=str))
+                result = FilePaths(
+                    paths=sorted(paths, key=str),
+                    files=sorted(files, key=lambda file: str(file.path)),
+                )
                 return await self.enrich_result("workspace_find_files", result, paths)
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
@@ -994,7 +1057,11 @@ class WorkspaceService:
                 with filesystem_errors(path):
                     async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
-                        await report_progress(visited, message="Files visited")
+                        current = self.qualified_path(
+                            path.area,
+                            self.relative_path(candidate, root=path.area),
+                        )
+                        await report_progress(visited, message=f"Searching {current}")
                         if not self.extension_matches(candidate, extensions):
                             continue
                         relative = self.qualified_path(

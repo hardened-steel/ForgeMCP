@@ -35,6 +35,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   views.setAttribute("role", "group");
   views.setAttribute("aria-label", "Result view");
   const fieldsButton = button("[ Fields ]");
+  const resourcesButton = button("[ Resources ]");
   const jsonButton = button("[ JSON ]");
   const copyAll = button(undefined, "fm-copy-all");
   copyAll.setAttribute("aria-label", "Copy entire result");
@@ -129,7 +130,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   }
 
   function valueNode(value, key = "", record) {
-    const custom = renderValue?.(value, key, record, { doc, valueNode });
+    const custom = renderValue?.(value, key, record, { doc, valueNode, query: search.value.toLocaleLowerCase() });
     if (custom) return custom;
     const date = ["started_at", "finished_at", "created_at", "modified_at"].includes(key) ? timestamp(value) : null;
     if (date) {
@@ -167,13 +168,13 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     return element("span", `fm-value ${tone}`, value === "" ? "Empty string" : String(value));
   }
 
-  function fields(value) {
+  function fields(value, source = value) {
     const list = element("dl", "fm-fields");
     const entries = isObject(value) ? Object.entries(value) : [["value", value]];
     for (const [key, item] of entries) {
       const row = element("div", "fm-field");
       const description = element("dd", "fm-value");
-      description.append(valueNode(item, key, value));
+      description.append(valueNode(item, key, source));
       if (description.querySelector(".fm-source, .fm-tree")) row.classList.add("fm-wide-field");
       const copyField = button(undefined, "fm-copy");
       copyField.setAttribute("aria-label", `Copy ${key}`);
@@ -194,8 +195,9 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     hideHelp();
     content.replaceChildren();
     fieldsButton.setAttribute("aria-pressed", String(mode === "fields"));
+    resourcesButton.setAttribute("aria-pressed", String(mode === "resources"));
     jsonButton.setAttribute("aria-pressed", String(mode === "json"));
-    filters.hidden = mode !== "fields" || !presentation;
+    filters.hidden = mode !== "fields" || !presentation || presentation.hideFilter;
     if (!presentation) return;
     if (mode === "copy") {
       content.append(element("pre", "fm-json", manualCopy));
@@ -207,6 +209,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       for (const token of jsonTokens(raw)) pre.append(element("span", token.tone, token.text));
       content.append(pre);
       count.textContent = "Complete original result";
+      return;
+    }
+    if (mode === "resources") {
+      content.append(fields(Object.fromEntries((presentation.resourceFields ?? []).map((key) => [key, raw[key]]))));
+      count.textContent = "Linked result resources";
       return;
     }
     const query = search.value.toLocaleLowerCase();
@@ -237,9 +244,10 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       if (!shown) content.append(element("p", "fm-empty", presentation.records.length ? "No matching records. Clear or change the filters." : "No records in this result."));
       count.textContent = `${shown} / ${presentation.records.length} records${shown < presentation.records.length ? " · filter active" : ""}`;
     } else {
-      const entries = isObject(raw) ? Object.entries(raw) : [["value", raw]];
-      const filtered = entries.filter(([key, value]) => matches({ [key]: value }));
-      content.append(fields(Object.fromEntries(filtered)));
+      const display = presentation.viewData ?? raw;
+      const entries = isObject(display) ? Object.entries(display) : [["value", display]];
+      const filtered = presentation.fieldFilter === false ? entries : entries.filter(([key, value]) => matches({ [key]: value }));
+      content.append(fields(Object.fromEntries(filtered), raw));
       if (!filtered.length) content.append(element("p", "fm-empty", entries.length ? "No matching fields. Clear the filter." : "Empty result."));
       count.textContent = `${filtered.length} / ${entries.length} fields${filtered.length < entries.length ? " · filter active" : ""}`;
     }
@@ -253,7 +261,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     search.value = "";
     categories.replaceChildren();
     categories.hidden = true;
-    fieldsButton.disabled = jsonButton.disabled = copyAll.disabled = true;
+    fieldsButton.disabled = resourcesButton.disabled = jsonButton.disabled = copyAll.disabled = true;
     feedback.textContent = message;
     count.textContent = "";
     render();
@@ -272,9 +280,15 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     }
     raw = result.structuredContent;
     presentation = describe(raw);
+    root.classList.toggle("fm-compact", Boolean(presentation.compact));
+    if (presentation.resourceFields?.length) views.insertBefore(resourcesButton, jsonButton);
+    else resourcesButton.remove();
+    search.placeholder = presentation.filterPlaceholder ?? "Filter all fields";
+    search.setAttribute("aria-label", search.placeholder);
     title.textContent = presentation.toolName;
     mode = "fields";
     fieldsButton.disabled = jsonButton.disabled = copyAll.disabled = false;
+    resourcesButton.disabled = !presentation.resourceFields?.length;
     const values = presentation.categoryKey
       ? [...new Set((presentation.records ?? []).map((record) => record?.[presentation.categoryKey]).filter((value) => typeof value === "string"))]
       : [];
@@ -292,6 +306,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   }
 
   fieldsButton.addEventListener("click", () => { mode = "fields"; render(); });
+  resourcesButton.addEventListener("click", () => { mode = "resources"; render(); });
   jsonButton.addEventListener("click", () => { mode = "json"; render(); });
   search.addEventListener("input", render);
   categories.addEventListener("change", render);
