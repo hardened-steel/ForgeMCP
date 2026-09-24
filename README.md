@@ -238,8 +238,9 @@ or CTest case, with the common notification throttle. Preset generators are not
 overridden; their compilation-database settings remain controlled by the preset.
 
 The initial CMake slice does not yet include clean/project-inspection tools,
-widgets, syntax highlighting, or automated tests. Existing workspace tests and
-widgets have not been migrated or validated against the new path contract yet.
+widgets or syntax highlighting. Unit and in-process MCP tests cover profiles,
+command parsing, generator changes, result resources, and qualified paths.
+Existing workspace widgets have not yet been adapted or validated against the new path contract.
 
 ## Toolchain discovery
 

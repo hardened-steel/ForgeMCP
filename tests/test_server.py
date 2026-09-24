@@ -11,6 +11,7 @@ from mcp.types import ResourceTemplateReference
 from mcp.shared.exceptions import MCPError
 
 from forgemcp.server import argument_parser, create_server
+from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.service import WorkspaceService
 
 
@@ -61,7 +62,7 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
             app = await client.read_resource(tool.meta["ui"]["resourceUri"])
             assert app.contents[0].mime_type == APP_MIME_TYPE
         result = await client.call_tool("workspace_list", {}, progress_callback=collect)
-        assert not result.is_error and result.structured_content["root"] == "project"
+        assert not result.is_error and result.structured_content["path"] == "project/"
         assert result.content
         assert len(progress) > 2
         assert [value for value, _ in progress] == list(range(len(progress)))
@@ -78,34 +79,34 @@ async def test_full_file_workflow_through_client(cpp_acceptance_project):
             assert not result.is_error, result.content
             return result.structured_content
 
-        assert (await call("mkdir", path="new"))["action"] == "created"
-        assert (await call("write_file", path="new/a.txt", text="one\ntwo two\n"))[
+        assert (await call("mkdir", path="project/new"))["action"] == "created"
+        assert (await call("write_file", path="project/new/a.txt", text="one\ntwo two\n"))[
             "lines_added"
         ] == 2
         assert (
             await call(
                 "edit_file",
-                path="new/a.txt",
+                path="project/new/a.txt",
                 old_text="two",
                 new_text="three",
                 replace_all=True,
             )
         )["replacements"] == 2
-        assert (await call("read_file", path="new/a.txt", start_line=2))[
+        assert (await call("read_file", path="project/new/a.txt", start_line=2))[
             "text"
         ] == "three three\n"
-        assert (await call("file_info", path="new/a.txt"))["size_bytes"] == len(
+        assert (await call("file_info", path="project/new/a.txt"))["size_bytes"] == len(
             b"one\nthree three\n"
         )
-        assert (await call("find_files", pattern="new/*.txt"))["paths"] == ["new/a.txt"]
-        assert (await call("search", query="three", path="new"))["matches"][0][
+        assert (await call("find_files", pattern="new/*.txt"))["paths"] == ["project/new/a.txt"]
+        assert (await call("search", query="three", path="project/new"))["matches"][0][
             "line"
         ] == 2
-        assert (await call("move", source="new/a.txt", destination="new/b.txt"))[
+        assert (await call("move", source="project/new/a.txt", destination="project/new/b.txt"))[
             "action"
         ] == "moved"
-        assert (await call("delete", path="new/b.txt"))["action"] == "deleted"
-        await call("delete", path="new")
+        assert (await call("delete", path="project/new/b.txt"))["action"] == "deleted"
+        await call("delete", path="project/new")
         failed = await client.call_tool("workspace_read_file", {"path": "../outside"})
         assert failed.is_error
 
@@ -113,9 +114,9 @@ async def test_full_file_workflow_through_client(cpp_acceptance_project):
 @pytest.mark.anyio
 async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_project):
     workspace = WorkspaceService(cpp_acceptance_project)
-    workspace.mkdir("resource data")
+    workspace.mkdir(WorkspacePath("project/resource data"))
     text = "α\r\nfoo(x)/../#&\r\n```\n"
-    workspace.write_file("resource data/a#%.cpp", text)
+    workspace.write_file(WorkspacePath("project/resource data/a#%.cpp"), text)
     (cpp_acceptance_project / "resource data/data.bin").write_bytes(b"\x00\xff\x01")
     async with Client(create_server(cpp_acceptance_project)) as client:
         templates = (await client.list_resource_templates()).resource_templates
@@ -124,43 +125,43 @@ async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_p
             for item in templates
             if str(item.uri_template).startswith("forgemcp://workspace/")
         ]
-        assert len(workspace_templates) == 6
-        uri = workspace.file_uri("project", "resource data/a#%.cpp")
+        assert len(workspace_templates) == 8
+        uri = workspace.file_uri(WorkspacePath("project/resource data/a#%.cpp"))
         result = await client.read_resource(uri)
         assert result.contents[0].text == text
         assert result.contents[0].mime_type == "text/plain"
         raw = await client.read_resource(
-            "forgemcp://workspace/project/raw/resource%20data/data.bin"
+            "forgemcp://workspace/raw/project/resource%20data/data.bin"
         )
         assert base64.b64decode(raw.contents[0].blob) == b"\x00\xff\x01"
         assert raw.contents[0].mime_type == "application/octet-stream"
         cases = [
-            ("list", {"path": "resource data", "depth": "all"}, "a#%.cpp"),
+            ("list", {"path": "project/resource data", "depth": "all"}, "a#%.cpp"),
             (
                 "find-files",
                 {"pattern": "resource data/*.cpp"},
                 "a%23%25.cpp",
             ),
-            ("file-info", {"path": "resource data/a#%.cpp"}, "size\\_bytes"),
+            ("file-info", {"path": "project/resource data/a#%.cpp"}, "size\\_bytes"),
             (
                 "search",
                 {
                     "query": r"foo\(x\)/\.\./#&",
                     "regex": "true",
-                    "path": "resource data",
+                    "path": "project/resource data",
                 },
                 "foo(x)/../#&",
             ),
         ]
         for name, arguments, expected in cases:
             resource = await client.read_resource(
-                f"forgemcp://workspace/project/{name}?{urlencode(arguments, quote_via=quote)}"
+                f"forgemcp://workspace/{name}?{urlencode(arguments, quote_via=quote)}"
             )
             assert resource.contents[0].mime_type == "text/markdown"
             assert expected in resource.contents[0].text
         for template, argument, prefix, expected in [
-            (WorkspaceService.FILE_URI, "root", "st", "storage"),
-            (WorkspaceService.FILE_URI, "path", "src/ma", "src/math.cpp"),
+            (WorkspaceService.FILE_URI, "path", "st", "storage/"),
+            (WorkspaceService.FILE_URI, "path", "project/src/ma", "project/src/math.cpp"),
             (WorkspaceService.LIST_URI, "depth", "a", "all"),
             (WorkspaceService.SEARCH_URI, "regex", "t", "true"),
             (WorkspaceService.SEARCH_URI, "extensions", "cp", "cpp"),
@@ -171,10 +172,10 @@ async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_p
             )
             assert expected in completion.completion.values
         for uri in (
-            "forgemcp://workspace/project/file/%2E%2E/secret",
-            "forgemcp://workspace/project/search?query=%5B&regex=true",
-            "forgemcp://workspace/project/file-info",
-            "forgemcp://workspace/project/search",
+            "forgemcp://workspace/file/project/%2E%2E/secret",
+            "forgemcp://workspace/search?query=%5B&regex=true",
+            "forgemcp://workspace/file-info",
+            "forgemcp://workspace/search",
         ):
             with pytest.raises(MCPError):
                 await client.read_resource(uri)
@@ -190,19 +191,19 @@ async def test_default_project_custom_storage_and_resource_updates(
     options = argument_parser().parse_args(["--workspace-storage", str(storage)])
     assert options.workspace_storage == storage
     async with Client(create_server(storage_root=storage)) as client:
-        await client.call_tool("workspace_mkdir", {"path": "index", "root": "storage"})
+        await client.call_tool("workspace_mkdir", {"path": "storage/index"})
         for text in ("first", "second"):
             await client.call_tool(
                 "workspace_write_file",
-                {"path": "index/state", "text": text, "root": "storage"},
+                {"path": "storage/index/state", "text": text},
             )
             result = await client.read_resource(
-                "forgemcp://workspace/storage/file/index/state"
+                "forgemcp://workspace/file/storage/index/state"
             )
             assert result.contents[0].text == text
         assert (
-            await client.call_tool("workspace_read_file", {"path": "README.md"})
-        ).structured_content["path"] == "README.md"
+            await client.call_tool("workspace_read_file", {"path": "project/README.md"})
+        ).structured_content["path"] == "project/README.md"
 
 
 @pytest.mark.anyio
@@ -226,10 +227,10 @@ async def test_hidden_directories_and_find_schema(cpp_acceptance_project):
                 {"include_hidden": include_hidden},
             )
             paths = {entry["path"] for entry in result.structured_content["entries"]}
-            assert (".hidden" in paths) is include_hidden
-            assert ".visible-file" in paths
+            assert ("project/.hidden" in paths) is include_hidden
+            assert "project/.visible-file" in paths
             resource = await client.read_resource(
-                "forgemcp://workspace/project/list?include_hidden="
+                "forgemcp://workspace/list?include_hidden="
                 + str(include_hidden).lower()
             )
             assert (".hidden/" in resource.contents[0].text) is include_hidden
@@ -249,7 +250,6 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
         for root in ("wrong", quote("цуацуа")):
             for suffix in (
                 "file",
-                "file/README.md",
                 "raw",
                 "list",
                 "find-files",
@@ -261,12 +261,16 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
                     match="Root must be 'project' or 'storage'",
                 ):
                     await asyncio.wait_for(
-                        client.read_resource(f"forgemcp://workspace/{root}/{suffix}"),
+                        client.read_resource(
+                            f"forgemcp://workspace/{suffix}/{root}/README.md"
+                            if suffix in ("file", "raw")
+                            else f"forgemcp://workspace/{suffix}?path={root}/README.md"
+                        ),
                         timeout=2,
                     )
-        with pytest.raises(MCPError, match="nonempty relative path"):
-            await client.read_resource("forgemcp://workspace/project/file")
-        failed = await client.call_tool("workspace_delete", {"path": "src"})
+        with pytest.raises(MCPError, match="Path must start"):
+            await client.read_resource("forgemcp://workspace/file")
+        failed = await client.call_tool("workspace_delete", {"path": "project/src"})
         assert failed.is_error
         assert "src:" in failed.content[0].text
 
@@ -288,7 +292,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
             ("workspace_list", {"depth": None}),
             ("workspace_find_files", {}),
             ("workspace_search", {"query": "STRASSE", "case_sensitive": False}),
-            ("workspace_read_file", {"path": "large.txt"}),
+            ("workspace_read_file", {"path": "project/large.txt"}),
         ):
             progress.clear()
             result = await client.call_tool(tool, arguments, progress_callback=collect)
@@ -304,7 +308,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
                 match = next(
                     item
                     for item in result.structured_content["matches"]
-                    if item["path"] == "unicode.txt"
+                    if item["path"] == "project/unicode.txt"
                 )
                 assert match["spans"] == [[2, 8], [9, 16]]
                 assert [match["text"][a:b] for a, b in match["spans"]] == [
@@ -332,3 +336,35 @@ def test_invalid_progress_interval_is_rejected_before_service_creation(
     monkeypatch.setattr("forgemcp.server.WorkspaceService", unexpected_service)
     with pytest.raises(ValueError, match="Progress interval"):
         create_server(cpp_acceptance_project, progress_interval=interval)
+
+@pytest.mark.anyio
+async def test_completions_follow_qualified_path_and_storage_context(cpp_acceptance_project):
+    storage = cpp_acceptance_project / "service-data"
+    (storage / "index").mkdir(parents=True)
+    (storage / "index/data.xyz").write_text("data")
+    async with Client(create_server(cpp_acceptance_project, storage_root=storage)) as client:
+        async def complete(template, value, name="path", context=None):
+            response = await client.complete(
+                ResourceTemplateReference(uri=template),
+                {"name": name, "value": value},
+                context_arguments=context,
+            )
+            return response.completion.values
+
+        assert await complete(WorkspaceService.FILE_URI, "") == ["project/", "storage/"]
+        assert await complete(WorkspaceService.FILE_URI, "storage/in") == ["storage/index/"]
+        assert await complete(WorkspaceService.FILE_URI, "storage/index/d") == ["storage/index/data.xyz"]
+        assert await complete(WorkspaceService.LIST_URI, "storage/index/") == []
+        assert await complete(WorkspaceService.FILE_URI, "project/../") == []
+        assert await complete(
+            WorkspaceService.SEARCH_URI,
+            "x",
+            name="extensions",
+            context={"path": "storage/index/"},
+        ) == ["xyz"]
+        assert await complete(
+            WorkspaceService.FILE_URI,
+            "project/service-data/in",
+        ) == ["project/service-data/index/"]
+        listing = await client.read_resource("forgemcp://workspace/list?path=storage/index/")
+        assert "data.xyz" in listing.contents[0].text

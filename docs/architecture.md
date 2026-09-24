@@ -314,9 +314,12 @@ Low-level ToolSpec results retain exit codes for the service to interpret. CTest
 JUnit into a workspace temporary directory; parsed cases are returned before cleanup.
 
 This initial backend slice deliberately registers tools directly with MCP, with
-icons and structured/text results but no widgets. CMake highlighting and automated
-tests are deferred by explicit request. Existing workspace widgets and tests have
-not yet been adapted or verified against the new WorkspacePath/extension contract.
+icons and structured/text results but no widgets. CMake highlighting remains deferred.
+Unit and in-process MCP tests cover operator profiles, parsed command results,
+generator-change cleanup, error isolation, immutable extensions, qualified resource
+paths, and completions. They use fake ToolSpecs/process streams and isolated fixture
+copies; installed compilers are not required. Existing workspace widgets have not
+yet been adapted or verified against the new WorkspacePath/extension contract.
 
 ## External process execution
 

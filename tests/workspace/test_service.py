@@ -11,6 +11,7 @@ from mcp.server.apps import Apps
 from mcp.server.mcpserver.exceptions import ToolError
 from forgemcp.completion import Complete
 
+from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.errors import WorkspaceError
 from forgemcp.workspace.service import WorkspaceService
 
@@ -30,6 +31,8 @@ def call(workspace):
     handlers = {binding.fn.__name__: binding.fn for binding in apps.tools()}
 
     def invoke(name, *args, **kwargs):
+        if "path" in kwargs:
+            kwargs["path"] = WorkspacePath("project/" + kwargs["path"])
         return asyncio.run(
             handlers[name](
                 *args,
@@ -82,52 +85,52 @@ def test_path_escape_rejected(workspace, path):
 
 
 def test_tree_depth_hidden_directories_and_file_error(workspace, call):
-    workspace.mkdir(".hidden/nested")
-    workspace.write_file(".hidden/nested/value.txt", "data")
-    workspace.write_file(".dotfile", "visible")
+    workspace.mkdir(WorkspacePath("project/.hidden/nested"))
+    workspace.write_file(WorkspacePath("project/.hidden/nested/value.txt"), "data")
+    workspace.write_file(WorkspacePath("project/.dotfile"), "visible")
     shallow = call(
         "workspace_list",
     )
-    assert ".hidden" not in {entry.path for entry in shallow.entries}
-    assert ".dotfile" in {entry.path for entry in shallow.entries}
+    assert ".hidden" not in {entry.path.relative for entry in shallow.entries}
+    assert ".dotfile" in {entry.path.relative for entry in shallow.entries}
     assert all(entry.children is None for entry in shallow.entries)
     hidden = next(
         entry
         for entry in call("workspace_list", depth=None, include_hidden=True).entries
-        if entry.path == ".hidden"
+        if entry.path.relative == ".hidden"
     )
-    assert hidden.children[0].children[0].path == ".hidden/nested/value.txt"
+    assert hidden.children[0].children[0].path.relative == ".hidden/nested/value.txt"
     for kwargs in ({"path": "README.md"}, {"depth": 0}, {"path": "missing"}):
         with pytest.raises(ToolError):
             call("workspace_list", **kwargs)
 
 
 def test_find_globs_extensions_and_hidden_directory_policy(workspace, call):
-    workspace.mkdir(".hidden")
-    workspace.write_file(".hidden/ignored.cpp", "needle")
-    workspace.write_file(".clangd", "needle")
-    workspace.write_file("UPPER.CPP", "needle")
-    workspace.write_file("LICENSE", "needle")
-    workspace.mkdir("build")
-    workspace.write_file("build/generated.cpp", "needle")
-    files = call("workspace_find_files").paths
+    workspace.mkdir(WorkspacePath("project/.hidden"))
+    workspace.write_file(WorkspacePath("project/.hidden/ignored.cpp"), "needle")
+    workspace.write_file(WorkspacePath("project/.clangd"), "needle")
+    workspace.write_file(WorkspacePath("project/UPPER.CPP"), "needle")
+    workspace.write_file(WorkspacePath("project/LICENSE"), "needle")
+    workspace.mkdir(WorkspacePath("project/build"))
+    workspace.write_file(WorkspacePath("project/build/generated.cpp"), "needle")
+    files = [path.relative for path in call("workspace_find_files").paths]
     assert "UPPER.CPP" in files and "build/generated.cpp" in files
     assert ".hidden/ignored.cpp" not in files
-    assert call("workspace_find_files", path=".hidden").paths == []
-    assert workspace.read_file(".hidden/ignored.cpp").text == "needle"
+    assert [path.relative for path in call("workspace_find_files", path=".hidden").paths] == []
+    assert workspace.read_file(WorkspacePath("project/.hidden/ignored.cpp")).text == "needle"
     assert (
         ".clangd"
-        in call(
+        in [path.relative for path in call(
             "workspace_find_files",
-        ).paths
+        ).paths]
     )
-    assert "LICENSE" in call("workspace_find_files", pattern="LICENSE").paths
-    assert call("workspace_find_files", pattern="src/*.cpp").paths == [
+    assert "LICENSE" in [path.relative for path in call("workspace_find_files", pattern="LICENSE").paths]
+    assert [path.relative for path in call("workspace_find_files", pattern="src/*.cpp").paths] == [
         "src/hierarchy.cpp",
         "src/math.cpp",
     ]
-    assert "UPPER.CPP" in call("workspace_find_files", pattern="**/*.CPP").paths
-    assert call("workspace_find_files", pattern="*.cpp", path="src").paths == [
+    assert "UPPER.CPP" in [path.relative for path in call("workspace_find_files", pattern="**/*.CPP").paths]
+    assert [path.relative for path in call("workspace_find_files", pattern="*.cpp", path="src").paths] == [
         "src/hierarchy.cpp",
         "src/math.cpp",
     ]
@@ -135,57 +138,58 @@ def test_find_globs_extensions_and_hidden_directory_policy(workspace, call):
 
 def test_read_write_metadata_and_utf8_crlf(workspace):
     text = "α\r\n日本語\r\nlast"
-    created = workspace.write_file("utf8.txt", text)
+    created = workspace.write_file(WorkspacePath("project/utf8.txt"), text)
     assert (created.action, created.lines_removed, created.lines_added) == (
         "created",
         0,
         3,
     )
-    assert workspace.read_bytes("utf8.txt") == text.encode()
+    assert workspace.read_bytes(WorkspacePath("project/utf8.txt")) == text.encode()
     assert (
-        workspace.read_file("utf8.txt", start_line=2, end_line=2).text == "日本語\r\n"
+        workspace.read_file(WorkspacePath("project/utf8.txt"), start_line=2, end_line=2).text == "日本語\r\n"
     )
-    assert workspace.read_file("utf8.txt", start_line=99).text == ""
-    info = workspace.file_info("utf8.txt")
+    assert workspace.read_file(WorkspacePath("project/utf8.txt"), start_line=99).text == ""
+    info = workspace.file_info(WorkspacePath("project/utf8.txt"))
     assert info.size_bytes == len(text.encode())
     assert info.modified_at.utcoffset().total_seconds() == 0
     if os.name == "nt":
         assert info.created_at is not None and info.owner
-    overwritten = workspace.write_file("utf8.txt", "new\n")
+    overwritten = workspace.write_file(WorkspacePath("project/utf8.txt"), "new\n")
     assert (overwritten.action, overwritten.lines_removed, overwritten.lines_added) == (
         "overwritten",
         3,
         1,
     )
-    assert set(workspace.read_file("utf8.txt").model_dump()) == {
-        "root",
+    assert set(workspace.read_file(WorkspacePath("project/utf8.txt")).model_dump()) == {
+        "extensions_uri",
+        "resources",
         "path",
         "text",
         "start_line",
     }
     for bounds in ({"start_line": 0}, {"start_line": 3, "end_line": 2}):
         with pytest.raises(WorkspaceError):
-            workspace.read_file("utf8.txt", **bounds)
+            workspace.read_file(WorkspacePath("project/utf8.txt"), **bounds)
 
 
 def test_exact_edit_is_unambiguous_and_preserves_unaffected_bytes(workspace):
-    workspace.write_file("edit.txt", "α\r\nrepeat repeat\r\nend")
+    workspace.write_file(WorkspacePath("project/edit.txt"), "α\r\nrepeat repeat\r\nend")
     for old in ("", "missing", "repeat"):
         with pytest.raises(WorkspaceError):
-            workspace.edit_file("edit.txt", old, "changed")
-        assert workspace.read_bytes("edit.txt") == "α\r\nrepeat repeat\r\nend".encode()
+            workspace.edit_file(WorkspacePath("project/edit.txt"), old, "changed")
+        assert workspace.read_bytes(WorkspacePath("project/edit.txt")) == "α\r\nrepeat repeat\r\nend".encode()
     assert (
-        workspace.edit_file("edit.txt", "repeat", "x", replace_all=True).replacements
+        workspace.edit_file(WorkspacePath("project/edit.txt"), "repeat", "x", replace_all=True).replacements
         == 2
     )
-    assert workspace.edit_file("edit.txt", "α\r\nx x", "β").replacements == 1
-    assert workspace.read_bytes("edit.txt") == "β\r\nend".encode()
-    workspace.edit_file("edit.txt", "β", "")
-    assert workspace.read_file("edit.txt").text == "\r\nend"
+    assert workspace.edit_file(WorkspacePath("project/edit.txt"), "α\r\nx x", "β").replacements == 1
+    assert workspace.read_bytes(WorkspacePath("project/edit.txt")) == "β\r\nend".encode()
+    workspace.edit_file(WorkspacePath("project/edit.txt"), "β", "")
+    assert workspace.read_file(WorkspacePath("project/edit.txt")).text == "\r\nend"
 
 
 def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, monkeypatch):
-    workspace.write_file("keep.txt", "original")
+    workspace.write_file(WorkspacePath("project/keep.txt"), "original")
 
     def fail(source, destination):
         assert Path(source).parent == Path(destination).parent
@@ -193,23 +197,23 @@ def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, monkeypa
 
     monkeypatch.setattr(os, "replace", fail)
     with pytest.raises(WorkspaceError):
-        workspace.write_file("keep.txt", "replacement")
-    assert workspace.read_file("keep.txt").text == "original"
+        workspace.write_file(WorkspacePath("project/keep.txt"), "replacement")
+    assert workspace.read_file(WorkspacePath("project/keep.txt")).text == "original"
     assert not list(workspace.root.glob(".forgemcp-*"))
 
 
 def test_search_literals_regex_extensions_and_skips(workspace, call):
-    workspace.mkdir("search")
-    workspace.write_file("search/a.cpp", "a.b a.b\nAxb\nfoo(x)/../#&\n")
-    workspace.write_file("search/b.txt", "a.b")
+    workspace.mkdir(WorkspacePath("project/search"))
+    workspace.write_file(WorkspacePath("project/search/a.cpp"), "a.b a.b\nAxb\nfoo(x)/../#&\n")
+    workspace.write_file(WorkspacePath("project/search/b.txt"), "a.b")
     (workspace.root / "search/binary").write_bytes(b"a.b\0")
     (workspace.root / "search/invalid").write_bytes(b"\xff")
     result = call("workspace_search", "a.b", path="search")
-    assert [(item.path, item.line) for item in result.matches] == [
+    assert [(item.path.relative, item.line) for item in result.matches] == [
         ("search/a.cpp", 1),
         ("search/b.txt", 1),
     ]
-    assert result.skipped_files == ["search/binary", "search/invalid"]
+    assert [path.relative for path in result.skipped_files] == ["search/binary", "search/invalid"]
     result = call(
         "workspace_search",
         "a.b",
@@ -230,63 +234,63 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
             call("workspace_search", query=query, regex=use_regex)
     for path in ("search/binary", "search/invalid"):
         with pytest.raises(WorkspaceError):
-            workspace.read_file(path)
+            workspace.read_file(WorkspacePath("project/" + path))
 
 
 def test_move_files_directories_and_empty_directory_deletion(workspace):
-    assert workspace.mkdir("new/nested").action == "created"
-    assert workspace.mkdir("new/nested").action == "already_exists"
-    workspace.write_file("new/nested/file.txt", "content")
-    workspace.move("new", "moved")
-    workspace.move("moved/nested/file.txt", "moved/file.txt")
-    assert workspace.read_file("moved/file.txt").text == "content"
+    assert workspace.mkdir(WorkspacePath("project/new/nested")).action == "created"
+    assert workspace.mkdir(WorkspacePath("project/new/nested")).action == "already_exists"
+    workspace.write_file(WorkspacePath("project/new/nested/file.txt"), "content")
+    workspace.move(WorkspacePath("project/new"), WorkspacePath("project/moved"))
+    workspace.move(WorkspacePath("project/moved/nested/file.txt"), WorkspacePath("project/moved/file.txt"))
+    assert workspace.read_file(WorkspacePath("project/moved/file.txt")).text == "content"
     for source, target in (("moved/file.txt", "README.md"), ("moved", "moved/child")):
         with pytest.raises(WorkspaceError):
-            workspace.move(source, target)
+            workspace.move(WorkspacePath("project/" + source), WorkspacePath("project/" + target))
     with pytest.raises(WorkspaceError):
-        workspace.delete("moved")
-    workspace.delete("moved/file.txt")
-    workspace.delete("moved/nested")
-    workspace.delete("moved")
+        workspace.delete(WorkspacePath("project/moved"))
+    workspace.delete(WorkspacePath("project/moved/file.txt"))
+    workspace.delete(WorkspacePath("project/moved/nested"))
+    workspace.delete(WorkspacePath("project/moved"))
     with pytest.raises(WorkspaceError):
-        workspace.delete("moved")
+        workspace.delete(WorkspacePath("project/moved"))
 
 
 def test_protected_paths_and_parents_apply_to_all_mutations(workspace):
-    workspace.mkdir("repo/.git")
-    workspace.write_file("repo/.git/config", "data")
-    workspace.protect_path("repo/.git")
-    workspace.protect_path("repo/.git")
-    assert workspace.read_file("repo/.git/config").text == "data"
+    workspace.mkdir(WorkspacePath("project/repo/.git"))
+    workspace.write_file(WorkspacePath("project/repo/.git/config"), "data")
+    workspace.protect_path(WorkspacePath("project/repo/.git"))
+    workspace.protect_path(WorkspacePath("project/repo/.git"))
+    assert workspace.read_file(WorkspacePath("project/repo/.git/config")).text == "data"
     operations = [
-        lambda: workspace.write_file("repo/.git/config", "x"),
-        lambda: workspace.edit_file("repo/.git/config", "data", "x"),
-        lambda: workspace.delete("repo/.git/config"),
-        lambda: workspace.mkdir("repo/.git/new"),
-        lambda: workspace.move("repo", "elsewhere"),
-        lambda: workspace.move("README.md", "repo/.git/new"),
+        lambda: workspace.write_file(WorkspacePath("project/repo/.git/config"), "x"),
+        lambda: workspace.edit_file(WorkspacePath("project/repo/.git/config"), "data", "x"),
+        lambda: workspace.delete(WorkspacePath("project/repo/.git/config")),
+        lambda: workspace.mkdir(WorkspacePath("project/repo/.git/new")),
+        lambda: workspace.move(WorkspacePath("project/repo"), WorkspacePath("project/elsewhere")),
+        lambda: workspace.move(WorkspacePath("project/README.md"), WorkspacePath("project/repo/.git/new")),
     ]
     for operation in operations:
         with pytest.raises(WorkspaceError, match="protected"):
             operation()
-    workspace.protect_path("reserved")
+    workspace.protect_path(WorkspacePath("project/reserved"))
     with pytest.raises(WorkspaceError, match="protected"):
-        workspace.write_file("reserved", "x")
+        workspace.write_file(WorkspacePath("project/reserved"), "x")
     for root in ("project", "storage"):
         for operation in (workspace.delete, workspace.mkdir):
             with pytest.raises(WorkspaceError, match="root"):
-                operation(".", root=root)
+                operation(WorkspacePath(root + "/"))
 
 
 def test_storage_persistence_nesting_cleanup_and_protection(workspace):
     directory = workspace.storage_directory("build").subdirectory("debug")
-    workspace.write_file("build/debug/state", "cache", root="storage")
+    workspace.write_file(WorkspacePath("storage/build/debug/state"), "cache")
     restarted = WorkspaceService(workspace.root, workspace.storage_root)
     assert (
         restarted.storage_directory("build").subdirectory("debug").path
         == directory.path
     )
-    assert restarted.read_file("build/debug/state", root="storage").text == "cache"
+    assert restarted.read_file(WorkspacePath("storage/build/debug/state")).text == "cache"
     with pytest.raises(RuntimeError):
         with workspace.temporary_directory("test") as temporary:
             temporary.subdirectory("nested")
@@ -294,7 +298,7 @@ def test_storage_persistence_nesting_cleanup_and_protection(workspace):
             raise RuntimeError("operation failed")
     assert not temporary.path.exists()
     assert directory.path.exists()
-    workspace.protect_path("build/debug/state", root="storage")
+    workspace.protect_path(WorkspacePath("storage/build/debug/state"))
     with pytest.raises(WorkspaceError, match="protected"):
         directory.remove()
     removable = workspace.storage_directory("removable")
@@ -316,30 +320,30 @@ def test_links_are_visible_but_not_traversed_or_modified(workspace, call):
     outside = workspace.root / "outside"
     outside.symlink_to(workspace.root.parent, target_is_directory=True)
     entries = call("workspace_list", depth=None).entries
-    assert next(entry for entry in entries if entry.path == "alias").kind == "symlink"
+    assert next(entry for entry in entries if entry.path.relative == "alias").kind == "symlink"
     assert not any(
         path.startswith("alias/")
-        for path in call(
+        for path in [path.relative for path in call(
             "workspace_find_files",
-        ).paths
+        ).paths]
     )
     assert (
-        workspace.read_file("alias/math.cpp").text
-        == workspace.read_file("src/math.cpp").text
+        workspace.read_file(WorkspacePath("project/alias/math.cpp")).text
+        == workspace.read_file(WorkspacePath("project/src/math.cpp")).text
     )
     with pytest.raises(WorkspaceError):
-        workspace.write_file("alias/math.cpp", "x")
+        workspace.write_file(WorkspacePath("project/alias/math.cpp"), "x")
     with pytest.raises(WorkspaceError):
-        workspace.read_file("outside/secret")
+        workspace.read_file(WorkspacePath("project/outside/secret"))
 
 
 def test_markdown_escapes_source_fences_and_link_characters(workspace, call):
-    workspace.write_file("fence.txt", "```\n<script>unsafe</script>\n")
+    workspace.write_file(WorkspacePath("project/fence.txt"), "```\n<script>unsafe</script>\n")
     result = workspace.render_markdown(
         call("workspace_search", "```", path="fence.txt")
     )
     assert "````\n```\n````" in result
-    assert workspace.file_uri("project", "a#b%[x].cpp").endswith("a%23b%25%5Bx%5D.cpp")
+    assert workspace.file_uri(WorkspacePath("project/a#b%[x].cpp")).endswith("a%23b%25%5Bx%5D.cpp")
 
 
 def test_filesystem_errors_preserve_os_message_without_absolute_path():
@@ -365,7 +369,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
     import forgemcp.progress as module
 
     workspace.progress_interval = interval
-    workspace.write_file("large.txt", "needle\n" * 30000)
+    workspace.write_file(WorkspacePath("project/large.txt"), "needle\n" * 30000)
     apps = Apps()
     workspace.register(MCPServer("test", extensions=[apps]), apps, Complete())
     handlers = {binding.fn.__name__: binding.fn for binding in apps.tools()}
@@ -393,7 +397,10 @@ def test_progress_throttles_per_invocation_without_losing_results(
         result = asyncio.run(
             handlers[name](
                 ctx=SimpleNamespace(report_progress=collect),
-                **arguments,
+                **{
+                    key: WorkspacePath("project/" + value) if key == "path" else value
+                    for key, value in arguments.items()
+                },
             )
         )
         assert events[0][1] == 0

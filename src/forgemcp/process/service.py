@@ -166,7 +166,7 @@ class ProcessRecord:
         try:
             loop = asyncio.get_running_loop()
             while True:
-                chunk = await reader.read(128)
+                chunk = await reader.read(4096)
                 if not chunk:
                     break
 
