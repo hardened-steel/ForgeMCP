@@ -30,7 +30,7 @@ function describe(data) {
       const order = doc.createElement("button");
       order.type = "button";
       order.className = "fm-process-action";
-      order.textContent = "Newest first";
+      order.textContent = newestFirst ? "Oldest first" : "Newest first";
       order.setAttribute("aria-pressed", String(newestFirst));
       order.addEventListener("click", () => {
         newestFirst = !newestFirst;
