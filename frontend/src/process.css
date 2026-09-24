@@ -1,5 +1,6 @@
-.fm-process-summary { margin: 4px 0 9px; color: var(--fm-muted); }
-.fm-process-expand { margin: 0 0 7px; border-color: var(--fm-border) !important; color: var(--fm-accent) !important; }
+.fm-process-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 7px; padding: 4px 0 7px; }
+.fm-process-summary { flex: 1 1 160px; margin: 0; color: var(--fm-muted); }
+.fm-process-action { border-color: var(--fm-border) !important; color: var(--fm-accent) !important; }
 .fm-process-row { border-bottom: 1px solid var(--fm-border); padding: 5px 0; }
 .fm-process-row summary { cursor: pointer; overflow-wrap: anywhere; }
 .fm-process-row dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 7px 0 2px 12px; }
