@@ -28,7 +28,7 @@ class TestCase(BaseModel):
 
 class TestResult(BaseModel):
     return_code: int
-    output_tail: str
+    process_id: int
     tests: list[TestCase] = Field(default_factory=list)
 
 
@@ -49,9 +49,6 @@ def parse_report(path: Path) -> list[TestCase]:
                 status = "failed"
                 problem = failure if failure is not None else error
                 message = problem.get("message") or problem.text or "Test failed."
-                output = case.findtext("system-out")
-                if output:
-                    message += "\n" + output[-8192:]
             elif skipped is not None:
                 status = "skipped"
                 message = skipped.get("message") or skipped.text
@@ -159,7 +156,6 @@ def create_spec(
         if parallel is not None:
             arguments.extend(("--parallel", str(parallel)))
         buffers = {"stdout": "", "stderr": ""}
-        tail = ""
 
         async def parse_progress(line: str) -> None:
             if on_progress is not None and re.search(
@@ -168,30 +164,36 @@ def create_spec(
             ):
                 await on_progress(line.strip())
 
-        async with await processes.launch(
-            path,
-            arguments,
-            cwd=source,
-            env=environment,
-            inherit_environment=inherit_environment,
-            timeout=timeout,
-        ) as session:
-            await session.close_stdin()
-            async for chunk in session.output():
-                tail = (tail + chunk.text)[-8192:]
-                buffers[chunk.stream] += chunk.text.replace("\r", "\n")
-                while "\n" in buffers[chunk.stream]:
-                    line, _, buffers[chunk.stream] = buffers[chunk.stream].partition("\n")
+        session = None
+        try:
+            async with await processes.launch(
+                path,
+                arguments,
+                cwd=source,
+                env=environment,
+                inherit_environment=inherit_environment,
+                timeout=timeout,
+            ) as session:
+                await session.close_stdin()
+                async for chunk in session.output():
+                    buffers[chunk.stream] += chunk.text.replace("\r", "\n")
+                    while "\n" in buffers[chunk.stream]:
+                        line, _, buffers[chunk.stream] = buffers[chunk.stream].partition("\n")
+                        await parse_progress(line)
+                for line in buffers.values():
                     await parse_progress(line)
-            for line in buffers.values():
-                await parse_progress(line)
-            code = await session.wait()
-        cases = parse_report(report_path) if report_path.exists() or code == 0 else []
-        return TestResult(
-            return_code=code,
-            output_tail=tail,
-            tests=cases,
-        )
+                code = await session.wait()
+            cases = parse_report(report_path) if report_path.exists() or code == 0 else []
+            return TestResult(
+                return_code=code,
+                process_id=session.process_id,
+                tests=cases,
+            )
+        except (ProcessError, ToolParserError) as error:
+            raise ToolCommandError(
+                str(error),
+                process_id=session.process_id if session is not None else None,
+            ) from error
 
     methods: Methods = {"version": version, "test": test}
     return ToolSpec(INFO.name, INFO.kind, path, methods)

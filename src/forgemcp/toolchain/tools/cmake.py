@@ -26,14 +26,14 @@ class PresetsResult(BaseModel):
 
 class ConfigureResult(BaseModel):
     return_code: int = 0
-    output_tail: str = ""
+    process_id: int | None = None
     configured: bool = False
     generated: bool = False
 
 
 class BuildResult(BaseModel):
     return_code: int = 0
-    output_tail: str = ""
+    process_id: int | None = None
     completed_steps: int | None = None
     total_steps: int | None = None
 
@@ -132,29 +132,34 @@ def create_spec(
         arguments: Sequence[str],
         timeout: ProcessTimeout,
         on_line: Progress,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, int]:
         buffers = {"stdout": "", "stderr": ""}
-        tail = ""
-        async with await processes.launch(
-            path,
-            arguments,
-            cwd=source,
-            env=environment,
-            inherit_environment=inherit_environment,
-            timeout=timeout,
-        ) as session:
-            await session.close_stdin()
-            async for chunk in session.output():
-                tail = (tail + chunk.text)[-8192:]
-                buffers[chunk.stream] += chunk.text.replace("\r", "\n")
-                while "\n" in buffers[chunk.stream]:
-                    line, _, buffers[chunk.stream] = buffers[chunk.stream].partition("\n")
+        session = None
+        try:
+            async with await processes.launch(
+                path,
+                arguments,
+                cwd=source,
+                env=environment,
+                inherit_environment=inherit_environment,
+                timeout=timeout,
+            ) as session:
+                await session.close_stdin()
+                async for chunk in session.output():
+                    buffers[chunk.stream] += chunk.text.replace("\r", "\n")
+                    while "\n" in buffers[chunk.stream]:
+                        line, _, buffers[chunk.stream] = buffers[chunk.stream].partition("\n")
+                        if line.strip():
+                            await on_line(line)
+                for line in buffers.values():
                     if line.strip():
                         await on_line(line)
-            for line in buffers.values():
-                if line.strip():
-                    await on_line(line)
-            return await session.wait(), tail
+                return await session.wait(), session.process_id
+        except ProcessError as error:
+            raise ToolCommandError(
+                str(error),
+                process_id=session.process_id if session is not None else None,
+            ) from error
 
     async def presets(source: Path) -> PresetsResult:
         result = PresetsResult()
@@ -170,14 +175,14 @@ def create_spec(
                 if match is not None:
                     getattr(result, kind).append(match.group(1))
 
-        code, tail = await execute(
+        code, process_id = await execute(
             source,
             ("--list-presets=all",),
             ProcessTimeout(total=30),
             parse,
         )
         if code != 0:
-            raise ToolCommandError(f"CMake could not list presets (exit {code}).\n{tail}")
+            raise ToolCommandError(f"CMake could not list presets (exit {code}, process {process_id}).")
         return result
 
     async def configure(
@@ -209,7 +214,7 @@ def create_spec(
             if on_progress is not None and line.startswith(("-- ", "CMake Error", "CMake Warning")):
                 await on_progress(line.removeprefix("-- "))
 
-        result.return_code, result.output_tail = await execute(
+        result.return_code, result.process_id = await execute(
             source,
             arguments,
             timeout,
@@ -255,7 +260,7 @@ def create_spec(
             ):
                 await on_progress(line)
 
-        result.return_code, result.output_tail = await execute(
+        result.return_code, result.process_id = await execute(
             source,
             arguments,
             timeout,

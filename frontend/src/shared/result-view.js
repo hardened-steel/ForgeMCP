@@ -168,10 +168,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     return element("span", `fm-value ${tone}`, value === "" ? "Empty string" : String(value));
   }
 
-  function fields(value, source = value) {
+  function fields(value, source = value, headingKey) {
     const list = element("dl", "fm-fields");
     const entries = isObject(value) ? Object.entries(value) : [["value", value]];
     for (const [key, item] of entries) {
+      if (key === headingKey) continue;
       const row = element("div", "fm-field");
       const description = element("dd", "fm-value");
       description.append(valueNode(item, key, source));
@@ -197,7 +198,8 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     fieldsButton.setAttribute("aria-pressed", String(mode === "fields"));
     resourcesButton.setAttribute("aria-pressed", String(mode === "resources"));
     jsonButton.setAttribute("aria-pressed", String(mode === "json"));
-    filters.hidden = mode !== "fields" || !presentation || presentation.hideFilter;
+    searchLabel.hidden = !presentation?.filterPlaceholder;
+    filters.hidden = mode !== "fields" || !presentation || presentation.hideFilter || (searchLabel.hidden && categories.hidden);
     if (!presentation) return;
     if (mode === "copy") {
       content.append(element("pre", "fm-json", manualCopy));
@@ -238,7 +240,15 @@ export function createResultView(root, { toolName, describe, renderValue }) {
         const label = record?.[presentation.titleKey];
         heading.append(element("span", "fm-index", String(index + 1).padStart(2, "0")),
           element("span", presentation.titleKey === "status" ? statusTone(label, record) : "", typeof label === "string" ? label : "Record"));
-        article.append(heading, fields(record));
+        if (typeof label === "string") {
+          const copyHeading = button(undefined, "fm-copy");
+          copyHeading.setAttribute("aria-label", `Copy ${presentation.titleKey}`);
+          copyHeading.append(icon());
+          help(copyHeading, `Copy the complete original ${presentation.titleKey} value.`);
+          copyHeading.addEventListener("click", () => { void copy(label); });
+          heading.append(copyHeading);
+        }
+        article.append(heading, fields(record, record, typeof label === "string" ? presentation.titleKey : undefined));
         content.append(article);
       });
       if (!shown) content.append(element("p", "fm-empty", presentation.records.length ? "No matching records. Clear or change the filters." : "No records in this result."));
@@ -292,7 +302,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     const values = presentation.categoryKey
       ? [...new Set((presentation.records ?? []).map((record) => record?.[presentation.categoryKey]).filter((value) => typeof value === "string"))]
       : [];
-    const all = element("option", "", presentation.categoryKey === "status" ? "All statuses" : "All types");
+    const all = element("option", "", { status: "All statuses", profile: "All profiles", mode: "All modes" }[presentation.categoryKey] ?? "All types");
     all.value = "";
     categories.append(all);
     for (const value of values) {

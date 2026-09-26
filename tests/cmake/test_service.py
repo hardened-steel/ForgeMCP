@@ -11,6 +11,7 @@ from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import ProfileDefinition, parse_profiles
 from forgemcp.cmake.service import CMakeService
 from forgemcp.completion import Complete
+from forgemcp.toolchain.errors import ToolCommandError
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
 from forgemcp.toolchain.tools import cmake, ctest
@@ -26,9 +27,9 @@ def anyio_backend():
 @pytest.fixture
 def setup(cpp_acceptance_project):
     workspace = WorkspaceService(cpp_acceptance_project)
-    configure = AsyncMock(return_value=cmake.ConfigureResult())
+    configure = AsyncMock(return_value=cmake.ConfigureResult(process_id=40))
     build = AsyncMock(return_value=cmake.BuildResult(completed_steps=2, total_steps=2))
-    test = AsyncMock(return_value=ctest.TestResult(return_code=0, output_tail=""))
+    test = AsyncMock(return_value=ctest.TestResult(return_code=0, process_id=42))
     presets = AsyncMock(
         return_value=cmake.PresetsResult(
             configure=["native"],
@@ -70,8 +71,13 @@ def setup(cpp_acceptance_project):
 
 
 def server(service):
-    mcp = MCPServer("cmake-unit")
-    service.register(mcp, Apps(), Complete())
+    apps = Apps()
+    mcp = MCPServer("cmake-unit", extensions=[apps])
+    service.register(mcp, apps, Complete())
+    for binding in apps.tools():
+        mcp.add_tool(binding.fn, meta=binding.meta, **binding.kwargs)
+    for binding in apps.resources():
+        mcp.add_resource(binding.resource)
     return mcp
 
 
@@ -145,7 +151,7 @@ async def test_generator_change_cleans_only_eligible_build_directory(setup, bloc
         assert (directory / ".cmake/api/v1/query/client-forgemcp/codemodel-v2").is_file()
         assert kwargs["generator"] == "Ninja"
         (directory / "compile_commands.json").write_text("[]")
-        return cmake.ConfigureResult()
+        return cmake.ConfigureResult(process_id=40)
 
     setup.configure.side_effect = configure
     async with Client(server(setup.service)) as client:
@@ -174,12 +180,12 @@ async def test_native_batch_continues_after_failure_and_tools_have_distinct_resu
         for name in ("first", "second")
     )
     setup.build.side_effect = [
-        cmake.BuildResult(return_code=1),
+        cmake.BuildResult(return_code=1, process_id=41),
         cmake.BuildResult(completed_steps=3, total_steps=3),
     ]
     setup.test.return_value = ctest.TestResult(
         return_code=0,
-        output_tail="",
+        process_id=42,
         tests=[ctest.TestCase(name="broken", status="failed")],
     )
     async with Client(server(setup.service)) as client:
@@ -187,15 +193,33 @@ async def test_native_batch_continues_after_failure_and_tools_have_distinct_resu
         built = await client.call_tool("cmake_build", {})
         tested = await client.call_tool("cmake_test", {"profiles": ["first"]})
     assert not configured.is_error and not built.is_error and not tested.is_error
+    assert [item["process_id"] for item in configured.structured_content["result"]] == [40, 40]
     setup.configure.assert_awaited_once()
     assert setup.configure.call_args.args == (setup.workspace.root, None)
     assert setup.configure.call_args.kwargs["generator"] is None
     results = built.structured_content["result"]
     assert results[0]["error"] and results[1]["error"] is None
+    assert results[0]["process_id"] == 41
     assert results[1]["completed_steps"] == 3
     assert "tests" not in results[0]
     test_result = tested.structured_content["result"][0]
+    assert test_result["process_id"] == 42
+    assert "output_tail" not in test_result
     assert test_result["error"]
     assert test_result["tests"][0]["name"] == "broken"
     assert "completed_steps" not in test_result
     assert not setup.test.call_args.kwargs["report_path"].parent.exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["configure", "build", "test"])
+async def test_command_errors_keep_log_reference_in_tool_result(setup, operation):
+    command = getattr(setup, operation)
+    command.side_effect = ToolCommandError("Timed out", process_id=73)
+    async with Client(server(setup.service)) as client:
+        response = await client.call_tool(f"cmake_{operation}", {})
+    assert not response.is_error
+    result = response.structured_content["result"][0]
+    assert result["process_id"] == 73
+    assert result["error"] == "Timed out"
+    assert "output_tail" not in result

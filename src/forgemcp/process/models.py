@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
 ProcessStream = Literal["stdin", "stdout", "stderr"]
@@ -52,6 +52,8 @@ class ProcessLogEntry:
     time: float = Field(repr=False)
     stream: Literal["stdout", "stderr", "stdin"]
     text: str
+    start_line: int
+    end_line: int
 
 
 @dataclass(frozen=True)
@@ -110,3 +112,60 @@ class ProcessDetails(BaseModel):
 
     process: ProcessInfo
     transcript: list[ProcessLogEntry]
+    lines: tuple[int, int] | None = None
+
+
+class FirstLines(BaseModel):
+    """Select the first N lines."""
+
+    model_config = ConfigDict(extra="forbid")
+    first: int = Field(ge=1)
+
+
+class LastLines(BaseModel):
+    """Select the last N lines."""
+
+    model_config = ConfigDict(extra="forbid")
+    last: int = Field(ge=1)
+
+
+class LineRange(BaseModel):
+    """Select an inclusive absolute line range."""
+
+    model_config = ConfigDict(extra="forbid")
+    start: int = Field(ge=1)
+    end: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> LineRange:
+        if self.end < self.start:
+            raise ValueError("Line range requires start <= end.")
+        return self
+
+
+class FirstSeconds(BaseModel):
+    """Select the first N seconds from process start."""
+
+    model_config = ConfigDict(extra="forbid")
+    first: float = Field(gt=0, allow_inf_nan=False)
+
+
+class LastSeconds(BaseModel):
+    """Select the last N seconds of the process snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+    last: float = Field(gt=0, allow_inf_nan=False)
+
+
+class TimeRange(BaseModel):
+    """Seconds from process start; include start and exclude end."""
+
+    model_config = ConfigDict(extra="forbid")
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> TimeRange:
+        if self.end <= self.start:
+            raise ValueError("Time range requires start < end.")
+        return self

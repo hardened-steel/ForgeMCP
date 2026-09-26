@@ -12,7 +12,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from forgemcp.assets import IconFile
+from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.process.errors import ProcessError
 from forgemcp.process.models import ProcessTimeout
@@ -50,7 +50,7 @@ class CMakeConfigureResult(BaseModel):
         default=None,
         description="Null on success; failure explanation otherwise.",
     )
-    output_tail: str = ""
+    process_id: int | None = None
 
 
 class CMakeBuildResult(BaseModel):
@@ -63,7 +63,7 @@ class CMakeBuildResult(BaseModel):
         default=None,
         description="Null on success; failure explanation otherwise.",
     )
-    output_tail: str = ""
+    process_id: int | None = None
 
 
 class CMakeTestResult(BaseModel):
@@ -75,7 +75,7 @@ class CMakeTestResult(BaseModel):
         default=None,
         description="Null on success; failure explanation otherwise.",
     )
-    output_tail: str = ""
+    process_id: int | None = None
 
 
 class CMakeService:
@@ -87,6 +87,10 @@ class CMakeService:
     """
 
     ICON = IconFile("icons/cmake.svg")
+    PROFILES_WIDGET = Widget("assets/cmake-profiles.html")
+    CONFIGURE_WIDGET = Widget("assets/cmake-configure.html")
+    BUILD_WIDGET = Widget("assets/cmake-build.html")
+    TEST_WIDGET = Widget("assets/cmake-test.html")
 
     def __init__(
         self,
@@ -346,7 +350,6 @@ class CMakeService:
         return self.workspace.workspace_path(path) if path.is_file() else None
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
-        # The first CMake slice intentionally has no widgets.
         icon = self.ICON.icon
         changes_files = ToolAnnotations(
             read_only_hint=False,
@@ -355,7 +358,8 @@ class CMakeService:
             open_world_hint=True,
         )
 
-        @mcp.tool(
+        @apps.tool(
+            resource_uri=self.PROFILES_WIDGET.uri,
             icons=[icon],
             annotations=ToolAnnotations(read_only_hint=True),
         )
@@ -374,7 +378,11 @@ class CMakeService:
             except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
 
-        @mcp.tool(icons=[icon], annotations=changes_files)
+        @apps.tool(
+            resource_uri=self.CONFIGURE_WIDGET.uri,
+            icons=[icon],
+            annotations=changes_files,
+        )
         async def cmake_configure(
             ctx: Context,
             profiles: list[str] | None = None,
@@ -422,7 +430,7 @@ class CMakeService:
                         if preset is not None and key in configured:
                             prior = configured[key]
                             result.error = prior.error
-                            result.output_tail = prior.output_tail
+                            result.process_id = prior.process_id
                             continue
                         build_directory = None
                         settings = {}
@@ -447,7 +455,7 @@ class CMakeService:
                             timeout=timeout,
                             on_progress=report_status,
                         )
-                        result.output_tail = command.output_tail
+                        result.process_id = command.process_id
                         if command.return_code != 0:
                             result.error = f"CMake configure exited with {command.return_code}."
                         if command.return_code == 0 and profile.build_directory is not None:
@@ -456,10 +464,15 @@ class CMakeService:
                             configured[key] = result
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
+                        result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
             return results
 
-        @mcp.tool(icons=[icon], annotations=changes_files)
+        @apps.tool(
+            resource_uri=self.BUILD_WIDGET.uri,
+            icons=[icon],
+            annotations=changes_files,
+        )
         async def cmake_build(
             ctx: Context,
             profiles: list[str] | None = None,
@@ -525,15 +538,20 @@ class CMakeService:
                         )
                         result.completed_steps = command.completed_steps
                         result.total_steps = command.total_steps
-                        result.output_tail = command.output_tail
+                        result.process_id = command.process_id
                         if command.return_code != 0:
                             result.error = f"CMake build exited with {command.return_code}."
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
+                        result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
             return results
 
-        @mcp.tool(icons=[icon], annotations=changes_files)
+        @apps.tool(
+            resource_uri=self.TEST_WIDGET.uri,
+            icons=[icon],
+            annotations=changes_files,
+        )
         async def cmake_test(
             ctx: Context,
             profiles: list[str] | None = None,
@@ -600,7 +618,7 @@ class CMakeService:
                                 timeout=timeout,
                                 on_progress=report_status,
                             )
-                            result.output_tail = command.output_tail
+                            result.process_id = command.process_id
                             result.tests = command.tests
                         failed = any(
                             test.status in ("failed", "not_run") for test in result.tests
@@ -609,5 +627,14 @@ class CMakeService:
                             result.error = f"CTest failed (exit {command.return_code})."
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
+                        result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
             return results
+
+        for widget in (
+            self.PROFILES_WIDGET,
+            self.CONFIGURE_WIDGET,
+            self.BUILD_WIDGET,
+            self.TEST_WIDGET,
+        ):
+            apps.add_html_resource(widget.uri, widget.content)

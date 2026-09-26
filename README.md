@@ -14,8 +14,8 @@ Language-server, quality, and debugger modules are planned.
   completions for qualified paths, extensions, depth, and boolean options.
 - No prompts are currently registered.
 - CMake tools list operator profiles, configure projects, build targets, and run
-  CTest. This initial backend slice has structured/text results and icons; its
-  widgets and syntax highlighting are not implemented yet.
+  CTest. Each tool has its own widget with profile filters, Fields/JSON views,
+  copying and per-test results. Command logs are available through `process_get`. CMake syntax highlighting remains deferred.
 - Tool `processes_overview` shows running and completed external development tools,
   including exit codes and timeout interruptions. `process_get(process_id)` returns
   one process with its ordered stdin/stdout/stderr transcript.
@@ -177,8 +177,8 @@ Configuration must precede building, and building must precede testing. Profiles
 run sequentially; one failed execution does not suppress later executions.
 Each tool returns its own list of per-profile/preset results. The sole outcome
 field is `error`: null means success, otherwise it explains the failure (including
-the exit code for a failed command). Each result retains the last 8192 output
-characters. Configure returns the build-directory and compilation-database paths
+the exit code for a failed command). Results include `process_id` for reading
+command output through `process_get`; they do not duplicate logs. Configure returns the build-directory and compilation-database paths
 when known; build returns parsed step counts when available; test returns JUnit cases.
 Full process transcripts remain in the process module; CMake results contain no
 transcript links. The default command timeout is 600 seconds per execution and
@@ -237,8 +237,8 @@ Progress messages identify the profile and current configure step, build action,
 or CTest case, with the common notification throttle. Preset generators are not
 overridden; their compilation-database settings remain controlled by the preset.
 
-The initial CMake slice does not yet include clean/project-inspection tools,
-widgets or syntax highlighting. Unit and in-process MCP tests cover profiles,
+The initial CMake slice does not yet include clean/project-inspection tools
+or syntax highlighting. Unit and in-process MCP tests cover profiles,
 command parsing, generator changes, result resources, and qualified paths.
 Existing workspace widgets have not yet been adapted or validated against the new path contract.
 
@@ -302,3 +302,29 @@ git diff --check
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and the
 registration lifecycle. Repository rules for coding agents live in [AGENTS.md](AGENTS.md).
+
+## Reading process logs
+
+`process_get` accepts `lines`, `time`, and `max_bytes` (default 65536). With neither
+selector it reads the last 100 lines. For example:
+
+```json
+{"process_id": 42, "time": {"last": 1}, "lines": {"last": 100}, "max_bytes": 4000}
+```
+
+Each selector takes exactly one form: `{"first": N}`, `{"last": N}`, or
+`{"start": A, "end": B}`. Lines start at 1 and ranges include both endpoints.
+Time uses seconds from process start and includes start but excludes end. Last
+seconds are relative to request time while running and completion after exit.
+Time is measured when a chunk is recorded, not when each character was produced.
+
+Selection applies time, then lines within that selection, then the combined UTF-8
+text byte budget (excluding JSON/metadata). Absolute line numbers are retained.
+Tail selections keep the end when bytes run out; other selections keep the start.
+A lines selector determines direction when supplied, otherwise the time selector does.
+Partial lines are allowed, but UTF-8 characters are never split. `max_bytes=0`
+returns metadata without text. The response adds only `lines: [first, last]`, or
+null for an empty selection; each entry carries its own inclusive start/end lines.
+All streams share line numbering in observed order; entries can overlap a line.
+LF advances the line, including split CRLF; standalone CR is preserved as text.
+The retained journal and the existing process Markdown resource remain complete.
