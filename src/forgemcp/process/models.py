@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
 ProcessStream = Literal["stdin", "stdout", "stderr"]
@@ -52,6 +52,8 @@ class ProcessLogEntry:
     time: float = Field(repr=False)
     stream: Literal["stdout", "stderr", "stdin"]
     text: str
+    start_line: int
+    end_line: int
 
 
 @dataclass(frozen=True)
@@ -110,3 +112,56 @@ class ProcessDetails(BaseModel):
 
     process: ProcessInfo
     transcript: list[ProcessLogEntry]
+    lines: tuple[int, int] | None = None
+
+
+class LineSelection(BaseModel):
+    """Choose first/last N lines, or an inclusive absolute line range."""
+
+    model_config = ConfigDict(extra="forbid")
+    first: int | None = Field(default=None, ge=1)
+    last: int | None = Field(default=None, ge=1)
+    start: int | None = Field(default=None, ge=1)
+    end: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> LineSelection:
+        modes = sum(
+            (
+                self.first is not None,
+                self.last is not None,
+                self.start is not None or self.end is not None,
+            )
+        )
+        if modes != 1:
+            raise ValueError("Choose exactly one of first, last, or start/end.")
+        if self.start is not None or self.end is not None:
+            if self.start is None or self.end is None or self.end < self.start:
+                raise ValueError("Line range requires start <= end.")
+        return self
+
+
+class TimeSelection(BaseModel):
+    """Seconds from process start; ranges include start and exclude end."""
+
+    model_config = ConfigDict(extra="forbid")
+    first: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    last: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    start: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    end: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> TimeSelection:
+        modes = sum(
+            (
+                self.first is not None,
+                self.last is not None,
+                self.start is not None or self.end is not None,
+            )
+        )
+        if modes != 1:
+            raise ValueError("Choose exactly one of first, last, or start/end.")
+        if self.start is not None or self.end is not None:
+            if self.start is None or self.end is None or self.end <= self.start:
+                raise ValueError("Time range requires start < end.")
+        return self

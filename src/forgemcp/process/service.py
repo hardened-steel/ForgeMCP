@@ -13,7 +13,9 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
+
+from pydantic import Field
 
 from forgemcp import markdown
 
@@ -50,7 +52,12 @@ from .models import (
     ProcessSummary,
     ProcessInfo,
     ProcessDetails,
+    ProcessStream,
+    LineSelection,
+    TimeSelection,
 )
+
+from .transcript import select_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +70,24 @@ class ProcessRecord:
     status: ProcessStatus
     start: float = field(init=False, default=0)
     transcript: list[ProcessLogEntry] = field(default_factory=list)
+    next_line: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def append_log(self, stream: ProcessStream, text: str, time: float) -> None:
+        """Append under the record lock; all streams share one line sequence."""
+        if not text:
+            return
+        newlines = text.count("\n")
+        self.transcript.append(
+            ProcessLogEntry(
+                time=time,
+                stream=stream,
+                text=text,
+                start_line=self.next_line,
+                end_line=self.next_line + newlines - int(text.endswith("\n")),
+            )
+        )
+        self.next_line += newlines
 
     def snapshot(self) -> ProcessInfo:
         """Copy the small process state while the caller holds the record lock."""
@@ -174,24 +198,12 @@ class ProcessRecord:
                 await queue.put(ProcessOutput(stream=stream, text=text))
                 async with self.lock:
                     now = loop.time()
-                    self.transcript.append(
-                        ProcessLogEntry(
-                            time=now,
-                            stream=stream,
-                            text=text,
-                        )
-                    )
+                    self.append_log(stream, text, now)
 
             if text := decoder.final():
                 async with self.lock:
                     now = loop.time()
-                    self.transcript.append(
-                        ProcessLogEntry(
-                            time=now,
-                            stream=stream,
-                            text=text,
-                        )
-                    )
+                    self.append_log(stream, text, now)
                 await queue.put(ProcessOutput(stream=stream, text=text))
 
         except (OSError, UnicodeError) as error:
@@ -227,13 +239,7 @@ class ProcessRecord:
                 writer.write(encoder.encode(text))
                 async with self.lock:
                     now = loop.time()
-                    self.transcript.append(
-                        ProcessLogEntry(
-                            time=now,
-                            stream="stdin",
-                            text=text,
-                        )
-                    )
+                    self.append_log("stdin", text, now)
                 await writer.drain()
         except (OSError, UnicodeError) as error:
             raise ProcessStreamError(
@@ -475,17 +481,50 @@ class ProcessService:
                 open_world_hint=False,
             ),
         )
-        async def process_get(ctx: Context, process_id: int) -> ProcessDetails:
-            """Show one retained process and its ordered stdin/stdout/stderr transcript."""
+        async def process_get(
+            ctx: Context,
+            process_id: int,
+            lines: LineSelection | None = None,
+            time: TimeSelection | None = None,
+            max_bytes: Annotated[int, Field(ge=0)] = 65536,
+        ) -> ProcessDetails:
+            """Read a log slice: time, then lines, then UTF-8 text bytes.
+
+            With neither selector, return the last 100 lines. Line ranges are
+            inclusive; time ranges are [start, end) seconds from process start.
+            Last seconds end at now for running processes, at completion otherwise.
+            Returned line numbers remain absolute; a byte limit can cut a line.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Reading process transcript")
             record = self.records.get(process_id)
             if record is None:
                 raise ToolError(f"Process {process_id} is not retained.")
             async with record.lock:
+                end = (
+                    asyncio.get_running_loop().time()
+                    if record.status.current_status == "running"
+                    else max(
+                        record.start + record.status.work_time,
+                        record.transcript[-1].time if record.transcript else record.start,
+                    )
+                )
+                transcript = select_transcript(
+                    record.transcript,
+                    process_start=record.start,
+                    snapshot_end=end,
+                    lines=lines,
+                    time=time,
+                    max_bytes=max_bytes,
+                )
                 details = ProcessDetails(
                     process=record.snapshot(),
-                    transcript=list(record.transcript),
+                    transcript=transcript,
+                    lines=(
+                        (transcript[0].start_line, transcript[-1].end_line)
+                        if transcript
+                        else None
+                    ),
                 )
             await report_progress(1, total=1, message="Process transcript ready")
             return details

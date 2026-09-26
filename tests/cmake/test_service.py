@@ -70,8 +70,13 @@ def setup(cpp_acceptance_project):
 
 
 def server(service):
-    mcp = MCPServer("cmake-unit")
-    service.register(mcp, Apps(), Complete())
+    apps = Apps()
+    mcp = MCPServer("cmake-unit", extensions=[apps])
+    service.register(mcp, apps, Complete())
+    for binding in apps.tools():
+        mcp.add_tool(binding.fn, meta=binding.meta, **binding.kwargs)
+    for binding in apps.resources():
+        mcp.add_resource(binding.resource)
     return mcp
 
 

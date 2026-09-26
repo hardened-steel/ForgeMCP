@@ -32,6 +32,10 @@ class InvalidToolPathError(ToolchainError):
 class ToolCommandError(ToolchainError):
     """Tool arguments or process execution failed."""
 
+    def __init__(self, message: str, *, process_id: int | None = None) -> None:
+        super().__init__(message)
+        self.process_id = process_id
+
 
 class ToolParserError(ToolchainError):
     """A parser failed for a particular tool command."""

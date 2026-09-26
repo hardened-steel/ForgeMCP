@@ -11,6 +11,10 @@ const widgets = {
   process: "process-overview",
   "process-details": "process-details",
   toolsets: "toolsets",
+  "cmake-profiles": "cmake-profiles",
+  "cmake-configure": "cmake-configure",
+  "cmake-build": "cmake-build",
+  "cmake-test": "cmake-test",
 };
 
 export default defineConfig(({ mode }) => {
