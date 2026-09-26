@@ -23,17 +23,7 @@ export function renderCMakeValue(value, key, record, { doc, valueNode }) {
   };
   if (key === "error" && (value === null || typeof value === "string")) {
     return node("span", `fm-value ${value === null ? "fm-success" : "fm-error"}`,
-      value === null ? "Succeeded (null)" : value === "" ? "Empty error string" : value);
-  }
-  if (key === "output_tail" && typeof value === "string") {
-    if (!value) return node("span", "fm-value fm-null", "No command output (empty string)");
-    const details = node("details", "fm-source");
-    details.open = Boolean(record?.error);
-    details.append(
-      node("summary", "fm-label", "Command output (tail)"),
-      node("pre", "fm-json", value),
-    );
-    return details;
+      value === null ? "Succeeded" : value === "" ? "Empty error string" : value);
   }
   if (key === "tests" && Array.isArray(value)) {
     if (!value.length) return node("span", "fm-value fm-null", "No test cases in this result");
@@ -50,7 +40,8 @@ export function renderCMakeValue(value, key, record, { doc, valueNode }) {
         node("span", statusTone(test.status, test), String(test.status ?? "Unknown status")),
         doc.createTextNode(` · ${test.name ?? "Unnamed test"}`),
       );
-      details.append(summary, valueNode(test));
+      const fields = Object.fromEntries(Object.entries(test).filter(([name]) => name !== "name" && name !== "status"));
+      details.append(summary, valueNode(fields));
       list.append(details);
     }
     return list;

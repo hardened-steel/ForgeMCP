@@ -316,8 +316,10 @@ JUnit into a workspace temporary directory; parsed cases are returned before cle
 
 CMake registers all four tools through Apps with separate packaged widgets:
 profiles, configure, build, and test. They share `cmake-view.js` and the common
-result renderer: profile/mode filters, Fields/JSON, full-value copying, collapsible
-command output, and expandable test cases. The widgets display the original
+result renderer: profile/mode filters, Fields/JSON, full-value copying,
+process identifiers for log retrieval, and expandable test cases. Fields used as
+record headings are not repeated in the body; JSON and copying retain all fields.
+The widgets display the original
 invocation only and issue no tool calls or resource reads. CMake highlighting remains deferred.
 Unit and in-process MCP tests cover operator profiles, parsed command results,
 generator-change cleanup, error isolation, immutable extensions, qualified resource
@@ -571,7 +573,7 @@ These requirements apply to all existing and future widgets:
   structured result, unaffected by local filters. Highlight keys, strings, numbers,
   booleans, null and punctuation. Insert untrusted text with DOM text nodes, never
   interpret result strings as HTML. Line wrapping must preserve selectable content.
-- **Local interaction:** allow text and category filters, view switches, tooltips,
+- **Local interaction:** allow category filters, view switches, tooltips,
   keyboard navigation and copying. Show matched/total counts and an explicit
   no-match state. Filters are reversible and have no effect on the source result.
   All supplied records are visible by default; none is silently omitted.
@@ -665,9 +667,10 @@ single LF-based line cursor across stdin/stdout/stderr. Each immutable entry has
 inclusive `start_line`/`end_line`; a line spanning chunks overlaps their ranges.
 Empty text does not create an entry, and a trailing LF creates no phantom line.
 
-`process_get` snapshots and selects under the same lock. `LineSelection` and
-`TimeSelection` accept exactly one first/last/range mode; ranges require both
-bounds. Time is monotonic elapsed process time. Completed processes use the later
+`process_get` snapshots and selects under the same lock. Its selectors are unions:
+`FirstLines | LastLines | LineRange` and `FirstSeconds | LastSeconds | TimeRange`.
+Each variant requires its own fields and forbids other fields; ranges require both
+bounds. JSON remains `{"first": N}`, `{"last": N}`, or `{"start": N, "end": M}`. Time is monotonic elapsed process time. Completed processes use the later
 of their recorded duration and final entry time for tail selection, so drained
 output remains available. Explicit time intervals are half-open.
 
@@ -679,4 +682,5 @@ line selector (or time selector when lines is absent), preserving Unicode charac
 Responses add only the returned inclusive `lines` range, null when empty. No
 truncation flags or total counters are added. Without selectors the default is
 last 100 lines; the default text budget is 64 KiB. The full journal stays in memory.
-Widget filtering/heading changes and adaptation to sliced logs remain deferred.
+The shared widget view omits the generic text filter and repeated heading fields.
+Adaptation of the process widget to sliced logs remains deferred.

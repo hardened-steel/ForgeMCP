@@ -42,15 +42,9 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   views.append(fieldsButton, jsonButton);
   toolbar.append(views, copyAll);
   const filters = element("div", "fm-filters");
-  const searchLabel = element("label", "fm-search");
-  const search = element("input");
-  search.type = "search";
-  search.placeholder = "Filter all fields";
-  search.setAttribute("aria-label", "Filter all fields");
-  searchLabel.append(element("span", "fm-search-label", "/"), search);
   const categories = element("select");
   categories.setAttribute("aria-label", "Filter category");
-  filters.append(searchLabel, categories);
+  filters.append(categories);
   const content = element("div", "fm-scroll");
   content.setAttribute("role", "region");
   content.setAttribute("aria-label", "Complete result");
@@ -167,10 +161,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     return element("span", `fm-value ${tone}`, value === "" ? "Empty string" : String(value));
   }
 
-  function fields(value) {
+  function fields(value, headingKey) {
     const list = element("dl", "fm-fields");
     const entries = isObject(value) ? Object.entries(value) : [["value", value]];
     for (const [key, item] of entries) {
+      if (key === headingKey) continue;
       const row = element("div", "fm-field");
       const description = element("dd", "fm-value");
       description.append(valueNode(item, key, value));
@@ -195,7 +190,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     content.replaceChildren();
     fieldsButton.setAttribute("aria-pressed", String(mode === "fields"));
     jsonButton.setAttribute("aria-pressed", String(mode === "json"));
-    filters.hidden = mode !== "fields" || !presentation;
+    filters.hidden = mode !== "fields" || !presentation || categories.hidden;
     if (!presentation) return;
     if (mode === "copy") {
       content.append(element("pre", "fm-json", manualCopy));
@@ -209,10 +204,8 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       count.textContent = "Complete original result";
       return;
     }
-    const query = search.value.toLocaleLowerCase();
-    const matches = (item) => JSON.stringify(item).toLocaleLowerCase().includes(query);
     if (presentation.render) {
-      content.append(presentation.render(doc, query, content.clientWidth));
+      content.append(presentation.render(doc, "", content.clientWidth));
       count.textContent = presentation.count;
       return;
     }
@@ -224,24 +217,31 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       }
       let shown = 0;
       presentation.records.forEach((record, index) => {
-        if (!matches(record) || (categories.value && record?.[presentation.categoryKey] !== categories.value)) return;
+        if (categories.value && record?.[presentation.categoryKey] !== categories.value) return;
         shown++;
         const article = element("section", "fm-record");
         const heading = element("h2", "fm-record-heading");
         const label = record?.[presentation.titleKey];
         heading.append(element("span", "fm-index", String(index + 1).padStart(2, "0")),
           element("span", presentation.titleKey === "status" ? statusTone(label, record) : "", typeof label === "string" ? label : "Record"));
-        article.append(heading, fields(record));
+        if (typeof label === "string") {
+          const copyHeading = button(undefined, "fm-copy");
+          copyHeading.setAttribute("aria-label", `Copy ${presentation.titleKey}`);
+          copyHeading.append(icon());
+          help(copyHeading, `Copy the complete original ${presentation.titleKey} value.`);
+          copyHeading.addEventListener("click", () => { void copy(label); });
+          heading.append(copyHeading);
+        }
+        article.append(heading, fields(record, typeof label === "string" ? presentation.titleKey : undefined));
         content.append(article);
       });
       if (!shown) content.append(element("p", "fm-empty", presentation.records.length ? "No matching records. Clear or change the filters." : "No records in this result."));
       count.textContent = `${shown} / ${presentation.records.length} records${shown < presentation.records.length ? " · filter active" : ""}`;
     } else {
       const entries = isObject(raw) ? Object.entries(raw) : [["value", raw]];
-      const filtered = entries.filter(([key, value]) => matches({ [key]: value }));
-      content.append(fields(Object.fromEntries(filtered)));
-      if (!filtered.length) content.append(element("p", "fm-empty", entries.length ? "No matching fields. Clear the filter." : "Empty result."));
-      count.textContent = `${filtered.length} / ${entries.length} fields${filtered.length < entries.length ? " · filter active" : ""}`;
+      content.append(fields(Object.fromEntries(entries)));
+      if (!entries.length) content.append(element("p", "fm-empty", "Empty result."));
+      count.textContent = `${entries.length} fields`;
     }
   }
 
@@ -250,7 +250,6 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     raw = undefined;
     presentation = undefined;
     manualCopy = "";
-    search.value = "";
     categories.replaceChildren();
     categories.hidden = true;
     fieldsButton.disabled = jsonButton.disabled = copyAll.disabled = true;
@@ -278,7 +277,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     const values = presentation.categoryKey
       ? [...new Set((presentation.records ?? []).map((record) => record?.[presentation.categoryKey]).filter((value) => typeof value === "string"))]
       : [];
-    const all = element("option", "", presentation.categoryKey === "status" ? "All statuses" : "All types");
+    const all = element("option", "", { status: "All statuses", profile: "All profiles", mode: "All modes" }[presentation.categoryKey] ?? "All types");
     all.value = "";
     categories.append(all);
     for (const value of values) {
@@ -293,7 +292,6 @@ export function createResultView(root, { toolName, describe, renderValue }) {
 
   fieldsButton.addEventListener("click", () => { mode = "fields"; render(); });
   jsonButton.addEventListener("click", () => { mode = "json"; render(); });
-  search.addEventListener("input", render);
   categories.addEventListener("change", render);
   copyAll.addEventListener("click", () => { if (presentation) void copy(JSON.stringify(raw, null, 2)); });
   let previousWidth = content.clientWidth;

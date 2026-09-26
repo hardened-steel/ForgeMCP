@@ -53,8 +53,12 @@ from .models import (
     ProcessInfo,
     ProcessDetails,
     ProcessStream,
-    LineSelection,
-    TimeSelection,
+    FirstLines,
+    LastLines,
+    LineRange,
+    FirstSeconds,
+    LastSeconds,
+    TimeRange,
 )
 
 from .transcript import select_transcript
@@ -484,8 +488,8 @@ class ProcessService:
         async def process_get(
             ctx: Context,
             process_id: int,
-            lines: LineSelection | None = None,
-            time: TimeSelection | None = None,
+            lines: FirstLines | LastLines | LineRange | None = None,
+            time: FirstSeconds | LastSeconds | TimeRange | None = None,
             max_bytes: Annotated[int, Field(ge=0)] = 65536,
         ) -> ProcessDetails:
             """Read a log slice: time, then lines, then UTF-8 text bytes.

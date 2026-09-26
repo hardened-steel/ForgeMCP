@@ -3,7 +3,15 @@
 from dataclasses import replace
 from collections.abc import Sequence
 
-from .models import LineSelection, ProcessLogEntry, TimeSelection
+from .models import (
+    FirstLines,
+    LastLines,
+    LineRange,
+    FirstSeconds,
+    LastSeconds,
+    TimeRange,
+    ProcessLogEntry,
+)
 
 
 def fragment(entry: ProcessLogEntry, start: int, end: int) -> ProcessLogEntry:
@@ -32,19 +40,19 @@ def select_transcript(
     *,
     process_start: float,
     snapshot_end: float,
-    lines: LineSelection | None,
-    time: TimeSelection | None,
+    lines: FirstLines | LastLines | LineRange | None,
+    time: FirstSeconds | LastSeconds | TimeRange | None,
     max_bytes: int,
 ) -> list[ProcessLogEntry]:
     """Apply time, distinct line selection, then a UTF-8 text byte budget."""
     if lines is None and time is None:
-        lines = LineSelection(last=100)
+        lines = LastLines(last=100)
     lower_time = process_start
     upper_time = None
     if time is not None:
-        if time.first is not None:
+        if isinstance(time, FirstSeconds):
             upper_time = process_start + time.first
-        elif time.last is not None:
+        elif isinstance(time, LastSeconds):
             lower_time = max(process_start, snapshot_end - time.last)
         else:
             lower_time = process_start + time.start
@@ -59,9 +67,9 @@ def select_transcript(
         return []
     first = selected[0].start_line
     last = selected[-1].end_line
-    from_end = lines.last is not None if lines is not None else time.last is not None
+    from_end = isinstance(lines, LastLines) if lines is not None else isinstance(time, LastSeconds)
     if lines is not None:
-        if lines.start is not None:
+        if isinstance(lines, LineRange):
             first, last = lines.start, lines.end
         else:
             # Merge overlapping entry ranges, so split lines count only once.
@@ -71,7 +79,7 @@ def select_transcript(
                     ranges[-1][1] = max(ranges[-1][1], entry.end_line)
                 else:
                     ranges.append([entry.start_line, entry.end_line])
-            remaining = lines.last if from_end else lines.first
+            remaining = lines.last if isinstance(lines, LastLines) else lines.first
             for begin, end in reversed(ranges) if from_end else ranges:
                 size = end - begin + 1
                 if remaining <= size:

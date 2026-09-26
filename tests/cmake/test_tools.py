@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from forgemcp.toolchain.errors import ToolParserError
+from forgemcp.process.errors import ProcessError
+from forgemcp.toolchain.errors import ToolCommandError, ToolParserError
 from forgemcp.toolchain.tools import cmake, ctest
 
 
@@ -15,6 +16,7 @@ def anyio_backend():
 
 class Session:
     def __init__(self, text, code=0):
+        self.process_id = 42
         self.text = text
         self.code = code
         self.closed = False
@@ -71,7 +73,8 @@ async def test_cmake_parses_split_lines_and_preserves_native_arguments(cpp_accep
         on_progress=progress,
     )
     assert (result.completed_steps, result.total_steps, result.return_code) == (2, 2, 1)
-    assert "FAILED: app" in result.output_tail
+    assert result.process_id == 42
+    assert "output_tail" not in result.model_dump()
     assert progress.await_args_list[0].args == ("[1/2] Building main.cpp",)
     assert launch.call_args.args[1] == [
         "--build",
@@ -89,7 +92,8 @@ async def test_ctest_report_statuses_and_exact_name_filter(cpp_acceptance_projec
     report = cpp_acceptance_project / "report.xml"
     report.write_text(
         '<testsuite><testcase name="ok" time="0.25"/>'
-        '<testcase name="bad"><failure message="assertion"/></testcase>'
+        '<testcase name="bad"><failure message="assertion"/>'
+        '<system-out>Long command log stays in process_get</system-out></testcase>'
         '<testcase name="skip"><skipped/></testcase>'
         '<testcase name="disabled" status="notrun"/></testsuite>'
     )
@@ -108,9 +112,32 @@ async def test_ctest_report_statuses_and_exact_name_filter(cpp_acceptance_projec
     assert [case.status for case in result.tests] == ["passed", "failed", "skipped", "not_run"]
     assert result.tests[0].duration_seconds == 0.25
     assert result.tests[1].message == "assertion"
+    assert result.process_id == 42
     arguments = launch.call_args.args[1]
     assert arguments[:2] == ["--preset", "native-test"]
     assert arguments[arguments.index("--tests-regex") + 1] == r"^(case\.\+\(x\))$"
     report.write_text("invalid XML")
     with pytest.raises(ToolParserError):
         ctest.parse_report(report)
+    with pytest.raises(ToolCommandError) as failure:
+        await methods["test"](
+            cpp_acceptance_project,
+            None,
+            preset="native-test",
+            report_path=report,
+        )
+    assert failure.value.process_id == 42
+
+
+@pytest.mark.anyio
+async def test_command_failure_preserves_process_id_and_closes_session(cpp_acceptance_project):
+    session = Session("partial output")
+    session.wait = AsyncMock(side_effect=ProcessError("Timed out"))
+    methods = cmake.create_spec(
+        cpp_acceptance_project / "cmake",
+        SimpleNamespace(launch=AsyncMock(return_value=session)),
+    ).methods
+    with pytest.raises(ToolCommandError, match="Timed out") as failure:
+        await methods["build"](cpp_acceptance_project, None, preset="native-build")
+    assert failure.value.process_id == 42
+    assert session.closed
