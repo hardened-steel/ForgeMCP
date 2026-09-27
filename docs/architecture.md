@@ -231,8 +231,13 @@ only completion responses observe the protocol's 100-value cap.
 ### Workspace result extensions
 
 `register_extension(name, provider, kind=..., version=1)` registers an async
-provider. Each workspace tool supplies an `ExtensionContext` with its tool name,
+provider. An optional `tools` sequence limits invocation to those tools; the diff
+provider is scoped to write/edit so it does not retain full search texts.
+Each workspace tool supplies an `ExtensionContext` with its tool name,
 a copy of its result, qualified paths, and already-read full text when available.
+Write/edit also supply an immutable `TextChange` containing their captured before
+and after text. Both business methods accept an optional `on_change` callback to
+capture the successful mutation without adding snapshots to their public models.
 Providers may read files themselves; they must not change files. This is not a
 filesystem snapshot: independent reads can observe external changes.
 
@@ -245,13 +250,32 @@ Provider failures become sanitized extension errors without undoing a successful
 file operation; cancellation still propagates.
 
 Results expose `extensions_uri` and separate resource links. The main manifest
-contains every provider payload; separate resources let a model or user inspect
+contains provider metadata and inline payloads or resource references; separate resources let a model or user inspect
 diagnostics without loading unrelated token data. The templates are:
 
 ```text
 forgemcp://workspace/results/{result_id}/{name}.json
 forgemcp://workspace/results/{result_id}/{name}.md
 ```
+
+The first built-in provider is `workspace/diff.py`, explicitly registered in
+`server.py` as `diff`, kind `diff`, version 1. Its manifest data is
+`{"resource":"diff.json"}`. The separate JSON resource is a typed `FileDiff`:
+qualified path, compact change ranges, and hunks with three lines of context.
+Each hunk contains typed context/added/removed lines with nullable before/after
+line numbers and exact text, preserving CRLF and missing final newlines. Starts
+are one-based; a zero count denotes the next insertion position. Identical text
+produces empty changes/hunks. The provider uses only the invocation's snapshots,
+never a subsequent file read. Write/edit primary models retain counts, paths, and
+resource references; they contain no diff or detailed ranges.
+
+The App bridge reads the linked manifest followed by its version-1 diff resource.
+It requires both links to stay within that invocation's result namespace, verifies
+the diff link against both result and manifest links, and validates decoded data.
+Late reads after input, cancellation, or teardown are ignored. Resource failures
+are shown separately from a successful mutation. Rendering receives decoded data
+without App/transport access and displays two number columns and change markers,
+with no unified-diff headers. JSON and Copy all retain the original tool result.
 
 The manifest is named `extensions.json`. Published text is immutable and retained
 in memory until server shutdown; reads never rerun providers. Unknown IDs/names

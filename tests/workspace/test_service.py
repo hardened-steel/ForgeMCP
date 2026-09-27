@@ -141,8 +141,14 @@ def test_find_globs_extensions_and_hidden_directory_policy(workspace, call):
 
 def test_read_write_metadata_and_utf8_crlf(workspace):
     text = "α\r\n日本語\r\nlast"
-    created = workspace.write_file(WorkspacePath("project/utf8.txt"), text)
-    assert "+α" in created.diff
+    changes = []
+    created = workspace.write_file(
+        WorkspacePath("project/utf8.txt"),
+        text,
+        on_change=changes.append,
+    )
+    assert (changes[0].before, changes[0].after) == ("", text)
+    assert "diff" not in created.model_dump()
     assert (created.action, created.lines_removed, created.lines_added) == (
         "created",
         0,
@@ -158,8 +164,13 @@ def test_read_write_metadata_and_utf8_crlf(workspace):
     assert info.modified_at.utcoffset().total_seconds() == 0
     if os.name == "nt":
         assert info.created_at is not None and info.owner
-    overwritten = workspace.write_file(WorkspacePath("project/utf8.txt"), "new\n")
-    assert "-α" in overwritten.diff and "+new" in overwritten.diff
+    overwritten = workspace.write_file(
+        WorkspacePath("project/utf8.txt"),
+        "new\n",
+        on_change=changes.append,
+    )
+    assert (changes[1].before, changes[1].after) == (text, "new\n")
+    assert "diff" not in overwritten.model_dump()
     assert (overwritten.action, overwritten.lines_removed, overwritten.lines_added) == (
         "overwritten",
         3,
@@ -183,10 +194,21 @@ def test_exact_edit_is_unambiguous_and_preserves_unaffected_bytes(workspace):
         with pytest.raises(WorkspaceError):
             workspace.edit_file(WorkspacePath("project/edit.txt"), old, "changed")
         assert workspace.read_bytes(WorkspacePath("project/edit.txt")) == "α\r\nrepeat repeat\r\nend".encode()
-    first_edit = workspace.edit_file(WorkspacePath("project/edit.txt"), "repeat", "x", replace_all=True)
+    changes = []
+    first_edit = workspace.edit_file(
+        WorkspacePath("project/edit.txt"),
+        "repeat",
+        "x",
+        replace_all=True,
+        on_change=changes.append,
+    )
+    assert (changes[0].before, changes[0].after) == (
+        "α\r\nrepeat repeat\r\nend",
+        "α\r\nx x\r\nend",
+    )
     assert first_edit.replacements == 2
-    assert first_edit.changed_lines == ["-2 +2"]
-    assert "-repeat repeat" in first_edit.diff and "+x x" in first_edit.diff
+    assert "diff" not in first_edit.model_dump()
+    assert "changed_lines" not in first_edit.model_dump()
     assert workspace.edit_file(WorkspacePath("project/edit.txt"), "α\r\nx x", "β").replacements == 1
     assert workspace.read_bytes(WorkspacePath("project/edit.txt")) == "β\r\nend".encode()
     workspace.edit_file(WorkspacePath("project/edit.txt"), "β", "")
@@ -201,8 +223,14 @@ def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, monkeypa
         raise PermissionError("locked")
 
     monkeypatch.setattr(os, "replace", fail)
+    changes = []
     with pytest.raises(WorkspaceError):
-        workspace.write_file(WorkspacePath("project/keep.txt"), "replacement")
+        workspace.write_file(
+            WorkspacePath("project/keep.txt"),
+            "replacement",
+            on_change=changes.append,
+        )
+    assert changes == []
     assert workspace.read_file(WorkspacePath("project/keep.txt")).text == "original"
     assert not list(workspace.root.glob(".forgemcp-*"))
 

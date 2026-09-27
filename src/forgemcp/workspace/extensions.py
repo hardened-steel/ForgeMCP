@@ -9,11 +9,19 @@ from .path import WorkspacePath
 
 
 @dataclass(frozen=True)
+class TextChange:
+    path: WorkspacePath
+    before: str
+    after: str
+
+
+@dataclass(frozen=True)
 class ExtensionContext:
     tool_name: str
     result: BaseModel
     paths: tuple[WorkspacePath, ...]
     texts: Mapping[WorkspacePath, str] = field(default_factory=dict)
+    change: TextChange | None = None
 
 
 @dataclass(frozen=True)

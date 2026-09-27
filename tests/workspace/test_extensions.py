@@ -89,3 +89,22 @@ async def test_cancelled_provider_does_not_publish_result(cpp_acceptance_project
     with pytest.raises(asyncio.CancelledError):
         await workspace.enrich_result("read", workspace.read_file(path), [path])
     assert not workspace.result_resources
+
+
+@pytest.mark.anyio
+async def test_provider_scope_does_not_enrich_other_tools(cpp_acceptance_project):
+    workspace = WorkspaceService(cpp_acceptance_project)
+    calls = []
+
+    async def provider(context):
+        calls.append(context.tool_name)
+        return ExtensionOutput(data={"ok": True})
+
+    workspace.register_extension("scoped", provider, kind="test", tools=("workspace_write_file",))
+    path = WorkspacePath("project/README.md")
+    result = workspace.read_file(path)
+    read = await workspace.enrich_result("workspace_read_file", result, [path])
+    assert read.extensions_uri is None and calls == []
+    assert workspace.extensions_for("workspace_search") == {}
+    await workspace.enrich_result("workspace_write_file", result, [path])
+    assert calls == ["workspace_write_file"]

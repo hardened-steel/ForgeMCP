@@ -197,7 +197,7 @@ function findView(doc, data, query, state) {
   return container;
 }
 
-export function workspacePresentation(data) {
+export function workspacePresentation(data, extensions = {}) {
   if (!isObject(data)) return { toolName: "Workspace result", summary: data, records: null };
   if (Array.isArray(data.paths)) {
     const state = { key: "name", desc: false };
@@ -227,7 +227,6 @@ export function workspacePresentation(data) {
   const resourceFields = resources(data);
   const hidden = [...resourceFields];
   if (toolName === "workspace_read_file") hidden.push("start_line");
-  if (toolName === "workspace_edit_file") hidden.push("changed_lines");
   if (toolName === "workspace_move" || toolName === "workspace_delete") {
     const fields = toolName === "workspace_move" ? ["source", "path"] : ["path"];
     return {
@@ -244,7 +243,17 @@ export function workspacePresentation(data) {
   }
   if (["workspace_read_file", "workspace_write_file", "workspace_edit_file"].includes(toolName)) {
     const display = without(data, hidden);
-    if (toolName === "workspace_edit_file") display.replacements = data.changed_lines?.join(", ") || "None";
+    if (toolName !== "workspace_read_file") {
+      display.diff = extensions.diff ?? (extensions.diffState === "error" ? "Diff could not be loaded. The file operation succeeded."
+        : extensions.diffState === "ready" || !data.extensions_uri ? "No diff available." : "Loading diff…");
+      if (toolName === "workspace_edit_file" && extensions.diff) {
+        const range = (start, count) => count === 1 ? String(start) : `${start}–${start + count - 1}`;
+        display.replacements = extensions.diff.changes.map((change) => [
+          change.before_count ? `−${range(change.before_start, change.before_count)}` : "",
+          change.after_count ? `+${range(change.after_start, change.after_count)}` : "",
+        ].filter(Boolean).join(" ")).join(", ") || "None";
+      }
+    }
     return {
       toolName, summary: data, records: null, resourceFields, viewData: display,
       fieldFilter: false, filterPlaceholder: "Search lines",
@@ -254,10 +263,62 @@ export function workspacePresentation(data) {
 }
 
 export function workspaceValue(value, key, record, { doc, valueNode, query = "" }) {
-  if ((key === "text" || key === "diff") && typeof value === "string") {
+  if (key === "diff" && isObject(value) && Array.isArray(value.hunks)) {
+    const source = doc.createElement("div");
+    source.className = "fm-source fm-diff";
+    source.setAttribute("aria-label", "File changes with original and new line numbers");
+    const wrap = doc.createElement("button");
+    wrap.type = "button";
+    wrap.textContent = "Wrap lines";
+    wrap.setAttribute("aria-pressed", "true");
+    wrap.addEventListener("click", () => {
+      const enabled = wrap.getAttribute("aria-pressed") !== "true";
+      wrap.setAttribute("aria-pressed", String(enabled));
+      source.classList.toggle("fm-source-nowrap", !enabled);
+    });
+    source.append(wrap);
+    let shown = 0;
+    for (const hunk of value.hunks) {
+      const block = doc.createElement("div");
+      block.className = "fm-source-viewport fm-diff-hunk";
+      block.tabIndex = 0;
+      block.setAttribute("aria-label", `Changes at line ${hunk.after_start}`);
+      for (const entry of hunk.lines) {
+        if (query && !entry.text.toLocaleLowerCase().includes(query)) continue;
+        shown++;
+        const row = doc.createElement("div");
+        row.className = `fm-source-line fm-diff-line ${entry.kind === "added" ? "fm-diff-add" : entry.kind === "removed" ? "fm-diff-remove" : ""}`;
+        row.dataset.beforeLine = entry.before_line ?? "";
+        row.dataset.afterLine = entry.after_line ?? "";
+        for (const number of [entry.before_line, entry.after_line]) {
+          const label = doc.createElement("span");
+          label.className = "fm-diff-number";
+          label.textContent = number ?? "";
+          row.append(label);
+        }
+        const sign = doc.createElement("span");
+        sign.className = "fm-diff-sign";
+        sign.textContent = entry.kind === "added" ? "+" : entry.kind === "removed" ? "−" : " ";
+        sign.setAttribute("aria-label", entry.kind);
+        const code = doc.createElement("code");
+        appendHighlighted(doc, code, entry.text, query);
+        row.append(sign, code);
+        block.append(row);
+      }
+      if (block.children.length) source.append(block);
+    }
+    if (!shown) {
+      const empty = doc.createElement("p");
+      empty.className = "fm-empty";
+      empty.textContent = query ? "No matching lines." : "No text changes.";
+      source.append(empty);
+    }
+    return source;
+  }
+  if (key === "text" && typeof value === "string") {
     const source = doc.createElement("div");
     source.className = "fm-source";
-    source.setAttribute("aria-label", key === "diff" ? "File diff with line numbers" : "File text with line numbers");
+    source.setAttribute("aria-label", "File text with line numbers");
     if (!value) { source.textContent = "Empty string"; return source; }
     const wrap = doc.createElement("button");
     wrap.type = "button";
@@ -274,36 +335,13 @@ export function workspaceValue(value, key, record, { doc, valueNode, query = "" 
     viewport.setAttribute("aria-label", "File contents");
     source.append(wrap, viewport);
     const lines = value.split(/(?<=\n)|(?<=\r)(?!\n)/);
-    let oldLine = 0;
-    let newLine = 0;
     lines.forEach((text, index) => {
       if (index === lines.length - 1 && text === "") return;
-      let number = String((record.start_line ?? record.line ?? 1) + index);
-      if (key === "diff") {
-        const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
-        if (hunk) {
-          oldLine = Number(hunk[1]);
-          newLine = Number(hunk[2]);
-          number = "";
-        } else if (text.startsWith("---") || text.startsWith("+++")) {
-          number = "";
-        } else if (text.startsWith("-")) {
-          number = `-${oldLine++}`;
-        } else if (text.startsWith("+")) {
-          number = `+${newLine++}`;
-        } else if (oldLine && newLine) {
-          number = String(newLine++);
-          oldLine++;
-        }
-      }
+      const number = String((record.start_line ?? record.line ?? 1) + index);
       if (query && !text.toLocaleLowerCase().includes(query)) return;
       const line = doc.createElement("div");
       line.className = "fm-source-line";
       line.dataset.line = number;
-      if (key === "diff") {
-        if (text.startsWith("+")) line.classList.add("fm-diff-add");
-        if (text.startsWith("-")) line.classList.add("fm-diff-remove");
-      }
       const code = doc.createElement("code");
       appendHighlighted(doc, code, text, query);
       line.append(code);

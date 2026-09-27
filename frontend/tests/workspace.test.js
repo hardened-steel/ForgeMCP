@@ -153,12 +153,33 @@ test("read, write, and edit search only source lines while keeping original numb
   assert.deepEqual([...root.querySelectorAll(".fm-source-line")].map((node) => node.dataset.line), ["31", "33"]);
   assert.equal(root.querySelectorAll(".fm-local-match").length, 2);
   assert.ok(![...root.querySelectorAll("dt")].some((node) => node.textContent === "start_line"));
-  view.receive({ structuredContent: { path: "project/a.cpp", action: "overwritten", lines_added: 1, lines_removed: 1, diff: "--- before\n+++ after\n@@ -4 +4 @@\n-old\n+needle\n" } });
+  const diff = {
+    path: "project/a.cpp",
+    changes: [{ kind: "replace", before_start: 4, before_count: 1, after_start: 4, after_count: 1 }],
+    hunks: [{ before_start: 4, before_count: 1, after_start: 4, after_count: 1, lines: [
+      { kind: "removed", before_line: 4, after_line: null, text: "old\n" },
+      { kind: "added", before_line: null, after_line: 4, text: "needle\n" },
+    ] }],
+  };
+  const written = { path: "project/a.cpp", action: "overwritten", lines_added: 1, lines_removed: 1 };
+  view.receive({ structuredContent: written });
   root.querySelector("input").value = "needle";
   root.querySelector("input").dispatchEvent(new win.Event("input"));
-  assert.deepEqual([...root.querySelectorAll(".fm-source-line")].map((node) => node.dataset.line), ["+4"]);
-  view.receive({ structuredContent: { path: "project/a.cpp", replacements: 1, changed_lines: ["-4 +4"], diff: "--- before\n+++ after\n@@ -4 +4 @@\n-old\n+needle\n" } });
-  assert.ok(root.textContent.includes("-4 +4"));
+  view.setExtensions({ diff, diffState: "ready" });
+  assert.equal(root.querySelector("input").value, "needle");
+  assert.deepEqual([...root.querySelectorAll(".fm-diff-line")].map((node) => node.dataset.afterLine), ["4"]);
+  assert.equal(root.querySelector(".fm-diff-line code").textContent, "needle\n");
+  assert.ok(!root.textContent.includes("--- before"));
+  root.querySelector(".fm-views button:last-child").click();
+  assert.equal(root.querySelector("pre").textContent, JSON.stringify(written, null, 2));
+  view.receive({ structuredContent: { path: "project/a.cpp", replacements: 1 } });
+  view.setExtensions({ diff, diffState: "ready" });
+  assert.ok(root.textContent.includes("−4 +4"));
+  assert.deepEqual([...root.querySelectorAll(".fm-diff-line")].map((node) => [node.dataset.beforeLine, node.dataset.afterLine]), [["4", ""], ["", "4"]]);
+  view.setExtensions({ diffState: "error" });
+  assert.ok(root.textContent.includes("The file operation succeeded."));
+  view.setExtensions({ diff: { path: "project/a.cpp", changes: [], hunks: [] }, diffState: "ready" });
+  assert.ok(root.textContent.includes("No text changes."));
 });
 
 test("result resources have a separate tab and move/delete use compact fields", (t) => {
@@ -192,7 +213,8 @@ test("mutation and metadata shapes select the correct tool without additional ca
     const data = { root: "project", path: "example", ...fields };
     const { root, view } = mount(t, data);
     assert.equal(root.querySelector("h1").textContent, name);
-    const visible = name === "workspace_move" ? 2 : name === "workspace_delete" ? 1 : Object.keys(data).length;
+    const visible = name === "workspace_move" ? 2 : name === "workspace_delete" ? 1
+      : Object.keys(data).length + (["workspace_write_file", "workspace_edit_file"].includes(name) ? 1 : 0);
     assert.equal(root.querySelectorAll("dt").length, visible);
     view.receive({ isError: true, content: [{ type: "text", text: "Expected one occurrence" }] });
     assert.ok(root.textContent.includes("Expected one occurrence"));

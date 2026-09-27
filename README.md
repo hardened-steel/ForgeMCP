@@ -164,10 +164,18 @@ binary content, and the other four resources return `text/markdown`.
 
 Dependent modules may register workspace result extensions. Tool results include
 `extensions_uri` and separate `resources` links when providers supply data.
-`extensions.json` contains the complete extension data; optional files such as
+`extensions.json` contains extension metadata and inline data or resource references; optional files such as
 `diagnostics.json` and `diagnostics.md` can be read without syntax token data.
 All result resources are immutable, held in memory, and disappear on restart.
-No syntax/diagnostic provider or frontend resource loading is included in this slice.
+Write/edit results expose a `diff` extension (version 1) whose data references
+`diff.json`. This typed resource contains `path`, compact `changes` ranges, and
+`hunks` with context/added/removed lines, original/new line numbers, and exact text
+including line endings. Starts are one-based; a zero count denotes an empty range
+at that insertion position. Diff data is absent from the tool's primary result.
+Workspace widgets read the linked manifest and diff resource, displaying changes
+without unified-diff headers. Search highlights matching lines; JSON and Copy all
+retain the original tool result. A loading failure does not change the successful
+file-operation outcome. No syntax/diagnostic provider is included yet.
 
 ## CMake profiles
 

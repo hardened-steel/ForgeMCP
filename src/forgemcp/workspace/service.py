@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import fnmatch
 import json
 import logging
@@ -49,6 +48,7 @@ from .extensions import (
     ResultExtensions,
     ResultResource,
     ResultResources,
+    TextChange,
 )
 from .metadata import file_owner
 from .path import WorkspacePath
@@ -111,14 +111,11 @@ class FileWriteResult(ResultResources):
     action: Literal["created", "overwritten"]
     lines_removed: int
     lines_added: int
-    diff: str = ""
 
 
 class FileEditResult(ResultResources):
     path: WorkspacePath
     replacements: int
-    changed_lines: list[str] = Field(default_factory=list)
-    diff: str = ""
 
 
 class PathOperationResult(ResultResources):
@@ -208,7 +205,10 @@ class WorkspaceService:
             if self.storage_root.exists() and not self.storage_root.is_dir():
                 raise WorkspaceError("Storage root must be a directory.")
         self.protected_paths: set[Path] = set()
-        self.extension_providers: dict[str, tuple[str, int, ExtensionProvider]] = {}
+        self.extension_providers: dict[
+            str,
+            tuple[str, int, ExtensionProvider, frozenset[str] | None],
+        ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
 
     def register_extension(
@@ -218,25 +218,39 @@ class WorkspaceService:
         *,
         kind: str,
         version: int = 1,
+        tools: Sequence[str] | None = None,
     ) -> None:
         """Register one uniquely named provider; workspace does not interpret its data."""
         if not name or not kind or version < 1 or name in self.extension_providers:
             raise WorkspaceError("Extension needs a unique name, kind and positive version.")
-        self.extension_providers[name] = (kind, version, provider)
+        self.extension_providers[name] = (
+            kind,
+            version,
+            provider,
+            frozenset(tools) if tools is not None else None,
+        )
+
+    def extensions_for(self, tool_name: str) -> dict[str, tuple[str, int, ExtensionProvider]]:
+        return {
+            name: (kind, version, provider)
+            for name, (kind, version, provider, tools) in self.extension_providers.items()
+            if tools is None or tool_name in tools
+        }
 
     async def create_result_extensions(
         self,
         context: ExtensionContext,
     ) -> ResultResources:
         """Freeze provider output once; subsequent resource reads only retrieve text."""
-        if not self.extension_providers:
+        providers = self.extensions_for(context.tool_name)
+        if not providers:
             return ResultResources()
         result_id = uuid4().hex
         base_uri = f"forgemcp://workspace/results/{result_id}/"
         stored = {}
         extensions = []
         links = []
-        for name, (kind, version, provider) in tuple(self.extension_providers.items()):
+        for name, (kind, version, provider) in providers.items():
             entry = ResultExtension(name=name, kind=kind, version=version)
             try:
                 # Every provider sees an independent result object and immutable text mapping.
@@ -246,6 +260,7 @@ class WorkspaceService:
                         result=context.result.model_copy(deep=True),
                         paths=context.paths,
                         texts=MappingProxyType(dict(context.texts)),
+                        change=context.change,
                     )
                 )
                 if output is None:
@@ -324,6 +339,7 @@ class WorkspaceService:
         result: T,
         paths: Sequence[WorkspacePath],
         texts: Mapping[WorkspacePath, str] | None = None,
+        change: TextChange | None = None,
     ) -> T:
         references = await self.create_result_extensions(
             ExtensionContext(
@@ -331,6 +347,7 @@ class WorkspaceService:
                 result=result,
                 paths=tuple(dict.fromkeys(paths)),
                 texts=texts or {},
+                change=change,
             )
         )
         result.extensions_uri = references.extensions_uri
@@ -551,58 +568,25 @@ class WorkspaceService:
                 temporary.chmod(temporary.stat().st_mode | stat.S_IWUSR)
                 temporary.unlink(missing_ok=True)
 
-    @staticmethod
-    def text_diff(before: str, after: str) -> tuple[str, list[str]]:
-        old_lines = before.splitlines(keepends=True)
-        new_lines = after.splitlines(keepends=True)
-        diff = "".join(
-            line if line.endswith(("\n", "\r")) else line + "\n"
-            for line in difflib.unified_diff(
-                old_lines,
-                new_lines,
-                fromfile="before",
-                tofile="after",
-            )
-        )
-        ranges = []
-        for operation, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-            None,
-            old_lines,
-            new_lines,
-            autojunk=False,
-        ).get_opcodes():
-            if operation == "equal":
-                continue
-            old = (
-                f"-{old_start + 1}" if old_end - old_start == 1
-                else f"-{old_start + 1}-{old_end}" if old_end > old_start
-                else ""
-            )
-            new = (
-                f"+{new_start + 1}" if new_end - new_start == 1
-                else f"+{new_start + 1}-{new_end}" if new_end > new_start
-                else ""
-            )
-            ranges.append(" ".join(part for part in (old, new) if part))
-        return diff, ranges
-
     def write_file(
         self,
         path: WorkspacePath,
         text: str,
+        *,
+        on_change: Callable[[TextChange], None] | None = None,
     ) -> FileWriteResult:
         with filesystem_errors(path):
             candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.exists()
             previous = self.read_file(path).text if existed else ""
-            diff, _ = self.text_diff(previous, text)
             self.replace_text(candidate, text)
+            if on_change is not None:
+                on_change(TextChange(path=path, before=previous, after=text))
             return FileWriteResult(
                 path=path,
                 action="overwritten" if existed else "created",
                 lines_removed=len(previous.splitlines()),
                 lines_added=len(text.splitlines()),
-                diff=diff,
             )
 
     def edit_file(
@@ -612,6 +596,7 @@ class WorkspaceService:
         new_text: str,
         *,
         replace_all: bool = False,
+        on_change: Callable[[TextChange], None] | None = None,
     ) -> FileEditResult:
         if not old_text:
             raise WorkspaceError("old_text must not be empty.")
@@ -628,13 +613,12 @@ class WorkspaceService:
                     f"Found {count} occurrences; use replace_all or a more specific old_text."
                 )
             updated = text.replace(old_text, new_text)
-            diff, changed_lines = self.text_diff(text, updated)
             self.replace_text(candidate, updated)
+            if on_change is not None:
+                on_change(TextChange(path=path, before=text, after=updated))
             return FileEditResult(
                 path=path,
                 replacements=count,
-                changed_lines=changed_lines,
-                diff=diff,
             )
 
     def move(
@@ -1053,6 +1037,7 @@ class WorkspaceService:
                         f"Invalid regular expression: {error}"
                     ) from error
                 matches, skipped = [], []
+                collect_texts = bool(self.extensions_for("workspace_search"))
                 texts: dict[WorkspacePath, str] = {}
                 with filesystem_errors(path):
                     async for candidate in self.iter_files(path.relative, path.area):
@@ -1084,7 +1069,7 @@ class WorkspaceService:
                                 match.span() for match in expression.finditer(value)
                             ]
                             if spans:
-                                if self.extension_providers:
+                                if collect_texts:
                                     texts[relative] = text
                                 matches.append(
                                     SearchMatch(
@@ -1120,10 +1105,12 @@ class WorkspaceService:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting write file")
+            changes: list[TextChange] = []
             try:
                 result = self.write_file(
                     path=path,
                     text=text,
+                    on_change=changes.append,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
@@ -1133,6 +1120,7 @@ class WorkspaceService:
                 result,
                 [path],
                 {path: text},
+                change=changes[0],
             )
 
         @apps.tool(
@@ -1150,17 +1138,24 @@ class WorkspaceService:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting edit file")
+            changes: list[TextChange] = []
             try:
                 result = self.edit_file(
                     path=path,
                     old_text=old_text,
                     new_text=new_text,
                     replace_all=replace_all,
+                    on_change=changes.append,
                 )
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed edit file")
-            return await self.enrich_result("workspace_edit_file", result, [path])
+            return await self.enrich_result(
+                "workspace_edit_file",
+                result,
+                [path],
+                change=changes[0],
+            )
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,

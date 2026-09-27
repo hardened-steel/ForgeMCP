@@ -331,6 +331,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   clear("Waiting for tool result…");
   return {
     receive,
+    setExtensions: (extensions) => {
+      if (disposed || raw === undefined || !presentation) return;
+      presentation = describe(raw, extensions);
+      render();
+    },
     pending: () => { if (!disposed) clear("Waiting for tool result…"); },
     cancelled: () => { if (!disposed) clear("Tool invocation cancelled."); },
     unavailable: () => { if (!disposed) clear("Unable to connect to the host."); },
