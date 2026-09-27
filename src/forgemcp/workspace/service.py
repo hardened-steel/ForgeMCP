@@ -44,8 +44,6 @@ from .extensions import (
     ExtensionContext,
     ExtensionOutput,
     ExtensionProvider,
-    ResultExtension,
-    ResultExtensions,
     ResultResource,
     ResultResources,
     TextChange,
@@ -207,7 +205,7 @@ class WorkspaceService:
         self.protected_paths: set[Path] = set()
         self.extension_providers: dict[
             str,
-            tuple[str, int, ExtensionProvider, frozenset[str] | None],
+            tuple[ExtensionProvider, frozenset[str] | None],
         ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
 
@@ -216,24 +214,20 @@ class WorkspaceService:
         name: str,
         provider: ExtensionProvider,
         *,
-        kind: str,
-        version: int = 1,
         tools: Sequence[str] | None = None,
     ) -> None:
         """Register one uniquely named provider; workspace does not interpret its data."""
-        if not name or not kind or version < 1 or name in self.extension_providers:
-            raise WorkspaceError("Extension needs a unique name, kind and positive version.")
+        if not name or name in self.extension_providers:
+            raise WorkspaceError("Extension needs a unique nonempty name.")
         self.extension_providers[name] = (
-            kind,
-            version,
             provider,
             frozenset(tools) if tools is not None else None,
         )
 
-    def extensions_for(self, tool_name: str) -> dict[str, tuple[str, int, ExtensionProvider]]:
+    def extensions_for(self, tool_name: str) -> dict[str, ExtensionProvider]:
         return {
-            name: (kind, version, provider)
-            for name, (kind, version, provider, tools) in self.extension_providers.items()
+            name: provider
+            for name, (provider, tools) in self.extension_providers.items()
             if tools is None or tool_name in tools
         }
 
@@ -248,12 +242,9 @@ class WorkspaceService:
         result_id = uuid4().hex
         base_uri = f"forgemcp://workspace/results/{result_id}/"
         stored = {}
-        extensions = []
-        links = []
-        for name, (kind, version, provider) in providers.items():
-            entry = ResultExtension(name=name, kind=kind, version=version)
+        links = {}
+        for name, provider in providers.items():
             try:
-                # Every provider sees an independent result object and immutable text mapping.
                 output = await provider(
                     ExtensionContext(
                         tool_name=context.tool_name,
@@ -267,64 +258,38 @@ class WorkspaceService:
                     continue
                 if not isinstance(output, ExtensionOutput):
                     raise WorkspaceError("Provider must return ExtensionOutput or None.")
-                pending = {}
-                for resource in output.resources:
-                    expected_mime = {
-                        ".json": "application/json",
-                        ".md": "text/markdown",
-                    }.get(Path(resource.name).suffix)
-                    if (
-                        not resource.name
-                        or not resource.name.isascii()
-                        or any(
-                            not (char.isalnum() or char in "._-")
-                            for char in resource.name
-                        )
-                        or ".." in resource.name
-                        or resource.name == "extensions.json"
-                        or resource.name in stored
-                        or resource.name in pending
-                        or expected_mime is None
-                        or resource.mime_type != expected_mime
-                        or not isinstance(resource.text, str)
-                    ):
-                        raise WorkspaceError(
-                            "Extension resources need unique .json/.md filenames and matching MIME types."
-                        )
-                    if resource.mime_type == "application/json":
-                        json.loads(resource.text)
-                    pending[resource.name] = (resource.mime_type, resource.text)
-                entry = ResultExtension(
-                    name=name,
-                    kind=kind,
-                    version=version,
-                    data=output.data,
+                resource = output.resource
+                expected_mime = {
+                    ".json": "application/json",
+                    ".md": "text/markdown",
+                }.get(Path(resource.name).suffix)
+                if (
+                    not resource.name
+                    or not resource.name.isascii()
+                    or any(not (char.isalnum() or char in "._-") for char in resource.name)
+                    or ".." in resource.name
+                    or resource.name in stored
+                    or expected_mime is None
+                    or resource.mime_type != expected_mime
+                    or not isinstance(resource.text, str)
+                    or "uri" in output.metadata
+                    or "mime_type" in output.metadata
+                ):
+                    raise WorkspaceError("Resource needs a unique .json/.md filename and matching MIME type.")
+                if resource.mime_type == "application/json":
+                    json.loads(resource.text)
+                link = ResultResource(
+                    uri=base_uri + resource.name,
+                    mime_type=resource.mime_type,
+                    **output.metadata,
                 )
-                # Detach mutable JSON supplied by the provider before another await.
-                entry = ResultExtension.model_validate_json(entry.model_dump_json())
-                stored.update(pending)
-                links.extend(
-                    ResultResource(uri=base_uri + filename, mime_type=mime_type)
-                    for filename, (mime_type, _) in pending.items()
-                )
+                links[name] = ResultResource.model_validate_json(link.model_dump_json())
+                stored[resource.name] = (resource.mime_type, resource.text)
             except Exception:
                 logging.getLogger(__name__).warning("Workspace extension failed: %s", name)
-                entry = ResultExtension(
-                    name=name,
-                    kind=kind,
-                    version=version,
-                    error="Extension provider failed.",
-                )
-            extensions.append(entry)
-        if not extensions:
-            return ResultResources()
-        manifest = ResultExtensions(extensions=extensions, resources=links)
-        stored["extensions.json"] = ("application/json", manifest.model_dump_json())
-        self.result_resources[result_id] = stored
-        return ResultResources(
-            extensions_uri=base_uri + "extensions.json",
-            resources=links,
-        )
+        if stored:
+            self.result_resources[result_id] = stored
+        return ResultResources(resources=links)
 
     def read_result_resource(self, result_id: str, name: str) -> str:
         """Return an immutable resource without invoking its provider again."""
@@ -350,7 +315,6 @@ class WorkspaceService:
                 change=change,
             )
         )
-        result.extensions_uri = references.extensions_uri
         result.resources = references.resources
         return result
 

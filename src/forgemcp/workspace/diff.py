@@ -14,6 +14,7 @@ class DiffLine(BaseModel):
     before_line: int | None = Field(ge=1)
     after_line: int | None = Field(ge=1)
     text: str
+    spans: list[tuple[int, int]] = Field(default_factory=list)
 
 
 class DiffRange(BaseModel):
@@ -74,12 +75,29 @@ def create_diff(change: TextChange) -> FileDiff:
                     for number in range(i, j)
                 )
             else:
+                before_spans = {}
+                after_spans = {}
+                if kind == "replace":
+                    for old, new in zip(range(i, j), range(k, l)):
+                        character_diff = difflib.SequenceMatcher(
+                            None,
+                            before[old],
+                            after[new],
+                            autojunk=False,
+                        )
+                        before_spans[old] = []
+                        after_spans[new] = []
+                        for operation, a, b, c, d in character_diff.get_opcodes():
+                            if operation != "equal":
+                                before_spans[old].append((a, b))
+                                after_spans[new].append((c, d))
                 lines.extend(
                     DiffLine(
                         kind="removed",
                         before_line=number + 1,
                         after_line=None,
                         text=before[number],
+                        spans=before_spans.get(number, [(0, len(before[number]))]),
                     )
                     for number in range(i, j)
                 )
@@ -89,6 +107,7 @@ def create_diff(change: TextChange) -> FileDiff:
                         before_line=None,
                         after_line=number + 1,
                         text=after[number],
+                        spans=after_spans.get(number, [(0, len(after[number]))]),
                     )
                     for number in range(k, l)
                 )
@@ -109,12 +128,10 @@ async def diff_extension(context: ExtensionContext) -> ExtensionOutput | None:
         return None
     diff = create_diff(context.change)
     return ExtensionOutput(
-        data={"resource": "diff.json"},
-        resources=(
-            ExtensionResource(
-                name="diff.json",
-                mime_type="application/json",
-                text=diff.model_dump_json(),
-            ),
+        resource=ExtensionResource(
+            name="diff.json",
+            mime_type="application/json",
+            text=diff.model_dump_json(),
         ),
+        metadata={"version": 1},
     )

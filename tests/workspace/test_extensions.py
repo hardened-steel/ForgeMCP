@@ -33,23 +33,23 @@ def test_qualified_path_serializes_as_string():
 
 
 @pytest.mark.anyio
-async def test_extensions_are_immutable_and_provider_failure_preserves_file_result(cpp_acceptance_project):
+async def test_named_resources_are_immutable_and_failures_preserve_file_result(cpp_acceptance_project):
     workspace = WorkspaceService(cpp_acceptance_project)
-    payload = {"messages": ["original"]}
+    metadata = {"messages": ["original"]}
     calls = []
 
     async def provider(context):
         calls.append(context)
         return ExtensionOutput(
-            data=payload,
-            resources=(ExtensionResource("diagnostics.md", "text/markdown", "original"),),
+            resource=ExtensionResource("diagnostics.json", "application/json", '{"message":"original"}'),
+            metadata=metadata,
         )
 
     async def broken(context):
         raise RuntimeError("private failure details")
 
-    workspace.register_extension("diagnostics", provider, kind="diagnostics")
-    workspace.register_extension("broken", broken, kind="diagnostics")
+    workspace.register_extension("diagnostics", provider)
+    workspace.register_extension("broken", broken)
     apps = Apps()
     mcp = MCPServer("extension-unit", extensions=[apps])
     complete = Complete()
@@ -60,21 +60,20 @@ async def test_extensions_are_immutable_and_provider_failure_preserves_file_resu
     async with Client(mcp) as client:
         result = await client.call_tool("workspace_read_file", {"path": "project/README.md"})
         assert not result.is_error
-        uri = result.structured_content["extensions_uri"]
+        assert "extensions_uri" not in result.structured_content
+        resources = result.structured_content["resources"]
+        assert set(resources) == {"diagnostics"}
+        uri = resources["diagnostics"]["uri"]
         first = (await client.read_resource(uri)).contents[0].text
-        payload["messages"].append("changed")
+        metadata["messages"].append("changed")
+        assert resources["diagnostics"]["messages"] == ["original"]
         assert (await client.read_resource(uri)).contents[0].text == first
-        manifest = json.loads(first)
-        assert manifest["extensions"][0]["data"] == {"messages": ["original"]}
-        assert manifest["extensions"][1]["error"] == "Extension provider failed."
-        assert "private failure details" not in first
-        extra = result.structured_content["resources"][0]["uri"]
-        assert (await client.read_resource(extra)).contents[0].text == "original"
+        assert json.loads(first) == {"message": "original"}
         assert len(calls) == 1
         path = WorkspacePath("project/README.md")
         assert calls[0].texts[path] == result.structured_content["text"]
         with pytest.raises(MCPError):
-            await client.read_resource(uri.replace("extensions.json", "missing.json"))
+            await client.read_resource(uri.replace("diagnostics.json", "extensions.json"))
 
 
 @pytest.mark.anyio
@@ -84,7 +83,7 @@ async def test_cancelled_provider_does_not_publish_result(cpp_acceptance_project
     async def cancelled(context):
         raise asyncio.CancelledError()
 
-    workspace.register_extension("cancel", cancelled, kind="test")
+    workspace.register_extension("cancel", cancelled)
     path = WorkspacePath("project/README.md")
     with pytest.raises(asyncio.CancelledError):
         await workspace.enrich_result("read", workspace.read_file(path), [path])
@@ -98,13 +97,30 @@ async def test_provider_scope_does_not_enrich_other_tools(cpp_acceptance_project
 
     async def provider(context):
         calls.append(context.tool_name)
-        return ExtensionOutput(data={"ok": True})
+        return ExtensionOutput(resource=ExtensionResource("scoped.json", "application/json", "{}"))
 
-    workspace.register_extension("scoped", provider, kind="test", tools=("workspace_write_file",))
+    workspace.register_extension("scoped", provider, tools=("workspace_write_file",))
     path = WorkspacePath("project/README.md")
     result = workspace.read_file(path)
     read = await workspace.enrich_result("workspace_read_file", result, [path])
-    assert read.extensions_uri is None and calls == []
+    assert read.resources == {} and calls == []
     assert workspace.extensions_for("workspace_search") == {}
     await workspace.enrich_result("workspace_write_file", result, [path])
     assert calls == ["workspace_write_file"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("metadata", [{"uri": "https://example.com"}, {"mime_type": "text/plain"}])
+async def test_provider_cannot_override_resource_link(cpp_acceptance_project, metadata):
+    workspace = WorkspaceService(cpp_acceptance_project)
+
+    async def provider(context):
+        return ExtensionOutput(
+            resource=ExtensionResource("example.json", "application/json", "{}"),
+            metadata=metadata,
+        )
+
+    workspace.register_extension("invalid", provider)
+    path = WorkspacePath("project/README.md")
+    result = await workspace.enrich_result("read", workspace.read_file(path), [path])
+    assert result.resources == {} and workspace.result_resources == {}

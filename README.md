@@ -162,20 +162,23 @@ files. Encode query values using percent encoding (spaces as `%20`, not `+`);
 regex is supported. Text mirrors return the original text, raw mirrors return MCP
 binary content, and the other four resources return `text/markdown`.
 
-Dependent modules may register workspace result extensions. Tool results include
-`extensions_uri` and separate `resources` links when providers supply data.
-`extensions.json` contains extension metadata and inline data or resource references; optional files such as
-`diagnostics.json` and `diagnostics.md` can be read without syntax token data.
-All result resources are immutable, held in memory, and disappear on restart.
-Write/edit results expose a `diff` extension (version 1) whose data references
-`diff.json`. This typed resource contains `path`, compact `changes` ranges, and
-`hunks` with context/added/removed lines, original/new line numbers, and exact text
-including line endings. Starts are one-based; a zero count denotes an empty range
-at that insertion position. Diff data is absent from the tool's primary result.
-Workspace widgets read the linked manifest and diff resource, displaying changes
-without unified-diff headers. Search highlights matching lines; JSON and Copy all
-retain the original tool result. A loading failure does not change the successful
-file-operation outcome. No syntax/diagnostic provider is included yet.
+Dependent modules may register workspace result providers. A tool's `resources`
+object maps each contributing provider name to a descriptor with `uri` and
+`mime_type`, plus optional provider-specific JSON metadata. There is no manifest
+or `extensions_uri`. All result resources are immutable, held in memory, and
+disappear on restart.
+
+Write/edit return `resources.diff` linking to `diff.json` with `version: 1`.
+This typed resource contains `path`, compact `changes` ranges, and `hunks` with
+context/added/removed lines, original/new numbers, exact text including line
+endings, and character `spans` in zero-based Unicode code points [start, end).
+Starts are one-based; a zero count denotes an empty range at an insertion position.
+Diff data is absent from the primary result. Widgets read the named resource
+and display changes without headers or a redundant diff label. The Highlight
+changes button toggles changed-substring highlighting next to Wrap lines; local
+search uses a separate color. JSON and Copy all retain the original tool result.
+A resource-loading failure does not change the successful file-operation outcome.
+No syntax/diagnostic provider is included yet.
 
 ## CMake profiles
 

@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -122,11 +121,10 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
         )
         result = written.structured_content
         assert "diff" not in result and "changed_lines" not in result
-        manifest = json.loads((await client.read_resource(result["extensions_uri"])).contents[0].text)
-        assert manifest["extensions"][0]["data"] == {"resource": "diff.json"}
-        assert manifest["extensions"][0]["kind"] == "diff"
-        resource = result["resources"][0]
+        assert "extensions_uri" not in result
+        resource = result["resources"]["diff"]
         assert resource["uri"].endswith("/diff.json")
+        assert resource["version"] == 1
         frozen = (await client.read_resource(resource["uri"])).contents[0].text
         diff = FileDiff.model_validate_json(frozen)
         assert diff.path == WorkspacePath("project/diff.txt")
@@ -138,13 +136,13 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
         assert edited.structured_content["replacements"] == 1
         assert "diff" not in edited.structured_content
         changed = FileDiff.model_validate_json(
-            (await client.read_resource(edited.structured_content["resources"][0]["uri"])).contents[0].text
+            (await client.read_resource(edited.structured_content["resources"]["diff"]["uri"])).contents[0].text
         )
         assert [line.kind for line in changed.hunks[0].lines] == ["removed", "added", "context"]
         (cpp_acceptance_project / "diff.txt").write_text("externally changed")
         assert (await client.read_resource(resource["uri"])).contents[0].text == frozen
         read = await client.call_tool("workspace_read_file", {"path": "project/diff.txt"})
-        assert read.structured_content["extensions_uri"] is None
+        assert read.structured_content["resources"] == {}
 
 
 @pytest.mark.anyio

@@ -48,7 +48,6 @@ def create_server(
     workspace.register_extension(
         "diff",
         diff_extension,
-        kind="diff",
         tools=("workspace_write_file", "workspace_edit_file"),
     )
     processes = ProcessService(

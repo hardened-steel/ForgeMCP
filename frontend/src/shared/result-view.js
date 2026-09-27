@@ -186,7 +186,12 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       // The action is inside dd so dl keeps valid term/description semantics.
       const action = element("dd", "fm-value");
       action.append(copyField);
-      row.append(element("dt", "fm-label", key), description, action);
+      const label = element("dt", "fm-label", key);
+      if (presentation?.unlabeledFields?.includes(key)) {
+        label.hidden = true;
+        row.classList.add("fm-unlabeled-field");
+      }
+      row.append(label, description, action);
       list.append(row);
     }
     return list;

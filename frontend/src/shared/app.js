@@ -28,7 +28,7 @@ export async function connectWidget({ toolName, describe, renderValue }) {
     const current = ++generation;
     view.receive(result);
     const data = result?.structuredContent;
-    if (!data?.extensions_uri || result.isError || !("lines_added" in data || "replacements" in data)) return;
+    if (!data?.resources?.diff || result.isError || !("lines_added" in data || "replacements" in data)) return;
     try {
       const diff = await loadResultDiff(result, (params) => app.readServerResource(params), () => current === generation);
       if (current === generation) view.setExtensions({ diff, diffState: "ready" });

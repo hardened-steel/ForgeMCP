@@ -62,6 +62,19 @@ def test_unchanged_text_has_empty_diff():
     assert diff.hunks == diff.changes == []
 
 
+def test_character_spans_use_unicode_code_points_and_preserve_unchanged_parts():
+    diff = create_diff(
+        TextChange(
+            path=WorkspacePath("project/a"),
+            before="😀 value = old;\n",
+            after="😀 value = newer;\n",
+        )
+    )
+    removed, added = diff.hunks[0].lines
+    assert "".join(removed.text[a:b] for a, b in removed.spans) == "old"
+    assert "".join(added.text[a:b] for a, b in added.spans) == "newer"
+
+
 @pytest.mark.anyio
 async def test_provider_skips_results_without_a_mutation():
     result = FileWriteResult(path=WorkspacePath("project/a"), action="created", lines_added=0, lines_removed=0)

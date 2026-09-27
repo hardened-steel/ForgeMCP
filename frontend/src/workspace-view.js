@@ -148,8 +148,49 @@ function appendHighlighted(doc, target, text, query) {
   }
 }
 
+function appendDiffText(doc, target, entry, query) {
+  const points = Array.from(entry.text);
+  const changes = entry.spans ?? [];
+  const matches = [];
+  const lower = entry.text.toLocaleLowerCase();
+  if (query) {
+    let offset = 0;
+    while (offset < entry.text.length) {
+      const found = lower.indexOf(query, offset);
+      if (found < 0) break;
+      matches.push([Array.from(entry.text.slice(0, found)).length, Array.from(entry.text.slice(0, found + query.length)).length]);
+      offset = found + query.length;
+    }
+  }
+  const boundaries = [...new Set([0, points.length, ...changes.flat(), ...matches.flat()])].sort((a, b) => a - b);
+  boundaries.forEach((start, index) => {
+    for (const [a, b] of changes) {
+      if (a !== start || a !== b) continue;
+      const marker = doc.createElement("mark");
+      marker.className = "fm-inline-change fm-inline-zero";
+      target.append(marker);
+    }
+    const end = boundaries[index + 1];
+    if (end === undefined || end === start) return;
+    let parent = target;
+    if (changes.some(([a, b]) => a <= start && b >= end)) {
+      const changed = doc.createElement("mark");
+      changed.className = "fm-inline-change";
+      parent.append(changed);
+      parent = changed;
+    }
+    if (matches.some(([a, b]) => a <= start && b >= end)) {
+      const match = doc.createElement("mark");
+      match.className = "fm-local-match";
+      parent.append(match);
+      parent = match;
+    }
+    parent.append(doc.createTextNode(points.slice(start, end).join("")));
+  });
+}
+
 function resources(data) {
-  return ["extensions_uri", "resources"].filter((key) => key in data);
+  return ["resources"].filter((key) => key in data);
 }
 
 function without(data, keys) {
@@ -245,7 +286,7 @@ export function workspacePresentation(data, extensions = {}) {
     const display = without(data, hidden);
     if (toolName !== "workspace_read_file") {
       display.diff = extensions.diff ?? (extensions.diffState === "error" ? "Diff could not be loaded. The file operation succeeded."
-        : extensions.diffState === "ready" || !data.extensions_uri ? "No diff available." : "Loading diff…");
+        : extensions.diffState === "ready" || !data.resources?.diff ? "No diff available." : "Loading diff…");
       if (toolName === "workspace_edit_file" && extensions.diff) {
         const range = (start, count) => count === 1 ? String(start) : `${start}–${start + count - 1}`;
         display.replacements = extensions.diff.changes.map((change) => [
@@ -257,6 +298,7 @@ export function workspacePresentation(data, extensions = {}) {
     return {
       toolName, summary: data, records: null, resourceFields, viewData: display,
       fieldFilter: false, filterPlaceholder: "Search lines",
+      unlabeledFields: ["diff"],
     };
   }
   return { toolName, summary: data, records: null, resourceFields, viewData: without(data, hidden) };
@@ -276,7 +318,16 @@ export function workspaceValue(value, key, record, { doc, valueNode, query = "" 
       wrap.setAttribute("aria-pressed", String(enabled));
       source.classList.toggle("fm-source-nowrap", !enabled);
     });
-    source.append(wrap);
+    const highlight = doc.createElement("button");
+    highlight.type = "button";
+    highlight.textContent = "Highlight changes";
+    highlight.setAttribute("aria-pressed", "false");
+    highlight.addEventListener("click", () => {
+      const enabled = highlight.getAttribute("aria-pressed") !== "true";
+      highlight.setAttribute("aria-pressed", String(enabled));
+      source.classList.toggle("fm-diff-highlight", enabled);
+    });
+    source.append(wrap, highlight);
     let shown = 0;
     for (const hunk of value.hunks) {
       const block = doc.createElement("div");
@@ -301,7 +352,7 @@ export function workspaceValue(value, key, record, { doc, valueNode, query = "" 
         sign.textContent = entry.kind === "added" ? "+" : entry.kind === "removed" ? "−" : " ";
         sign.setAttribute("aria-label", entry.kind);
         const code = doc.createElement("code");
-        appendHighlighted(doc, code, entry.text, query);
+        appendDiffText(doc, code, entry, query);
         row.append(sign, code);
         block.append(row);
       }

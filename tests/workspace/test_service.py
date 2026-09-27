@@ -177,7 +177,6 @@ def test_read_write_metadata_and_utf8_crlf(workspace):
         1,
     )
     assert set(workspace.read_file(WorkspacePath("project/utf8.txt")).model_dump()) == {
-        "extensions_uri",
         "resources",
         "path",
         "text",

@@ -230,57 +230,51 @@ only completion responses observe the protocol's 100-value cap.
 
 ### Workspace result extensions
 
-`register_extension(name, provider, kind=..., version=1)` registers an async
-provider. An optional `tools` sequence limits invocation to those tools; the diff
-provider is scoped to write/edit so it does not retain full search texts.
-Each workspace tool supplies an `ExtensionContext` with its tool name,
-a copy of its result, qualified paths, and already-read full text when available.
-Write/edit also supply an immutable `TextChange` containing their captured before
-and after text. Both business methods accept an optional `on_change` callback to
-capture the successful mutation without adding snapshots to their public models.
-Providers may read files themselves; they must not change files. This is not a
-filesystem snapshot: independent reads can observe external changes.
+`register_extension(name, provider, tools=None)` registers an async provider under
+a unique name. An optional tools sequence limits its invocation. Each tool passes
+an `ExtensionContext` containing a result copy, qualified paths, already-read
+texts, and an optional immutable `TextChange`. Write/edit capture the successful
+mutation through their optional `on_change` callback; snapshots stay out of
+public results. The diff provider is scoped to write/edit, so searches do not
+retain full texts for it. Providers must not change files.
 
-A provider returns `ExtensionOutput(data, resources=...)` or `None` when it has
-nothing to add. Workspace knows only JSON payloads and provider metadata, not
-syntax tokens, diagnostic schemas, or particular language servers. Optional
-`ExtensionResource` entries contain named JSON or Markdown text, for example
-`diagnostics.json` and `diagnostics.md`. Names must be unique within the result.
-Provider failures become sanitized extension errors without undoing a successful
-file operation; cancellation still propagates.
-
-Results expose `extensions_uri` and separate resource links. The main manifest
-contains provider metadata and inline payloads or resource references; separate resources let a model or user inspect
-diagnostics without loading unrelated token data. The templates are:
+A provider returns `ExtensionOutput(resource, metadata=...)` or None. Its primary
+`ExtensionResource` supplies a unique .json/.md filename, matching MIME type, and
+text. Workspace validates JSON and stores immutable resource text. The result's
+`resources` mapping uses provider names as keys, each containing a typed descriptor
+with `uri`, `mime_type`, and optional JSON metadata. Metadata cannot override the
+link fields and is detached from provider-owned mutable values before another
+await. A failed provider publishes no descriptor and logs only a lifecycle summary;
+the successful file operation is preserved. Cancellation still propagates.
+There is no separate manifest or `extensions_uri`.
 
 ```text
 forgemcp://workspace/results/{result_id}/{name}.json
 forgemcp://workspace/results/{result_id}/{name}.md
 ```
 
-The first built-in provider is `workspace/diff.py`, explicitly registered in
-`server.py` as `diff`, kind `diff`, version 1. Its manifest data is
-`{"resource":"diff.json"}`. The separate JSON resource is a typed `FileDiff`:
-qualified path, compact change ranges, and hunks with three lines of context.
-Each hunk contains typed context/added/removed lines with nullable before/after
-line numbers and exact text, preserving CRLF and missing final newlines. Starts
-are one-based; a zero count denotes the next insertion position. Identical text
-produces empty changes/hunks. The provider uses only the invocation's snapshots,
-never a subsequent file read. Write/edit primary models retain counts, paths, and
-resource references; they contain no diff or detailed ranges.
+`workspace/diff.py` is explicitly registered in `server.py` as diff. It publishes
+`resources.diff` with URI, application/json MIME type, and version 1. `diff.json`
+is a typed `FileDiff`: qualified path, compact change ranges, and hunks with three
+context lines. Each hunk contains typed context/added/removed lines with nullable
+before/after numbers, exact text (including line endings), and character spans.
+Spans use zero-based Unicode code-point [start, end) offsets; zero-width spans mark
+insertions/deletions. Replacement lines are paired in their original order for
+character comparison; unpaired added/removed lines are wholly changed. Starts are
+one-based; a zero count denotes the next insertion position. Identical text produces
+empty changes/hunks. Providers use captured snapshots, never subsequent file reads.
 
-The App bridge reads the linked manifest followed by its version-1 diff resource.
-It requires both links to stay within that invocation's result namespace, verifies
-the diff link against both result and manifest links, and validates decoded data.
-Late reads after input, cancellation, or teardown are ignored. Resource failures
-are shown separately from a successful mutation. Rendering receives decoded data
-without App/transport access and displays two number columns and change markers,
-with no unified-diff headers. JSON and Copy all retain the original tool result.
+The App bridge reads resources.diff directly, restricts it to workspace result
+JSON URIs, checks its MIME type/version, and validates decoded data. It ignores
+late reads after input, cancellation, or teardown. Rendering receives data without
+transport access and displays two number columns and change markers, without
+unified-diff headers or a redundant field label. Highlight changes toggles
+character-span emphasis next to Wrap lines; search highlighting is independent.
+JSON and Copy all retain the original tool result.
 
-The manifest is named `extensions.json`. Published text is immutable and retained
-in memory until server shutdown; reads never rerun providers. Unknown IDs/names
-raise `ResourceNotFoundError`. No resource is created when no provider contributes.
-Persistent storage, concrete providers, and widget consumption are deferred.
+Published resources remain immutable in memory until shutdown; reads never rerun
+providers. Unknown IDs/names raise ResourceNotFoundError. No resources are created
+when no provider contributes. Persistent result storage remains deferred.
 
 ## CMake profiles and operations
 

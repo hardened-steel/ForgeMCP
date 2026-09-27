@@ -13,6 +13,13 @@ export function validateDiff(diff, path) {
     || !diff.changes.every((change) => range(change) && ["replace", "insert", "delete"].includes(change.kind))
     || !diff.hunks.every((hunk) => range(hunk) && Array.isArray(hunk.lines) && hunk.lines.every((line) => {
       if (!line || typeof line.text !== "string") return false;
+      let cursor = 0;
+      if (line.spans !== undefined && (!Array.isArray(line.spans) || !line.spans.every((span) => {
+        if (!Array.isArray(span) || span.length !== 2 || !integer(span[0]) || !integer(span[1])
+          || span[0] < cursor || span[1] < span[0] || span[1] > Array.from(line.text).length) return false;
+        cursor = span[1];
+        return true;
+      }))) return false;
       const before = integer(line.before_line) && line.before_line > 0;
       const after = integer(line.after_line) && line.after_line > 0;
       return line.kind === "context" ? before && after
@@ -24,19 +31,13 @@ export function validateDiff(diff, path) {
 
 export async function loadResultDiff(result, read, current = () => true) {
   const data = result?.structuredContent;
-  const uri = data?.extensions_uri;
-  if (!uri || result.isError || !("lines_added" in data || "replacements" in data)) return null;
-  if (!/^forgemcp:\/\/workspace\/results\/[a-zA-Z0-9_-]+\/extensions\.json$/.test(uri)) throw new Error("Invalid manifest link");
-  const manifest = decode(await read({ uri }), uri);
+  const link = data?.resources?.diff;
+  if (!link || result.isError || !("lines_added" in data || "replacements" in data)) return null;
+  if (link.version !== undefined && link.version !== 1) return null;
+  const uri = link.uri;
+  if (typeof uri !== "string" || !/^forgemcp:\/\/workspace\/results\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.json$/.test(uri)
+    || link.mime_type !== "application/json") throw new Error("Invalid diff link");
   if (!current()) return null;
-  const extension = manifest.extensions?.find((item) => item.kind === "diff" && item.version === 1);
-  if (!extension) return null;
-  if (extension.error) throw new Error("Diff provider failed");
-  const name = extension.data?.resource;
-  if (typeof name !== "string" || !/^[a-zA-Z0-9_-]+\.json$/.test(name)) throw new Error("Invalid diff link");
-  const diffUri = uri.slice(0, -"extensions.json".length) + name;
-  const linked = (links) => links?.some((link) => link.uri === diffUri && link.mime_type === "application/json");
-  if (!linked(data.resources) || !linked(manifest.resources)) throw new Error("Diff resource is not linked");
-  const diff = decode(await read({ uri: diffUri }), diffUri);
+  const diff = decode(await read({ uri }), uri);
   return current() ? validateDiff(diff, data.path) : null;
 }

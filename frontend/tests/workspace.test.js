@@ -185,19 +185,44 @@ test("read, write, and edit search only source lines while keeping original numb
 test("result resources have a separate tab and move/delete use compact fields", (t) => {
   const data = {
     path: "project/new.cpp", action: "moved", source: "project/old.cpp",
-    extensions_uri: "forgemcp://workspace/results/1/extensions.json",
-    resources: [{ uri: "forgemcp://workspace/results/1/info.md", mime_type: "text/markdown" }],
+    resources: { info: { uri: "forgemcp://workspace/results/1/info.md", mime_type: "text/markdown" } },
   };
   const { root, view } = mount(t, data);
   assert.ok(root.classList.contains("fm-compact"));
   assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["source", "destination"]);
   assert.equal(root.querySelector(".fm-filters").hidden, true);
   root.querySelector(".fm-views button:nth-child(2)").click();
-  assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["extensions_uri", "resources"]);
+  assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["resources"]);
   root.querySelector(".fm-views button:last-child").click();
   assert.equal(root.querySelector("pre").textContent, JSON.stringify(data, null, 2));
   view.receive({ structuredContent: { path: "project/new.cpp", action: "deleted" } });
   assert.deepEqual([...root.querySelectorAll("dt")].map((node) => node.textContent), ["path"]);
+});
+
+test("diff has no visible field label and character highlighting can be toggled", (t) => {
+  const { root, view, win } = mount(t, { path: "project/a.cpp", replacements: 1 });
+  view.setExtensions({ diffState: "ready", diff: {
+    path: "project/a.cpp", changes: [],
+    hunks: [{ before_start: 1, after_start: 1, before_count: 1, after_count: 1, lines: [
+      { kind: "removed", before_line: 1, after_line: null, text: "return old;\n", spans: [[7, 10]] },
+      { kind: "added", before_line: null, after_line: 1, text: "return newer;\n", spans: [[7, 12]] },
+    ] }],
+  } });
+  assert.equal(root.querySelector(".fm-unlabeled-field dt").hidden, true);
+  assert.deepEqual([...root.querySelectorAll(".fm-inline-change")].map((node) => node.textContent), ["old", "newer"]);
+  const source = root.querySelector(".fm-diff");
+  const toggle = source.querySelectorAll("button")[1];
+  const text = [...source.querySelectorAll("code")].map((node) => node.textContent);
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  toggle.click();
+  assert.ok(source.classList.contains("fm-diff-highlight"));
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  toggle.click();
+  assert.ok(!source.classList.contains("fm-diff-highlight"));
+  assert.deepEqual([...source.querySelectorAll("code")].map((node) => node.textContent), text);
+  root.querySelector("input").value = "return newer";
+  root.querySelector("input").dispatchEvent(new win.Event("input"));
+  assert.equal([...root.querySelectorAll(".fm-local-match")].map((node) => node.textContent).join(""), "return newer");
 });
 
 test("mutation and metadata shapes select the correct tool without additional calls", (t) => {

@@ -3,7 +3,7 @@
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from .path import WorkspacePath
 
@@ -33,8 +33,8 @@ class ExtensionResource:
 
 @dataclass(frozen=True)
 class ExtensionOutput:
-    data: JsonValue
-    resources: tuple[ExtensionResource, ...] = ()
+    resource: ExtensionResource
+    metadata: Mapping[str, JsonValue] = field(default_factory=dict)
 
 
 type ExtensionProvider = Callable[
@@ -44,23 +44,11 @@ type ExtensionProvider = Callable[
 
 
 class ResultResource(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, JsonValue] = Field(init=False)
     uri: str
     mime_type: str
 
 
 class ResultResources(BaseModel):
-    extensions_uri: str | None = None
-    resources: list[ResultResource] = Field(default_factory=list)
-
-
-class ResultExtension(BaseModel):
-    name: str
-    kind: str
-    version: int
-    data: JsonValue = None
-    error: str | None = None
-
-
-class ResultExtensions(BaseModel):
-    extensions: list[ResultExtension]
-    resources: list[ResultResource]
+    resources: dict[str, ResultResource] = Field(default_factory=dict)

@@ -104,6 +104,11 @@ body { margin: 0; background: transparent; }
 .fm-diff-sign { color: var(--fm-muted); text-align: center; }
 .fm-diff-add .fm-diff-sign { color: var(--fm-success); }
 .fm-diff-remove .fm-diff-sign { color: var(--fm-error); }
+.fm-inline-change { color: inherit; background: transparent; }
+.fm-diff-highlight .fm-diff-add .fm-inline-change { background: light-dark(#c4e9c8, #285032); }
+.fm-diff-highlight .fm-diff-remove .fm-inline-change { background: light-dark(#f4c3c9, #603039); }
+.fm-diff-highlight .fm-inline-zero::after { content: "│"; }
+.fm-unlabeled-field > dd:first-of-type { grid-row: 1; grid-column: 1; }
 .fm-source-nowrap .fm-diff-line { grid-template-columns: 6ch 6ch 2ch auto; }
 .fm-file-sort { display: flex; gap: 6px; border-bottom: 1px solid var(--fm-border); padding: 3px 0; }
 .fm-file-path { padding: 3px 0; border-bottom: 1px solid var(--fm-border); overflow-wrap: anywhere; }
