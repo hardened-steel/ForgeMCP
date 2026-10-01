@@ -36,6 +36,11 @@ Before designing or changing a module, read:
 - Use `WorkspacePath` for paths shared between modules and in tool arguments/results.
   It serializes as `project/...`, `storage/...`, or `root/<absolute-path>`; native
   executable locations and low-level filesystem operations still use `Path`.
+- Each feature module owns filesystem operations on its files. Do not read, write,
+  create, move, or delete files through `WorkspaceService` methods from another
+  module. Implement Workspace tool operations in their decorated MCP handlers;
+  expose only the Workspace APIs other modules actually need for provider
+  registration and result resources.
 - Feature services launch external programs only through the injected
   `ProcessService`; do not call `asyncio.create_subprocess_exec` directly outside the
   process module.
@@ -43,8 +48,9 @@ Before designing or changing a module, read:
 ## Registration rules
 
 - Each module exposes one `register(mcp, apps, complete)` method. Define decorated MCP
-  tools, resources, and prompts as local entrypoint functions in that method; keep
-  reusable business operations as ordinary methods on the long-lived service object.
+  tools, resources, and prompts as local entrypoint functions in that method. Keep
+  tool-specific behavior in those functions; use service methods only for shared
+  state, provider APIs, or concrete behavior needed by more than one caller.
 - Let the SDK infer handler names, descriptions, input schemas, and structured output
   from function names, docstrings, annotations, and return types. Supply registration
   arguments only when they add metadata the SDK cannot infer. Do not repeat a title
@@ -84,6 +90,8 @@ Before designing or changing a module, read:
   and pass decoded data to rendering code.
 - A tool's `content` must remain useful to the model and to text-only clients; a
   widget is an enhancement, not the only result.
+- Do not add or run automated tests for widgets. The user reviews widget behavior
+  and appearance visually.
 
 ## Safety and errors
 

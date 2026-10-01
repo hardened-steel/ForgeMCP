@@ -722,10 +722,15 @@ the build task before starting the server.
 
 The likely order is:
 
-1. clangd validation and widgets;
-2. formatting, static analysis, and sanitizer parsing;
-3. debugger adapter lifecycle and DAP operations;
-4. persistent process transcripts and configurable retention limits.
+1. Refactor Workspace result providers around before/after/error notifications and
+   sequential Workspace MCP entrypoints. Move tool-specific filesystem work into
+   the decorated handlers. Remove CMake's calls to Workspace file, directory,
+   temporary-directory, and path-resolution methods; CMake owns its build-tree
+   filesystem work while process launches continue through ProcessService.
+2. clangd validation and widgets;
+3. formatting, static analysis, and sanitizer parsing;
+4. debugger adapter lifecycle and DAP operations;
+5. persistent process transcripts and configurable retention limits.
 
 This ordering is guidance, not a framework contract. Add the smallest end-to-end slice
 needed by the next user-visible workflow.
