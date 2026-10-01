@@ -106,10 +106,14 @@ class CMakeService:
         toolchains: ToolchainService,
         profiles: tuple[ProfileDefinition, ...] = (),
         *,
+        project_root: Path,
+        storage_root: Path,
         default_toolset: str = "system",
         progress_interval: float = 1.0,
     ) -> None:
         self.workspace = workspace
+        self.project_root = project_root.resolve()
+        self.storage_root = storage_root.resolve()
         self.toolchains = toolchains
         self.definitions = profiles
         self.default_toolset = default_toolset
@@ -139,7 +143,7 @@ class CMakeService:
 
     async def available_presets(self, toolset_id: str) -> cmake.PresetsResult:
         methods = self.cmake_methods(toolset_id)
-        return await methods["presets"](self.workspace.root)
+        return await methods["presets"](self.project_root)
 
     async def selection(
         self,
@@ -149,7 +153,7 @@ class CMakeService:
         if self.definitions:
             definitions = list(self.definitions)
         elif any(
-            (self.workspace.root / filename).is_file()
+            (self.project_root / filename).is_file()
             for filename in ("CMakePresets.json", "CMakeUserPresets.json")
         ):
             toolset = self.toolset(self.default_toolset)
@@ -244,7 +248,12 @@ class CMakeService:
         toolset = self.toolset(definition.toolset)
         directory = definition.build_directory
         if directory is None:
-            self.workspace.validate_directory_key(definition.name)
+            if (
+                not definition.name
+                or definition.name in (".", "..")
+                or any(char in definition.name for char in "/\\\0")
+            ):
+                raise CMakeError("Directory key must be one nonempty directory name.")
             directory = WorkspacePath(f"storage/build/cmake-{definition.name}")
         self.build_path(directory)
         return CMakeProfile(
@@ -257,13 +266,13 @@ class CMakeService:
 
     def build_path(self, directory: WorkspacePath) -> Path:
         path = self.workspace.writable_path(directory.relative, root=directory.area)
-        if path == self.workspace.root:
+        if path == self.project_root:
             raise CMakeError("In-source CMake builds are not supported.")
         return path
 
     def cache(self, directory: WorkspacePath) -> dict[str, str]:
         path = self.build_path(directory) / "CMakeCache.txt"
-        reference = self.workspace.workspace_path(path)
+        reference = WorkspacePath(f"{directory}/CMakeCache.txt")
         text = self.workspace.read_file(reference).text
         return cmake.parse_cache(text)
 
@@ -275,7 +284,7 @@ class CMakeService:
         except WorkspaceError as error:
             raise CMakeError(f"Configure profile {profile.name!r} first.") from error
         source = cache.get("CMAKE_HOME_DIRECTORY")
-        if source is None or Path(source).resolve() != self.workspace.root:
+        if source is None or Path(source).resolve() != self.project_root:
             raise CMakeError("Build directory belongs to another source project.")
         return cache
 
@@ -320,7 +329,12 @@ class CMakeService:
             if any(key.partition(":")[0] == "CMAKE_TOOLCHAIN_FILE" for key in result):
                 raise CMakeError("Duplicate setting for CMAKE_TOOLCHAIN_FILE.")
             reference = definition.toolchain_file
-            toolchain_file = self.workspace.resolve_workspace_path(reference)
+            if reference.area == "root":
+                raise CMakeError("Toolchain file must be inside the project or storage root.")
+            base = self.project_root if reference.area == "project" else self.storage_root
+            toolchain_file = (base / reference.relative).resolve()
+            if not toolchain_file.is_relative_to(base):
+                raise CMakeError(f"Toolchain file is outside its root: {reference}.")
             if not toolchain_file.is_file():
                 raise CMakeError(f"Toolchain file does not exist: {reference}.")
             result["CMAKE_TOOLCHAIN_FILE"] = str(toolchain_file)
@@ -346,16 +360,15 @@ class CMakeService:
 
     def prepare_file_api(self, directory: WorkspacePath) -> None:
         self.workspace.mkdir(directory)
-        query = self.build_path(directory) / ".cmake/api/v1/query/client-forgemcp"
-        reference = self.workspace.workspace_path(query)
+        reference = WorkspacePath(f"{directory}/.cmake/api/v1/query/client-forgemcp")
         self.workspace.mkdir(reference)
         for name in ("codemodel-v2", "cache-v2", "toolchains-v1"):
-            target = self.workspace.workspace_path(query / name)
+            target = WorkspacePath(f"{reference}/{name}")
             self.workspace.write_file(target, "")
 
     def compilation_database(self, directory: WorkspacePath) -> WorkspacePath | None:
         path = self.build_path(directory) / "compile_commands.json"
-        return self.workspace.workspace_path(path) if path.is_file() else None
+        return WorkspacePath(f"{directory}/compile_commands.json") if path.is_file() else None
 
     async def compilation_contexts(
         self,
@@ -495,7 +508,7 @@ class CMakeService:
                             self.prepare_file_api(profile.build_directory)
                         await report_status("Starting configure")
                         command = await methods["configure"](
-                            self.workspace.root,
+                            self.project_root,
                             build_directory,
                             preset=preset,
                             generator=profile.generator,
@@ -575,7 +588,7 @@ class CMakeService:
                             build_directory = self.build_path(profile.build_directory)
                         await report_status("Starting build")
                         command = await methods["build"](
-                            self.workspace.root,
+                            self.project_root,
                             build_directory,
                             preset=preset,
                             configuration=configuration,
@@ -656,7 +669,7 @@ class CMakeService:
                             report_path = temporary.path / "results.xml"
                             await report_status("Starting tests")
                             command = await methods["test"](
-                                self.workspace.root,
+                                self.project_root,
                                 build_directory,
                                 report_path=report_path,
                                 preset=preset,

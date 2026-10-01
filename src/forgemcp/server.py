@@ -65,6 +65,8 @@ def create_server(
         workspace,
         toolchains,
         profiles,
+        project_root=workspace.root,
+        storage_root=workspace.storage_root,
         default_toolset=cmake_toolset,
         progress_interval=progress_interval,
     )
