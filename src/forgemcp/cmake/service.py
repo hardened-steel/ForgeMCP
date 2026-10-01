@@ -272,8 +272,15 @@ class CMakeService:
 
     def cache(self, directory: WorkspacePath) -> dict[str, str]:
         path = self.build_path(directory) / "CMakeCache.txt"
-        reference = WorkspacePath(f"{directory}/CMakeCache.txt")
-        text = self.workspace.read_file(reference).text
+        base = self.project_root if directory.area == "project" else self.storage_root
+        try:
+            if not path.resolve().is_relative_to(base):
+                raise CMakeError("CMake cache resolves outside the build root.")
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise CMakeError(f"Cannot read CMake cache in {directory}.") from error
+        if "\0" in text:
+            raise CMakeError(f"CMake cache in {directory} is not a text file.")
         return cmake.parse_cache(text)
 
     def require_configured(self, profile: CMakeProfile) -> dict[str, str]:
@@ -281,7 +288,7 @@ class CMakeService:
             raise CMakeError("Set build-directory for operations without a preset.")
         try:
             cache = self.cache(profile.build_directory)
-        except WorkspaceError as error:
+        except (CMakeError, WorkspaceError) as error:
             raise CMakeError(f"Configure profile {profile.name!r} first.") from error
         source = cache.get("CMAKE_HOME_DIRECTORY")
         if source is None or Path(source).resolve() != self.project_root:
@@ -359,12 +366,18 @@ class CMakeService:
         return result
 
     def prepare_file_api(self, directory: WorkspacePath) -> None:
-        self.workspace.mkdir(directory)
+        build_directory = self.build_path(directory)
         reference = WorkspacePath(f"{directory}/.cmake/api/v1/query/client-forgemcp")
-        self.workspace.mkdir(reference)
-        for name in ("codemodel-v2", "cache-v2", "toolchains-v1"):
-            target = WorkspacePath(f"{reference}/{name}")
-            self.workspace.write_file(target, "")
+        query = self.workspace.writable_path(reference.relative, root=reference.area)
+        try:
+            build_directory.mkdir(parents=True, exist_ok=True)
+            query.mkdir(parents=True, exist_ok=True)
+            for name in ("codemodel-v2", "cache-v2", "toolchains-v1"):
+                target = WorkspacePath(f"{reference}/{name}")
+                file = self.workspace.writable_path(target.relative, root=target.area)
+                file.write_text("", encoding="utf-8")
+        except OSError as error:
+            raise CMakeError(f"Cannot prepare CMake File API in {directory}.") from error
 
     def compilation_database(self, directory: WorkspacePath) -> WorkspacePath | None:
         path = self.build_path(directory) / "compile_commands.json"

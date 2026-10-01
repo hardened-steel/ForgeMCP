@@ -280,9 +280,9 @@ when no provider contributes. Persistent result storage remains deferred.
 ## CMake profiles and operations
 
 `CMakeService` receives project/storage roots directly, plus `WorkspaceService` for
-its remaining file operations and build-path safety checks, and `ToolchainService`
-for tool selection. Operator profiles
-are parsed from repeated `--cmake-profile NAME KEY=VALUE ...` arguments; the default
+remaining cleanup and build-path safety checks, and `ToolchainService`
+for tool selection. Operator profiles are parsed from repeated
+`--cmake-profile NAME KEY=VALUE ...` arguments; the default
 toolset is selected by `--cmake-toolset`. There is no environment-based profile
 configuration, persistent profile registry, or directory lock.
 
