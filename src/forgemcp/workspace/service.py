@@ -10,11 +10,11 @@ import os
 import shutil
 import stat
 import tempfile
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Generator, Literal
+from typing import Annotated, Generator, Literal
 from types import MappingProxyType
 from urllib.parse import quote
 from uuid import uuid4
@@ -22,7 +22,7 @@ from uuid import uuid4
 import regex as regex_engine
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
-from mcp.server.mcpserver import Context
+from mcp.server.mcpserver import Context, Elicit, Resolve
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.mcpserver.resources.templates import ResourceSecurity
 from mcp.types import (
@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
-from forgemcp.progress import progress
+from forgemcp.progress import Progress, progress
 
 from .errors import WorkspaceError
 from .extensions import (
@@ -50,6 +50,17 @@ from .extensions import (
 )
 from .metadata import file_owner
 from .path import WorkspacePath
+
+
+class ReadConfirmation(BaseModel):
+    allow: bool = Field(description="Allow reading this external file.")
+
+
+async def confirm_read(path: WorkspacePath) -> ReadConfirmation | Elicit[ReadConfirmation]:
+    if path.area != "root":
+        return ReadConfirmation(allow=True)
+    return Elicit(f"Allow reading external file {path.absolute}?", ReadConfirmation)
+
 
 WorkspaceRoot = Literal["project", "storage"]
 
@@ -208,6 +219,7 @@ class WorkspaceService:
             tuple[ExtensionProvider, frozenset[str] | None],
         ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
+        self.revision = 0
 
     def register_extension(
         self,
@@ -252,6 +264,7 @@ class WorkspaceService:
                         paths=context.paths,
                         texts=MappingProxyType(dict(context.texts)),
                         change=context.change,
+                        on_progress=context.on_progress,
                     )
                 )
                 if output is None:
@@ -305,6 +318,7 @@ class WorkspaceService:
         paths: Sequence[WorkspacePath],
         texts: Mapping[WorkspacePath, str] | None = None,
         change: TextChange | None = None,
+        on_progress: Progress | None = None,
     ) -> T:
         references = await self.create_result_extensions(
             ExtensionContext(
@@ -313,6 +327,7 @@ class WorkspaceService:
                 paths=tuple(dict.fromkeys(paths)),
                 texts=texts or {},
                 change=change,
+                on_progress=on_progress,
             )
         )
         result.resources = references.resources
@@ -419,14 +434,14 @@ class WorkspaceService:
             raise WorkspaceError("Expected a canonical relative workspace path.") from error
 
     def workspace_path(self, path: Path) -> WorkspacePath:
-        """Represent an absolute local path using one of the configured roots."""
+        """Represent a native path without granting permission to access it."""
         candidate = path.absolute()
         for area in ("storage", "project"):
             base = self.root_path(area)
             if candidate.is_relative_to(base):
                 relative = self.relative_path(candidate, root=area)
                 return WorkspacePath(f"{area}/{'' if relative == '.' else relative}")
-        raise WorkspaceError("Path is outside the project and storage roots.")
+        return WorkspacePath("root/" + candidate.as_posix())
 
     def require_file(self, path: str, root: WorkspaceRoot) -> Path:
         candidate = self.resolve_path(path, root=root)
@@ -437,7 +452,7 @@ class WorkspaceService:
     def raise_walk_error(self, error: OSError) -> None:
         raise error
 
-    async def iter_files(self, path: str, root: WorkspaceRoot) -> AsyncIterator[Path]:
+    async def iter_files(self, path: str, root: WorkspaceRoot) -> AsyncGenerator[Path]:
         start = self.resolve_path(path, root=root)
         self.check_path_links(start, root)
         relative = start.relative_to(self.root_path(root))
@@ -490,7 +505,10 @@ class WorkspaceService:
         with filesystem_errors(path):
             text = self.read_bytes(path).decode("utf-8")
             if "\0" in text:
-                raise WorkspaceError(f"{path}: binary file; use the raw resource.")
+                message = f"{path}: binary file."
+                if path.area != "root":
+                    message += " Use the raw resource."
+                raise WorkspaceError(message)
         return FileContent(
             path=path,
             text="".join(text.splitlines(keepends=True)[start_line - 1 : end_line]),
@@ -536,16 +554,13 @@ class WorkspaceService:
         self,
         path: WorkspacePath,
         text: str,
-        *,
-        on_change: Callable[[TextChange], None] | None = None,
     ) -> FileWriteResult:
         with filesystem_errors(path):
             candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.exists()
             previous = self.read_file(path).text if existed else ""
             self.replace_text(candidate, text)
-            if on_change is not None:
-                on_change(TextChange(path=path, before=previous, after=text))
+            self.revision += 1
             return FileWriteResult(
                 path=path,
                 action="overwritten" if existed else "created",
@@ -560,7 +575,6 @@ class WorkspaceService:
         new_text: str,
         *,
         replace_all: bool = False,
-        on_change: Callable[[TextChange], None] | None = None,
     ) -> FileEditResult:
         if not old_text:
             raise WorkspaceError("old_text must not be empty.")
@@ -578,8 +592,7 @@ class WorkspaceService:
                 )
             updated = text.replace(old_text, new_text)
             self.replace_text(candidate, updated)
-            if on_change is not None:
-                on_change(TextChange(path=path, before=text, after=updated))
+            self.revision += 1
             return FileEditResult(
                 path=path,
                 replacements=count,
@@ -612,6 +625,7 @@ class WorkspaceService:
                     raise WorkspaceError("Cannot move a directory into itself.")
                 self.check_tree_links(origin)
             origin.rename(target)
+            self.revision += 1
             return PathOperationResult(
                 path=destination,
                 action="moved",
@@ -628,6 +642,7 @@ class WorkspaceService:
                 candidate.rmdir()
             else:
                 self.require_file(path.relative, path.area).unlink()
+            self.revision += 1
             return PathOperationResult(
                 path=path,
                 action="deleted",
@@ -645,6 +660,7 @@ class WorkspaceService:
                 return
             self.check_tree_links(candidate)
             shutil.rmtree(candidate)
+            self.revision += 1
 
     def mkdir(
         self,
@@ -654,6 +670,8 @@ class WorkspaceService:
             candidate = self.writable_path(path.relative, root=path.area)
             existed = candidate.is_dir()
             candidate.mkdir(parents=True, exist_ok=True)
+            if not existed:
+                self.revision += 1
             return PathOperationResult(
                 path=path,
                 action="already_exists" if existed else "created",
@@ -681,6 +699,8 @@ class WorkspaceService:
             directory.remove()
 
     def file_uri(self, path: WorkspacePath) -> str:
+        if path.area == "root":
+            raise WorkspaceError("External files have no workspace mirror resources.")
         return f"forgemcp://workspace/file/{quote(str(path), safe='/')}"
 
     def render_markdown(
@@ -930,6 +950,7 @@ class WorkspaceService:
         async def workspace_read_file(
             path: WorkspacePath,
             ctx: Context,
+            confirm: Annotated[ReadConfirmation, Resolve(confirm_read)],
             start_line: int = 1,
             end_line: int | None = None,
         ) -> FileContent:
@@ -941,7 +962,14 @@ class WorkspaceService:
                         "Line range must start at 1 or later and end at or after its start."
                     )
                 with filesystem_errors(path):
-                    candidate = self.require_file(path.relative, path.area)
+                    if not confirm.allow:
+                        raise WorkspaceError("External file reading was not permitted.")
+                    candidate = (
+                        path.absolute if path.area == "root"
+                        else self.require_file(path.relative, path.area)
+                    )
+                    if not candidate.is_file():
+                        raise WorkspaceError(f"{path}: expected an existing regular file.")
                     text = bytearray()
                     await report_progress(0, message="Bytes read")
                     with candidate.open("rb") as stream:
@@ -952,7 +980,7 @@ class WorkspaceService:
                     decoded = text.decode("utf-8")
                     if "\0" in decoded:
                         raise WorkspaceError(
-                            f"{path}: binary file; use the raw resource."
+                            f"{path}: expected UTF-8 text, found a binary file."
                         )
                     result = FileContent(
                         path=path,
@@ -1069,13 +1097,14 @@ class WorkspaceService:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting write file")
-            changes: list[TextChange] = []
             try:
+                candidate = self.writable_path(path.relative, root=path.area)
+                before = self.read_file(path).text if candidate.exists() else ""
                 result = self.write_file(
                     path=path,
                     text=text,
-                    on_change=changes.append,
                 )
+                change = TextChange(path, before, text, self.revision)
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed write file")
@@ -1084,7 +1113,7 @@ class WorkspaceService:
                 result,
                 [path],
                 {path: text},
-                change=changes[0],
+                change=change,
             )
 
         @apps.tool(
@@ -1102,15 +1131,15 @@ class WorkspaceService:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Starting edit file")
-            changes: list[TextChange] = []
             try:
+                before = self.read_file(path).text
                 result = self.edit_file(
                     path=path,
                     old_text=old_text,
                     new_text=new_text,
                     replace_all=replace_all,
-                    on_change=changes.append,
                 )
+                change = TextChange(path, before, self.read_file(path).text, self.revision)
             except WorkspaceError as error:
                 raise ToolError(str(error)) from error
             await report_progress(1, total=1, message="Completed edit file")
@@ -1118,7 +1147,7 @@ class WorkspaceService:
                 "workspace_edit_file",
                 result,
                 [path],
-                change=changes[0],
+                change=change,
             )
 
         @apps.tool(
@@ -1237,6 +1266,8 @@ class WorkspaceService:
             try:
                 # Directory completions end in '/', while WorkspacePath is canonical.
                 area, separator, relative = value.partition("/")
+                if area == "root":
+                    raise ResourceNotFoundError("External files have no workspace mirror resources.")
                 if not separator:
                     raise WorkspaceError("Path must start with project/ or storage/.")
                 return self.qualified_path(area, relative.rstrip("/") or ".")

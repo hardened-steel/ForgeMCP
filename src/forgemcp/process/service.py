@@ -8,7 +8,7 @@ import codecs
 import locale
 import logging
 import os
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -775,7 +775,7 @@ class ProcessSession:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def output(self) -> AsyncIterator[ProcessOutput]:
+    async def output(self) -> AsyncGenerator[ProcessOutput]:
         """Consume tagged text once, ending after both pipes reach EOF."""
         if self.output_claimed:
             raise ProcessStreamError("Process output has already been claimed.")

@@ -15,6 +15,7 @@ from forgemcp import __version__
 from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import parse_profiles
 from forgemcp.cmake.service import CMakeService
+from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
 from forgemcp.progress import validate_progress_interval
@@ -67,7 +68,18 @@ def create_server(
         default_toolset=cmake_toolset,
         progress_interval=progress_interval,
     )
-    services = (workspace, processes, toolchains, builds)
+    analysis = ClangdService(
+        workspace,
+        toolchains,
+        builds,
+        progress_interval=progress_interval,
+    )
+    workspace.register_extension(
+        "clangd",
+        analysis.workspace_extension,
+        tools=analysis.EXTENSION_TOOLS,
+    )
+    services = (workspace, processes, toolchains, builds, analysis)
     apps = Apps()
     complete = Complete()
 
@@ -77,7 +89,10 @@ def create_server(
             await toolchains.initialize()
             yield {}
         finally:
-            await processes.close()
+            try:
+                await analysis.close()
+            finally:
+                await processes.close()
 
     service_instructions = [inspect.getdoc(type(service)) for service in services]
     instructions = "\n\n".join(

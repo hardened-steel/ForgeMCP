@@ -1,20 +1,212 @@
 """Typed methods for clangd."""
 
+import asyncio
+import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Protocol, TypedDict
+
+from pydantic import JsonValue
 
 from forgemcp.process.errors import ProcessError
-from forgemcp.process.models import ProcessTimeout
-from forgemcp.process.service import ProcessService
+from forgemcp.process.models import ProcessEncoding, ProcessTimeout
+from forgemcp.process.service import ProcessService, ProcessSession
 
 from ..errors import ToolCommandError, ToolParserError
 from ..spec import ToolInfo, ToolKind, ToolSpec
 
 
+type LspId = int | str
+
+
+@dataclass(frozen=True)
+class LspRequest:
+    id: LspId
+    method: str
+    params: JsonValue = None
+
+
+@dataclass(frozen=True)
+class LspNotification:
+    method: str
+    params: JsonValue = None
+
+
+@dataclass(frozen=True)
+class LspResponse:
+    id: LspId
+    result: JsonValue
+
+
+@dataclass(frozen=True)
+class LspErrorResponse:
+    id: LspId | None
+    code: int
+    message: str
+    data: JsonValue = None
+
+
+type LspMessage = LspRequest | LspNotification | LspResponse | LspErrorResponse
+
+
+def parse_message(value: object) -> LspMessage:
+    """Validate the JSON-RPC envelope without interpreting a language operation."""
+    if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
+        raise ToolParserError("clangd returned an invalid JSON-RPC envelope.")
+    identifier = value.get("id")
+    valid_id = type(identifier) in (int, str)
+    if "method" in value:
+        if (
+            not isinstance(value["method"], str)
+            or not value["method"]
+            or "result" in value
+            or "error" in value
+            or ("params" in value and not isinstance(value["params"], (dict, list)))
+        ):
+            raise ToolParserError("clangd returned an invalid request or notification.")
+        if "id" not in value:
+            return LspNotification(value["method"], value.get("params"))
+        if valid_id:
+            return LspRequest(identifier, value["method"], value.get("params"))
+    elif "result" in value and "error" not in value and valid_id:
+        return LspResponse(identifier, value["result"])
+    elif "error" in value and "result" not in value and "id" in value:
+        error = value["error"]
+        if (
+            (valid_id or identifier is None)
+            and isinstance(error, dict)
+            and type(error.get("code")) is int
+            and isinstance(error.get("message"), str)
+        ):
+            return LspErrorResponse(
+                identifier,
+                error["code"],
+                error["message"],
+                error.get("data"),
+            )
+    raise ToolParserError("clangd returned an invalid JSON-RPC response or identifier.")
+
+
+def reject_constant(value: str) -> None:
+    raise ValueError("Non-finite JSON number.")
+
+
+class Connection:
+    """A single-reader framed connection; process ownership stays in this module."""
+
+    def __init__(self, session: ProcessSession) -> None:
+        self._session = session
+        self.write_lock = asyncio.Lock()
+        self.claimed = False
+
+    @property
+    def process_id(self) -> int:
+        return self._session.process_id
+
+    async def close(self) -> None:
+        """Close the transport, leaving process cleanup inside the tool module."""
+        await self._session.close()
+
+    async def send(self, message: LspMessage) -> None:
+        value = {"jsonrpc": "2.0", **asdict(message)}
+        if isinstance(message, LspErrorResponse):
+            value = {
+                "jsonrpc": "2.0",
+                "id": message.id,
+                "error": {
+                    "code": message.code,
+                    "message": message.message,
+                    "data": message.data,
+                },
+            }
+        elif isinstance(message, (LspRequest, LspNotification)) and message.params is None:
+            value.pop("params")
+        parse_message(value)
+        try:
+            body = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            async with self.write_lock:
+                await self._session.write_stdin((header + body).decode("latin_1"))
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ToolParserError("Cannot serialize an LSP message.") from error
+        except ProcessError as error:
+            raise ToolCommandError(
+                "Cannot send an LSP message to clangd.",
+                process_id=self.process_id,
+            ) from error
+
+    async def messages(self) -> AsyncGenerator[LspMessage]:
+        if self.claimed:
+            raise ToolCommandError("clangd messages already have a reader.")
+        self.claimed = True
+        buffer = bytearray()
+        length = None
+        try:
+            async for chunk in self._session.output():
+                if chunk.stream != "stdout":
+                    continue
+                buffer.extend(chunk.text.encode("latin_1"))
+                while True:
+                    if length is None:
+                        end = buffer.find(b"\r\n\r\n")
+                        if end < 0:
+                            break
+                        headers = bytes(buffer[:end]).decode("ascii")
+                        del buffer[:end + 4]
+                        lengths = []
+                        for header in headers.split("\r\n"):
+                            key, separator, value = header.partition(":")
+                            if not separator:
+                                raise ValueError("Malformed LSP header.")
+                            if key.strip().lower() == "content-length":
+                                lengths.append(value.strip())
+                        if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+                            raise ValueError("Invalid LSP content length.")
+                        length = int(lengths[0])
+                    if len(buffer) < length:
+                        break
+                    body = bytes(buffer[:length])
+                    del buffer[:length]
+                    length = None
+                    yield parse_message(
+                        json.loads(body.decode("utf-8"), parse_constant=reject_constant),
+                    )
+            if buffer or length is not None:
+                raise ToolParserError("clangd closed an incomplete LSP message.")
+            code = await self._session.wait()
+            if code != 0:
+                raise ToolCommandError(
+                    f"clangd exited with code {code}.",
+                    process_id=self.process_id,
+                )
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise ToolParserError("clangd returned malformed LSP data.") from error
+        except ProcessError as error:
+            raise ToolCommandError(
+                "clangd process communication failed.",
+                process_id=self.process_id,
+            ) from error
+
+
+class Connect(Protocol):
+    def __call__(
+        self,
+        project: Path,
+        compilation_database_directory: Path,
+    ) -> AbstractAsyncContextManager[Connection]: ...
+
+
 class Methods(TypedDict):
     version: Callable[[], Awaitable[str]]
+    connect: Connect
 
 
 def create_spec(
@@ -54,7 +246,34 @@ def create_spec(
                 return match.group(1)
         raise ToolParserError(f"Cannot parse {INFO.name} version.")
 
-    methods: Methods = {"version": version}
+    @asynccontextmanager
+    async def connect(
+        project: Path,
+        compilation_database_directory: Path,
+    ) -> AsyncGenerator[Connection]:
+        if not (compilation_database_directory / "compile_commands.json").is_file():
+            raise ToolCommandError("clangd requires an existing compilation database.")
+        try:
+            async with await processes.launch(
+                path,
+                (
+                    f"--compile-commands-dir={compilation_database_directory}",
+                    "--background-index",
+                ),
+                cwd=project,
+                env=environment,
+                inherit_environment=inherit_environment,
+                encoding=ProcessEncoding(driver="latin_1", errors="strict"),
+                timeout=ProcessTimeout(),
+            ) as session:
+                yield Connection(session)
+        except ProcessError as error:
+            raise ToolCommandError("Cannot run clangd.") from error
+
+    methods: Methods = {
+        "version": version,
+        "connect": connect,
+    }
     return ToolSpec(INFO.name, INFO.kind, path, methods)
 
 

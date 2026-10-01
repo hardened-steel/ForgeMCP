@@ -2,7 +2,9 @@
 
 ForgeMCP is a Python MCP server for structured C and C++ development workflows.
 The repository contains workspace, process, toolchain, and initial CMake services.
-Language-server, quality, and debugger modules are planned.
+Clangd tools provide read-only analysis across CMake configurations; their widgets
+remain deferred. External file reads ask for confirmation through MCP elicitation. Quality and
+debugger modules are planned.
 
 ## Current MCP surface
 
@@ -12,6 +14,9 @@ Language-server, quality, and debugger modules are planned.
 - Workspace resources mirror UTF-8 text and raw bytes, and expose directory trees,
   file lists, metadata, and search results as Markdown. Resource parameters have
   completions for qualified paths, extensions, depth, and boolean options.
+- Clangd tools list available configurations and provide diagnostics, hover,
+  definitions, references, document symbols, and workspace symbols. Empty
+  configuration selections use all available contexts.
 - No prompts are currently registered.
 - CMake tools list operator profiles, configure projects, build targets, and run
   CTest. Each tool has its own widget with profile filters, Fields/JSON views,

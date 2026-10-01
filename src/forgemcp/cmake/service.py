@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal, cast
+from urllib.parse import quote
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
@@ -39,6 +41,12 @@ class CMakeProfile(BaseModel):
     test_presets: list[str] = Field(default_factory=list)
     configuration: str | None = None
     generator: str | None = None
+
+
+class CompilationContext(BaseModel):
+    id: str
+    toolset_id: str
+    compilation_database: WorkspacePath
 
 
 class CMakeConfigureResult(BaseModel):
@@ -349,6 +357,43 @@ class CMakeService:
         path = self.build_path(directory) / "compile_commands.json"
         return self.workspace.workspace_path(path) if path.is_file() else None
 
+    async def compilation_contexts(
+        self,
+        profiles: Sequence[str] = (),
+    ) -> list[CompilationContext]:
+        """Return configured contexts with existing databases; never configure here."""
+        definitions, catalogs = await self.selection(list(profiles) if profiles else None)
+        contexts = []
+        for definition in definitions:
+            try:
+                profile = self.resolve_profile(definition, catalogs)
+                presets = self.operation_presets(profile, "configure")
+            except (CMakeError, WorkspaceError, ToolchainError):
+                continue
+            for preset in presets:
+                directory = profile.build_directory
+                if preset is not None and len(presets) != 1:
+                    continue
+                if directory is None:
+                    continue
+                try:
+                    database = self.compilation_database(directory)
+                    if database is None:
+                        continue
+                except (CMakeError, WorkspaceError, OSError):
+                    continue
+                identifier = quote(profile.name, safe="")
+                if preset is not None:
+                    identifier += "/" + quote(preset, safe="")
+                contexts.append(
+                    CompilationContext(
+                        id=identifier,
+                        toolset_id=profile.toolset_id,
+                        compilation_database=database,
+                    ),
+                )
+        return contexts
+
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         icon = self.ICON.icon
         changes_files = ToolAnnotations(
@@ -426,13 +471,16 @@ class CMakeService:
                     )
                     results.append(result)
                     try:
-                        key = (profile.toolset_id, preset)
+                        key = (profile.toolset_id, preset, profile.build_directory)
                         if preset is not None and key in configured:
                             prior = configured[key]
                             result.error = prior.error
                             result.process_id = prior.process_id
                             continue
-                        build_directory = None
+                        build_directory = (
+                            self.build_path(profile.build_directory)
+                            if profile.build_directory is not None else None
+                        )
                         settings = {}
                         if preset is None:
                             if profile.build_directory is None:
@@ -458,8 +506,8 @@ class CMakeService:
                         result.process_id = command.process_id
                         if command.return_code != 0:
                             result.error = f"CMake configure exited with {command.return_code}."
-                        if command.return_code == 0 and profile.build_directory is not None:
-                            result.compilation_database = self.compilation_database(profile.build_directory)
+                        if command.return_code == 0 and result.build_directory is not None:
+                            result.compilation_database = self.compilation_database(result.build_directory)
                         if preset is not None:
                             configured[key] = result
                     except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:

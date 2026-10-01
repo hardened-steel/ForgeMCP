@@ -196,9 +196,9 @@ def create_spec(
         on_progress: Progress | None = None,
     ) -> ConfigureResult:
         arguments = ["--preset", preset] if preset is not None else ["-S", str(source)]
-        if preset is None:
-            if build_directory is None:
-                raise ToolCommandError("A plain configure requires a build directory.")
+        if preset is None and build_directory is None:
+            raise ToolCommandError("A plain configure requires a build directory.")
+        if build_directory is not None:
             arguments.extend(("-B", str(build_directory)))
         if generator is not None:
             arguments.extend(("-G", generator))

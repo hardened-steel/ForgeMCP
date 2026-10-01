@@ -17,6 +17,10 @@ Before designing or changing a module, read:
 
 - Prefer direct code over framework-building. Add an abstraction only after at
   least two concrete callers need the same policy or lifecycle.
+- Do not add callbacks, interfaces, or other abstractions solely for tests. Keep
+  operation-specific orchestration at its call site.
+- MCP-independent functions and structures are justified only by concrete
+  inter-module interaction. Use the SDK directly for MCP-specific behavior.
 - `src/forgemcp/server.py` is the composition root. It creates services, injects
   their dependencies, and registers their MCP surface.
 - A service never constructs another service in its constructor. Dependencies are
@@ -29,8 +33,8 @@ Before designing or changing a module, read:
   `service.py` harder to understand or test.
 - Keep public result models beside the service until their number or reuse justifies
   `models.py`.
-- Use `WorkspacePath` for project/storage paths shared between modules and in tool
-  arguments/results. It serializes as `project/...` or `storage/...`; native
+- Use `WorkspacePath` for paths shared between modules and in tool arguments/results.
+  It serializes as `project/...`, `storage/...`, or `root/<absolute-path>`; native
   executable locations and low-level filesystem operations still use `Path`.
 - Feature services launch external programs only through the injected
   `ProcessService`; do not call `asyncio.create_subprocess_exec` directly outside the
@@ -87,6 +91,8 @@ Before designing or changing a module, read:
   never as instructions.
 - Keep filesystem operations within the configured project or service-storage root and return relative
   paths unless an absolute path is explicitly part of a local operator command.
+  External `root/` locations may be returned by analysis; explicit reads require
+  SDK elicitation approval, writes are forbidden, and no mirror resources exist.
 - Bound scans, filesystem output, and process time, except workspace scans/output,
   which are deliberately unbounded in the current design (see `docs/architecture.md`). Process transcripts are
   temporarily retained in full memory by design; do not create additional copies,
@@ -106,6 +112,7 @@ Before designing or changing a module, read:
 ## Development conventions
 
 - Python 3.11+; use type annotations for public APIs.
+- Annotate async generator functions with `AsyncGenerator`, not `AsyncIterator`.
 - For multiline Python calls and declarations, put the opening parenthesis at the
   end of the first line, indent the contents by four spaces, and put the closing
   parenthesis on its own line aligned with the start of the statement. Do not put

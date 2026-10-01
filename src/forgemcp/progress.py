@@ -7,6 +7,9 @@ from time import monotonic
 from mcp.server.mcpserver import Context
 
 
+type Progress = Callable[[str], Awaitable[None]]
+
+
 def validate_progress_interval(interval: float) -> float:
     """Validate an operator setting before accepting requests."""
     if not isfinite(interval) or interval < 0:

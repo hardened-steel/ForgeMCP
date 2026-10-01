@@ -6,7 +6,8 @@ ForgeMCP is intentionally at foundation stage. The `workspace` feature manages
 project files and a separate service-storage root. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface for development commands. CMake now configures, builds, and tests operator
-profiles; clangd, quality, and debugger behavior remain future work.
+profiles. Read-only clangd analysis is mounted through MCP tools and workspace
+result extensions; its widgets remain deferred. Quality and debugger remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
 
@@ -190,7 +191,7 @@ for a unique directory below storage/tmp; it removes that directory on exit.
 The caller must stop processes before deleting their directories.
 
 CMake can request `storage_directory("build").subdirectory("cmake-debug")`;
-clangd can request a persistent index directory. Workspace knows neither build
+other consumers can request persistent storage directories. Workspace knows neither build
 configuration nor index lifecycle. Git can register `.git` with `protect_path`
 in its constructor. ProcessService receives plain allowed root paths, not a
 dependency on WorkspaceService. Its check restricts cwd, not OS-level file access.
@@ -234,7 +235,7 @@ only completion responses observe the protocol's 100-value cap.
 a unique name. An optional tools sequence limits its invocation. Each tool passes
 an `ExtensionContext` containing a result copy, qualified paths, already-read
 texts, and an optional immutable `TextChange`. Write/edit capture the successful
-mutation through their optional `on_change` callback; snapshots stay out of
+  mutation in the MCP handler at the call site; snapshots stay out of
 public results. The diff provider is scoped to write/edit, so searches do not
 retain full texts for it. Providers must not change files.
 
@@ -490,6 +491,59 @@ resource and details template return markdown, and completion
 offers discovered toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
 the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 
+## Clangd business API
+
+`ClangdService` receives `WorkspaceService`, `ToolchainService`, and `CMakeService`
+explicitly. `server.py` registers its seven MCP tools and workspace extension,
+and closes the analysis service before `ProcessService`. Widgets remain deferred.
+
+CMake exposes `CompilationContext(id, toolset_id, compilation_database)` only for
+existing compilation databases. Build directories come from profile parameters;
+a single native preset can use an explicitly configured build directory (`-B`).
+Unknown directories are omitted rather than parsing command output or guessing
+CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
+Empty configuration selections mean all available contexts; executables never fall
+back to another toolset or a system installation.
+
+The typed clangd ToolSpec method `connect` owns `ProcessSession` and JSON-RPC/LSP
+framing. Callers exchange typed request, notification, response, and error envelopes.
+UTF-8 message bodies are framed by byte length without an added frame-size limit.
+The process text transport uses reversible Latin-1 encoding for those bytes; its
+transcript is therefore not a decoded UTF-8 LSP log. Clangd uses its normal index
+locations, including the cache beside the compilation database.
+
+`ClangdSession` handles initialization, request correlation, cancellation, document
+versions, diagnostics, and shutdown. Progress callbacks reach the session layer.
+Positions use one-based lines and zero-based Unicode code-point offsets. The session
+requires UTF-32 position negotiation so external locations can be returned without
+reading their contents to convert offsets.
+
+`ClangdService` lazily retains one session per selected context. It implements
+diagnostics, hover, definition, references, document symbols, and workspace symbols.
+Each operation has its own result model with `configurations: list[str]`. Equal
+complete answers are grouped with their configuration IDs; differing answers remain
+separate. An analysis failure raises a domain error rather than silently returning
+an incomplete multi-configuration answer. Changed compilation databases, failed
+sessions, and missed workspace revisions invalidate retained sessions.
+
+The workspace extension supports read, write, edit, move, and delete results. It
+updates active sessions after mutations and captures version-matched diagnostics
+and semantic highlighting into the existing immutable result-resource mechanism.
+It does not watch external edits or manage editor buffers. Workspace mutations stay
+successful if enrichment fails, following the existing extension contract.
+
+`WorkspacePath` can also represent external absolute locations with `root/`, for
+example `root/C:/SDK/include/header.h` or `root//usr/include/header.h`. Managed
+filesystem operations reject this area. `workspace_read_file` uses an injected
+`confirm` parameter with SDK `Resolve`/`Elicit`: managed paths need no question,
+external paths require explicit approval, and declining or cancelling stops the
+read. The confirmation is requested for each external read; no separate permission
+service is used. Clangd's own include reads do not require these confirmations.
+External diagnostics are excluded, but symbol locations may reference external files.
+The path type exposes an inline JSON Schema string, without a `$ref` indirection.
+External files never have text/raw mirror resources, even after reading is approved;
+resource requests for them raise `ResourceNotFoundError`.
+
 ## MCP Apps and widget packaging
 
 Each model-visible tool must bind exactly one `ui://` resource through
@@ -668,12 +722,10 @@ the build task before starting the server.
 
 The likely order is:
 
-1. workspace-safe read/write operations and path policy;
-2. CMake discovery/configure/build/test using `ProcessService`;
-3. clangd lifecycle and language operations;
-4. formatting, static analysis, and sanitizer parsing;
-5. debugger adapter lifecycle and DAP operations;
-6. persistent process transcripts and configurable retention limits.
+1. clangd validation and widgets;
+2. formatting, static analysis, and sanitizer parsing;
+3. debugger adapter lifecycle and DAP operations;
+4. persistent process transcripts and configurable retention limits.
 
 This ordering is guidance, not a framework contract. Add the smallest end-to-end slice
 needed by the next user-visible workflow.
