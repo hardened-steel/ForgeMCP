@@ -499,8 +499,10 @@ the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 explicitly. `server.py` registers its seven MCP tools and workspace extension,
 and closes the analysis service before `ProcessService`. Widgets remain deferred.
 
-CMake exposes `CompilationContext(id, toolset_id, compilation_database)` only for
-existing compilation databases. Build directories come from profile parameters;
+CMake retains successful configurations as
+`CompilationContext(id, toolset_id, build_directory, compilation_database)`.
+It starts from existing compilation databases, updates entries after configure,
+and drops entries whose databases disappear. Build directories come from profile parameters;
 a single native preset can use an explicitly configured build directory (`-B`).
 Unknown directories are omitted rather than parsing command output or guessing
 CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.

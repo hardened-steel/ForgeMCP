@@ -47,6 +47,7 @@ class CMakeProfile(BaseModel):
 class CompilationContext(BaseModel):
     id: str
     toolset_id: str
+    build_directory: WorkspacePath
     compilation_database: WorkspacePath
 
 
@@ -119,6 +120,8 @@ class CMakeService:
         self.definitions = profiles
         self.default_toolset = default_toolset
         self.progress_interval = progress_interval
+        self.configurations: dict[str, CompilationContext] = {}
+        self.configurations_loaded = False
 
     def toolset(self, selector: str) -> Toolset:
         matches = [
@@ -409,38 +412,52 @@ class CMakeService:
         self,
         profiles: Sequence[str] = (),
     ) -> list[CompilationContext]:
-        """Return configured contexts with existing databases; never configure here."""
-        definitions, catalogs = await self.selection(list(profiles) if profiles else None)
-        contexts = []
-        for definition in definitions:
-            try:
-                profile = self.resolve_profile(definition, catalogs)
-                presets = self.operation_presets(profile, "configure")
-            except (CMakeError, ToolchainError):
-                continue
-            for preset in presets:
-                directory = profile.build_directory
-                if preset is not None and len(presets) != 1:
-                    continue
-                if directory is None:
-                    continue
+        """Return successful configurations with databases that still exist."""
+        if not self.configurations_loaded:
+            definitions, catalogs = await self.selection(None)
+            for definition in definitions:
                 try:
-                    database = self.compilation_database(directory)
+                    profile = self.resolve_profile(definition, catalogs)
+                    presets = self.operation_presets(profile, "configure")
+                except (CMakeError, ToolchainError):
+                    continue
+                for preset in presets:
+                    directory = profile.build_directory
+                    if directory is None or (preset is not None and len(presets) != 1):
+                        continue
+                    try:
+                        database = self.compilation_database(directory)
+                    except (CMakeError, OSError):
+                        continue
                     if database is None:
                         continue
-                except (CMakeError, OSError):
-                    continue
-                identifier = quote(profile.name, safe="")
-                if preset is not None:
-                    identifier += "/" + quote(preset, safe="")
-                contexts.append(
-                    CompilationContext(
+                    identifier = quote(profile.name, safe="")
+                    if preset is not None:
+                        identifier += "/" + quote(preset, safe="")
+                    self.configurations[identifier] = CompilationContext(
                         id=identifier,
                         toolset_id=profile.toolset_id,
+                        build_directory=directory,
                         compilation_database=database,
-                    ),
-                )
-        return contexts
+                    )
+            self.configurations_loaded = True
+        if profiles:
+            definitions, _ = await self.selection(list(profiles))
+            selected = {quote(definition.name, safe="") for definition in definitions}
+        else:
+            selected = None
+        for identifier, context in tuple(self.configurations.items()):
+            try:
+                available = self.compilation_database(context.build_directory)
+            except (CMakeError, OSError):
+                available = None
+            if available != context.compilation_database:
+                del self.configurations[identifier]
+        return [
+            context.model_copy(deep=True)
+            for context in self.configurations.values()
+            if selected is None or context.id.split("/", 1)[0] in selected
+        ]
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         icon = self.ICON.icon
@@ -486,6 +503,7 @@ class CMakeService:
             await report(0, message="Preparing CMake configure")
             try:
                 definitions, catalogs = await self.selection(profiles)
+                await self.compilation_contexts()
             except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             results: list[CMakeConfigureResult] = []
@@ -504,6 +522,10 @@ class CMakeService:
                     presets = self.operation_presets(profile, "configure")
                     methods = self.cmake_methods(profile.toolset_id)
                 except (CMakeError, ToolchainError) as error:
+                    identifier = quote(definition.name, safe="")
+                    for key in tuple(self.configurations):
+                        if key == identifier or key.startswith(identifier + "/"):
+                            del self.configurations[key]
                     results.append(
                         CMakeConfigureResult(
                             profile=definition.name,
@@ -512,6 +534,9 @@ class CMakeService:
                     )
                     continue
                 for preset in presets:
+                    identifier = quote(profile.name, safe="")
+                    if preset is not None:
+                        identifier += "/" + quote(preset, safe="")
                     result = CMakeConfigureResult(
                         profile=profile.name,
                         preset=preset,
@@ -524,6 +549,21 @@ class CMakeService:
                             prior = configured[key]
                             result.error = prior.error
                             result.process_id = prior.process_id
+                            result.compilation_database = prior.compilation_database
+                            if (
+                                result.error is None
+                                and result.build_directory is not None
+                                and result.compilation_database is not None
+                                and len(presets) == 1
+                            ):
+                                self.configurations[identifier] = CompilationContext(
+                                    id=identifier,
+                                    toolset_id=profile.toolset_id,
+                                    build_directory=result.build_directory,
+                                    compilation_database=result.compilation_database,
+                                )
+                            else:
+                                self.configurations.pop(identifier, None)
                             continue
                         build_directory = (
                             self.build_path(profile.build_directory)
@@ -591,6 +631,20 @@ class CMakeService:
                     except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
+                    if (
+                        result.error is None
+                        and result.build_directory is not None
+                        and result.compilation_database is not None
+                        and (preset is None or len(presets) == 1)
+                    ):
+                        self.configurations[identifier] = CompilationContext(
+                            id=identifier,
+                            toolset_id=profile.toolset_id,
+                            build_directory=result.build_directory,
+                            compilation_database=result.compilation_database,
+                        )
+                    else:
+                        self.configurations.pop(identifier, None)
                     await report_status(result.error or "Completed successfully")
             return results
 
