@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import Annotated, Literal, cast
 from urllib.parse import quote
@@ -122,6 +123,10 @@ class CMakeService:
         self.progress_interval = progress_interval
         self.configurations: dict[str, CompilationContext] = {}
         self.configurations_loaded = False
+        self.configuration_subscribers: dict[
+            asyncio.Queue[list[CompilationContext]], tuple[str, ...]
+        ] = {}
+        self.configuration_lock = asyncio.Lock()
 
     def toolset(self, selector: str) -> Toolset:
         matches = [
@@ -459,6 +464,38 @@ class CMakeService:
             if selected is None or context.id.split("/", 1)[0] in selected
         ]
 
+    async def configuration_updates(self) -> AsyncGenerator[list[CompilationContext], None]:
+        """Yield the current configurations, then their latest changed snapshot."""
+        queue: asyncio.Queue[list[CompilationContext]] = asyncio.Queue(maxsize=1)
+        async with self.configuration_lock:
+            current = await self.compilation_contexts()
+            self.configuration_subscribers[queue] = tuple(
+                item.model_dump_json() for item in current
+            )
+            queue.put_nowait(current)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            async with self.configuration_lock:
+                self.configuration_subscribers.pop(queue, None)
+
+    async def publish_configurations(self) -> None:
+        """Notify subscribers only when their last snapshot has changed."""
+        if not self.configuration_subscribers:
+            return
+        async with self.configuration_lock:
+            current = await self.compilation_contexts()
+            signature = tuple(item.model_dump_json() for item in current)
+            for queue, previous in tuple(self.configuration_subscribers.items()):
+                if signature == previous:
+                    continue
+                if queue.full():
+                    queue.get_nowait()
+                snapshot = [item.model_copy(deep=True) for item in current]
+                queue.put_nowait(snapshot)
+                self.configuration_subscribers[queue] = signature
+
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         icon = self.ICON.icon
         changes_files = ToolAnnotations(
@@ -526,6 +563,7 @@ class CMakeService:
                     for key in tuple(self.configurations):
                         if key == identifier or key.startswith(identifier + "/"):
                             del self.configurations[key]
+                    await self.publish_configurations()
                     results.append(
                         CMakeConfigureResult(
                             profile=definition.name,
@@ -564,6 +602,7 @@ class CMakeService:
                                 )
                             else:
                                 self.configurations.pop(identifier, None)
+                            await self.publish_configurations()
                             continue
                         build_directory = (
                             self.build_path(profile.build_directory)
@@ -608,6 +647,7 @@ class CMakeService:
                                             if not build_directory.resolve().is_relative_to(base):
                                                 raise CMakeError("Build directory escaped its root.")
                                             shutil.rmtree(build_directory)
+                                            await self.publish_configurations()
                                         except OSError as error:
                                             raise CMakeError("Cannot clear build directory.") from error
                             self.prepare_file_api(profile.build_directory)
@@ -645,6 +685,7 @@ class CMakeService:
                         )
                     else:
                         self.configurations.pop(identifier, None)
+                    await self.publish_configurations()
                     await report_status(result.error or "Completed successfully")
             return results
 

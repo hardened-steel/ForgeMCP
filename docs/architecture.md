@@ -509,6 +509,12 @@ CMake preset expansion. Clangd additionally excludes contexts whose toolset lack
 Empty configuration selections mean all available contexts; executables never fall
 back to another toolset or a system installation.
 
+`configuration_updates()` is CMake's in-process subscription stream. It yields the
+current list immediately and then yields changed snapshots when configure adds or
+removes a configuration. A slow subscriber keeps only the newest pending snapshot;
+it does not delay CMake or receive events for unchanged lists. Subscribers close
+their generators to unregister.
+
 The typed clangd ToolSpec method `connect` owns `ProcessSession` and JSON-RPC/LSP
 framing. Callers exchange typed request, notification, response, and error envelopes.
 UTF-8 message bodies are framed by byte length without an added frame-size limit.
