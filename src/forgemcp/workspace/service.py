@@ -11,8 +11,9 @@ import os
 import shutil
 import stat
 import tempfile
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Generator, Generic, Literal, TypeVar
@@ -153,7 +154,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_list(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: DirectoryTree,
     ) -> str | None:
         return None
@@ -169,7 +170,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_find_files(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: FilePaths,
     ) -> str | None:
         return None
@@ -184,7 +185,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_file_info(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: FileInfo,
     ) -> str | None:
         return None
@@ -202,7 +203,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_read_file(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: FileContent,
     ) -> str | None:
         return None
@@ -221,7 +222,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_search(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: SearchResult,
     ) -> str | None:
         return None
@@ -237,7 +238,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_write_file(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: FileWriteResult,
     ) -> str | None:
         return None
@@ -255,7 +256,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_edit_file(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: FileEditResult,
     ) -> str | None:
         return None
@@ -271,7 +272,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_move(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
         return None
@@ -286,7 +287,7 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_delete(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
         return None
@@ -301,12 +302,12 @@ class ResultProvider(Generic[ContextT]):
     async def after_workspace_mkdir(
         self,
         call_id: str,
-        context: ContextT | None,
+        context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
         return None
 
-    async def error(self, call_id: str, context: ContextT | None) -> None:
+    async def error(self, call_id: str, context: ContextT) -> None:
         pass
 
 
@@ -415,6 +416,22 @@ class WorkspaceService:
         ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
         self.revision = 0
+        self.operation_lock = asyncio.Lock()
+        self.operation_owner: asyncio.Task[object] | None = None
+
+    @asynccontextmanager
+    async def serialized_operation(self) -> AsyncGenerator[None]:
+        """Serialize Workspace entrypoints, allowing same-task resource delegation."""
+        task = asyncio.current_task()
+        if task is self.operation_owner:
+            yield
+            return
+        async with self.operation_lock:
+            self.operation_owner = task
+            try:
+                yield
+            finally:
+                self.operation_owner = None
 
     def register_extension(
         self,
@@ -596,7 +613,7 @@ class WorkspaceService:
         for name, outcome in zip(providers, outcomes):
             if isinstance(outcome, BaseException):
                 logging.getLogger(__name__).warning("Workspace provider before failed: %s", name)
-            else:
+            elif outcome[0] is not None:
                 contexts[name] = outcome[0]
         return ProviderCall(call_id, tool_name, MappingProxyType(contexts))
 
@@ -1142,6 +1159,17 @@ class WorkspaceService:
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register file tools, mirrors, Markdown resources, and completions."""
+
+        def serialized[**P, R](
+            handler: Callable[P, Awaitable[R]],
+        ) -> Callable[P, Awaitable[R]]:
+            @wraps(handler)
+            async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+                async with self.serialized_operation():
+                    return await handler(*args, **kwargs)
+
+            return wrapped
+
         read_only = ToolAnnotations(
             read_only_hint=True,
             destructive_hint=False,
@@ -1158,6 +1186,7 @@ class WorkspaceService:
             icons=[self.ICON.icon],
             annotations=read_only,
         )
+        @serialized
         async def workspace_list(
             ctx: Context,
             path: WorkspacePath = WorkspacePath("project/"),
@@ -1235,6 +1264,7 @@ class WorkspaceService:
             icons=[self.ICON.icon],
             annotations=read_only,
         )
+        @serialized
         async def workspace_find_files(
             ctx: Context,
             pattern: str = "*",
@@ -1291,6 +1321,7 @@ class WorkspaceService:
             icons=[self.FILE_ICON.icon],
             annotations=read_only,
         )
+        @serialized
         async def workspace_file_info(
             path: WorkspacePath,
             ctx: Context,
@@ -1312,6 +1343,7 @@ class WorkspaceService:
             icons=[self.FILE_ICON.icon],
             annotations=read_only,
         )
+        @serialized
         async def workspace_read_file(
             path: WorkspacePath,
             ctx: Context,
@@ -1368,6 +1400,7 @@ class WorkspaceService:
             icons=[self.SEARCH_ICON.icon],
             annotations=read_only,
         )
+        @serialized
         async def workspace_search(
             query: str,
             ctx: Context,
@@ -1454,6 +1487,7 @@ class WorkspaceService:
             icons=[self.EDIT_ICON.icon],
             annotations=modifying,
         )
+        @serialized
         async def workspace_write_file(
             path: WorkspacePath,
             text: str,
@@ -1486,6 +1520,7 @@ class WorkspaceService:
             icons=[self.EDIT_ICON.icon],
             annotations=modifying,
         )
+        @serialized
         async def workspace_edit_file(
             path: WorkspacePath,
             old_text: str,
@@ -1520,6 +1555,7 @@ class WorkspaceService:
             icons=[self.EDIT_ICON.icon],
             annotations=modifying,
         )
+        @serialized
         async def workspace_move(
             source: WorkspacePath,
             destination: WorkspacePath,
@@ -1547,6 +1583,7 @@ class WorkspaceService:
             icons=[self.EDIT_ICON.icon],
             annotations=modifying,
         )
+        @serialized
         async def workspace_delete(
             path: WorkspacePath,
             ctx: Context,
@@ -1573,6 +1610,7 @@ class WorkspaceService:
                 open_world_hint=False,
             ),
         )
+        @serialized
         async def workspace_mkdir(
             path: WorkspacePath,
             ctx: Context,
@@ -1608,6 +1646,7 @@ class WorkspaceService:
             mime_type="application/json",
             icons=[self.FILE_ICON.icon],
         )
+        @serialized
         async def workspace_result_json(result_id: str, name: str) -> str:
             """Read immutable result extensions or provider JSON from one tool invocation."""
             try:
@@ -1620,6 +1659,7 @@ class WorkspaceService:
             mime_type="text/markdown",
             icons=[self.FILE_ICON.icon],
         )
+        @serialized
         async def workspace_result_markdown(result_id: str, name: str) -> str:
             """Read a provider's immutable Markdown, independently of syntax token data."""
             try:
@@ -1644,6 +1684,7 @@ class WorkspaceService:
             mime_type="text/plain",
             icons=[self.FILE_ICON.icon],
         )
+        @serialized
         async def workspace_file_resource(
             path: list[str] | None = None,
         ) -> str:
@@ -1656,6 +1697,7 @@ class WorkspaceService:
             mime_type="application/octet-stream",
             icons=[self.FILE_ICON.icon],
         )
+        @serialized
         async def workspace_raw_resource(
             path: list[str] | None = None,
         ) -> bytes:
@@ -1664,6 +1706,7 @@ class WorkspaceService:
             return resource(self.read_bytes, path=selected)
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
+        @serialized
         async def workspace_list_resource(
             ctx: Context,
             path: str = "project/",
@@ -1688,6 +1731,7 @@ class WorkspaceService:
             icons=[self.ICON.icon],
             security=ResourceSecurity(exempt_params={"pattern"}),
         )
+        @serialized
         async def workspace_find_files_resource(
             ctx: Context,
             pattern: str = "*",
@@ -1709,6 +1753,7 @@ class WorkspaceService:
             mime_type="text/markdown",
             icons=[self.FILE_ICON.icon],
         )
+        @serialized
         async def workspace_file_info_resource(path: str = "") -> str:
             """Read one file's metadata as a Markdown table; path is required."""
             selected = resource_path(path)
@@ -1720,6 +1765,7 @@ class WorkspaceService:
             icons=[self.SEARCH_ICON.icon],
             security=ResourceSecurity(exempt_params={"query"}),
         )
+        @serialized
         async def workspace_search_resource(
             ctx: Context,
             query: str = "",
@@ -1843,4 +1889,4 @@ class WorkspaceService:
                 has_more=len(matches) > 100,
             )
 
-        complete.add_completion(workspace_completion)
+        complete.add_completion(serialized(workspace_completion))

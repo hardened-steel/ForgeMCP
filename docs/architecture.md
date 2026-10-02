@@ -263,7 +263,7 @@ Spans use zero-based Unicode code-point [start, end) offsets; zero-width spans m
 insertions/deletions. Replacement lines are paired in their original order for
 character comparison; unpaired added/removed lines are wholly changed. Starts are
 one-based; a zero count denotes the next insertion position. Identical text produces
-empty changes/hunks. Providers use captured snapshots, never subsequent file reads.
+empty changes/hunks. The current extension receives captured file snapshots.
 
 The App bridge reads resources.diff directly, restricts it to workspace result
 JSON URIs, checks its MIME type/version, and validates decoded data. It ignores
@@ -282,8 +282,9 @@ handlers while they are migrated. `ResultProvider[ContextT]` has a typed
 `before_workspace_*` and `after_workspace_*` pair for each Workspace tool. Before
 receives that tool's arguments and returns provider-owned context; after receives
 the same context and that tool's concrete result model. Default methods do nothing,
-with `before` returning `None`; providers override only operations they use. On
-tool failure, `error(call_id, context)` receives each successful before context.
+with `before` returning `None`; this skips its `after` and `error` hooks for that
+operation. Providers override only operations they use. On tool failure,
+`error(call_id, context)` receives each non-`None` before context.
 Workspace uses one random ID for all providers in a tool call. It runs each stage
 concurrently, waits for every provider, and logs provider failures without changing
 the tool outcome. Each provider receives its own copy of the input arguments and result.
@@ -292,6 +293,14 @@ the tool outcome. Each provider receives its own copy of the input arguments and
 Markdown under that ID and returns its URI. Workspace accepts only a URI saved by
 the matching provider for that call. The old extension handlers continue serving
 tools until their later migration steps.
+
+Workspace serializes its MCP tool handlers, dynamic resource handlers, and path
+completion handler with one lock. The lock remains held while a handler waits for
+providers. A resource handler may call a tool handler in the same task without
+deadlocking; requests from other tasks still wait. `DiffProvider` implements the
+new write/edit hooks: before captures the previous file text, and after saves an
+immutable diff under the shared call ID and returns its URI. The current
+write/edit handlers still use the old diff extension until their migration.
 
 ## CMake profiles and operations
 

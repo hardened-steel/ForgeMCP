@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from .extensions import ExtensionContext, ExtensionOutput, ExtensionResource, TextChange
 from .path import WorkspacePath
+from .service import FileEditResult, FileWriteResult, ResultProvider, WorkspaceService
 
 
 class DiffLine(BaseModel):
@@ -124,6 +125,7 @@ def create_diff(change: TextChange) -> FileDiff:
 
 
 async def diff_extension(context: ExtensionContext) -> ExtensionOutput | None:
+    """Keep the current Workspace handlers working until their provider migration."""
     if context.change is None:
         return None
     diff = create_diff(context.change)
@@ -135,3 +137,55 @@ async def diff_extension(context: ExtensionContext) -> ExtensionOutput | None:
         ),
         metadata={"version": 1},
     )
+
+
+class DiffProvider(ResultProvider[str]):
+    """Capture the old text before a write/edit and publish its immutable diff."""
+
+    def __init__(self, workspace: WorkspaceService) -> None:
+        self.workspace = workspace
+
+    async def before_workspace_write_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        text: str,
+    ) -> str:
+        candidate = self.workspace.writable_path(path.relative, root=path.area)
+        return self.workspace.read_file(path).text if candidate.exists() else ""
+
+    async def after_workspace_write_file(
+        self,
+        call_id: str,
+        context: str,
+        result: FileWriteResult,
+    ) -> str:
+        return self.save_diff(call_id, result.path, context)
+
+    async def before_workspace_edit_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> str:
+        return self.workspace.read_file(path).text
+
+    async def after_workspace_edit_file(
+        self,
+        call_id: str,
+        context: str,
+        result: FileEditResult,
+    ) -> str:
+        return self.save_diff(call_id, result.path, context)
+
+    def save_diff(self, call_id: str, path: WorkspacePath, before: str) -> str:
+        after = self.workspace.read_file(path).text
+        diff = create_diff(TextChange(path=path, before=before, after=after))
+        return self.workspace.save_result_resource(
+            call_id,
+            "diff",
+            "application/json",
+            diff.model_dump_json(),
+        )
