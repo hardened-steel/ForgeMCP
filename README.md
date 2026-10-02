@@ -114,7 +114,7 @@ are dropped, not queued. Tool results signal completion even when its progress
 notification is suppressed. The interval must be finite and nonnegative.
 
 Storage is created on first use. Its persistent directories survive restarts;
-internal temporary-directory contexts clean up their own folders on exit. The
+each feature module manages its own directories and cleanup. The
 process service permits working directories inside either configured root. This is
 a working-directory check, not an operating-system sandbox.
 
@@ -173,7 +173,7 @@ object maps each contributing provider name to a descriptor with `uri` and
 or `extensions_uri`. All result resources are immutable, held in memory, and
 disappear on restart.
 
-Write/edit return `resources.diff` linking to `diff.json` with `version: 1`.
+Write/edit return `resources.diff` linking to `diff.json` with URI and MIME type.
 This typed resource contains `path`, compact `changes` ranges, and `hunks` with
 context/added/removed lines, original/new numbers, exact text including line
 endings, and character `spans` in zero-based Unicode code points [start, end).
@@ -183,7 +183,8 @@ and display changes without headers or a redundant diff label. The Highlight
 changes button toggles changed-substring highlighting next to Wrap lines; local
 search uses a separate color. JSON and Copy all retain the original tool result.
 A resource-loading failure does not change the successful file-operation outcome.
-No syntax/diagnostic provider is included yet.
+Diff widget adaptation to the new provider descriptors remains deferred.
+Automatic syntax/diagnostic enrichment awaits the clangd provider migration.
 
 ## CMake profiles
 

@@ -24,7 +24,7 @@ from forgemcp.toolchain.loader import load_tools
 from forgemcp.toolchain.providers.user import parse_toolsets
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.workspace.service import WorkspaceService
-from forgemcp.workspace.diff import DiffProvider, diff_extension
+from forgemcp.workspace.diff import DiffProvider
 from forgemcp.workspace.errors import WorkspaceError
 
 
@@ -45,11 +45,6 @@ def create_server(
         root,
         storage_root,
         progress_interval=progress_interval,
-    )
-    workspace.register_extension(
-        "diff",
-        diff_extension,
-        tools=("workspace_write_file", "workspace_edit_file"),
     )
     workspace.register_provider(
         "diff",

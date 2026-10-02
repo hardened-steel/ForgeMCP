@@ -1,5 +1,5 @@
 """Workspace filesystem feature."""
 
-from .service import StorageDirectory, WorkspaceService
+from .service import WorkspaceService
 
-__all__ = ["StorageDirectory", "WorkspaceService"]
+__all__ = ["WorkspaceService"]

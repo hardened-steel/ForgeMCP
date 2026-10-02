@@ -260,7 +260,10 @@ class ClangdService:
             raise ClangdError(f"Configuration {context.id} has no clangd.")
         methods = cast(clangd.Methods, tool.methods)
         database = self.workspace.resolve_workspace_path(context.compilation_database)
-        fingerprint = hashlib.sha256(self.workspace.read_bytes(context.compilation_database)).hexdigest()
+        try:
+            fingerprint = hashlib.sha256(database.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ClangdError("Cannot read the compilation database.") from error
         fingerprint += f"|{context.toolset_id}|{tool.path}|{database}"
         running = self.sessions.get(context.id)
         if running is not None and (
@@ -301,7 +304,13 @@ class ClangdService:
             raise ClangdError(
                 "Analysis inputs must be project/storage files; external locations are read-only results.",
             )
-        return self.workspace.read_file(path).text
+        try:
+            text = self.workspace.resolve_workspace_path(path).read_bytes().decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ClangdError(f"{path}: cannot read UTF-8 text.") from error
+        if "\0" in text:
+            raise ClangdError(f"{path}: expected UTF-8 text, found a binary file.")
+        return text
 
     @staticmethod
     def require_capability(session: ClangdSession, name: str) -> None:

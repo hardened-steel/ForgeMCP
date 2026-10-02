@@ -153,11 +153,11 @@ There is no separate `root` tool argument. Path traversal,
 absolute paths, and resolutions outside the selected root are rejected. Trees
 display symlinks/junctions without descending into them. Trees hide dot-prefixed
 directories by default (`include_hidden=true` includes them); dot files stay visible. Explicit reads may follow
-in-root links; mutations reject linked path components. Moving or recursively
-removing a directory containing links is rejected. Workspace roots cannot be
+in-root links; mutations reject linked path components. Moving a directory
+containing links is rejected. Workspace roots cannot be
 mutated. `protect_path(WorkspacePath(...))` lets dependent modules protect files or
 directories, including paths that do not exist yet. Protection also blocks moving
-or deleting their ancestors, and applies to storage cleanup. Read access remains
+or deleting their ancestors. Read access remains
 available; there is no owner bypass or protection registry framework.
 
 Reads optionally select inclusive one-based lines and return their first line
@@ -184,15 +184,12 @@ timeout, output cap, index, or pagination.
 
 The default storage root is `.<project-name>.forgemcp` beside the project; the CLI
 can override it with `--workspace-storage`. It is created lazily. Storage must not
-equal or contain the project root. `storage_directory(key)` returns a small
-`StorageDirectory` with `path`, `subdirectory(key)`, and `remove()`. Persistent
-directories survive restarts. `temporary_directory(prefix)` is a context manager
-for a unique directory below storage/tmp; it removes that directory on exit.
-The caller must stop processes before deleting their directories.
-
-CMake can request `storage_directory("build").subdirectory("cmake-debug")`;
-other consumers can request persistent storage directories. Workspace knows neither build
-configuration nor index lifecycle. Git can register `.git` with `protect_path`
+equal or contain the project root. Each feature creates and removes its own
+directories under the injected storage root; Workspace exposes no storage-directory
+wrapper or filesystem tool methods for other modules. Persistent directories
+survive restarts. The owning module must stop processes before deleting their
+directories. Workspace knows neither build configuration nor index lifecycle.
+Git can register `.git` with `protect_path`
 in its constructor. ProcessService receives plain allowed root paths, not a
 dependency on WorkspaceService. Its check restricts cwd, not OS-level file access.
 Watchers, Git change callbacks, and language-server synchronization/highlighting
@@ -229,24 +226,34 @@ Extension completions scan the directory selected by `path` in completion contex
 Completions also cover depth and booleans;
 only completion responses observe the protocol's 100-value cap.
 
-### Workspace result extensions
+### Workspace result providers
 
-`register_extension(name, provider, tools=None)` registers an async provider under
-a unique name. An optional tools sequence limits its invocation. Each tool passes
-an `ExtensionContext` containing a result copy, qualified paths, already-read
-texts, and an optional immutable `TextChange`. Write/edit capture the successful
-  mutation in the MCP handler at the call site; snapshots stay out of
-public results. The diff provider is scoped to write/edit, so searches do not
-retain full texts for it. Providers must not change files.
+Each Workspace tool implements its filesystem operation in the local decorated
+MCP handler. It calls `before_providers` with every operation argument, then
+`after_providers` with its typed result on success or `error_providers` when the
+operation raises, including cancellation. Expected Workspace errors become
+`ToolError`; unexpected failures retain the SDK's sanitization. The handler
+attaches the saved resource descriptors after all providers finish. Providers
+receive no progress callback and cannot change the operation's result or flow.
+Shared low-level UTF-8 reading and atomic replacement helpers serve multiple
+Workspace callers; there are no public service methods implementing file tools.
 
-A provider returns `ExtensionOutput(resource, metadata=...)` or None. Its primary
-`ExtensionResource` supplies a unique .json/.md filename, matching MIME type, and
-text. Workspace validates JSON and stores immutable resource text. The result's
-`resources` mapping uses provider names as keys, each containing a typed descriptor
-with `uri`, `mime_type`, and optional JSON metadata. Metadata cannot override the
-link fields and is detached from provider-owned mutable values before another
-await. A failed provider publishes no descriptor and logs only a lifecycle summary;
-the successful file operation is preserved. Cancellation still propagates.
+`ResultProvider[ContextT]` has a typed `before_workspace_*` and
+`after_workspace_*` pair for each Workspace tool. Before receives that tool's
+arguments and returns provider-owned context; after receives the same context
+and that tool's concrete result model. Default methods do nothing, with before
+returning `None`; this skips its after and error hooks for that operation.
+Providers override only operations they use. On tool failure,
+`error(call_id, context)` receives each non-`None` before context.
+
+Workspace uses one random ID for all providers in a tool call. It runs each stage
+concurrently, waits for every provider, and logs provider failures without changing
+the tool outcome. Each provider receives its own copy of the input arguments and
+result. `register_provider(name, provider, tools=...)` limits which tool methods
+are invoked. `save_result_resource(call_id, provider, mime_type, text)` stores
+immutable JSON or Markdown under that ID and returns its URI. Workspace accepts
+only a URI saved by the matching provider for that call. The result's `resources`
+mapping contains provider names and descriptors with `uri` and `mime_type`.
 There is no separate manifest or `extensions_uri`.
 
 ```text
@@ -254,53 +261,33 @@ forgemcp://workspace/results/{result_id}/{name}.json
 forgemcp://workspace/results/{result_id}/{name}.md
 ```
 
-`workspace/diff.py` is explicitly registered in `server.py` as diff. It publishes
-`resources.diff` with URI, application/json MIME type, and version 1. `diff.json`
-is a typed `FileDiff`: qualified path, compact change ranges, and hunks with three
+`DiffProvider` from `workspace/diff.py` is registered in `server.py` for write/edit.
+Before captures the previous complete file text; after reads the resulting text,
+saves `diff.json` under the shared call ID, and returns its URI. The resource is a
+typed `FileDiff`: qualified path, compact change ranges, and hunks with three
 context lines. Each hunk contains typed context/added/removed lines with nullable
 before/after numbers, exact text (including line endings), and character spans.
 Spans use zero-based Unicode code-point [start, end) offsets; zero-width spans mark
 insertions/deletions. Replacement lines are paired in their original order for
 character comparison; unpaired added/removed lines are wholly changed. Starts are
 one-based; a zero count denotes the next insertion position. Identical text produces
-empty changes/hunks. The current extension receives captured file snapshots.
-
-The App bridge reads resources.diff directly, restricts it to workspace result
-JSON URIs, checks its MIME type/version, and validates decoded data. It ignores
-late reads after input, cancellation, or teardown. Rendering receives data without
-transport access and displays two number columns and change markers, without
-unified-diff headers or a redundant field label. Highlight changes toggles
-character-span emphasis next to Wrap lines; search highlighting is independent.
-JSON and Copy all retain the original tool result.
+empty changes/hunks. Failed operations publish no diff resource.
 
 Published resources remain immutable in memory until shutdown; reads never rerun
 providers. Unknown IDs/names raise ResourceNotFoundError. No resources are created
 when no provider contributes. Persistent result storage remains deferred.
 
-The replacement provider contract is available alongside the current extension
-handlers while they are migrated. `ResultProvider[ContextT]` has a typed
-`before_workspace_*` and `after_workspace_*` pair for each Workspace tool. Before
-receives that tool's arguments and returns provider-owned context; after receives
-the same context and that tool's concrete result model. Default methods do nothing,
-with `before` returning `None`; this skips its `after` and `error` hooks for that
-operation. Providers override only operations they use. On tool failure,
-`error(call_id, context)` receives each non-`None` before context.
-Workspace uses one random ID for all providers in a tool call. It runs each stage
-concurrently, waits for every provider, and logs provider failures without changing
-the tool outcome. Each provider receives its own copy of the input arguments and result.
-`register_provider(name, provider, tools=...)` limits which tool methods are invoked.
-`save_result_resource(call_id, provider, mime_type, text)` stores immutable JSON or
-Markdown under that ID and returns its URI. Workspace accepts only a URI saved by
-the matching provider for that call. The old extension handlers continue serving
-tools until their later migration steps.
-
 Workspace serializes its MCP tool handlers, dynamic resource handlers, and path
 completion handler with one lock. The lock remains held while a handler waits for
 providers. A resource handler may call a tool handler in the same task without
-deadlocking; requests from other tasks still wait. `DiffProvider` implements the
-new write/edit hooks: before captures the previous file text, and after saves an
-immutable diff under the shared call ID and returns its URI. The current
-write/edit handlers still use the old diff extension until their migration.
+deadlocking; requests from other tasks still wait. File-info, list, find, and
+search resource handlers delegate to the corresponding tool handlers; file/raw
+mirrors directly read their managed files.
+
+The old extension contract remains temporarily for the pending clangd migration,
+but Workspace tool handlers no longer invoke it. Automatic clangd enrichment will
+resume when clangd registers a `ResultProvider`. Diff widgets still expect the old
+descriptor's version metadata; adapting widgets follows the backend migration.
 
 ## CMake profiles and operations
 
@@ -561,11 +548,11 @@ separate. An analysis failure raises a domain error rather than silently returni
 an incomplete multi-configuration answer. Changed compilation databases, failed
 sessions, and missed workspace revisions invalidate retained sessions.
 
-The workspace extension supports read, write, edit, move, and delete results. It
-updates active sessions after mutations and captures version-matched diagnostics
-and semantic highlighting into the existing immutable result-resource mechanism.
-It does not watch external edits or manage editor buffers. Workspace mutations stay
-successful if enrichment fails, following the existing extension contract.
+The legacy workspace extension code still supports read, write, edit, move, and
+delete snapshots, but the migrated Workspace handlers no longer invoke it.
+Automatic session synchronization and diagnostic/highlighting resources await
+clangd's migration to `ResultProvider`. Its explicit analysis tools remain available
+and read their own files. It does not watch external edits or manage editor buffers.
 
 `WorkspacePath` can also represent external absolute locations with `root/`, for
 example `root/C:/SDK/include/header.h` or `root//usr/include/header.h`. Managed

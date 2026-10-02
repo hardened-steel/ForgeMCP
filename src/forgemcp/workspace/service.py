@@ -8,7 +8,6 @@ import fnmatch
 import json
 import logging
 import os
-import shutil
 import stat
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
@@ -324,25 +323,36 @@ def filesystem_errors(path: str | WorkspacePath) -> Generator[None]:
         ) from error
 
 
-class StorageDirectory:
-    """A directory in the workspace's persistent or temporary storage."""
+def read_text(candidate: Path, path: WorkspacePath) -> str:
+    """Read complete UTF-8 text without newline conversion for Workspace and diff."""
+    with filesystem_errors(path):
+        if not candidate.is_file():
+            raise WorkspaceError(f"{path}: expected an existing regular file.")
+        text = candidate.read_bytes().decode("utf-8")
+        if "\0" in text:
+            raise WorkspaceError(f"{path}: expected UTF-8 text, found a binary file.")
+        return text
 
-    def __init__(self, workspace: WorkspaceService, path: Path) -> None:
-        self.workspace = workspace
-        self.path = workspace.resolve_path(
-            workspace.relative_path(path, root="storage"),
-            root="storage",
-        )
 
-    def subdirectory(self, key: str) -> StorageDirectory:
-        self.workspace.validate_directory_key(key)
-        relative = self.workspace.relative_path(self.path / key, root="storage")
-        self.workspace.mkdir(self.workspace.qualified_path("storage", relative))
-        return StorageDirectory(self.workspace, self.path / key)
-
-    def remove(self) -> None:
-        relative = self.workspace.relative_path(self.path, root="storage")
-        self.workspace.remove_directory(self.workspace.qualified_path("storage", relative))
+def replace_text(path: Path, text: str) -> None:
+    """Write UTF-8 without newline translation, then replace the destination."""
+    data = text.encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=".forgemcp-",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+        if path.exists():
+            temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.chmod(temporary.stat().st_mode | stat.S_IWUSR)
+            temporary.unlink(missing_ok=True)
 
 
 class WorkspaceService:
@@ -869,217 +879,6 @@ class WorkspaceService:
             extension.removeprefix(".").lower() for extension in extensions
         }
 
-    def read_bytes(self, path: WorkspacePath) -> bytes:
-        with filesystem_errors(path):
-            return self.require_file(path.relative, path.area).read_bytes()
-
-    def read_file(
-        self,
-        path: WorkspacePath,
-        *,
-        start_line: int = 1,
-        end_line: int | None = None,
-    ) -> FileContent:
-        if start_line < 1 or (end_line is not None and end_line < start_line):
-            raise WorkspaceError(
-                "Line range must start at 1 or later and end at or after its start."
-            )
-        with filesystem_errors(path):
-            text = self.read_bytes(path).decode("utf-8")
-            if "\0" in text:
-                message = f"{path}: binary file."
-                if path.area != "root":
-                    message += " Use the raw resource."
-                raise WorkspaceError(message)
-        return FileContent(
-            path=path,
-            text="".join(text.splitlines(keepends=True)[start_line - 1 : end_line]),
-            start_line=start_line,
-        )
-
-    def file_info(self, path: WorkspacePath) -> FileInfo:
-        with filesystem_errors(path):
-            candidate = self.require_file(path.relative, path.area)
-            metadata = candidate.stat()
-            birth = getattr(metadata, "st_birthtime", None)
-            return FileInfo(
-                path=path,
-                created_at=(
-                    datetime.fromtimestamp(birth, UTC) if birth is not None else None
-                ),
-                modified_at=datetime.fromtimestamp(metadata.st_mtime, UTC),
-                size_bytes=metadata.st_size,
-                owner=file_owner(candidate),
-            )
-
-    def replace_text(self, path: Path, text: str) -> None:
-        """Write UTF-8 without newline translation, then replace the destination."""
-        data = text.encode("utf-8")
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=path.parent,
-                prefix=".forgemcp-",
-                delete=False,
-            ) as stream:
-                temporary = Path(stream.name)
-                stream.write(data)
-            if path.exists():
-                temporary.chmod(stat.S_IMODE(path.stat().st_mode))
-            os.replace(temporary, path)
-        finally:
-            if temporary is not None and temporary.exists():
-                temporary.chmod(temporary.stat().st_mode | stat.S_IWUSR)
-                temporary.unlink(missing_ok=True)
-
-    def write_file(
-        self,
-        path: WorkspacePath,
-        text: str,
-    ) -> FileWriteResult:
-        with filesystem_errors(path):
-            candidate = self.writable_path(path.relative, root=path.area)
-            existed = candidate.exists()
-            previous = self.read_file(path).text if existed else ""
-            self.replace_text(candidate, text)
-            self.revision += 1
-            return FileWriteResult(
-                path=path,
-                action="overwritten" if existed else "created",
-                lines_removed=len(previous.splitlines()),
-                lines_added=len(text.splitlines()),
-            )
-
-    def edit_file(
-        self,
-        path: WorkspacePath,
-        old_text: str,
-        new_text: str,
-        *,
-        replace_all: bool = False,
-    ) -> FileEditResult:
-        if not old_text:
-            raise WorkspaceError("old_text must not be empty.")
-        with filesystem_errors(path):
-            candidate = self.writable_path(path.relative, root=path.area)
-            text = self.read_file(path).text
-            count = text.count(old_text)
-            if count == 0:
-                raise WorkspaceError(
-                    "Exact text was not found; the file was not changed."
-                )
-            if count > 1 and not replace_all:
-                raise WorkspaceError(
-                    f"Found {count} occurrences; use replace_all or a more specific old_text."
-                )
-            updated = text.replace(old_text, new_text)
-            self.replace_text(candidate, updated)
-            self.revision += 1
-            return FileEditResult(
-                path=path,
-                replacements=count,
-            )
-
-    def move(
-        self,
-        source: WorkspacePath,
-        destination: WorkspacePath,
-    ) -> PathOperationResult:
-        if source.area != destination.area:
-            raise WorkspaceError("Move source and destination must use the same root.")
-        with filesystem_errors(source):
-            origin = self.writable_path(
-                source.relative,
-                root=source.area,
-                subtree=True,
-            )
-            target = self.writable_path(
-                destination.relative,
-                root=destination.area,
-                subtree=True,
-            )
-            if not origin.exists():
-                raise WorkspaceError(f"{source}: path does not exist.")
-            if target.exists() or target.is_symlink():
-                raise WorkspaceError(f"{destination}: destination already exists.")
-            if origin.is_dir():
-                if target.is_relative_to(origin):
-                    raise WorkspaceError("Cannot move a directory into itself.")
-                self.check_tree_links(origin)
-            origin.rename(target)
-            self.revision += 1
-            return PathOperationResult(
-                path=destination,
-                action="moved",
-                source=source,
-            )
-
-    def delete(
-        self,
-        path: WorkspacePath,
-    ) -> PathOperationResult:
-        with filesystem_errors(path):
-            candidate = self.writable_path(path.relative, root=path.area, subtree=True)
-            if candidate.is_dir():
-                candidate.rmdir()
-            else:
-                self.require_file(path.relative, path.area).unlink()
-            self.revision += 1
-            return PathOperationResult(
-                path=path,
-                action="deleted",
-            )
-
-    def remove_directory(self, path: WorkspacePath) -> None:
-        """Remove a whole directory after checking roots, protections, and links."""
-        with filesystem_errors(path):
-            candidate = self.writable_path(
-                path.relative,
-                root=path.area,
-                subtree=True,
-            )
-            if not candidate.exists():
-                return
-            self.check_tree_links(candidate)
-            shutil.rmtree(candidate)
-            self.revision += 1
-
-    def mkdir(
-        self,
-        path: WorkspacePath,
-    ) -> PathOperationResult:
-        with filesystem_errors(path):
-            candidate = self.writable_path(path.relative, root=path.area)
-            existed = candidate.is_dir()
-            candidate.mkdir(parents=True, exist_ok=True)
-            if not existed:
-                self.revision += 1
-            return PathOperationResult(
-                path=path,
-                action="already_exists" if existed else "created",
-            )
-
-    def validate_directory_key(self, key: str) -> None:
-        if not key or key in (".", "..") or any(char in key for char in "/\\\0"):
-            raise WorkspaceError("Directory key must be one nonempty directory name.")
-
-    def storage_directory(self, key: str) -> StorageDirectory:
-        self.validate_directory_key(key)
-        self.mkdir(self.qualified_path("storage", key))
-        return StorageDirectory(self, self.storage_root / key)
-
-    @contextmanager
-    def temporary_directory(self, prefix: str = "tmp") -> Generator[StorageDirectory]:
-        self.validate_directory_key(prefix)
-        parent = self.storage_directory("tmp")
-        with filesystem_errors("tmp"):
-            path = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=parent.path))
-        directory = StorageDirectory(self, path)
-        try:
-            yield directory
-        finally:
-            directory.remove()
-
     def file_uri(self, path: WorkspacePath) -> str:
         if path.area == "root":
             raise WorkspaceError("External files have no workspace mirror resources.")
@@ -1195,6 +994,14 @@ class WorkspaceService:
         ) -> DirectoryTree:
             """Show a directory tree; null depth expands every directory. File paths are errors."""
             report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_list",
+                {
+                    "path": path,
+                    "depth": depth,
+                    "include_hidden": include_hidden,
+                },
+            )
             try:
                 visited = 0
                 await report_progress(0, message="Starting directory scan")
@@ -1206,7 +1013,6 @@ class WorkspaceService:
                 self.check_path_links(directory, path.area)
                 if not directory.is_dir():
                     raise WorkspaceError(f"{path}: expected an existing directory.")
-                listed_paths = [path]
 
                 async def entries(
                     parent: Path,
@@ -1244,7 +1050,6 @@ class WorkspaceService:
                             children=children,
                         )
                         result.append(entry)
-                        listed_paths.append(entry.path)
                         visited += 1
                         await report_progress(visited, message=f"process {entry.path}")
                         await asyncio.sleep(0)
@@ -1255,9 +1060,13 @@ class WorkspaceService:
                         path=path,
                         entries=await entries(directory, depth),
                     )
-                return await self.enrich_result("workspace_list", result, listed_paths)
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
 
         @apps.tool(
             resource_uri=self.TREE_WIDGET.uri,
@@ -1272,6 +1081,13 @@ class WorkspaceService:
         ) -> FilePaths:
             """Find file paths by glob, skipping dot directories and links."""
             report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_find_files",
+                {
+                    "pattern": pattern,
+                    "path": path,
+                },
+            )
             try:
                 visited = 0
                 await report_progress(0, message="Files visited")
@@ -1312,9 +1128,13 @@ class WorkspaceService:
                     paths=sorted(paths, key=str),
                     files=sorted(files, key=lambda file: str(file.path)),
                 )
-                return await self.enrich_result("workspace_find_files", result, paths)
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1328,15 +1148,30 @@ class WorkspaceService:
         ) -> FileInfo:
             """Read creation/modification times, byte size, and owner of one file."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting file info")
+            call = await self.before_providers("workspace_file_info", {"path": path})
             try:
-                result = self.file_info(
-                    path=path,
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+                await report_progress(0, total=1, message="Starting file info")
+                with filesystem_errors(path):
+                    candidate = self.require_file(path.relative, path.area)
+                    metadata = candidate.stat()
+                    birth = getattr(metadata, "st_birthtime", None)
+                    result = FileInfo(
+                        path=path,
+                        created_at=(
+                            datetime.fromtimestamp(birth, UTC) if birth is not None else None
+                        ),
+                        modified_at=datetime.fromtimestamp(metadata.st_mtime, UTC),
+                        size_bytes=metadata.st_size,
+                        owner=file_owner(candidate),
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed file info")
-            return await self.enrich_result("workspace_file_info", result, [path])
+            return result
 
         @apps.tool(
             resource_uri=self.FILE_WIDGET.uri,
@@ -1353,6 +1188,15 @@ class WorkspaceService:
         ) -> FileContent:
             """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
             report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_read_file",
+                {
+                    "path": path,
+                    "confirm": confirm,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                },
+            )
             try:
                 if start_line < 1 or (end_line is not None and end_line < start_line):
                     raise WorkspaceError(
@@ -1386,14 +1230,13 @@ class WorkspaceService:
                         ),
                         start_line=start_line,
                     )
-                return await self.enrich_result(
-                    "workspace_read_file",
-                    result,
-                    [path],
-                    {path: decoded},
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
 
         @apps.tool(
             resource_uri=self.SEARCH_WIDGET.uri,
@@ -1411,6 +1254,16 @@ class WorkspaceService:
         ) -> SearchResult:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files."""
             report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_search",
+                {
+                    "query": query,
+                    "path": path,
+                    "regex": regex,
+                    "extensions": extensions,
+                    "case_sensitive": case_sensitive,
+                },
+            )
             try:
                 visited = 0
                 await report_progress(0, message="Files visited")
@@ -1427,8 +1280,6 @@ class WorkspaceService:
                         f"Invalid regular expression: {error}"
                     ) from error
                 matches, skipped = [], []
-                collect_texts = bool(self.extensions_for("workspace_search"))
-                texts: dict[WorkspacePath, str] = {}
                 with filesystem_errors(path):
                     async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
@@ -1459,8 +1310,6 @@ class WorkspaceService:
                                 match.span() for match in expression.finditer(value)
                             ]
                             if spans:
-                                if collect_texts:
-                                    texts[relative] = text
                                 matches.append(
                                     SearchMatch(
                                         path=relative,
@@ -1473,14 +1322,13 @@ class WorkspaceService:
                     matches=sorted(matches, key=lambda item: (str(item.path), item.line)),
                     skipped_files=sorted(skipped, key=str),
                 )
-                return await self.enrich_result(
-                    "workspace_search",
-                    result,
-                    [*(match.path for match in result.matches), *result.skipped_files],
-                    texts,
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1495,25 +1343,35 @@ class WorkspaceService:
         ) -> FileWriteResult:
             """Create or overwrite a UTF-8 file; report removed and added line counts."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting write file")
-            try:
-                candidate = self.writable_path(path.relative, root=path.area)
-                before = self.read_file(path).text if candidate.exists() else ""
-                result = self.write_file(
-                    path=path,
-                    text=text,
-                )
-                change = TextChange(path, before, text, self.revision)
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
-            await report_progress(1, total=1, message="Completed write file")
-            return await self.enrich_result(
+            call = await self.before_providers(
                 "workspace_write_file",
-                result,
-                [path],
-                {path: text},
-                change=change,
+                {
+                    "path": path,
+                    "text": text,
+                },
             )
+            try:
+                await report_progress(0, total=1, message="Starting write file")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    existed = candidate.exists()
+                    previous = read_text(candidate, path) if existed else ""
+                    replace_text(candidate, text)
+                    self.revision += 1
+                    result = FileWriteResult(
+                        path=path,
+                        action="overwritten" if existed else "created",
+                        lines_removed=len(previous.splitlines()),
+                        lines_added=len(text.splitlines()),
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed write file")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1530,25 +1388,45 @@ class WorkspaceService:
         ) -> FileEditResult:
             """Replace one exact text occurrence, or all occurrences with replace_all=true."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting edit file")
-            try:
-                before = self.read_file(path).text
-                result = self.edit_file(
-                    path=path,
-                    old_text=old_text,
-                    new_text=new_text,
-                    replace_all=replace_all,
-                )
-                change = TextChange(path, before, self.read_file(path).text, self.revision)
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
-            await report_progress(1, total=1, message="Completed edit file")
-            return await self.enrich_result(
+            call = await self.before_providers(
                 "workspace_edit_file",
-                result,
-                [path],
-                change=change,
+                {
+                    "path": path,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "replace_all": replace_all,
+                },
             )
+            try:
+                await report_progress(0, total=1, message="Starting edit file")
+                if not old_text:
+                    raise WorkspaceError("old_text must not be empty.")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    text = read_text(candidate, path)
+                    count = text.count(old_text)
+                    if count == 0:
+                        raise WorkspaceError(
+                            "Exact text was not found; the file was not changed."
+                        )
+                    if count > 1 and not replace_all:
+                        raise WorkspaceError(
+                            f"Found {count} occurrences; use replace_all or a more specific old_text."
+                        )
+                    replace_text(candidate, text.replace(old_text, new_text))
+                    self.revision += 1
+                    result = FileEditResult(
+                        path=path,
+                        replacements=count,
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed edit file")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1563,20 +1441,51 @@ class WorkspaceService:
         ) -> PathOperationResult:
             """Move a file or directory inside one root; the destination must not exist."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting move")
-            try:
-                result = self.move(
-                    source=source,
-                    destination=destination,
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
-            await report_progress(1, total=1, message="Completed move")
-            return await self.enrich_result(
+            call = await self.before_providers(
                 "workspace_move",
-                result,
-                [source, destination],
+                {
+                    "source": source,
+                    "destination": destination,
+                },
             )
+            try:
+                await report_progress(0, total=1, message="Starting move")
+                if source.area != destination.area:
+                    raise WorkspaceError("Move source and destination must use the same root.")
+                with filesystem_errors(source):
+                    origin = self.writable_path(
+                        source.relative,
+                        root=source.area,
+                        subtree=True,
+                    )
+                    target = self.writable_path(
+                        destination.relative,
+                        root=destination.area,
+                        subtree=True,
+                    )
+                    if not origin.exists():
+                        raise WorkspaceError(f"{source}: path does not exist.")
+                    if target.exists() or target.is_symlink():
+                        raise WorkspaceError(f"{destination}: destination already exists.")
+                    if origin.is_dir():
+                        if target.is_relative_to(origin):
+                            raise WorkspaceError("Cannot move a directory into itself.")
+                        self.check_tree_links(origin)
+                    origin.rename(target)
+                    self.revision += 1
+                    result = PathOperationResult(
+                        path=destination,
+                        action="moved",
+                        source=source,
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed move")
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1590,15 +1499,32 @@ class WorkspaceService:
         ) -> PathOperationResult:
             """Delete a file or empty directory; protected paths and roots cannot be deleted."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting delete")
+            call = await self.before_providers("workspace_delete", {"path": path})
             try:
-                result = self.delete(
-                    path=path,
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+                await report_progress(0, total=1, message="Starting delete")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(
+                        path.relative,
+                        root=path.area,
+                        subtree=True,
+                    )
+                    if candidate.is_dir():
+                        candidate.rmdir()
+                    else:
+                        self.require_file(path.relative, path.area).unlink()
+                    self.revision += 1
+                    result = PathOperationResult(
+                        path=path,
+                        action="deleted",
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed delete")
-            return await self.enrich_result("workspace_delete", result, [path])
+            return result
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1617,15 +1543,27 @@ class WorkspaceService:
         ) -> PathOperationResult:
             """Create a directory and missing parents, or report that it already exists."""
             report_progress = progress(ctx, interval=self.progress_interval)
-            await report_progress(0, total=1, message="Starting mkdir")
+            call = await self.before_providers("workspace_mkdir", {"path": path})
             try:
-                result = self.mkdir(
-                    path=path,
-                )
-            except WorkspaceError as error:
-                raise ToolError(str(error)) from error
+                await report_progress(0, total=1, message="Starting mkdir")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    existed = candidate.is_dir()
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    if not existed:
+                        self.revision += 1
+                    result = PathOperationResult(
+                        path=path,
+                        action="already_exists" if existed else "created",
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed mkdir")
-            return await self.enrich_result("workspace_mkdir", result, [path])
+            return result
 
         for widget in (
             self.TREE_WIDGET,
@@ -1634,12 +1572,6 @@ class WorkspaceService:
             self.RESULT_WIDGET,
         ):
             apps.add_html_resource(widget.uri, widget.content)
-
-        def resource[T](operation: Callable[..., T], **kwargs: object) -> T:
-            try:
-                return operation(**kwargs)
-            except (WorkspaceError, ToolError) as error:
-                raise ResourceError(str(error)) from error
 
         @mcp.resource(
             self.RESULT_JSON_URI,
@@ -1690,7 +1622,10 @@ class WorkspaceService:
         ) -> str:
             """Read the complete UTF-8 file without formatting or metadata."""
             selected = resource_path("/".join(path or []))
-            return resource(self.read_file, path=selected).text
+            try:
+                return read_text(self.resolve_workspace_path(selected), selected)
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
 
         @mcp.resource(
             self.RAW_URI,
@@ -1703,7 +1638,11 @@ class WorkspaceService:
         ) -> bytes:
             """Read the exact bytes of any file."""
             selected = resource_path("/".join(path or []))
-            return resource(self.read_bytes, path=selected)
+            try:
+                with filesystem_errors(selected):
+                    return self.require_file(selected.relative, selected.area).read_bytes()
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
 
         @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
         @serialized
@@ -1754,10 +1693,20 @@ class WorkspaceService:
             icons=[self.FILE_ICON.icon],
         )
         @serialized
-        async def workspace_file_info_resource(path: str = "") -> str:
+        async def workspace_file_info_resource(
+            ctx: Context,
+            path: str = "",
+        ) -> str:
             """Read one file's metadata as a Markdown table; path is required."""
             selected = resource_path(path)
-            return self.render_markdown(resource(self.file_info, path=selected))
+            try:
+                result = await workspace_file_info(
+                    path=selected,
+                    ctx=ctx,
+                )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
 
         @mcp.resource(
             self.SEARCH_URI,

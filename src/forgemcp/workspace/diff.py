@@ -5,9 +5,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .extensions import ExtensionContext, ExtensionOutput, ExtensionResource, TextChange
+from .extensions import TextChange
 from .path import WorkspacePath
-from .service import FileEditResult, FileWriteResult, ResultProvider, WorkspaceService
+from .service import (
+    FileEditResult,
+    FileWriteResult,
+    ResultProvider,
+    WorkspaceService,
+    read_text,
+)
 
 
 class DiffLine(BaseModel):
@@ -124,21 +130,6 @@ def create_diff(change: TextChange) -> FileDiff:
     return FileDiff(path=change.path, changes=changes, hunks=hunks)
 
 
-async def diff_extension(context: ExtensionContext) -> ExtensionOutput | None:
-    """Keep the current Workspace handlers working until their provider migration."""
-    if context.change is None:
-        return None
-    diff = create_diff(context.change)
-    return ExtensionOutput(
-        resource=ExtensionResource(
-            name="diff.json",
-            mime_type="application/json",
-            text=diff.model_dump_json(),
-        ),
-        metadata={"version": 1},
-    )
-
-
 class DiffProvider(ResultProvider[str]):
     """Capture the old text before a write/edit and publish its immutable diff."""
 
@@ -151,8 +142,8 @@ class DiffProvider(ResultProvider[str]):
         path: WorkspacePath,
         text: str,
     ) -> str:
-        candidate = self.workspace.writable_path(path.relative, root=path.area)
-        return self.workspace.read_file(path).text if candidate.exists() else ""
+        candidate = self.workspace.resolve_workspace_path(path)
+        return read_text(candidate, path) if candidate.exists() else ""
 
     async def after_workspace_write_file(
         self,
@@ -170,7 +161,7 @@ class DiffProvider(ResultProvider[str]):
         new_text: str,
         replace_all: bool,
     ) -> str:
-        return self.workspace.read_file(path).text
+        return read_text(self.workspace.resolve_workspace_path(path), path)
 
     async def after_workspace_edit_file(
         self,
@@ -181,7 +172,7 @@ class DiffProvider(ResultProvider[str]):
         return self.save_diff(call_id, result.path, context)
 
     def save_diff(self, call_id: str, path: WorkspacePath, before: str) -> str:
-        after = self.workspace.read_file(path).text
+        after = read_text(self.workspace.resolve_workspace_path(path), path)
         diff = create_diff(TextChange(path=path, before=before, after=after))
         return self.workspace.save_result_resource(
             call_id,
