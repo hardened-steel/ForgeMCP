@@ -277,6 +277,22 @@ Published resources remain immutable in memory until shutdown; reads never rerun
 providers. Unknown IDs/names raise ResourceNotFoundError. No resources are created
 when no provider contributes. Persistent result storage remains deferred.
 
+The replacement provider contract is available alongside the current extension
+handlers while they are migrated. `ResultProvider[ContextT]` has a typed
+`before_workspace_*` and `after_workspace_*` pair for each Workspace tool. Before
+receives that tool's arguments and returns provider-owned context; after receives
+the same context and that tool's concrete result model. Default methods do nothing,
+with `before` returning `None`; providers override only operations they use. On
+tool failure, `error(call_id, context)` receives each successful before context.
+Workspace uses one random ID for all providers in a tool call. It runs each stage
+concurrently, waits for every provider, and logs provider failures without changing
+the tool outcome. Each provider receives its own copy of the input arguments and result.
+`register_provider(name, provider, tools=...)` limits which tool methods are invoked.
+`save_result_resource(call_id, provider, mime_type, text)` stores immutable JSON or
+Markdown under that ID and returns its URI. Workspace accepts only a URI saved by
+the matching provider for that call. The old extension handlers continue serving
+tools until their later migration steps.
+
 ## CMake profiles and operations
 
 `CMakeService` receives project/storage roots and protected paths directly, plus

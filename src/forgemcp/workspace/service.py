@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import fnmatch
 import json
 import logging
@@ -14,7 +15,7 @@ from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Annotated, Generator, Literal
+from typing import Annotated, Generator, Generic, Literal, TypeVar
 from types import MappingProxyType
 from urllib.parse import quote
 from uuid import uuid4
@@ -44,6 +45,7 @@ from .extensions import (
     ExtensionContext,
     ExtensionOutput,
     ExtensionProvider,
+    ProviderCall,
     ResultResource,
     ResultResources,
     TextChange,
@@ -133,6 +135,181 @@ class PathOperationResult(ResultResources):
     source: WorkspacePath | None = None
 
 
+ContextT = TypeVar("ContextT")
+
+
+class ResultProvider(Generic[ContextT]):
+    """Typed hooks for Workspace tools; override only operations of interest."""
+
+    async def before_workspace_list(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        depth: int | None,
+        include_hidden: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_list(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: DirectoryTree,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_find_files(
+        self,
+        call_id: str,
+        pattern: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_find_files(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: FilePaths,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_file_info(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_file_info(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: FileInfo,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_read_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        confirm: ReadConfirmation,
+        start_line: int,
+        end_line: int | None,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_read_file(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: FileContent,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_search(
+        self,
+        call_id: str,
+        query: str,
+        path: WorkspacePath,
+        regex: bool,
+        extensions: list[str] | None,
+        case_sensitive: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_search(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: SearchResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_write_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        text: str,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_write_file(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: FileWriteResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_edit_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_edit_file(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: FileEditResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_move(
+        self,
+        call_id: str,
+        source: WorkspacePath,
+        destination: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_move(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_delete(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_delete(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_mkdir(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_mkdir(
+        self,
+        call_id: str,
+        context: ContextT | None,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def error(self, call_id: str, context: ContextT | None) -> None:
+        pass
+
+
 @contextmanager
 def filesystem_errors(path: str | WorkspacePath) -> Generator[None]:
     """Translate expected failures without exposing absolute filesystem paths."""
@@ -191,6 +368,20 @@ class WorkspaceService:
     SEARCH_URI = "forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}"
     RESULT_JSON_URI = "forgemcp://workspace/results/{result_id}/{name}.json"
     RESULT_MARKDOWN_URI = "forgemcp://workspace/results/{result_id}/{name}.md"
+    PROVIDER_TOOLS = frozenset(
+        (
+            "workspace_list",
+            "workspace_find_files",
+            "workspace_file_info",
+            "workspace_read_file",
+            "workspace_search",
+            "workspace_write_file",
+            "workspace_edit_file",
+            "workspace_move",
+            "workspace_delete",
+            "workspace_mkdir",
+        ),
+    )
 
     def __init__(
         self,
@@ -217,6 +408,10 @@ class WorkspaceService:
         self.extension_providers: dict[
             str,
             tuple[ExtensionProvider, frozenset[str] | None],
+        ] = {}
+        self.result_providers: dict[
+            str,
+            tuple[ResultProvider, frozenset[str] | None],
         ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
         self.revision = 0
@@ -310,6 +505,176 @@ class WorkspaceService:
             return self.result_resources[result_id][name][1]
         except KeyError as error:
             raise WorkspaceError("Workspace result resource does not exist.") from error
+
+    def register_provider(
+        self,
+        name: str,
+        provider: ResultProvider,
+        *,
+        tools: Sequence[str] | None = None,
+    ) -> None:
+        """Register a before/after/error observer for selected Workspace tools."""
+        if (
+            not name
+            or not name.isascii()
+            or any(not (char.isalnum() or char in "_-") for char in name)
+            or name in self.result_providers
+        ):
+            raise WorkspaceError("Provider needs a unique ASCII name.")
+        if tools is not None and any(tool not in self.PROVIDER_TOOLS for tool in tools):
+            raise WorkspaceError("Provider names an unknown Workspace tool.")
+        self.result_providers[name] = (
+            provider,
+            frozenset(tools) if tools is not None else None,
+        )
+
+    def save_result_resource(
+        self,
+        call_id: str,
+        provider: str,
+        mime_type: Literal["application/json", "text/markdown"],
+        text: str,
+    ) -> str:
+        """Store one immutable resource for a provider under the tool call ID."""
+        if len(call_id) != 32 or any(char not in "0123456789abcdef" for char in call_id):
+            raise WorkspaceError("Invalid Workspace call ID.")
+        if provider not in self.result_providers:
+            raise WorkspaceError("Unknown Workspace result provider.")
+        if not isinstance(text, str):
+            raise WorkspaceError("Result resource must contain text.")
+        if mime_type == "application/json":
+            try:
+                json.loads(text)
+            except ValueError as error:
+                raise WorkspaceError("Result resource must contain valid JSON.") from error
+            suffix = ".json"
+        elif mime_type == "text/markdown":
+            suffix = ".md"
+        else:
+            raise WorkspaceError("Result resource must be JSON or Markdown.")
+        stored = self.result_resources.setdefault(call_id, {})
+        if any(f"{provider}{extension}" in stored for extension in (".json", ".md")):
+            raise WorkspaceError("Provider already saved a resource for this call.")
+        name = provider + suffix
+        stored[name] = (mime_type, text)
+        return f"forgemcp://workspace/results/{call_id}/{name}"
+
+    async def before_providers(
+        self,
+        tool_name: str,
+        parameters: Mapping[str, object],
+    ) -> ProviderCall:
+        """Start every eligible provider with the same randomly generated ID."""
+        if tool_name not in self.PROVIDER_TOOLS:
+            raise WorkspaceError("Unknown Workspace provider operation.")
+        call_id = uuid4().hex
+        providers = {
+            name: provider
+            for name, (provider, tools) in self.result_providers.items()
+            if tools is None or tool_name in tools
+        }
+
+        async def run(provider: ResultProvider) -> tuple[object]:
+            # Keep arbitrary context values distinct from gather's exceptions.
+            method = getattr(provider, f"before_{tool_name}")
+            return (
+                await method(
+                    call_id,
+                    **deepcopy(dict(parameters)),
+                ),
+            )
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(provider) for provider in providers.values()),
+                return_exceptions=True,
+            )
+        except BaseException:
+            self.result_resources.pop(call_id, None)
+            raise
+        contexts = {}
+        for name, outcome in zip(providers, outcomes):
+            if isinstance(outcome, BaseException):
+                logging.getLogger(__name__).warning("Workspace provider before failed: %s", name)
+            else:
+                contexts[name] = outcome[0]
+        return ProviderCall(call_id, tool_name, MappingProxyType(contexts))
+
+    async def after_providers(
+        self,
+        call: ProviderCall,
+        result: BaseModel,
+    ) -> ResultResources:
+        """Wait for all successful before providers and attach their saved URIs."""
+        names = list(call.contexts)
+
+        async def run(name: str) -> str | None:
+            provider = self.result_providers[name][0]
+            method = getattr(provider, f"after_{call.tool_name}")
+            return await method(
+                call.id,
+                call.contexts[name],
+                result.model_copy(deep=True),
+            )
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(name) for name in names),
+                return_exceptions=True,
+            )
+        except BaseException:
+            self.result_resources.pop(call.id, None)
+            raise
+        stored = self.result_resources.get(call.id, {})
+        links = {}
+        for name, outcome in zip(names, outcomes):
+            if isinstance(outcome, BaseException):
+                logging.getLogger(__name__).warning("Workspace provider after failed: %s", name)
+                continue
+            expected = {
+                f"forgemcp://workspace/results/{call.id}/{name}.json",
+                f"forgemcp://workspace/results/{call.id}/{name}.md",
+            }
+            if outcome is None:
+                continue
+            if (
+                not isinstance(outcome, str)
+                or outcome not in expected
+                or outcome.rsplit("/", 1)[-1] not in stored
+            ):
+                logging.getLogger(__name__).warning(
+                    "Workspace provider returned no saved URI: %s",
+                    name,
+                )
+                continue
+            filename = outcome.rsplit("/", 1)[-1]
+            links[name] = ResultResource(uri=outcome, mime_type=stored[filename][0])
+        if links:
+            kept = {link.uri.rsplit("/", 1)[-1] for link in links.values()}
+            self.result_resources[call.id] = {
+                name: value for name, value in stored.items() if name in kept
+            }
+        else:
+            self.result_resources.pop(call.id, None)
+        return ResultResources(resources=links)
+
+    async def error_providers(self, call: ProviderCall) -> None:
+        """Tell providers with a context that the Workspace tool failed."""
+
+        async def run(name: str) -> None:
+            provider = self.result_providers[name][0]
+            await provider.error(call.id, call.contexts[name])
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(name) for name in call.contexts),
+                return_exceptions=True,
+            )
+            for name, outcome in zip(call.contexts, outcomes):
+                if isinstance(outcome, BaseException):
+                    logging.getLogger(__name__).warning("Workspace provider error failed: %s", name)
+        finally:
+            self.result_resources.pop(call.id, None)
 
     async def enrich_result[T: ResultResources](
         self,

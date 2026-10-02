@@ -62,3 +62,10 @@ class ResultResource(BaseModel):
 
 class ResultResources(BaseModel):
     resources: dict[str, ResultResource] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProviderCall:
+    id: str
+    tool_name: str
+    contexts: Mapping[str, object]
