@@ -1,7 +1,10 @@
-"""CMake profile selection, workspace integration, and MCP operations."""
+"""CMake profile selection, build-tree ownership, and MCP operations."""
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal, cast
@@ -23,9 +26,7 @@ from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import Toolset
 from forgemcp.toolchain.tools import cmake, ctest
-from forgemcp.workspace.errors import WorkspaceError
 from forgemcp.workspace.path import WorkspacePath
-from forgemcp.workspace.service import WorkspaceService
 
 from .errors import CMakeError
 from .profiles import ProfileDefinition
@@ -102,18 +103,18 @@ class CMakeService:
 
     def __init__(
         self,
-        workspace: WorkspaceService,
         toolchains: ToolchainService,
         profiles: tuple[ProfileDefinition, ...] = (),
         *,
         project_root: Path,
         storage_root: Path,
+        protected_paths: set[Path],
         default_toolset: str = "system",
         progress_interval: float = 1.0,
     ) -> None:
-        self.workspace = workspace
         self.project_root = project_root.resolve()
         self.storage_root = storage_root.resolve()
+        self.protected_paths = protected_paths
         self.toolchains = toolchains
         self.definitions = profiles
         self.default_toolset = default_toolset
@@ -265,9 +266,30 @@ class CMakeService:
         )
 
     def build_path(self, directory: WorkspacePath) -> Path:
-        path = self.workspace.writable_path(directory.relative, root=directory.area)
-        if path == self.project_root:
-            raise CMakeError("In-source CMake builds are not supported.")
+        if directory.area == "root":
+            raise CMakeError("Build directory must be inside the project or storage root.")
+        base = self.project_root if directory.area == "project" else self.storage_root
+        path = base / directory.relative
+        try:
+            if not path.resolve().is_relative_to(base):
+                raise CMakeError(f"Build path resolves outside its root: {directory}.")
+            if path in (self.project_root, self.storage_root):
+                raise CMakeError("Cannot use a workspace root as a build directory.")
+            if os.name == "nt" and any(
+                os.path.isreserved(part) for part in Path(directory.relative).parts
+            ):
+                raise CMakeError(f"Build path contains a reserved name: {directory}.")
+            current = path
+            while True:
+                if current.is_symlink() or current.is_junction():
+                    raise CMakeError("Build path cannot traverse symbolic links or junctions.")
+                if current == base:
+                    break
+                current = current.parent
+            if any(path.is_relative_to(protected) for protected in self.protected_paths):
+                raise CMakeError(f"Build path is protected: {directory}.")
+        except OSError as error:
+            raise CMakeError(f"Cannot inspect build path {directory}.") from error
         return path
 
     def cache(self, directory: WorkspacePath) -> dict[str, str]:
@@ -288,7 +310,7 @@ class CMakeService:
             raise CMakeError("Set build-directory for operations without a preset.")
         try:
             cache = self.cache(profile.build_directory)
-        except (CMakeError, WorkspaceError) as error:
+        except CMakeError as error:
             raise CMakeError(f"Configure profile {profile.name!r} first.") from error
         source = cache.get("CMAKE_HOME_DIRECTORY")
         if source is None or Path(source).resolve() != self.project_root:
@@ -368,13 +390,13 @@ class CMakeService:
     def prepare_file_api(self, directory: WorkspacePath) -> None:
         build_directory = self.build_path(directory)
         reference = WorkspacePath(f"{directory}/.cmake/api/v1/query/client-forgemcp")
-        query = self.workspace.writable_path(reference.relative, root=reference.area)
+        query = self.build_path(reference)
         try:
             build_directory.mkdir(parents=True, exist_ok=True)
             query.mkdir(parents=True, exist_ok=True)
             for name in ("codemodel-v2", "cache-v2", "toolchains-v1"):
                 target = WorkspacePath(f"{reference}/{name}")
-                file = self.workspace.writable_path(target.relative, root=target.area)
+                file = self.build_path(target)
                 file.write_text("", encoding="utf-8")
         except OSError as error:
             raise CMakeError(f"Cannot prepare CMake File API in {directory}.") from error
@@ -394,7 +416,7 @@ class CMakeService:
             try:
                 profile = self.resolve_profile(definition, catalogs)
                 presets = self.operation_presets(profile, "configure")
-            except (CMakeError, WorkspaceError, ToolchainError):
+            except (CMakeError, ToolchainError):
                 continue
             for preset in presets:
                 directory = profile.build_directory
@@ -406,7 +428,7 @@ class CMakeService:
                     database = self.compilation_database(directory)
                     if database is None:
                         continue
-                except (CMakeError, WorkspaceError, OSError):
+                except (CMakeError, OSError):
                     continue
                 identifier = quote(profile.name, safe="")
                 if preset is not None:
@@ -446,7 +468,7 @@ class CMakeService:
                     profiles.append(profile)
                     await report(len(profiles), message=f"Read {profile.name}")
                 return profiles
-            except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+            except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
 
         @apps.tool(
@@ -464,7 +486,7 @@ class CMakeService:
             await report(0, message="Preparing CMake configure")
             try:
                 definitions, catalogs = await self.selection(profiles)
-            except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+            except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             results: list[CMakeConfigureResult] = []
             configured = {}
@@ -481,7 +503,7 @@ class CMakeService:
                     profile = self.resolve_profile(definition, catalogs)
                     presets = self.operation_presets(profile, "configure")
                     methods = self.cmake_methods(profile.toolset_id)
-                except (CMakeError, WorkspaceError, ToolchainError) as error:
+                except (CMakeError, ToolchainError) as error:
                     results.append(
                         CMakeConfigureResult(
                             profile=definition.name,
@@ -517,7 +539,37 @@ class CMakeService:
                                 cache = self.require_configured(profile)
                                 if cache.get("CMAKE_GENERATOR") != profile.generator:
                                     await report_status("Clearing build directory for generator change")
-                                    self.workspace.remove_directory(profile.build_directory)
+                                    if any(
+                                        protected.is_relative_to(build_directory)
+                                        for protected in self.protected_paths
+                                    ) or self.storage_root.is_relative_to(build_directory):
+                                        raise CMakeError("Build directory contains a protected path.")
+                                    if build_directory.exists():
+                                        def raise_walk_error(error: OSError) -> None:
+                                            raise error
+
+                                        try:
+                                            for parent, directories, files in os.walk(
+                                                build_directory,
+                                                followlinks=False,
+                                                onerror=raise_walk_error,
+                                            ):
+                                                for name in (*directories, *files):
+                                                    item = Path(parent) / name
+                                                    if item.is_symlink() or item.is_junction():
+                                                        raise CMakeError(
+                                                            "Build directory contains a link or junction."
+                                                        )
+                                            base = (
+                                                self.project_root
+                                                if profile.build_directory.area == "project"
+                                                else self.storage_root
+                                            )
+                                            if not build_directory.resolve().is_relative_to(base):
+                                                raise CMakeError("Build directory escaped its root.")
+                                            shutil.rmtree(build_directory)
+                                        except OSError as error:
+                                            raise CMakeError("Cannot clear build directory.") from error
                             self.prepare_file_api(profile.build_directory)
                         await report_status("Starting configure")
                         command = await methods["configure"](
@@ -536,7 +588,7 @@ class CMakeService:
                             result.compilation_database = self.compilation_database(result.build_directory)
                         if preset is not None:
                             configured[key] = result
-                    except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+                    except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
@@ -561,7 +613,7 @@ class CMakeService:
             await report(0, message="Preparing CMake build")
             try:
                 definitions, catalogs = await self.selection(profiles)
-            except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+            except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             results: list[CMakeBuildResult] = []
             updates = 0
@@ -577,7 +629,7 @@ class CMakeService:
                     profile = self.resolve_profile(definition, catalogs)
                     methods = self.cmake_methods(profile.toolset_id)
                     presets = self.operation_presets(profile, "build")
-                except (CMakeError, WorkspaceError, ToolchainError) as error:
+                except (CMakeError, ToolchainError) as error:
                     results.append(
                         CMakeBuildResult(
                             profile=definition.name,
@@ -615,7 +667,7 @@ class CMakeService:
                         result.process_id = command.process_id
                         if command.return_code != 0:
                             result.error = f"CMake build exited with {command.return_code}."
-                    except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+                    except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
@@ -640,7 +692,7 @@ class CMakeService:
             await report(0, message="Preparing CTest")
             try:
                 definitions, catalogs = await self.selection(profiles)
-            except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+            except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             results: list[CMakeTestResult] = []
             updates = 0
@@ -656,7 +708,7 @@ class CMakeService:
                     profile = self.resolve_profile(definition, catalogs)
                     methods = self.ctest_methods(profile.toolset_id)
                     presets = self.operation_presets(profile, "test")
-                except (CMakeError, WorkspaceError, ToolchainError) as error:
+                except (CMakeError, ToolchainError) as error:
                     results.append(
                         CMakeTestResult(
                             profile=definition.name,
@@ -678,28 +730,39 @@ class CMakeService:
                             cache = self.require_configured(profile)
                             self.require_configuration(cache, configuration)
                             build_directory = self.build_path(profile.build_directory)
-                        with self.workspace.temporary_directory("ctest") as temporary:
-                            report_path = temporary.path / "results.xml"
-                            await report_status("Starting tests")
-                            command = await methods["test"](
-                                self.project_root,
-                                build_directory,
-                                report_path=report_path,
-                                preset=preset,
-                                configuration=configuration,
-                                names=names,
-                                parallel=parallel,
-                                timeout=timeout,
-                                on_progress=report_status,
-                            )
-                            result.process_id = command.process_id
-                            result.tests = command.tests
+                        temporary_root = self.build_path(WorkspacePath("storage/tmp"))
+                        try:
+                            temporary_root.mkdir(parents=True, exist_ok=True)
+                        except OSError as error:
+                            raise CMakeError("Cannot create CTest temporary storage.") from error
+                        try:
+                            with tempfile.TemporaryDirectory(
+                                prefix="ctest-",
+                                dir=temporary_root,
+                            ) as temporary:
+                                report_path = Path(temporary) / "results.xml"
+                                await report_status("Starting tests")
+                                command = await methods["test"](
+                                    self.project_root,
+                                    build_directory,
+                                    report_path=report_path,
+                                    preset=preset,
+                                    configuration=configuration,
+                                    names=names,
+                                    parallel=parallel,
+                                    timeout=timeout,
+                                    on_progress=report_status,
+                                )
+                                result.process_id = command.process_id
+                                result.tests = command.tests
+                        except OSError as error:
+                            raise CMakeError("Cannot use CTest temporary storage.") from error
                         failed = any(
                             test.status in ("failed", "not_run") for test in result.tests
                         )
                         if command.return_code != 0 or failed:
                             result.error = f"CTest failed (exit {command.return_code})."
-                    except (CMakeError, WorkspaceError, ToolchainError, ProcessError) as error:
+                    except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")

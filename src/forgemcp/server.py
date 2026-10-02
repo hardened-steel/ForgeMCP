@@ -62,11 +62,11 @@ def create_server(
         progress_interval=progress_interval,
     )
     builds = CMakeService(
-        workspace,
         toolchains,
         profiles,
         project_root=workspace.root,
         storage_root=workspace.storage_root,
+        protected_paths=workspace.protected_paths,
         default_toolset=cmake_toolset,
         progress_interval=progress_interval,
     )

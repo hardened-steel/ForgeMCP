@@ -279,9 +279,9 @@ when no provider contributes. Persistent result storage remains deferred.
 
 ## CMake profiles and operations
 
-`CMakeService` receives project/storage roots directly, plus `WorkspaceService` for
-remaining cleanup and build-path safety checks, and `ToolchainService`
-for tool selection. Operator profiles are parsed from repeated
+`CMakeService` receives project/storage roots and protected paths directly, plus
+`ToolchainService` for tool selection. It owns its build-tree filesystem operations.
+Operator profiles are parsed from repeated
 `--cmake-profile NAME KEY=VALUE ...` arguments; the default
 toolset is selected by `--cmake-toolset`. There is no environment-based profile
 configuration, persistent profile registry, or directory lock.
@@ -305,9 +305,8 @@ Their source is always the project root and their build path passes workspace ch
 Plain profiles default to Ninja; its executable is taken from the chosen toolset.
 Missing Ninja is an error, not a reason to change generators. For a plain profile,
 changing the generator completely removes and recreates its build directory.
-Settings and cache ownership are checked first. Recursive deletion goes through
-`WorkspaceService.remove_directory`, also used by storage cleanup, with root,
-protected-subtree, and symlink checks before any removal. Native presets are unchanged.
+Settings and cache ownership are checked first. CMake checks roots, protected
+subtrees, and links before removing its build directory. Native presets are unchanged.
 
 `cmake_profiles` lists the effective profiles. `cmake_configure`, `cmake_build`, and
 `cmake_test` run all profiles unless a subset is supplied. Operations run sequentially,
@@ -333,7 +332,8 @@ known build/compilation-database paths, build adds parsed step counts, and test 
 JUnit cases. Results carry `process_id` instead of copied output; use `process_get`
 for command logs. ToolSpec results retain exit codes for the service to interpret.
 Execution/parser failures after launch also retain the process identifier. CTest writes
-JUnit into a workspace temporary directory; parsed cases are returned before cleanup.
+JUnit into a CMake-owned temporary directory under storage; parsed cases are returned
+before cleanup.
 
 CMake registers all four tools through Apps with separate packaged widgets:
 profiles, configure, build, and test. They share `cmake-view.js` and the common
@@ -726,9 +726,8 @@ The likely order is:
 
 1. Refactor Workspace result providers around before/after/error notifications and
    sequential Workspace MCP entrypoints. Move tool-specific filesystem work into
-   the decorated handlers. Remove CMake's calls to Workspace file, directory,
-   temporary-directory, and path-resolution methods; CMake owns its build-tree
-   filesystem work while process launches continue through ProcessService.
+   the decorated handlers. CMake already owns its build-tree filesystem work;
+   process launches continue through ProcessService.
 2. clangd validation and widgets;
 3. formatting, static analysis, and sanitizer parsing;
 4. debugger adapter lifecycle and DAP operations;
