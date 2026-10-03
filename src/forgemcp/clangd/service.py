@@ -157,11 +157,17 @@ def group_results[T: BaseModel](results: list[T]) -> list[T]:
 
 
 class ClangdService(ResultProvider[WorkspaceContext]):
-    """Analyze C/C++ files in CMake contexts with compilation databases and clangd.
+    """Clangd: read-only semantic C/C++ analysis and navigation across CMake contexts.
 
-    Empty configuration selections mean all available contexts. Results describe
-    one workspace snapshot; diagnostics outside project/storage are excluded.
-    Symbol locations may use root/ without granting access to external files.
+    Each context requires a compilation database and clangd in its toolset.
+    Omitted or empty configuration selections use all available contexts; equal
+    answers are grouped by configuration IDs. Positions use one-based lines and
+    zero-based Unicode code-point characters.
+
+    Results and linked analysis resources are immutable snapshots. Workspace
+    mutations synchronize retained sessions; external edits are not watched.
+    Diagnostics outside project/storage are excluded; symbol locations may use
+    root/... without granting file access.
     """
 
     WIDGET = Widget("assets/clangd-result.html")
@@ -1074,7 +1080,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> list[DefinitionResult]:
-            """Find symbol definitions; external locations use root/. Empty configurations selects all."""
+            """Find definitions of the symbol at the supplied position.
+
+            External locations use root/. Empty configurations selects all.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:

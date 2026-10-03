@@ -302,7 +302,12 @@ class ChunkEncoder:
 
 
 class ProcessService:
-    """Run external development tools and expose their state without allowing arbitrary execution."""
+    """Process: read-only inspection of development commands and their transcripts.
+
+    Feature results identify commands by process_id. Process state and ordered
+    stdin/stdout/stderr logs are retained in memory until the server stops.
+    Arbitrary command execution is unavailable through the public surface.
+    """
 
     WIDGET = Widget("assets/process-overview.html")
     DETAILS_WIDGET = Widget("assets/process-details.html")

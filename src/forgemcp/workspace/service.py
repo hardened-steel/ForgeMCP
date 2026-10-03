@@ -348,11 +348,16 @@ def replace_text(path: Path, text: str) -> None:
 
 
 class WorkspaceService:
-    """Browse project/storage trees, search files, and read or change UTF-8 text.
+    """Workspace: access and modify project files and separate service storage.
 
-    Paths use project/... or storage/... strings. Searches skip dot directories
-    and links. Read files before editing; edits replace one exact text occurrence
-    unless replace_all is requested. File resources mirror text or raw bytes.
+    Paths use / separators: project/... is relative to the project root,
+    storage/... to the storage root. Neither permits . or .. segments.
+    root/<absolute-path> identifies an external file; each explicit read requires
+    approval, and writes and file mirror resources are unavailable there.
+
+    Text is UTF-8; file resources mirror text or raw bytes. Searches skip dot
+    directories and links. Read existing files before editing. Protected paths
+    remain readable but cannot be modified.
     """
 
     TREE_WIDGET = Widget("assets/workspace-tree.html")
@@ -896,7 +901,11 @@ class WorkspaceService:
             depth: int | None = 1,
             include_hidden: bool = False,
         ) -> DirectoryTree:
-            """Show a directory tree; null depth expands every directory. File paths are errors."""
+            """Show a directory tree; null depth expands every directory.
+
+            File paths are errors. include_hidden controls dot directories;
+            dot files remain visible and links are listed without traversal.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_list",
@@ -983,7 +992,11 @@ class WorkspaceService:
             pattern: str = "*",
             path: WorkspacePath = WorkspacePath("project/"),
         ) -> FilePaths:
-            """Find file paths by glob, skipping dot directories and links."""
+            """Find file paths recursively by case-sensitive glob, skipping dot directories and links.
+
+            Patterns without / match basenames; patterns with / match paths
+            relative to the search directory.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_find_files",
@@ -1156,7 +1169,11 @@ class WorkspaceService:
             extensions: list[str] | None = None,
             case_sensitive: bool = True,
         ) -> SearchResult:
-            """Search lines by literal text or regex; report skipped binary/non-UTF-8 files."""
+            """Search lines by literal text or regex; report skipped binary/non-UTF-8 files.
+
+            extensions accepts suffixes with or without a leading dot;
+            null selects all files, while an empty list selects none.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_search",
@@ -1245,7 +1262,10 @@ class WorkspaceService:
             text: str,
             ctx: Context,
         ) -> FileWriteResult:
-            """Create or overwrite a UTF-8 file; report removed and added line counts."""
+            """Create or fully overwrite a UTF-8 file; its parent directory must exist.
+
+            Return removed/added line counts and linked change resources.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_write_file",
@@ -1289,7 +1309,11 @@ class WorkspaceService:
             ctx: Context,
             replace_all: bool = False,
         ) -> FileEditResult:
-            """Replace one exact text occurrence, or all occurrences with replace_all=true."""
+            """Replace one exact text occurrence, or all with replace_all=true.
+
+            old_text must be nonempty. Missing or ambiguous matches leave the
+            file unchanged. Text and line endings outside replacements are preserved.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_edit_file",
@@ -1341,7 +1365,10 @@ class WorkspaceService:
             destination: WorkspacePath,
             ctx: Context,
         ) -> PathOperationResult:
-            """Move a file or directory inside one root; the destination must not exist."""
+            """Move a file or directory within project/ or within storage/.
+
+            The destination must not exist, and its parent directory must exist.
+            """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
                 "workspace_move",

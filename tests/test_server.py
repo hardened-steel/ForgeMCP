@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import inspect
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -11,6 +12,10 @@ from mcp.types import ElicitResult, ResourceTemplateReference
 from mcp.shared.exceptions import MCPError
 
 from forgemcp.server import argument_parser, create_server
+from forgemcp.cmake.service import CMakeService
+from forgemcp.clangd.service import ClangdService
+from forgemcp.process.service import ProcessService
+from forgemcp.toolchain.service import ToolchainService
 from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.service import WorkspaceService
 from forgemcp.workspace.diff import FileDiff
@@ -69,7 +74,14 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
         assert len(progress) > 2
         assert [value for value, _ in progress] == list(range(len(progress)))
         assert all(total is None for _, total in progress)
-        assert WorkspaceService.__doc__ in client.instructions
+        for service in (
+            WorkspaceService,
+            ProcessService,
+            ToolchainService,
+            CMakeService,
+            ClangdService,
+        ):
+            assert inspect.getdoc(service) in client.instructions
 
 
 @pytest.mark.anyio

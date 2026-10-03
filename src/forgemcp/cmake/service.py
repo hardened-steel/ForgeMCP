@@ -90,11 +90,20 @@ class CMakeTestResult(BaseModel):
 
 
 class CMakeService:
-    """Configure, build and test the CMake profiles selected by the operator.
+    """CMake: configuration, builds, and CTest runs through named operator profiles.
 
-    With no profile filter, commands run all profiles. Use a subset to diagnose a
-    failure, then verify all profiles. Configure before building; build before
-    testing. Compiler and preset choices belong to the operator, not tool arguments.
+    Each profile binds a toolset to manual settings (configuration, generator,
+    compilers, build directory, cache definitions) or native presets.
+    Configure/build/test presets are selected independently; no associations are
+    inferred. Profile settings belong to the operator, not tool arguments.
+
+    When the operator supplies no profiles, preset files yield one presets profile
+    running all available presets; without preset files, Debug and Release use
+    separate storage/build/cmake-<name> directories.
+    Omitting the profiles filter runs all profiles; a nonempty list selects a subset.
+    Configure before building; build before testing. Diagnose with a subset,
+    then verify all profiles. Each execution reports error (null means success)
+    and, when launched, process_id for its command log.
     """
 
     ICON = IconFile("icons/cmake.svg")
@@ -514,7 +523,7 @@ class CMakeService:
             annotations=ToolAnnotations(read_only_hint=True),
         )
         async def cmake_profiles(ctx: Context) -> list[CMakeProfile]:
-            """List operator profiles and their configure/build/test presets."""
+            """List effective profiles with their toolsets, build settings, and preset selections."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Reading CMake profiles")
             try:
@@ -538,7 +547,10 @@ class CMakeService:
             profiles: list[str] | None = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
         ) -> list[CMakeConfigureResult]:
-            """Configure all operator profiles, or an explicitly selected subset."""
+            """Configure selected profiles; return build/database paths and per-execution errors.
+
+            Changing a manual profile's generator removes and recreates its build directory.
+            """
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing CMake configure")
             try:
@@ -704,7 +716,11 @@ class CMakeService:
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
         ) -> list[CMakeBuildResult]:
-            """Build all selected profiles and their build presets after configuration."""
+            """Build selected profiles and their build presets after configuration.
+
+            Omitted targets use CMake or preset defaults; a nonempty targets list
+            selects explicit build targets.
+            """
             if targets is not None and (not targets or any(not name for name in targets)):
                 raise ToolError("Targets must be a nonempty list of nonempty names.")
             report = progress(ctx, interval=self.progress_interval)
@@ -783,7 +799,11 @@ class CMakeService:
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
         ) -> list[CMakeTestResult]:
-            """Run CTest for selected profiles and their test presets after building."""
+            """Run CTest for selected profiles and test presets after building; return test cases.
+
+            names selects exact test names, not regex patterns; omit it to use
+            CTest or preset defaults.
+            """
             if names is not None and (not names or any(not name for name in names)):
                 raise ToolError("Test names must be a nonempty list of nonempty names.")
             report = progress(ctx, interval=self.progress_interval)

@@ -50,10 +50,13 @@ class ToolsetDetails(BaseModel):
 
 
 class ToolchainService:
-    """Inspect independent toolsets, then pass an explicit toolset ID to consumers.
+    """Toolchain: independent sets of development executables and execution environments.
 
-    Toolsets may be incomplete. No current or preferred toolset is selected. Absolute
-    executable paths and versions are public; toolset environments remain internal.
+    Toolsets are discovered once at startup and may be incomplete or empty.
+    No current or preferred toolset is selected; consumers bind an explicit ID.
+    Executable paths are absolute; available versions are queried on demand.
+    A missing version does not imply a missing executable. Toolset results omit
+    execution environments.
     """
 
     WIDGET = Widget("assets/toolsets.html")
