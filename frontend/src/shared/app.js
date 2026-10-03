@@ -1,13 +1,16 @@
 import { App, PostMessageTransport, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { createResultView } from "./result-view.js";
-import { loadResultDiff } from "./result-resources.js";
+import { loadResultClangd, loadResultDiff } from "./result-resources.js";
 import "./widget.css";
 
 /** Lifecycle bridge and immutable result-resource loading; never calls tools. */
 export async function connectWidget({ toolName, describe, renderValue }) {
   const root = document.getElementById("widget");
-  const view = createResultView(root, { toolName, describe, renderValue });
   const app = new App({ name: `ForgeMCP ${toolName}`, version: "0.2.0" });
+  const view = createResultView(root, {
+    toolName, renderValue,
+    describe: (data, resources) => describe(data, resources, app.getHostContext()?.toolInfo?.tool?.name ?? toolName),
+  });
   let generation = 0;
   const invalidate = (handler) => () => { generation++; handler(); };
   const contextChanged = (context) => {
@@ -28,13 +31,17 @@ export async function connectWidget({ toolName, describe, renderValue }) {
     const current = ++generation;
     view.receive(result);
     const data = result?.structuredContent;
-    if (!data?.resources?.diff || result.isError || !("lines_added" in data || "replacements" in data)) return;
-    try {
-      const diff = await loadResultDiff(result, (params) => app.readServerResource(params), () => current === generation);
-      if (current === generation) view.setExtensions({ diff, diffState: "ready" });
-    } catch {
-      if (current === generation) view.setExtensions({ diffState: "error" });
-    }
+    if (result?.isError || data?.action === "moved") return;
+    await Promise.all([
+      ["diff", loadResultDiff], ["clangd", loadResultClangd],
+    ].filter(([name]) => data?.resources?.[name]).map(async ([name, load]) => {
+      try {
+        const resource = await load(result, (params) => app.readServerResource(params), () => current === generation);
+        if (current === generation) view.setResources({ [name]: resource, [`${name}State`]: "ready" });
+      } catch {
+        if (current === generation) view.setResources({ [`${name}State`]: "error" });
+      }
+    }));
   });
   app.addEventListener("toolcancelled", invalidate(view.cancelled));
   app.addEventListener("hostcontextchanged", contextChanged);

@@ -19,11 +19,15 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   const icon = () => createCopyIcon(doc);
   let raw;
   let presentation;
+  let resourceData = {};
   let mode = "fields";
   let generation = 0;
   let disposed = false;
   let manualCopy = "";
   let activeHelp;
+  let lifetime = new win.AbortController();
+  const panels = new Map();
+  let displayedMode;
 
   root.classList.add("fm-widget");
   const frame = element("div", "fm-window");
@@ -119,6 +123,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     else {
       manualCopy = text;
       mode = "copy";
+      panels.delete("copy");
       render();
       const range = doc.createRange();
       range.selectNodeContents(content.querySelector("pre"));
@@ -130,7 +135,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   }
 
   function valueNode(value, key = "", record) {
-    const custom = renderValue?.(value, key, record, { doc, valueNode, query: search.value.toLocaleLowerCase() });
+    const custom = renderValue?.(value, key, record, { doc, valueNode, resources: resourceData, query: search.value.toLocaleLowerCase(), signal: lifetime.signal, toolName: presentation?.toolName });
     if (custom) return custom;
     const date = ["started_at", "finished_at", "created_at", "modified_at"].includes(key) ? timestamp(value) : null;
     if (date) {
@@ -177,6 +182,11 @@ export function createResultView(root, { toolName, describe, renderValue }) {
       const description = element("dd", "fm-value");
       description.append(valueNode(item, key, source));
       if (description.querySelector(".fm-source, .fm-tree")) row.classList.add("fm-wide-field");
+      if (presentation?.minimal) {
+        row.append(element("dt", "fm-label", key), description);
+        list.append(row);
+        continue;
+      }
       const copyField = button(undefined, "fm-copy");
       copyField.setAttribute("aria-label", `Copy ${key}`);
       copyField.append(icon());
@@ -197,34 +207,80 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     return list;
   }
 
+  function jsonNode(value) {
+    const text = JSON.stringify(value, null, 2);
+    const pre = element("pre", "fm-json");
+    // Large resources keep every byte, but avoid tens of thousands of token nodes.
+    if (text.length > 100_000) {
+      pre.classList.add("fm-json-plain");
+      pre.textContent = text;
+    }
+    else for (const token of jsonTokens(value, text)) pre.append(element("span", token.tone, token.text));
+    return pre;
+  }
+
   function render() {
     hideHelp();
-    content.replaceChildren();
+    root.dispatchEvent(new win.Event("fm-source-reset"));
+    const previous = panels.get(displayedMode);
+    if (previous) {
+      previous.nodes = [...content.childNodes];
+      previous.scrollTop = content.scrollTop;
+    }
     fieldsButton.setAttribute("aria-pressed", String(mode === "fields"));
     resourcesButton.setAttribute("aria-pressed", String(mode === "resources"));
     jsonButton.setAttribute("aria-pressed", String(mode === "json"));
     searchLabel.hidden = !presentation?.filterPlaceholder;
+    titlebar.hidden = toolbar.hidden = footer.hidden = Boolean(presentation?.minimal);
     filters.hidden = mode !== "fields" || !presentation || presentation.hideFilter || (searchLabel.hidden && categories.hidden);
-    if (!presentation) return;
+    if (!presentation) { content.replaceChildren(); displayedMode = undefined; return; }
+    const cached = panels.get(mode);
+    if (cached) {
+      if (mode !== displayedMode) content.replaceChildren(...cached.nodes);
+      count.textContent = cached.count;
+      content.scrollTop = cached.scrollTop;
+    } else {
+      content.replaceChildren();
+      draw();
+      panels.set(mode, { nodes: [...content.childNodes], count: count.textContent, scrollTop: 0 });
+      content.scrollTop = 0;
+    }
+    displayedMode = mode;
+  }
+
+  function draw() {
     if (mode === "copy") {
       content.append(element("pre", "fm-json", manualCopy));
       count.textContent = "Original value — select Fields or JSON to return";
       return;
     }
     if (mode === "json") {
-      const pre = element("pre", "fm-json");
-      for (const token of jsonTokens(raw)) pre.append(element("span", token.tone, token.text));
-      content.append(pre);
+      content.append(jsonNode(raw));
       count.textContent = "Complete original result";
       return;
     }
     if (mode === "resources") {
       content.append(fields(Object.fromEntries((presentation.resourceFields ?? []).map((key) => [key, raw[key]]))));
+      for (const name of Object.keys(raw.resources ?? {})) {
+        const resource = resourceData[name];
+        if (resource) {
+          const heading = element("h2", "fm-record-heading", name);
+          const json = jsonNode(resource);
+          const copyResource = button(undefined, "fm-copy");
+          copyResource.setAttribute("aria-label", `Copy ${name} resource`);
+          copyResource.append(icon());
+          copyResource.addEventListener("click", () => { void copy(JSON.stringify(resource, null, 2)); });
+          heading.append(copyResource);
+          content.append(heading, json);
+        } else if (["diff", "clangd"].includes(name)) {
+          content.append(element("p", "fm-empty", `${name}: ${resourceData[`${name}State`] === "error" ? "Resource could not be loaded." : "Loading resource…"}`));
+        }
+      }
       count.textContent = "Linked result resources";
       return;
     }
     const query = search.value.toLocaleLowerCase();
-    const matches = (item) => JSON.stringify(item).toLocaleLowerCase().includes(query);
+    const matches = (item) => !query || JSON.stringify(item).toLocaleLowerCase().includes(query);
     if (presentation.render) {
       content.append(presentation.render(doc, query, content.clientWidth));
       count.textContent = presentation.count;
@@ -244,7 +300,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
         const heading = element("h2", "fm-record-heading");
         const label = record?.[presentation.titleKey];
         heading.append(element("span", "fm-index", String(index + 1).padStart(2, "0")),
-          element("span", presentation.titleKey === "status" ? statusTone(label, record) : "", typeof label === "string" ? label : "Record"));
+          element("span", presentation.titleKey === "status" ? statusTone(label, record) : "", typeof label === "string" ? label : presentation.recordLabel ?? "Record"));
         if (typeof label === "string") {
           const copyHeading = button(undefined, "fm-copy");
           copyHeading.setAttribute("aria-label", `Copy ${presentation.titleKey}`);
@@ -270,8 +326,13 @@ export function createResultView(root, { toolName, describe, renderValue }) {
 
   function clear(message) {
     generation++;
+    lifetime.abort();
+    lifetime = new win.AbortController();
+    panels.clear();
+    root.classList.remove("fm-minimal");
     raw = undefined;
     presentation = undefined;
+    resourceData = {};
     manualCopy = "";
     search.value = "";
     categories.replaceChildren();
@@ -296,6 +357,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     raw = result.structuredContent;
     presentation = describe(raw);
     root.classList.toggle("fm-compact", Boolean(presentation.compact));
+    root.classList.toggle("fm-minimal", Boolean(presentation.minimal));
     if (presentation.resourceFields?.length) views.insertBefore(resourcesButton, jsonButton);
     else resourcesButton.remove();
     search.placeholder = presentation.filterPlaceholder ?? "Filter all fields";
@@ -323,22 +385,33 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   fieldsButton.addEventListener("click", () => { mode = "fields"; render(); });
   resourcesButton.addEventListener("click", () => { mode = "resources"; render(); });
   jsonButton.addEventListener("click", () => { mode = "json"; render(); });
-  search.addEventListener("input", render);
-  categories.addEventListener("change", render);
+  const refreshFields = () => {
+    lifetime.abort();
+    lifetime = new win.AbortController();
+    panels.delete("fields");
+    render();
+  };
+  search.addEventListener("input", refreshFields);
+  categories.addEventListener("change", refreshFields);
   copyAll.addEventListener("click", () => { if (presentation) void copy(JSON.stringify(raw, null, 2)); });
   let previousWidth = content.clientWidth;
   const observer = win.ResizeObserver ? new win.ResizeObserver(() => {
     if (content.clientWidth === previousWidth) return;
     previousWidth = content.clientWidth;
-    if (presentation?.render && mode === "fields") render();
+    if (presentation?.render && mode === "fields") refreshFields();
   }) : null;
   observer?.observe(content);
   clear("Waiting for tool result…");
   return {
     receive,
-    setExtensions: (extensions) => {
+    setResources: (resources) => {
       if (disposed || raw === undefined || !presentation) return;
-      presentation = describe(raw, extensions);
+      resourceData = { ...resourceData, ...resources };
+      presentation = describe(raw, resourceData);
+      lifetime.abort();
+      lifetime = new win.AbortController();
+      panels.delete("fields");
+      panels.delete("resources");
       render();
     },
     pending: () => { if (!disposed) clear("Waiting for tool result…"); },

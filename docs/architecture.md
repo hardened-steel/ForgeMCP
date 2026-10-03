@@ -7,7 +7,7 @@ project files and a separate service-storage root. The shared `process` service 
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface for development commands. CMake now configures, builds, and tests operator
 profiles. Read-only clangd analysis is mounted through MCP tools and workspace
-result providers; its widgets remain deferred. Quality and debugger remain future work.
+result providers, with a shared analysis widget. Quality and debugger remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
 
@@ -291,8 +291,9 @@ mirrors directly read their managed files.
 Clangd registers a typed result provider alongside diff. The former extension
 contract and Workspace revision counter have been removed. Resource descriptors
 contain only URI and MIME type; provider-specific data belongs in the resource.
-Diff widgets still expect the old descriptor's version metadata; adapting widgets
-follows the backend migration.
+Widgets load diff and clangd from these descriptors independently through the App
+bridge. Diff validates its concrete payload; clangd's resource version is inside
+its JSON payload rather than the link.
 
 ## CMake profiles and operations
 
@@ -362,8 +363,7 @@ invocation only and issue no tool calls or resource reads. CMake highlighting re
 Unit and in-process MCP tests cover operator profiles, parsed command results,
 generator-change cleanup, error isolation, qualified resource
 paths, and completions. They use fake ToolSpecs/process streams and isolated fixture
-copies; installed compilers are not required. Existing workspace widgets have not
-yet been adapted to the provider resource contract. Workspace/server tests still
+copies; installed compilers are not required. Workspace/server tests still
 target the former service methods and extension API; their migration follows the
 widget work as the last refactoring stage.
 
@@ -518,7 +518,24 @@ the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 explicitly. `server.py` registers its seven MCP tools and typed Workspace provider.
 After toolset discovery, the server initializes analysis and its CMake subscription;
 shutdown unsubscribes and closes all sessions before `ProcessService`.
-Widgets remain deferred.
+All seven tools bind the packaged `clangd-result.html` widget with the clangd icon.
+It renders the original per-configuration answers, including empty results, with
+local text filtering, Fields/JSON, and copying. It never reads source files or calls tools.
+Diagnostics use severity badges, source ranges, and separate related-location notes.
+Hover renders Markdown headings, emphasis, lists, tables, and highlighted C/C++ code
+blocks. The bundled markdown-it parser has HTML disabled; link/image rendering is
+inert so descriptions cannot navigate or load external content.
+Definition/reference locations and workspace-symbol locations additionally carry
+`preview: SourceExcerpt(start_line, text) | None`, captured during the analysis call.
+The service reads each managed target file once per answer and captures up to seven
+lines around the target's start; missing, unreadable, and external files keep their
+locations without a preview. These excerpts are part of the original structured
+result, so the widget never reads a source file later or observes newer edits.
+Navigation widgets group targets by file, with scope headings for workspace symbols,
+and switch a highlighted source preview when a saved target is selected. Document
+symbols render a collapsible outline preserving clangd's nesting, kinds, signatures,
+deprecation tags, and ranges. Closed files and outline branches create their DOM
+only when opened. External locations remain visible without bypassing read approval.
 
 CMake retains successful configurations as
 `CompilationContext(id, toolset_id, build_directory, compilation_database)`.
@@ -570,11 +587,12 @@ Move captures the source subtree's file paths before it disappears. After writes
 edits, moves, deletes, and directory creation, the provider notifies retained sessions
 and reopens their existing documents from disk. This rebuilds dependent headers and
 obtains fresh versioned diagnostics without restarting clangd processes. Deleted or
-moved source documents are closed; move analyzes files at their new paths. Pure reads
+moved source documents are closed. Moves synchronize sessions without producing
+diagnostic/highlighting result resources. Pure reads
 reuse unchanged document versions instead of requesting diagnostics for a no-op
 change that clangd may not publish.
 
-After read/write/edit/move, managed C/C++ files are analyzed across available
+After read/write/edit, managed C/C++ files are analyzed across available
 configurations. Diagnostics and semantic highlighting are separately grouped and
 saved as `ClangdResource` in Workspace under the shared invocation ID. Later edits
 never change these resources. Provider failures close potentially stale sessions and
@@ -633,6 +651,33 @@ specialized tree/source values, passed through the shared renderer's optional
 the original text used by copying and JSON. Search/find results reuse the shared
 collection filters. Metadata and mutation results use the shared fields view.
 
+The App bridge loads only the linked `diff.json` and `clangd.json` resources, in
+parallel, and ignores late responses after cancellation or teardown. Each resource
+has its own loading/error state; failures leave the original operation result
+visible. The Resources view includes the descriptors and full decoded JSON with
+copy controls. It never replaces the original result used by JSON and Copy all.
+
+`clangd-view.js` supplies the analysis projection and standalone diagnostic rendering.
+`source-view.js` supplies configuration controls, lexical C/C++ coloring, and
+code-point annotations indexed by line in each immutable file. Workspace source/diff
+views choose one explicitly displayed configuration for semantic tokens and diagnostics.
+Diagnostics appear in selectable hover panels on underlined source ranges, including
+source/code and related messages with locations; they are not repeated below the source.
+Symbol signatures and documentation require saved clangd hover data, which the
+Workspace analysis resource does not currently contain. Diff combines change
+spans and local search with annotations on new/context lines only, since clangd
+analyzes the resulting file. Move results have a minimal, content-sized view with
+only source and destination, without header, controls, footer, or analysis.
+Resource reads remain limited to the original
+invocation's immutable links.
+
+Fields, Resources, and JSON retain their DOM and scroll positions between tab
+switches. File reads draw source lines in short animation-frame batches; a newer
+result or teardown cancels pending work. Large JSON (over 100,000 UTF-16 units) uses
+one plain-text node instead of individual colored token elements; every value
+remains visible and copyable, without truncation. Long lines in that large-JSON
+view scroll horizontally instead of wrapping a potentially huge source string.
+
 An HTML entrypoint contains `<main id="widget" aria-label="Descriptive name"></main>`
 and one module script. Its JavaScript supplies the tool name and a pure projection:
 
@@ -668,6 +713,8 @@ These requirements apply to all existing and future widgets:
   included inside that height. Switching views, filtering, receiving a result and
   expanding data must not resize it. The content area scrolls vertically; header,
   controls and footer remain in place. No horizontal scrollbar.
+  The `workspace_move` confirmation is an exception: its two rows determine the
+  height, capped at 420px for long paths, and there are no header or controls.
 - **Density:** use 13px monospace text with a 1.35 line height, compact rows, small
   control padding and thin neutral separators. Avoid large cards, generous blank
   space, rounded dashboard panels and oversized headings. Touch controls can have
@@ -727,12 +774,9 @@ These requirements apply to all existing and future widgets:
   through the SDK. Useful MCP text fallback remains independent of the widget.
 
 When adding a widget, wire its source into the Vite build and Python `Widget` binding,
-add representative DOM tests, and verify its generated HTML and icon are packaged.
-Tests should cover full values, extra fields, long paths, local filtering without
-data loss, JSON escaping, copying, empty/error states and teardown.
-Run `npm test --prefix frontend` and `npm run build --prefix frontend`; these use
-Node/jsdom and Vite without launching a browser. DOM tests do not prove pixel layout;
-visual review remains a separate step.
+and verify its generated HTML and icon are packaged. Build with
+`npm run build --prefix frontend` or the wheel build. Do not add or run automated
+widget tests; the user reviews appearance and behavior visually.
 
 ## Errors and trust boundaries
 
@@ -777,7 +821,7 @@ The likely order is:
    sequential Workspace MCP entrypoints. Move tool-specific filesystem work into
    the decorated handlers. CMake already owns its build-tree filesystem work;
    process launches continue through ProcessService.
-2. clangd validation and widgets;
+2. finish migrating backend tests for Workspace providers and clangd lifecycle;
 3. formatting, static analysis, and sanitizer parsing;
 4. debugger adapter lifecycle and DAP operations;
 5. persistent process transcripts and configurable retention limits.

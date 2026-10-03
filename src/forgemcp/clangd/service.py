@@ -20,6 +20,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, JsonValue, ValidationError
 
+from forgemcp.assets import IconFile, Widget
 from forgemcp.cmake.service import CMakeService, CompilationContext
 from forgemcp.completion import Complete
 from forgemcp.process.errors import ProcessError
@@ -52,7 +53,9 @@ from .models import (
     Hover,
     HoverText,
     Location,
+    NavigationLocation,
     Position,
+    SourceExcerpt,
     SourceRange,
     WorkspaceSymbol,
 )
@@ -83,12 +86,12 @@ class HoverResult(BaseModel):
 
 class DefinitionResult(BaseModel):
     configurations: list[str]
-    locations: list[Location]
+    locations: list[NavigationLocation]
 
 
 class ReferencesResult(BaseModel):
     configurations: list[str]
-    locations: list[Location]
+    locations: list[NavigationLocation]
 
 
 class DocumentSymbolsResult(BaseModel):
@@ -161,6 +164,8 @@ class ClangdService(ResultProvider[WorkspaceContext]):
     Symbol locations may use root/ without granting access to external files.
     """
 
+    WIDGET = Widget("assets/clangd-result.html")
+    ICON = IconFile("icons/clangd.svg")
     SOURCE_EXTENSIONS = frozenset(
         (
             ".c",
@@ -502,14 +507,14 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         params: dict[str, JsonValue],
         on_progress: Progress | None,
         timeout: float,
-    ) -> list[Location]:
+    ) -> list[NavigationLocation]:
         raw = await session.request(method, params, on_progress=on_progress, timeout=timeout)
         if raw is None:
             return []
         values = raw if isinstance(raw, list) else [raw]
         locations = [session.location(value) for value in values]
         return sorted(
-            locations,
+            self.navigation_locations(locations),
             key=lambda item: (
                 str(item.path),
                 item.range.start.line,
@@ -518,6 +523,38 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 item.range.end.character,
             ),
         )
+
+    def navigation_locations(
+        self,
+        locations: Sequence[Location],
+    ) -> list[NavigationLocation]:
+        """Capture seven source lines per target; never read external locations."""
+        sources: dict[WorkspacePath, list[str] | None] = {}
+        result = []
+        for location in locations:
+            preview = None
+            if location.path.area != "root":
+                if location.path not in sources:
+                    try:
+                        sources[location.path] = self.text(location.path).splitlines(keepends=True)
+                    except (ClangdError, WorkspaceError):
+                        sources[location.path] = None
+                lines = sources[location.path]
+                if lines and location.range.start.line <= len(lines):
+                    start = max(1, location.range.start.line - 3)
+                    end = min(len(lines), location.range.start.line + 3)
+                    preview = SourceExcerpt(
+                        start_line=start,
+                        text="".join(lines[start - 1:end]),
+                    )
+            result.append(
+                NavigationLocation(
+                    path=location.path,
+                    range=location.range,
+                    preview=preview,
+                ),
+            )
+        return result
 
     def document_symbol(self, value: JsonValue) -> DocumentSymbol:
         data = object_value(value)
@@ -708,19 +745,22 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             origin = self.workspace.resolve_workspace_path(context.paths[0])
             destination = self.workspace.resolve_workspace_path(result.path)
             changes = []
-            paths = []
             for old in context.paths:
                 relative = self.workspace.resolve_workspace_path(old).relative_to(origin)
                 new = self.workspace.workspace_path(destination / relative)
                 changes.extend([FileChange(old, 3), FileChange(new, 1)])
-                paths.append(new)
         except BaseException:
             try:
                 await self.close_sessions()
             finally:
                 self.lock.release()
             raise
-        return await self.finish_workspace(call_id, context, changes=changes, paths=paths)
+        return await self.finish_workspace(
+            call_id,
+            context,
+            changes=changes,
+            paths=(),
+        )
 
     async def before_workspace_delete(
         self,
@@ -888,7 +928,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         return files
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
-        """Expose read-only analysis; widget registration is deferred."""
+        """Expose read-only analysis through one result-only MCP App."""
         read_only = ToolAnnotations(read_only_hint=True, destructive_hint=False)
 
         def analysis_progress(ctx: Context) -> Progress:
@@ -902,7 +942,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
 
             return status
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_configurations(ctx: Context) -> list[CompilationContext]:
             """List CMake contexts with an existing compilation database and clangd."""
             report = progress(ctx, interval=self.progress_interval)
@@ -914,7 +958,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await report(1, total=1, message="Completed configuration discovery")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_diagnostics(
             path: WorkspacePath,
             ctx: Context,
@@ -949,7 +997,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Completed clangd analysis")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_hover(
             path: WorkspacePath,
             ctx: Context,
@@ -1010,7 +1062,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Completed clangd analysis")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_definition(
             path: WorkspacePath,
             ctx: Context,
@@ -1047,7 +1103,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Completed clangd analysis")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_references(
             path: WorkspacePath,
             ctx: Context,
@@ -1087,7 +1147,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Completed clangd analysis")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_document_symbols(
             path: WorkspacePath,
             ctx: Context,
@@ -1142,7 +1206,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Completed clangd analysis")
             return result
 
-        @mcp.tool(icons=[WorkspaceService.FILE_ICON.icon], annotations=read_only)
+        @apps.tool(
+            resource_uri=self.WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
         async def clangd_workspace_symbols(
             query: str,
             ctx: Context,
@@ -1163,16 +1231,22 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                         on_progress=status,
                         timeout=timeout,
                     )
+                    data = [
+                        object_value(value)
+                        for value in list_value([] if raw is None else raw)
+                    ]
+                    locations = self.navigation_locations(
+                        [session.location(item.get("location")) for item in data],
+                    )
                     symbols = []
-                    for value in list_value([] if raw is None else raw):
-                        data = object_value(value)
+                    for item, location in zip(data, locations, strict=True):
                         symbols.append(
                             WorkspaceSymbol(
-                                name=string(data.get("name")),
-                                kind=integer(data.get("kind")),
-                                location=session.location(data.get("location")),
-                                container_name=data.get("containerName"),
-                                tags=data.get("tags", []),
+                                name=string(item.get("name")),
+                                kind=integer(item.get("kind")),
+                                location=location,
+                                container_name=item.get("containerName"),
+                                tags=item.get("tags", []),
                             ),
                         )
                     return WorkspaceSymbolsResult(
@@ -1192,3 +1266,5 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
             return result
+
+        apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)

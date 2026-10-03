@@ -1,5 +1,7 @@
 /** Workspace snapshot projections and file/tree values. No transport or SDK. */
 import { isObject } from "./shared/presentation.js";
+import { clangdValue } from "./clangd-view.js";
+import { appendSourceText, cppSyntax, sourceConfiguration } from "./source-view.js";
 
 function searchView(doc, data, query, width) {
   const node = (tag, className, text) => {
@@ -148,47 +150,6 @@ function appendHighlighted(doc, target, text, query) {
   }
 }
 
-function appendDiffText(doc, target, entry, query) {
-  const points = Array.from(entry.text);
-  const changes = entry.spans ?? [];
-  const matches = [];
-  const lower = entry.text.toLocaleLowerCase();
-  if (query) {
-    let offset = 0;
-    while (offset < entry.text.length) {
-      const found = lower.indexOf(query, offset);
-      if (found < 0) break;
-      matches.push([Array.from(entry.text.slice(0, found)).length, Array.from(entry.text.slice(0, found + query.length)).length]);
-      offset = found + query.length;
-    }
-  }
-  const boundaries = [...new Set([0, points.length, ...changes.flat(), ...matches.flat()])].sort((a, b) => a - b);
-  boundaries.forEach((start, index) => {
-    for (const [a, b] of changes) {
-      if (a !== start || a !== b) continue;
-      const marker = doc.createElement("mark");
-      marker.className = "fm-inline-change fm-inline-zero";
-      target.append(marker);
-    }
-    const end = boundaries[index + 1];
-    if (end === undefined || end === start) return;
-    let parent = target;
-    if (changes.some(([a, b]) => a <= start && b >= end)) {
-      const changed = doc.createElement("mark");
-      changed.className = "fm-inline-change";
-      parent.append(changed);
-      parent = changed;
-    }
-    if (matches.some(([a, b]) => a <= start && b >= end)) {
-      const match = doc.createElement("mark");
-      match.className = "fm-local-match";
-      parent.append(match);
-      parent = match;
-    }
-    parent.append(doc.createTextNode(points.slice(start, end).join("")));
-  });
-}
-
 function resources(data) {
   return ["resources"].filter((key) => key in data);
 }
@@ -238,7 +199,7 @@ function findView(doc, data, query, state) {
   return container;
 }
 
-export function workspacePresentation(data, extensions = {}) {
+export function workspacePresentation(data, loaded = {}) {
   if (!isObject(data)) return { toolName: "Workspace result", summary: data, records: null };
   if (Array.isArray(data.paths)) {
     const state = { key: "name", desc: false };
@@ -266,14 +227,24 @@ export function workspacePresentation(data, extensions = {}) {
     : data.action === "deleted" ? "workspace_delete"
     : ["created", "already_exists"].includes(data.action) ? "workspace_mkdir" : "Workspace result";
   const resourceFields = resources(data);
+  const analysis = data.resources?.clangd ? {
+    analysis: loaded.clangd?.files ?? (loaded.clangdState === "error"
+      ? "Clangd resource could not be loaded. The file operation succeeded." : "Loading clangd analysis…"),
+  } : {};
   const hidden = [...resourceFields];
   if (toolName === "workspace_read_file") hidden.push("start_line");
-  if (toolName === "workspace_move" || toolName === "workspace_delete") {
-    const fields = toolName === "workspace_move" ? ["source", "path"] : ["path"];
+  if (toolName === "workspace_move") {
+    return {
+      toolName, summary: data, records: null,
+      viewData: { source: data.source, destination: data.path },
+      fieldFilter: false, hideFilter: true, minimal: true,
+    };
+  }
+  if (toolName === "workspace_delete") {
     return {
       toolName, summary: data, records: null, resourceFields,
-      viewData: Object.fromEntries(fields.map((key) => [key === "path" && toolName === "workspace_move" ? "destination" : key, data[key]])),
-      fieldFilter: false, hideFilter: true, compact: true,
+      viewData: { path: data.path, ...analysis },
+      fieldFilter: false, hideFilter: true, compact: !data.resources?.clangd,
     };
   }
   if (toolName === "workspace_list") {
@@ -285,26 +256,31 @@ export function workspacePresentation(data, extensions = {}) {
   if (["workspace_read_file", "workspace_write_file", "workspace_edit_file"].includes(toolName)) {
     const display = without(data, hidden);
     if (toolName !== "workspace_read_file") {
-      display.diff = extensions.diff ?? (extensions.diffState === "error" ? "Diff could not be loaded. The file operation succeeded."
-        : extensions.diffState === "ready" || !data.resources?.diff ? "No diff available." : "Loading diff…");
-      if (toolName === "workspace_edit_file" && extensions.diff) {
+      display.diff = loaded.diff ?? (loaded.diffState === "error" ? "Diff could not be loaded. The file operation succeeded."
+        : loaded.diffState === "ready" || !data.resources?.diff ? "No diff available." : "Loading diff…");
+      if (toolName === "workspace_edit_file" && loaded.diff) {
         const range = (start, count) => count === 1 ? String(start) : `${start}–${start + count - 1}`;
-        display.replacements = extensions.diff.changes.map((change) => [
+        display.replacements = loaded.diff.changes.map((change) => [
           change.before_count ? `−${range(change.before_start, change.before_count)}` : "",
           change.after_count ? `+${range(change.after_start, change.after_count)}` : "",
         ].filter(Boolean).join(" ")).join(", ") || "None";
       }
     }
+    // Source diagnostics belong to their ranges, not a duplicate list below the file.
+    if (loaded.clangdState === "error") display.analysis = analysis.analysis;
     return {
       toolName, summary: data, records: null, resourceFields, viewData: display,
       fieldFilter: false, filterPlaceholder: "Search lines",
-      unlabeledFields: ["diff"],
+      unlabeledFields: ["text", "diff"],
     };
   }
   return { toolName, summary: data, records: null, resourceFields, viewData: without(data, hidden) };
 }
 
-export function workspaceValue(value, key, record, { doc, valueNode, query = "" }) {
+export function workspaceValue(value, key, record, { doc, valueNode, resources: loaded = {}, query = "", signal }) {
+  const analysis = clangdValue(value, key, record, { doc, valueNode });
+  if (analysis) return analysis;
+  const file = loaded.clangd?.files.find((file) => file.path === (record?.path ?? value?.path));
   if (key === "diff" && isObject(value) && Array.isArray(value.hunks)) {
     const source = doc.createElement("div");
     source.className = "fm-source fm-diff";
@@ -328,42 +304,61 @@ export function workspaceValue(value, key, record, { doc, valueNode, query = "" 
       source.classList.toggle("fm-diff-highlight", enabled);
     });
     source.append(wrap, highlight);
-    let shown = 0;
+    const configuration = sourceConfiguration(doc, source, file, render);
+    const hunks = doc.createElement("div");
+    const syntax = new Map();
     for (const hunk of value.hunks) {
-      const block = doc.createElement("div");
-      block.className = "fm-source-viewport fm-diff-hunk";
-      block.tabIndex = 0;
-      block.setAttribute("aria-label", `Changes at line ${hunk.after_start}`);
-      for (const entry of hunk.lines) {
-        if (query && !entry.text.toLocaleLowerCase().includes(query)) continue;
-        shown++;
-        const row = doc.createElement("div");
-        row.className = `fm-source-line fm-diff-line ${entry.kind === "added" ? "fm-diff-add" : entry.kind === "removed" ? "fm-diff-remove" : ""}`;
-        row.dataset.beforeLine = entry.before_line ?? "";
-        row.dataset.afterLine = entry.after_line ?? "";
-        for (const number of [entry.before_line, entry.after_line]) {
-          const label = doc.createElement("span");
-          label.className = "fm-diff-number";
-          label.textContent = number ?? "";
-          row.append(label);
-        }
-        const sign = doc.createElement("span");
-        sign.className = "fm-diff-sign";
-        sign.textContent = entry.kind === "added" ? "+" : entry.kind === "removed" ? "−" : " ";
-        sign.setAttribute("aria-label", entry.kind);
-        const code = doc.createElement("code");
-        appendDiffText(doc, code, entry, query);
-        row.append(sign, code);
-        block.append(row);
+      // Old and new snapshots have independent lexical state in a diff hunk.
+      for (const side of ["before_line", "after_line"]) {
+        const entries = hunk.lines.filter((entry) => entry[side] !== null);
+        const tokens = cppSyntax(entries.map((entry) => entry.text), value.path);
+        entries.forEach((entry, index) => {
+          if (side === "after_line" || entry.after_line === null) syntax.set(entry, tokens[index]);
+        });
       }
-      if (block.children.length) source.append(block);
     }
-    if (!shown) {
-      const empty = doc.createElement("p");
-      empty.className = "fm-empty";
-      empty.textContent = query ? "No matching lines." : "No text changes.";
-      source.append(empty);
+    source.append(hunks);
+    function render() {
+      source.closest(".fm-widget")?.dispatchEvent(new doc.defaultView.Event("fm-source-reset"));
+      hunks.replaceChildren();
+      let shown = 0;
+      for (const hunk of value.hunks) {
+        const block = doc.createElement("div");
+        block.className = "fm-source-viewport fm-diff-hunk";
+        block.tabIndex = 0;
+        block.setAttribute("aria-label", `Changes at line ${hunk.after_start}`);
+        for (const entry of hunk.lines) {
+          if (query && !entry.text.toLocaleLowerCase().includes(query)) continue;
+          shown++;
+          const row = doc.createElement("div");
+          row.className = `fm-source-line fm-diff-line ${entry.kind === "added" ? "fm-diff-add" : entry.kind === "removed" ? "fm-diff-remove" : ""}`;
+          row.dataset.beforeLine = entry.before_line ?? "";
+          row.dataset.afterLine = entry.after_line ?? "";
+          for (const number of [entry.before_line, entry.after_line]) {
+            const label = doc.createElement("span");
+            label.className = "fm-diff-number";
+            label.textContent = number ?? "";
+            row.append(label);
+          }
+          const sign = doc.createElement("span");
+          sign.className = "fm-diff-sign";
+          sign.textContent = entry.kind === "added" ? "+" : entry.kind === "removed" ? "−" : " ";
+          sign.setAttribute("aria-label", entry.kind);
+          const code = doc.createElement("code");
+          appendSourceText(doc, code, entry.text, query, entry.after_line === null ? undefined : file, entry.after_line, configuration(), entry.spans, syntax.get(entry));
+          row.append(sign, code);
+          block.append(row);
+        }
+        if (block.children.length) hunks.append(block);
+      }
+      if (!shown) {
+        const empty = doc.createElement("p");
+        empty.className = "fm-empty";
+        empty.textContent = query ? "No matching lines." : "No text changes.";
+        hunks.append(empty);
+      }
     }
+    render();
     return source;
   }
   if (key === "text" && typeof value === "string") {
@@ -384,26 +379,52 @@ export function workspaceValue(value, key, record, { doc, valueNode, query = "" 
     viewport.className = "fm-source-viewport";
     viewport.tabIndex = 0;
     viewport.setAttribute("aria-label", "File contents");
-    source.append(wrap, viewport);
+    source.append(wrap);
+    const configuration = sourceConfiguration(doc, source, file, render);
+    source.append(viewport);
     const lines = value.split(/(?<=\n)|(?<=\r)(?!\n)/);
-    lines.forEach((text, index) => {
-      if (index === lines.length - 1 && text === "") return;
-      const number = String((record.start_line ?? record.line ?? 1) + index);
-      if (query && !text.toLocaleLowerCase().includes(query)) return;
-      const line = doc.createElement("div");
-      line.className = "fm-source-line";
-      line.dataset.line = number;
-      const code = doc.createElement("code");
-      appendHighlighted(doc, code, text, query);
-      line.append(code);
-      viewport.append(line);
-    });
-    if (query && !viewport.children.length) {
-      const empty = doc.createElement("p");
-      empty.className = "fm-empty";
-      empty.textContent = "No matching lines.";
-      viewport.append(empty);
+    const syntax = cppSyntax(lines, record.path);
+    let renderVersion = 0;
+    function render() {
+      source.closest(".fm-widget")?.dispatchEvent(new doc.defaultView.Event("fm-source-reset"));
+      const version = ++renderVersion;
+      viewport.replaceChildren();
+      viewport.setAttribute("aria-busy", "true");
+      const selected = configuration();
+      let index = 0;
+      function chunk() {
+        if (signal?.aborted || version !== renderVersion) return;
+        const fragment = doc.createDocumentFragment();
+        const until = doc.defaultView.performance.now() + 8;
+        do {
+          const text = lines[index];
+          const number = String((record.start_line ?? record.line ?? 1) + index);
+          if (text && (!query || text.toLocaleLowerCase().includes(query))) {
+            const line = doc.createElement("div");
+            line.className = "fm-source-line";
+            line.dataset.line = number;
+            const code = doc.createElement("code");
+            appendSourceText(doc, code, text, query, file, Number(number), selected, [], syntax[index]);
+            line.append(code);
+            fragment.append(line);
+          }
+          index++;
+        } while (index < lines.length && doc.defaultView.performance.now() < until);
+        viewport.append(fragment);
+        if (index < lines.length) doc.defaultView.requestAnimationFrame(chunk);
+        else {
+          viewport.setAttribute("aria-busy", "false");
+          if (query && !viewport.children.length) {
+            const empty = doc.createElement("p");
+            empty.className = "fm-empty";
+            empty.textContent = "No matching lines.";
+            viewport.append(empty);
+          }
+        }
+      }
+      doc.defaultView.requestAnimationFrame(chunk);
     }
+    render();
     return source;
   }
   if (key !== "entries" || !Array.isArray(value)) return undefined;

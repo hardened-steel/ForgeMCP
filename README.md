@@ -2,8 +2,8 @@
 
 ForgeMCP is a Python MCP server for structured C and C++ development workflows.
 The repository contains workspace, process, toolchain, and initial CMake services.
-Clangd tools provide read-only analysis across CMake configurations; their widgets
-remain deferred. External file reads ask for confirmation through MCP elicitation. Quality and
+Clangd tools provide read-only analysis across CMake configurations with a shared
+result widget. External file reads ask for confirmation through MCP elicitation. Quality and
 debugger modules are planned.
 
 ## Current MCP surface
@@ -36,7 +36,8 @@ The tools remain useful in clients without MCP Apps support because the Python S
 serializes their typed results into both text `content` and `structuredContent`.
 
 All widgets share a compact console style with a fixed 420px height and adapt to the
-host width. Long values wrap and remain selectable; overflow scrolls vertically.
+host width. The move confirmation uses only two rows, source and destination.
+Long values wrap and remain selectable; overflow scrolls vertically.
 File views separate line numbers and offer a wrap toggle with horizontal scrolling.
 Search groups matching lines by collapsible file, highlights matches, expands clipped
 context on click, and keeps skipped files in a separate tab.
@@ -183,15 +184,29 @@ and display changes without headers or a redundant diff label. The Highlight
 changes button toggles changed-substring highlighting next to Wrap lines; local
 search uses a separate color. JSON and Copy all retain the original tool result.
 A resource-loading failure does not change the successful file-operation outcome.
-Diff widget adaptation to the new provider descriptors remains deferred.
 When a CMake configuration has a compilation database and clangd in its toolset,
-Workspace reads, writes, edits, and moves of C/C++ files also return
+Workspace reads, writes, and edits of C/C++ files also return
 `resources.clangd`. This immutable JSON contains diagnostics and semantic
 highlighting grouped by configuration. Workspace mutations synchronize retained
 clangd sessions; changing a header refreshes already opened dependent files.
 Clangd starts sessions from CMake's configuration subscription and keeps them until
 the configuration disappears, its database changes, or the server stops.
-Displaying the clangd resource in widgets remains deferred.
+Workspace widgets load both resources independently. The source view lets you
+select a configuration for semantic highlighting and inline diagnostic markers;
+lexical C/C++ colors also cover keywords, comments, literals, directives, and nested
+brackets. Diagnostic hover panels show messages and related locations on underlined
+ranges. Symbol type/signature hover is not yet included in Workspace snapshots.
+Diff annotations apply to new/context lines only. Resources shows the complete saved
+JSON with copying; large JSON uses plain text to keep tab switching responsive.
+JSON and Copy all preserve the original tool result.
+Moves synchronize clangd sessions without collecting a diagnostic resource.
+The standalone diagnostics widget uses severity cards with ranges and related notes;
+hover renders Markdown descriptions and highlights C/C++ signature blocks.
+Definitions, references, and workspace symbols group matches by file and show a
+saved source excerpt when a location is selected. Workspace symbols also show their
+kind and containing scope; document symbols form a collapsible document outline.
+Managed excerpts are captured with the tool result; external `root/` locations have
+no source preview because explicit external reads require confirmation.
 
 ## CMake profiles
 
@@ -264,7 +279,6 @@ overridden; their compilation-database settings remain controlled by the preset.
 The initial CMake slice does not yet include clean/project-inspection tools
 or syntax highlighting. Unit and in-process MCP tests cover profiles,
 command parsing, generator changes, result resources, and qualified paths.
-Existing workspace widgets have not yet been adapted or validated against the new path contract.
 
 ## Toolchain discovery
 
@@ -318,7 +332,6 @@ changing repository files.
 ## Verify
 
 ```powershell
-npm test --prefix frontend
 .\.venv\Scripts\python.exe -m build --wheel
 .\.venv\Scripts\python.exe -m pytest -q
 git diff --check

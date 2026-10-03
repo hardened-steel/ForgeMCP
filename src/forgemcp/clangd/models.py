@@ -30,6 +30,20 @@ class Location(BaseModel):
     range: SourceRange
 
 
+class SourceExcerpt(BaseModel):
+    """Immutable source context captured with a navigation answer."""
+
+    start_line: int = Field(ge=1)
+    text: str
+
+
+class NavigationLocation(Location):
+    preview: SourceExcerpt | None = Field(
+        default=None,
+        description="Up to seven saved source lines near the target. External or unreadable files have no preview.",
+    )
+
+
 class RelatedDiagnostic(BaseModel):
     location: Location
     message: str
@@ -69,7 +83,7 @@ class DocumentSymbol(BaseModel):
 class WorkspaceSymbol(BaseModel):
     name: str
     kind: int
-    location: Location
+    location: NavigationLocation
     container_name: str | None = None
     tags: list[int] = Field(default_factory=list)
 

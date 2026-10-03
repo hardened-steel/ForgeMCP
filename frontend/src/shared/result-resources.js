@@ -33,11 +33,41 @@ export async function loadResultDiff(result, read, current = () => true) {
   const data = result?.structuredContent;
   const link = data?.resources?.diff;
   if (!link || result.isError || !("lines_added" in data || "replacements" in data)) return null;
-  if (link.version !== undefined && link.version !== 1) return null;
-  const uri = link.uri;
-  if (typeof uri !== "string" || !/^forgemcp:\/\/workspace\/results\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.json$/.test(uri)
-    || link.mime_type !== "application/json") throw new Error("Invalid diff link");
+  const uri = resultResourceUri(link, "diff");
   if (!current()) return null;
   const diff = decode(await read({ uri }), uri);
   return current() ? validateDiff(diff, data.path) : null;
+}
+
+function resultResourceUri(link, provider) {
+  if (link?.mime_type !== "application/json" || typeof link.uri !== "string"
+    || !new RegExp(`^forgemcp://workspace/results/[0-9a-f]{32}/${provider}\\.json$`).test(link.uri)) {
+    throw new Error("Invalid result resource link");
+  }
+  return link.uri;
+}
+
+export async function loadResultClangd(result, read, current = () => true) {
+  const link = result?.structuredContent?.resources?.clangd;
+  if (!link || result.isError) return null;
+  const uri = resultResourceUri(link, "clangd");
+  if (!current()) return null;
+  const analysis = decode(await read({ uri }), uri);
+  if (!current()) return null;
+  const position = (value) => value && Number.isInteger(value.line) && value.line > 0
+    && Number.isInteger(value.character) && value.character >= 0;
+  const range = (value) => position(value?.start) && position(value?.end)
+    && (value.end.line > value.start.line || value.end.line === value.start.line && value.end.character >= value.start.character);
+  const configured = (group) => group && Array.isArray(group.configurations)
+    && group.configurations.length > 0 && group.configurations.every((id) => typeof id === "string");
+  if (analysis?.version !== 1 || !Array.isArray(analysis.files) || !analysis.files.every((file) =>
+    typeof file.path === "string" && /^(project|storage)\//.test(file.path)
+    && Array.isArray(file.diagnostics) && file.diagnostics.every((group) => configured(group) && group.path === file.path
+      && Array.isArray(group.diagnostics) && group.diagnostics.every((item) => range(item?.range) && typeof item.message === "string"))
+    && Array.isArray(file.highlighting) && file.highlighting.every((group) => configured(group) && group.path === file.path
+      && Array.isArray(group.spans) && group.spans.every((item) => range(item?.range) && typeof item.kind === "string"
+        && Array.isArray(item.modifiers) && item.modifiers.every((modifier) => typeof modifier === "string"))))) {
+    throw new Error("Invalid clangd resource");
+  }
+  return analysis;
 }

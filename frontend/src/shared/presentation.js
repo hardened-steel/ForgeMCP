@@ -28,8 +28,7 @@ export function timestamp(value) {
   return { readable: `${dates.format(date)} UTC`, iso: date.toISOString().replace(/\.\d{3}Z$/, "Z") };
 }
 
-export function jsonTokens(data) {
-  const text = JSON.stringify(data, null, 2);
+export function jsonTokens(data, text = JSON.stringify(data, null, 2)) {
   const expression = /"(?:\\.|[^"\\])*"|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}\[\],:]/g;
   const tokens = [];
   let cursor = 0;
@@ -37,7 +36,11 @@ export function jsonTokens(data) {
     if (match.index > cursor) tokens.push({ text: text.slice(cursor, match.index), tone: "" });
     const token = match[0];
     let tone = "fm-json-punctuation";
-    if (token.startsWith('"')) tone = /^\s*:/.test(text.slice(match.index + token.length)) ? "fm-json-key" : "fm-json-string";
+    if (token.startsWith('"')) {
+      let next = match.index + token.length;
+      while (/\s/.test(text.charAt(next)) && next < text.length) next++;
+      tone = text[next] === ":" ? "fm-json-key" : "fm-json-string";
+    }
     else if (token === "true" || token === "false") tone = "fm-boolean";
     else if (token === "null") tone = "fm-null";
     else if (/^-?\d/.test(token)) tone = "fm-number";
