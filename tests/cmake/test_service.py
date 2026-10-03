@@ -1,4 +1,5 @@
 """Operator choices and CMake orchestration, without host tool discovery."""
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -59,7 +60,13 @@ def setup(cpp_acceptance_project):
     )
     toolchains = ToolchainService(SimpleNamespace())
     toolchains.toolsets = (Toolset("system", "System", tools, None, True),)
-    service = CMakeService(workspace, toolchains, progress_interval=0)
+    service = CMakeService(
+        toolchains,
+        project_root=workspace.root,
+        storage_root=workspace.storage_root,
+        protected_paths=workspace.protected_paths,
+        progress_interval=0,
+    )
     return SimpleNamespace(
         workspace=workspace,
         service=service,
@@ -135,8 +142,8 @@ async def test_automatic_native_presets_and_plain_defaults(setup):
 @pytest.mark.parametrize("blocked", [None, "protected", "foreign"])
 async def test_generator_change_cleans_only_eligible_build_directory(setup, blocked):
     setup.service.definitions = (ProfileDefinition(name="debug", configuration="Debug"),)
-    directory = setup.workspace.storage_directory("build").subdirectory("cmake-debug").path
-    (directory / "nested").mkdir()
+    directory = setup.workspace.storage_root / "build/cmake-debug"
+    (directory / "nested").mkdir(parents=True)
     stale = directory / "nested/old.obj"
     stale.write_text("stale")
     source = setup.workspace.root if blocked != "foreign" else setup.workspace.root / "other"
@@ -223,3 +230,45 @@ async def test_command_errors_keep_log_reference_in_tool_result(setup, operation
     assert result["process_id"] == 73
     assert result["error"] == "Timed out"
     assert "output_tail" not in result
+
+
+@pytest.mark.anyio
+async def test_subscription_reports_successful_configs_and_removes_failed_or_missing_databases(setup):
+    setup.service.definitions = (ProfileDefinition(name="debug", configuration="Debug"),)
+    updates = setup.service.configuration_updates()
+    assert await anext(updates) == []
+    directory = setup.workspace.storage_root / "build/cmake-debug"
+
+    async def configure(*args, **kwargs):
+        (directory / "compile_commands.json").write_text("[]")
+        return cmake.ConfigureResult(process_id=40)
+
+    setup.configure.side_effect = configure
+    try:
+        async with Client(server(setup.service)) as client:
+            await client.call_tool("cmake_configure", {})
+            snapshot = await asyncio.wait_for(anext(updates), timeout=5)
+            assert len(snapshot) == 1
+            assert snapshot[0].id == "debug"
+            assert snapshot[0].build_directory == WorkspacePath("storage/build/cmake-debug")
+            assert snapshot[0].compilation_database == WorkspacePath(
+                "storage/build/cmake-debug/compile_commands.json",
+            )
+            snapshot[0].id = "caller changed its copy"
+            assert (await setup.service.compilation_contexts())[0].id == "debug"
+
+            setup.configure.side_effect = None
+            setup.configure.return_value = cmake.ConfigureResult(return_code=1)
+            failed = await client.call_tool("cmake_configure", {})
+            assert failed.structured_content["result"][0]["error"]
+            assert await asyncio.wait_for(anext(updates), timeout=5) == []
+
+            setup.configure.side_effect = configure
+            await client.call_tool("cmake_configure", {})
+            assert len(await asyncio.wait_for(anext(updates), timeout=5)) == 1
+            (directory / "compile_commands.json").unlink()
+            await setup.service.publish_configurations()
+            assert await asyncio.wait_for(anext(updates), timeout=5) == []
+    finally:
+        await updates.aclose()
+    assert not setup.service.configuration_subscribers

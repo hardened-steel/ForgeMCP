@@ -262,13 +262,14 @@ async def test_configured_storage_is_an_allowed_working_directory(
         cpp_acceptance_project / "src",
         cpp_acceptance_project / "process-storage",
     )
-    directory = workspace.storage_directory("build")
+    directory = workspace.storage_root / "build"
+    directory.mkdir(parents=True)
     service = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
     try:
         async with await service.launch(
             sys.executable,
             ("-c", "print('storage')"),
-            cwd=directory.path,
+            cwd=directory,
         ) as session:
             assert await session.wait() == 0
         with pytest.raises(ProcessStartError):

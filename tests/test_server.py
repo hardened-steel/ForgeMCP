@@ -7,7 +7,7 @@ import pytest
 from mcp import Client
 from mcp.client import advertise
 from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID
-from mcp.types import ResourceTemplateReference
+from mcp.types import ElicitResult, ResourceTemplateReference
 from mcp.shared.exceptions import MCPError
 
 from forgemcp.server import argument_parser, create_server
@@ -58,6 +58,7 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
         assert (await client.list_prompts()).prompts == []
         for tool in tools:
             assert tool.output_schema and tool.icons and tool.meta["ui"]["resourceUri"]
+            assert "JsonValue" not in tool.output_schema.get("$defs", {})
             assert "ctx" not in tool.input_schema.get("properties", {})
             assert "expected_revision" not in tool.input_schema.get("properties", {})
             app = await client.read_resource(tool.meta["ui"]["resourceUri"])
@@ -69,6 +70,71 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
         assert [value for value, _ in progress] == list(range(len(progress)))
         assert all(total is None for _, total in progress)
         assert WorkspaceService.__doc__ in client.instructions
+
+
+@pytest.mark.anyio
+async def test_clangd_tools_are_registered_and_unavailable_configurations_fail_cleanly(
+    cpp_acceptance_project,
+):
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        tools = {
+            tool.name: tool
+            for tool in (await client.list_tools()).tools
+            if tool.name.startswith("clangd_")
+        }
+        assert set(tools) == {
+            "clangd_configurations",
+            "clangd_diagnostics",
+            "clangd_hover",
+            "clangd_definition",
+            "clangd_references",
+            "clangd_document_symbols",
+            "clangd_workspace_symbols",
+        }
+        for tool in tools.values():
+            assert tool.output_schema and tool.icons and tool.meta["ui"]["resourceUri"]
+        assert tools["clangd_diagnostics"].input_schema["properties"]["path"]["type"] == "string"
+        contexts = await client.call_tool("clangd_configurations", {})
+        assert not contexts.is_error and contexts.structured_content["result"] == []
+        diagnostics = await client.call_tool("clangd_diagnostics", {"path": "project/src/math.cpp"})
+        assert diagnostics.is_error and "compilation database" in diagnostics.content[0].text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["accept", "decline"])
+async def test_external_read_requires_confirmation_and_never_creates_mirrors(
+    cpp_acceptance_project,
+    action,
+):
+    external = cpp_acceptance_project / "README.md"
+    path = "root/" + external.as_posix()
+    questions = []
+
+    async def confirm(context, params):
+        questions.append(params.message)
+        return ElicitResult(
+            action=action,
+            content={"allow": True} if action == "accept" else None,
+        )
+
+    async with Client(
+        create_server(cpp_acceptance_project),
+        elicitation_callback=confirm,
+    ) as client:
+        managed = await client.call_tool("workspace_read_file", {"path": "project/README.md"})
+        assert not managed.is_error and questions == []
+        read = await client.call_tool("workspace_read_file", {"path": path})
+        assert len(questions) == 1 and str(external) in questions[0]
+        if action == "accept":
+            assert not read.is_error and read.structured_content["text"] == external.read_bytes().decode()
+        else:
+            assert read.is_error
+        write = await client.call_tool("workspace_write_file", {"path": path, "text": "forbidden"})
+        assert write.is_error
+        assert external.read_bytes().decode() == managed.structured_content["text"]
+        for kind in ("file", "raw"):
+            with pytest.raises(MCPError):
+                await client.read_resource(f"forgemcp://workspace/{kind}/{quote(path, safe='/')}")
 
 
 @pytest.mark.anyio
@@ -124,7 +190,7 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
         assert "extensions_uri" not in result
         resource = result["resources"]["diff"]
         assert resource["uri"].endswith("/diff.json")
-        assert resource["version"] == 1
+        assert resource["mime_type"] == "application/json"
         frozen = (await client.read_resource(resource["uri"])).contents[0].text
         diff = FileDiff.model_validate_json(frozen)
         assert diff.path == WorkspacePath("project/diff.txt")
@@ -148,9 +214,9 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
 @pytest.mark.anyio
 async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_project):
     workspace = WorkspaceService(cpp_acceptance_project)
-    workspace.mkdir(WorkspacePath("project/resource data"))
+    (cpp_acceptance_project / "resource data").mkdir()
     text = "α\r\nfoo(x)/../#&\r\n```\n"
-    workspace.write_file(WorkspacePath("project/resource data/a#%.cpp"), text)
+    (cpp_acceptance_project / "resource data/a#%.cpp").write_bytes(text.encode("utf-8"))
     (cpp_acceptance_project / "resource data/data.bin").write_bytes(b"\x00\xff\x01")
     async with Client(create_server(cpp_acceptance_project)) as client:
         templates = (await client.list_resource_templates()).resource_templates
