@@ -1,4 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <rect width="24" height="24" rx="5" fill="#5b5bd6"/>
-  <path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-12-2 14" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72">
+  <!-- clangd contributors, Apache-2.0 WITH LLVM-exception; see clangd.LICENSE.
+       Source: https://github.com/clangd/clangd/blob/master/logo/logo.svg
+       Original CD mark and gradients; lettering/editor metadata removed, square canvas. -->
+  <defs>
+    <radialGradient id="clangd-c" cx="93.45755" cy="230.91721" r="20.843767"
+      gradientUnits="userSpaceOnUse"
+      gradientTransform="matrix(-2.0309823,-8.6890853e-7,7.0332774e-7,-1.6935434,253.83964,637.53298)">
+      <stop offset="0" stop-color="#f0f8a0"/>
+      <stop offset="0.75" stop-color="#c1e0a4"/>
+      <stop offset="1" stop-color="#5aab7b"/>
+    </radialGradient>
+    <linearGradient id="clangd-d" x1="87.3125" y1="236.14583" x2="109.80209" y2="199.10417"
+      gradientUnits="userSpaceOnUse" gradientTransform="translate(-42.33333,27.781253)">
+      <stop offset="0" stop-color="#0f5499"/>
+      <stop offset="1" stop-color="#0ed6ff"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(-14.270835,-209.43051)" stroke-width="2">
+    <path fill="url(#clangd-c)" stroke="#055f25" stroke-linecap="round" stroke-linejoin="round"
+      d="M 63.5,225.5625 H 50.270837 c -13.229167,0 -26.458334,6.61458 -26.458334,26.45834 0,19.84374 13.229167,26.55586 26.599104,26.50658 L 63.5,278.47922 l 4e-5,-13.22917 H 50.270837 c 0,0 -12.705299,1e-4 -12.964614,-13.09685 -0.264553,-13.36153 12.964614,-13.36153 12.964614,-13.36153 H 63.5 Z"/>
+    <path fill="url(#clangd-d)" stroke="#0d386b"
+      d="m 64.82292,212.33333 h 10.58333 c 0.62363,0 1.32292,0.69929 1.32292,1.32292 v 50.27083 c 0,0.62363 -0.69929,1.32292 -1.32292,1.32292 H 63.5 50.270837 c 0,0 -12.612556,-1.5e-4 -12.924189,-13.37203 -0.304978,-13.0863 12.924189,-13.0863 12.924189,-13.0863 H 63.5 v -25.13542 c 0,-0.62363 0.69929,-1.32292 1.32292,-1.32292 z"/>
+  </g>
 </svg>
