@@ -38,18 +38,10 @@ from pydantic import BaseModel, Field
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
-from forgemcp.progress import Progress, progress
+from forgemcp.progress import progress
 
 from .errors import WorkspaceError
-from .extensions import (
-    ExtensionContext,
-    ExtensionOutput,
-    ExtensionProvider,
-    ProviderCall,
-    ResultResource,
-    ResultResources,
-    TextChange,
-)
+from .providers import ProviderCall, ResultResource, ResultResources
 from .metadata import file_owner
 from .path import WorkspacePath
 
@@ -416,16 +408,11 @@ class WorkspaceService:
             if self.storage_root.exists() and not self.storage_root.is_dir():
                 raise WorkspaceError("Storage root must be a directory.")
         self.protected_paths: set[Path] = set()
-        self.extension_providers: dict[
-            str,
-            tuple[ExtensionProvider, frozenset[str] | None],
-        ] = {}
         self.result_providers: dict[
             str,
             tuple[ResultProvider, frozenset[str] | None],
         ] = {}
         self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
-        self.revision = 0
         self.operation_lock = asyncio.Lock()
         self.operation_owner: asyncio.Task[object] | None = None
 
@@ -442,89 +429,6 @@ class WorkspaceService:
                 yield
             finally:
                 self.operation_owner = None
-
-    def register_extension(
-        self,
-        name: str,
-        provider: ExtensionProvider,
-        *,
-        tools: Sequence[str] | None = None,
-    ) -> None:
-        """Register one uniquely named provider; workspace does not interpret its data."""
-        if not name or name in self.extension_providers:
-            raise WorkspaceError("Extension needs a unique nonempty name.")
-        self.extension_providers[name] = (
-            provider,
-            frozenset(tools) if tools is not None else None,
-        )
-
-    def extensions_for(self, tool_name: str) -> dict[str, ExtensionProvider]:
-        return {
-            name: provider
-            for name, (provider, tools) in self.extension_providers.items()
-            if tools is None or tool_name in tools
-        }
-
-    async def create_result_extensions(
-        self,
-        context: ExtensionContext,
-    ) -> ResultResources:
-        """Freeze provider output once; subsequent resource reads only retrieve text."""
-        providers = self.extensions_for(context.tool_name)
-        if not providers:
-            return ResultResources()
-        result_id = uuid4().hex
-        base_uri = f"forgemcp://workspace/results/{result_id}/"
-        stored = {}
-        links = {}
-        for name, provider in providers.items():
-            try:
-                output = await provider(
-                    ExtensionContext(
-                        tool_name=context.tool_name,
-                        result=context.result.model_copy(deep=True),
-                        paths=context.paths,
-                        texts=MappingProxyType(dict(context.texts)),
-                        change=context.change,
-                        on_progress=context.on_progress,
-                    )
-                )
-                if output is None:
-                    continue
-                if not isinstance(output, ExtensionOutput):
-                    raise WorkspaceError("Provider must return ExtensionOutput or None.")
-                resource = output.resource
-                expected_mime = {
-                    ".json": "application/json",
-                    ".md": "text/markdown",
-                }.get(Path(resource.name).suffix)
-                if (
-                    not resource.name
-                    or not resource.name.isascii()
-                    or any(not (char.isalnum() or char in "._-") for char in resource.name)
-                    or ".." in resource.name
-                    or resource.name in stored
-                    or expected_mime is None
-                    or resource.mime_type != expected_mime
-                    or not isinstance(resource.text, str)
-                    or "uri" in output.metadata
-                    or "mime_type" in output.metadata
-                ):
-                    raise WorkspaceError("Resource needs a unique .json/.md filename and matching MIME type.")
-                if resource.mime_type == "application/json":
-                    json.loads(resource.text)
-                link = ResultResource(
-                    uri=base_uri + resource.name,
-                    mime_type=resource.mime_type,
-                    **output.metadata,
-                )
-                links[name] = ResultResource.model_validate_json(link.model_dump_json())
-                stored[resource.name] = (resource.mime_type, resource.text)
-            except Exception:
-                logging.getLogger(__name__).warning("Workspace extension failed: %s", name)
-        if stored:
-            self.result_resources[result_id] = stored
-        return ResultResources(resources=links)
 
     def read_result_resource(self, result_id: str, name: str) -> str:
         """Return an immutable resource without invoking its provider again."""
@@ -601,23 +505,30 @@ class WorkspaceService:
             if tools is None or tool_name in tools
         }
 
-        async def run(provider: ResultProvider) -> tuple[object]:
+        completed: dict[str, object] = {}
+
+        async def run(name: str, provider: ResultProvider) -> tuple[object]:
             # Keep arbitrary context values distinct from gather's exceptions.
             method = getattr(provider, f"before_{tool_name}")
-            return (
-                await method(
-                    call_id,
-                    **deepcopy(dict(parameters)),
-                ),
+            context = await method(
+                call_id,
+                **deepcopy(dict(parameters)),
             )
+            if context is not None:
+                completed[name] = context
+            return (context,)
 
         try:
             outcomes = await asyncio.gather(
-                *(run(provider) for provider in providers.values()),
+                *(run(name, provider) for name, provider in providers.items()),
                 return_exceptions=True,
             )
         except BaseException:
-            self.result_resources.pop(call_id, None)
+            # Completed before hooks may hold locks until after/error, even if
+            # another provider is still running when this call is cancelled.
+            await self.error_providers(
+                ProviderCall(call_id, tool_name, MappingProxyType(completed)),
+            )
             raise
         contexts = {}
         for name, outcome in zip(providers, outcomes):
@@ -634,15 +545,19 @@ class WorkspaceService:
     ) -> ResultResources:
         """Wait for all successful before providers and attach their saved URIs."""
         names = list(call.contexts)
+        finished: set[str] = set()
 
         async def run(name: str) -> str | None:
-            provider = self.result_providers[name][0]
-            method = getattr(provider, f"after_{call.tool_name}")
-            return await method(
-                call.id,
-                call.contexts[name],
-                result.model_copy(deep=True),
-            )
+            try:
+                provider = self.result_providers[name][0]
+                method = getattr(provider, f"after_{call.tool_name}")
+                return await method(
+                    call.id,
+                    call.contexts[name],
+                    result.model_copy(deep=True),
+                )
+            finally:
+                finished.add(name)
 
         try:
             outcomes = await asyncio.gather(
@@ -650,7 +565,18 @@ class WorkspaceService:
                 return_exceptions=True,
             )
         except BaseException:
-            self.result_resources.pop(call.id, None)
+            # Cancellation can prevent an after task from starting at all.
+            await self.error_providers(
+                ProviderCall(
+                    call.id,
+                    call.tool_name,
+                    MappingProxyType({
+                        name: call.contexts[name]
+                        for name in names
+                        if name not in finished
+                    }),
+                ),
+            )
             raise
         stored = self.result_resources.get(call.id, {})
         links = {}
@@ -702,28 +628,6 @@ class WorkspaceService:
                     logging.getLogger(__name__).warning("Workspace provider error failed: %s", name)
         finally:
             self.result_resources.pop(call.id, None)
-
-    async def enrich_result[T: ResultResources](
-        self,
-        tool_name: str,
-        result: T,
-        paths: Sequence[WorkspacePath],
-        texts: Mapping[WorkspacePath, str] | None = None,
-        change: TextChange | None = None,
-        on_progress: Progress | None = None,
-    ) -> T:
-        references = await self.create_result_extensions(
-            ExtensionContext(
-                tool_name=tool_name,
-                result=result,
-                paths=tuple(dict.fromkeys(paths)),
-                texts=texts or {},
-                change=change,
-                on_progress=on_progress,
-            )
-        )
-        result.resources = references.resources
-        return result
 
     def root_path(self, root: WorkspaceRoot) -> Path:
         if root == "project":
@@ -1357,7 +1261,6 @@ class WorkspaceService:
                     existed = candidate.exists()
                     previous = read_text(candidate, path) if existed else ""
                     replace_text(candidate, text)
-                    self.revision += 1
                     result = FileWriteResult(
                         path=path,
                         action="overwritten" if existed else "created",
@@ -1414,7 +1317,6 @@ class WorkspaceService:
                             f"Found {count} occurrences; use replace_all or a more specific old_text."
                         )
                     replace_text(candidate, text.replace(old_text, new_text))
-                    self.revision += 1
                     result = FileEditResult(
                         path=path,
                         replacements=count,
@@ -1472,7 +1374,6 @@ class WorkspaceService:
                             raise WorkspaceError("Cannot move a directory into itself.")
                         self.check_tree_links(origin)
                     origin.rename(target)
-                    self.revision += 1
                     result = PathOperationResult(
                         path=destination,
                         action="moved",
@@ -1512,7 +1413,6 @@ class WorkspaceService:
                         candidate.rmdir()
                     else:
                         self.require_file(path.relative, path.area).unlink()
-                    self.revision += 1
                     result = PathOperationResult(
                         path=path,
                         action="deleted",
@@ -1550,8 +1450,6 @@ class WorkspaceService:
                     candidate = self.writable_path(path.relative, root=path.area)
                     existed = candidate.is_dir()
                     candidate.mkdir(parents=True, exist_ok=True)
-                    if not existed:
-                        self.revision += 1
                     result = PathOperationResult(
                         path=path,
                         action="already_exists" if existed else "created",
@@ -1580,7 +1478,7 @@ class WorkspaceService:
         )
         @serialized
         async def workspace_result_json(result_id: str, name: str) -> str:
-            """Read immutable result extensions or provider JSON from one tool invocation."""
+            """Read immutable provider JSON from one tool invocation."""
             try:
                 return self.read_result_resource(result_id, name + ".json")
             except WorkspaceError as error:

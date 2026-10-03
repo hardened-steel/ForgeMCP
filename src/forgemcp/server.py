@@ -76,10 +76,10 @@ def create_server(
         builds,
         progress_interval=progress_interval,
     )
-    workspace.register_extension(
+    workspace.register_provider(
         "clangd",
-        analysis.workspace_extension,
-        tools=analysis.EXTENSION_TOOLS,
+        analysis,
+        tools=analysis.PROVIDER_TOOLS,
     )
     services = (workspace, processes, toolchains, builds, analysis)
     apps = Apps()
@@ -89,6 +89,7 @@ def create_server(
     async def lifespan(_: MCPServer) -> AsyncGenerator[dict[str, object]]:
         try:
             await toolchains.initialize()
+            await analysis.initialize()
             yield {}
         finally:
             try:

@@ -169,7 +169,7 @@ binary content, and the other four resources return `text/markdown`.
 
 Dependent modules may register workspace result providers. A tool's `resources`
 object maps each contributing provider name to a descriptor with `uri` and
-`mime_type`, plus optional provider-specific JSON metadata. There is no manifest
+`mime_type`. There is no manifest
 or `extensions_uri`. All result resources are immutable, held in memory, and
 disappear on restart.
 
@@ -184,7 +184,14 @@ changes button toggles changed-substring highlighting next to Wrap lines; local
 search uses a separate color. JSON and Copy all retain the original tool result.
 A resource-loading failure does not change the successful file-operation outcome.
 Diff widget adaptation to the new provider descriptors remains deferred.
-Automatic syntax/diagnostic enrichment awaits the clangd provider migration.
+When a CMake configuration has a compilation database and clangd in its toolset,
+Workspace reads, writes, edits, and moves of C/C++ files also return
+`resources.clangd`. This immutable JSON contains diagnostics and semantic
+highlighting grouped by configuration. Workspace mutations synchronize retained
+clangd sessions; changing a header refreshes already opened dependent files.
+Clangd starts sessions from CMake's configuration subscription and keeps them until
+the configuration disappears, its database changes, or the server stops.
+Displaying the clangd resource in widgets remains deferred.
 
 ## CMake profiles
 

@@ -440,19 +440,20 @@ class ClangdSession:
                     },
                 },
             )
-        document.version += 1
+        elif document.text != text:
+            document.version += 1
+            document.text = text
+            document.diagnostics_version = None
+            document.diagnostics = []
+            await self.notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": uri, "version": document.version},
+                    "contentChanges": [{"text": text}],
+                    "wantDiagnostics": True,
+                },
+            )
         self.versions[uri] = document.version
-        document.text = text
-        document.diagnostics_version = None
-        document.diagnostics = []
-        await self.notify(
-            "textDocument/didChange",
-            {
-                "textDocument": {"uri": uri, "version": document.version},
-                "contentChanges": [{"text": text}],
-                "wantDiagnostics": True,
-            },
-        )
         async with self.condition:
             self.condition.notify_all()
         await self.report(on_progress, f"Synchronized {path} version {document.version}")

@@ -7,7 +7,7 @@ project files and a separate service-storage root. The shared `process` service 
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface for development commands. CMake now configures, builds, and tests operator
 profiles. Read-only clangd analysis is mounted through MCP tools and workspace
-result extensions; its widgets remain deferred. Quality and debugger remain future work.
+result providers; its widgets remain deferred. Quality and debugger remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
 
@@ -245,6 +245,10 @@ and that tool's concrete result model. Default methods do nothing, with before
 returning `None`; this skips its after and error hooks for that operation.
 Providers override only operations they use. On tool failure,
 `error(call_id, context)` receives each non-`None` before context.
+If cancellation interrupts before while another provider is still running,
+Workspace also calls error for providers that already returned a context.
+If cancellation prevents an after hook from starting, its context is released
+through error as well; hooks that did run own their cleanup.
 
 Workspace uses one random ID for all providers in a tool call. It runs each stage
 concurrently, waits for every provider, and logs provider failures without changing
@@ -284,10 +288,11 @@ deadlocking; requests from other tasks still wait. File-info, list, find, and
 search resource handlers delegate to the corresponding tool handlers; file/raw
 mirrors directly read their managed files.
 
-The old extension contract remains temporarily for the pending clangd migration,
-but Workspace tool handlers no longer invoke it. Automatic clangd enrichment will
-resume when clangd registers a `ResultProvider`. Diff widgets still expect the old
-descriptor's version metadata; adapting widgets follows the backend migration.
+Clangd registers a typed result provider alongside diff. The former extension
+contract and Workspace revision counter have been removed. Resource descriptors
+contain only URI and MIME type; provider-specific data belongs in the resource.
+Diff widgets still expect the old descriptor's version metadata; adapting widgets
+follows the backend migration.
 
 ## CMake profiles and operations
 
@@ -355,10 +360,12 @@ record headings are not repeated in the body; JSON and copying retain all fields
 The widgets display the original
 invocation only and issue no tool calls or resource reads. CMake highlighting remains deferred.
 Unit and in-process MCP tests cover operator profiles, parsed command results,
-generator-change cleanup, error isolation, immutable extensions, qualified resource
+generator-change cleanup, error isolation, qualified resource
 paths, and completions. They use fake ToolSpecs/process streams and isolated fixture
 copies; installed compilers are not required. Existing workspace widgets have not
-yet been adapted or verified against the new WorkspacePath/extension contract.
+yet been adapted to the provider resource contract. Workspace/server tests still
+target the former service methods and extension API; their migration follows the
+widget work as the last refactoring stage.
 
 ## External process execution
 
@@ -508,8 +515,10 @@ the corresponding boundary; unexpected exceptions remain SDK-sanitized.
 ## Clangd business API
 
 `ClangdService` receives `WorkspaceService`, `ToolchainService`, and `CMakeService`
-explicitly. `server.py` registers its seven MCP tools and workspace extension,
-and closes the analysis service before `ProcessService`. Widgets remain deferred.
+explicitly. `server.py` registers its seven MCP tools and typed Workspace provider.
+After toolset discovery, the server initializes analysis and its CMake subscription;
+shutdown unsubscribes and closes all sessions before `ProcessService`.
+Widgets remain deferred.
 
 CMake retains successful configurations as
 `CompilationContext(id, toolset_id, build_directory, compilation_database)`.
@@ -524,8 +533,10 @@ back to another toolset or a system installation.
 `configuration_updates()` is CMake's in-process subscription stream. It yields the
 current list immediately and then yields changed snapshots when configure adds or
 removes a configuration. A slow subscriber keeps only the newest pending snapshot;
-it does not delay CMake or receive events for unchanged lists. Subscribers close
-their generators to unregister.
+it does not delay CMake. Successful configure also publishes unchanged lists so
+subscribers can detect changed database contents at the same paths. Subscribers
+close their generators to unregister. Missing CMake tooling produces an empty
+initial list rather than blocking server startup.
 
 The typed clangd ToolSpec method `connect` owns `ProcessSession` and JSON-RPC/LSP
 framing. Callers exchange typed request, notification, response, and error envelopes.
@@ -540,19 +551,37 @@ Positions use one-based lines and zero-based Unicode code-point offsets. The ses
 requires UTF-32 position negotiation so external locations can be returned without
 reading their contents to convert offsets.
 
-`ClangdService` lazily retains one session per selected context. It implements
-diagnostics, hover, definition, references, document symbols, and workspace symbols.
+`ClangdService` starts and retains one session per available context. Its subscription
+applies CMake snapshots under the same lock used by analysis. Removed contexts close
+their sessions; a changed configuration or database fingerprint replaces only the
+affected session. Failed sessions can be recreated by the next operation.
+Diagnostics, hover, definition, references, document symbols, and workspace symbols
+are implemented in their decorated MCP handlers; shared session and collection
+behavior stays on the service.
 Each operation has its own result model with `configurations: list[str]`. Equal
 complete answers are grouped with their configuration IDs; differing answers remain
 separate. An analysis failure raises a domain error rather than silently returning
-an incomplete multi-configuration answer. Changed compilation databases, failed
-sessions, and missed workspace revisions invalidate retained sessions.
+an incomplete multi-configuration answer. Progress from explicit analysis tools
+reaches `ClangdSession`; Workspace provider hooks receive no progress callback.
 
-The legacy workspace extension code still supports read, write, edit, move, and
-delete snapshots, but the migrated Workspace handlers no longer invoke it.
-Automatic session synchronization and diagnostic/highlighting resources await
-clangd's migration to `ResultProvider`. Its explicit analysis tools remain available
-and read their own files. It does not watch external edits or manage editor buffers.
+Clangd's before hooks retain its analysis lock until after or error, preventing
+explicit analysis and configuration updates from overlapping a Workspace mutation.
+Move captures the source subtree's file paths before it disappears. After writes,
+edits, moves, deletes, and directory creation, the provider notifies retained sessions
+and reopens their existing documents from disk. This rebuilds dependent headers and
+obtains fresh versioned diagnostics without restarting clangd processes. Deleted or
+moved source documents are closed; move analyzes files at their new paths. Pure reads
+reuse unchanged document versions instead of requesting diagnostics for a no-op
+change that clangd may not publish.
+
+After read/write/edit/move, managed C/C++ files are analyzed across available
+configurations. Diagnostics and semantic highlighting are separately grouped and
+saved as `ClangdResource` in Workspace under the shared invocation ID. Later edits
+never change these resources. Provider failures close potentially stale sessions and
+are isolated by Workspace without changing a successful file operation. Compilation
+database changes observed through Workspace also refresh CMake's snapshot and reconcile
+sessions. Clangd owns its file reads; it does not watch external edits or manage
+editor buffers.
 
 `WorkspacePath` can also represent external absolute locations with `root/`, for
 example `root/C:/SDK/include/header.h` or `root//usr/include/header.h`. Managed

@@ -5,7 +5,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .extensions import TextChange
 from .path import WorkspacePath
 from .service import (
     FileEditResult,
@@ -46,10 +45,10 @@ class FileDiff(BaseModel):
     hunks: list[DiffHunk]
 
 
-def create_diff(change: TextChange) -> FileDiff:
+def create_diff(path: WorkspacePath, before_text: str, after_text: str) -> FileDiff:
     """Preserve exact line text, including line endings and a missing final newline."""
-    before = change.before.splitlines(keepends=True)
-    after = change.after.splitlines(keepends=True)
+    before = before_text.splitlines(keepends=True)
+    after = after_text.splitlines(keepends=True)
     matcher = difflib.SequenceMatcher(
         None,
         before,
@@ -127,7 +126,7 @@ def create_diff(change: TextChange) -> FileDiff:
                 lines=lines,
             )
         )
-    return FileDiff(path=change.path, changes=changes, hunks=hunks)
+    return FileDiff(path=path, changes=changes, hunks=hunks)
 
 
 class DiffProvider(ResultProvider[str]):
@@ -173,7 +172,7 @@ class DiffProvider(ResultProvider[str]):
 
     def save_diff(self, call_id: str, path: WorkspacePath, before: str) -> str:
         after = read_text(self.workspace.resolve_workspace_path(path), path)
-        diff = create_diff(TextChange(path=path, before=before, after=after))
+        diff = create_diff(path, before, after)
         return self.workspace.save_result_resource(
             call_id,
             "diff",

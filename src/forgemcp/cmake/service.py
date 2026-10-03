@@ -419,7 +419,10 @@ class CMakeService:
     ) -> list[CompilationContext]:
         """Return successful configurations with databases that still exist."""
         if not self.configurations_loaded:
-            definitions, catalogs = await self.selection(None)
+            try:
+                definitions, catalogs = await self.selection(None)
+            except (CMakeError, ToolchainError, ProcessError):
+                return []
             for definition in definitions:
                 try:
                     profile = self.resolve_profile(definition, catalogs)
@@ -480,15 +483,15 @@ class CMakeService:
             async with self.configuration_lock:
                 self.configuration_subscribers.pop(queue, None)
 
-    async def publish_configurations(self) -> None:
-        """Notify subscribers only when their last snapshot has changed."""
+    async def publish_configurations(self, *, refresh: bool = False) -> None:
+        """Publish changed snapshots, or refresh databases after successful configure."""
         if not self.configuration_subscribers:
             return
         async with self.configuration_lock:
             current = await self.compilation_contexts()
             signature = tuple(item.model_dump_json() for item in current)
             for queue, previous in tuple(self.configuration_subscribers.items()):
-                if signature == previous:
+                if signature == previous and not refresh:
                     continue
                 if queue.full():
                     queue.get_nowait()
@@ -685,7 +688,7 @@ class CMakeService:
                         )
                     else:
                         self.configurations.pop(identifier, None)
-                    await self.publish_configurations()
+                    await self.publish_configurations(refresh=result.error is None)
                     await report_status(result.error or "Completed successfully")
             return results
 
