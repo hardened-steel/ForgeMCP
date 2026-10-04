@@ -251,8 +251,10 @@ class ProcessRecord:
             ) from error
         finally:
             # Normal EOF already flushed above; cancellation must not wait for
-            # a child that has stopped consuming buffered stdin.
-            writer.transport.abort()
+            # a child that has stopped consuming buffered stdin. Unix transports
+            # cannot be aborted again after wait_closed() releases their loop.
+            if not writer.is_closing() or writer.transport.get_write_buffer_size():
+                writer.transport.abort()
             with suppress(BrokenPipeError, ConnectionResetError):
                 await writer.wait_closed()
 
