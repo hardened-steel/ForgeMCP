@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Published GitHub release tag (for example v0.2.0)'
+        description: 'Published GitHub release tag (for example v0.2.1)'
         required: true
         type: string
 
@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 5
     environment:
       name: pypi
-      url: https://pypi.org/p/forgemcp
+      url: https://pypi.org/p/forge-cpp-mcp
     permissions:
       id-token: write
     steps:

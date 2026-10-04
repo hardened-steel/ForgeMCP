@@ -64,18 +64,19 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forgemcp-0.2.0-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.1-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
 The wheel includes the compiled HTML widgets and icons. No npm commands or separate
 frontend deployment are needed. CMake, Ninja, compilers, and clangd are external
 tools: install the ones needed by your workflows separately.
+The distribution name is `forge-cpp-mcp`; the Python module and server command are `forgemcp`.
 
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forgemcp==0.2.0
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.1
 ```
 
 ## Setup from source

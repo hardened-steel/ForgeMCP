@@ -25,12 +25,12 @@ def distributions(tmp_path: Path) -> Path:
     metadata["Name"] = PROJECT["name"]
     metadata["Version"] = PROJECT["version"]
     with zipfile.ZipFile(tmp_path / "package.whl", "w") as wheel:
-        wheel.writestr("forgemcp.dist-info/METADATA", metadata.as_bytes())
+        wheel.writestr("forge_cpp_mcp.dist-info/METADATA", metadata.as_bytes())
         wheel.writestr(
             "forgemcp/__init__.py",
             f'__version__ = "{PROJECT["version"]}"\n',
         )
-        wheel.writestr("forgemcp.dist-info/licenses/LICENSE", "MIT")
+        wheel.writestr("forge_cpp_mcp.dist-info/licenses/LICENSE", "MIT")
     required = {
         "hatch_build.py",
         "pyproject.toml",

@@ -815,6 +815,9 @@ the build task before starting the server.
 
 ### Distribution and release verification
 
+The distribution is named `forge-cpp-mcp`; the Python package, server command,
+and MCP resource names remain `forgemcp`.
+
 The sdist explicitly includes Python sources, frontend sources, the npm lockfile,
 and the wheel build hook. Generated HTML and local npm dependencies are excluded.
 `python -m build` builds the wheel from the sdist; installing a wheel requires no Node.js.
