@@ -96,6 +96,25 @@ builds the wheel first and then starts the server for this repository.
 
 All MCP traffic uses stdout. Operational logs must go to stderr.
 
+## Connect Codex or Claude Code
+
+After [setup](#setup), copy the appropriate example into the root of the C/C++
+project you want ForgeMCP to work on:
+
+| Client | Example | Destination |
+| --- | --- | --- |
+| Codex | [`examples/mcp-clients/codex/config.toml`](examples/mcp-clients/codex/config.toml) | `.codex/config.toml` |
+| Claude Code | [`examples/mcp-clients/claude-code/.mcp.json`](examples/mcp-clients/claude-code/.mcp.json) | `.mcp.json` |
+
+In the copied file, replace both example paths with absolute paths: the first points
+to the `forgemcp.exe` installed by setup, and the `--workspace` argument points to
+the C/C++ project root. The examples use Windows paths with forward slashes, which
+work in both TOML and JSON. On macOS or Linux, point `command` to the virtual
+environment's `bin/forgemcp` instead. If either destination file already exists,
+add the `forgemcp` entry to it rather than replacing the file. Restart the client
+after editing its configuration. Check the connection with `codex mcp list` or
+`claude mcp get forgemcp`, respectively.
+
 ## Workspace files and storage
 
 All file tools use string paths such as `project/src/main.cpp` and

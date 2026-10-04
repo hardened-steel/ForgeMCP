@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "forgemcp": {
+      "command": "C:/path/to/ForgeMCP/.venv/Scripts/forgemcp.exe",
+      "args": ["--workspace", "C:/path/to/cpp-project"]
+    }
+  }
+}
