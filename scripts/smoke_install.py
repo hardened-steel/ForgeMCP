@@ -20,7 +20,7 @@ async def main() -> None:
     package_path = Path(forgemcp.__file__).resolve()
     if package_path.is_relative_to(root / "src"):
         raise RuntimeError("Smoke verification must use the installed wheel, not src/.")
-    if forgemcp.__version__ != version("forgemcp"):
+    if forgemcp.__version__ != version("forge-cpp-mcp"):
         raise RuntimeError("Runtime and distribution versions disagree.")
     with tempfile.TemporaryDirectory(prefix="forgemcp-smoke-") as directory:
         workspace = Path(directory) / "project"
