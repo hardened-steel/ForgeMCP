@@ -1,3 +1,5 @@
+"""Managed filesystem operations, safety boundaries, search, and progress tests."""
+
 import asyncio
 import os
 from unittest.mock import AsyncMock
@@ -18,6 +20,7 @@ from forgemcp.workspace.service import ReadConfirmation, WorkspaceService
 
 @pytest.fixture
 def workspace(cpp_acceptance_project):
+    """Create a workspace service with isolated project and service-storage roots."""
     return WorkspaceService(
         cpp_acceptance_project,
         cpp_acceptance_project / "service-storage",
@@ -26,11 +29,13 @@ def workspace(cpp_acceptance_project):
 
 @pytest.fixture
 def call(workspace):
+    """Expose registered workspace handlers through a synchronous test invocation helper."""
     apps = Apps()
     workspace.register(MCPServer("test", extensions=[apps]), apps, Complete())
     handlers = {binding.fn.__name__: binding.fn for binding in apps.tools()}
 
     def invoke(name, *args, **kwargs):
+        """Qualify test paths, allow managed reads, and invoke the selected async tool handler."""
         if "path" in kwargs and isinstance(kwargs["path"], str):
             kwargs["path"] = WorkspacePath("project/" + kwargs["path"])
         if name == "workspace_read_file":
@@ -47,6 +52,7 @@ def call(workspace):
 
 
 def test_roots_are_validated_and_storage_is_lazy(workspace):
+    """Verify root validation, default storage placement, and lazy storage creation."""
     assert (
         WorkspaceService(workspace.root).storage_root
         == workspace.root.parent / f".{workspace.root.name}.forgemcp"
@@ -82,11 +88,13 @@ def test_roots_are_validated_and_storage_is_lazy(workspace):
     ],
 )
 def test_path_escape_rejected(workspace, path):
+    """Verify invalid and escaping paths are rejected by workspace resolution."""
     with pytest.raises(WorkspaceError):
         workspace.resolve_path(path)
 
 
 def test_tree_depth_hidden_directories_and_file_error(workspace, call):
+    """Verify tree depth and hidden-directory filtering and rejection of file inputs."""
     call("workspace_mkdir", WorkspacePath("project/.hidden/nested"))
     call("workspace_write_file", WorkspacePath("project/.hidden/nested/value.txt"), "data")
     call("workspace_write_file", WorkspacePath("project/.dotfile"), "visible")
@@ -108,6 +116,7 @@ def test_tree_depth_hidden_directories_and_file_error(workspace, call):
 
 
 def test_find_globs_extensions_and_hidden_directory_policy(workspace, call):
+    """Verify file glob matching and deliberate hidden-directory and extension behavior."""
     call("workspace_mkdir", WorkspacePath("project/.hidden"))
     call("workspace_write_file", WorkspacePath("project/.hidden/ignored.cpp"), "needle")
     call("workspace_write_file", WorkspacePath("project/.clangd"), "needle")
@@ -142,6 +151,7 @@ def test_find_globs_extensions_and_hidden_directory_policy(workspace, call):
 
 
 def test_read_write_metadata_and_utf8_crlf(workspace, call):
+    """Verify UTF-8 and CRLF preservation, line ranges, write counts, and file metadata."""
     text = "α\r\n日本語\r\nlast"
     created = call(
         "workspace_write_file",
@@ -187,6 +197,9 @@ def test_read_write_metadata_and_utf8_crlf(workspace, call):
 
 
 def test_exact_edit_is_unambiguous_and_preserves_unaffected_bytes(workspace, call):
+    """Verify exact edits reject ambiguous matches and preserve unaffected bytes and line
+    endings.
+    """
     call("workspace_write_file", WorkspacePath("project/edit.txt"), "α\r\nrepeat repeat\r\nend")
     for old in ("", "missing", "repeat"):
         with pytest.raises(ToolError):
@@ -209,9 +222,11 @@ def test_exact_edit_is_unambiguous_and_preserves_unaffected_bytes(workspace, cal
 
 
 def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, call, monkeypatch):
+    """Verify failed atomic replacement preserves the original and removes the temporary sibling."""
     call("workspace_write_file", WorkspacePath("project/keep.txt"), "original")
 
     def fail(source, destination):
+        """Require a sibling temporary file and simulate a locked replacement destination."""
         assert Path(source).parent == Path(destination).parent
         raise PermissionError("locked")
 
@@ -227,6 +242,7 @@ def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, call, mo
 
 
 def test_search_literals_regex_extensions_and_skips(workspace, call):
+    """Verify literal and regex search, extension filters, and binary or invalid UTF-8 skips."""
     call("workspace_mkdir", WorkspacePath("project/search"))
     call("workspace_write_file", WorkspacePath("project/search/a.cpp"), "a.b a.b\nAxb\nfoo(x)/../#&\n")
     call("workspace_write_file", WorkspacePath("project/search/b.txt"), "a.b")
@@ -262,6 +278,7 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
 
 
 def test_move_files_directories_and_empty_directory_deletion(workspace, call):
+    """Verify file and directory moves and deletion restricted to files or empty directories."""
     assert call("workspace_mkdir", WorkspacePath("project/new/nested")).action == "created"
     assert call("workspace_mkdir", WorkspacePath("project/new/nested")).action == "already_exists"
     call("workspace_write_file", WorkspacePath("project/new/nested/file.txt"), "content")
@@ -281,6 +298,7 @@ def test_move_files_directories_and_empty_directory_deletion(workspace, call):
 
 
 def test_protected_paths_and_parents_apply_to_all_mutations(workspace, call):
+    """Verify protected roots and required parents constrain every mutation while allowing reads."""
     call("workspace_mkdir", WorkspacePath("project/repo/.git"))
     call("workspace_write_file", WorkspacePath("project/repo/.git/config"), "data")
     workspace.protect_path(WorkspacePath("project/repo/.git"))
@@ -307,6 +325,7 @@ def test_protected_paths_and_parents_apply_to_all_mutations(workspace, call):
 
 
 def test_storage_is_lazy_and_persists_across_service_restarts(workspace, call):
+    """Verify storage is created on demand and survives workspace service replacement."""
     assert not workspace.storage_root.exists()
     call("workspace_mkdir", WorkspacePath("storage/build/debug"))
     call("workspace_write_file", WorkspacePath("storage/build/debug/state"), "cache")
@@ -320,6 +339,7 @@ def test_storage_is_lazy_and_persists_across_service_restarts(workspace, call):
 
 
 def test_links_are_visible_but_not_traversed_or_modified(workspace, call):
+    """Verify scans expose links without traversing them and mutations reject linked paths."""
     target = workspace.root / "src"
     alias = workspace.root / "alias"
     try:
@@ -347,6 +367,7 @@ def test_links_are_visible_but_not_traversed_or_modified(workspace, call):
 
 
 def test_markdown_escapes_source_fences_and_link_characters(workspace, call):
+    """Verify source fences remain data and managed mirror paths are URL-quoted."""
     call("workspace_write_file", WorkspacePath("project/fence.txt"), "```\n<script>unsafe</script>\n")
     result = workspace.render_markdown(
         call("workspace_search", "```", path="fence.txt")
@@ -356,6 +377,7 @@ def test_markdown_escapes_source_fences_and_link_characters(workspace, call):
 
 
 def test_filesystem_errors_preserve_os_message_without_absolute_path():
+    """Verify filesystem errors retain localized OS text and only the requested relative path."""
     import errno
     from forgemcp.workspace.service import filesystem_errors
 
@@ -376,6 +398,9 @@ def test_progress_throttles_per_invocation_without_losing_results(
     monkeypatch,
     interval,
 ):
+    """Verify per-call throttling preserves complete results and monotonic progress across tool
+    kinds.
+    """
     import forgemcp.progress as module
 
     workspace.progress_interval = interval
@@ -386,6 +411,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
     now = -0.25
 
     def clock():
+        """Advance the deterministic clock by a quarter second per read."""
         nonlocal now
         now += 0.25
         return now
@@ -402,6 +428,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
         events = []
 
         async def collect(value, total=None, message=None):
+            """Record timestamped progress updates for the current tool invocation."""
             events.append((now, value, message))
 
         if name == "workspace_read_file":

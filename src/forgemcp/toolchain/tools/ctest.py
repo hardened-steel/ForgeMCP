@@ -20,6 +20,8 @@ type Progress = Callable[[str], Awaitable[None]]
 
 
 class TestCase(BaseModel):
+    """One JUnit test outcome with optional duration and failure or skip explanation."""
+
     name: str
     status: Literal["passed", "failed", "skipped", "not_run"]
     duration_seconds: float | None = None
@@ -27,12 +29,15 @@ class TestCase(BaseModel):
 
 
 class TestResult(BaseModel):
+    """A CTest run's exit code, process reference, and parsed test cases."""
+
     return_code: int
     process_id: int
     tests: list[TestCase] = Field(default_factory=list)
 
 
 def parse_report(path: Path) -> list[TestCase]:
+    """Read a JUnit report and classify each testcase as passed, failed, skipped, or not run."""
     if not path.is_file():
         raise ToolParserError("CTest did not produce a JUnit report.")
     try:
@@ -69,6 +74,8 @@ def parse_report(path: Path) -> list[TestCase]:
 
 
 class Test(Protocol):
+    """The callable contract for running CTest with a managed JUnit report."""
+
     async def __call__(
         self,
         source: Path,
@@ -81,10 +88,14 @@ class Test(Protocol):
         parallel: int | None = None,
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
-    ) -> TestResult: ...
+    ) -> TestResult:
+        """Run selected tests and return the process reference and parsed JUnit outcomes."""
+        ...
 
 
 class Methods(TypedDict):
+    """The typed operations supported by the bound ctest executable."""
+
     version: Callable[[], Awaitable[str]]
     test: Test
 
@@ -95,9 +106,11 @@ def create_spec(
     environment: Mapping[str, str] | None = None,
     inherit_environment: bool = True,
 ) -> ToolSpec:
+    """Bind the resolved ctest executable to process execution and environment settings."""
     path = path.resolve()
 
     async def version() -> str:
+        """Run a bounded version probe, drain both output streams, and parse the ctest banner."""
         output = {"stdout": "", "stderr": ""}
         try:
             async with await processes.launch(
@@ -138,6 +151,7 @@ def create_spec(
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
     ) -> TestResult:
+        """Run CTest with exact-name filtering and parse its JUnit outcomes and progress."""
         if preset is None and build_directory is None:
             raise ToolCommandError("A plain test run requires a build directory.")
         arguments = (
@@ -158,6 +172,7 @@ def create_spec(
         buffers = {"stdout": "", "stderr": ""}
 
         async def parse_progress(line: str) -> None:
+            """Forward recognized CTest execution and summary lines to the progress callback."""
             if on_progress is not None and re.search(
                 r"Start\s+\d+:|\d+/\d+\s+Test|tests passed|Total Test time",
                 line,

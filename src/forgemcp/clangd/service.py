@@ -72,12 +72,16 @@ from .session import (
 
 
 class DiagnosticsResult(BaseModel):
+    """Diagnostics for one file with the configurations that produced them."""
+
     configurations: list[str]
     path: WorkspacePath
     diagnostics: list[Diagnostic]
 
 
 class HoverResult(BaseModel):
+    """A hover answer at a source position with configuration provenance."""
+
     configurations: list[str]
     path: WorkspacePath
     position: Position
@@ -85,45 +89,61 @@ class HoverResult(BaseModel):
 
 
 class DefinitionResult(BaseModel):
+    """Definition targets shared by the listed configurations."""
+
     configurations: list[str]
     locations: list[NavigationLocation]
 
 
 class ReferencesResult(BaseModel):
+    """Reference targets shared by the listed configurations."""
+
     configurations: list[str]
     locations: list[NavigationLocation]
 
 
 class DocumentSymbolsResult(BaseModel):
+    """A file's symbol tree with configuration provenance."""
+
     configurations: list[str]
     path: WorkspacePath
     symbols: list[DocumentSymbol]
 
 
 class WorkspaceSymbolsResult(BaseModel):
+    """Matching workspace symbols with configuration provenance."""
+
     configurations: list[str]
     symbols: list[WorkspaceSymbol]
 
 
 class HighlightingResult(BaseModel):
+    """Semantic spans for a file with configuration provenance."""
+
     configurations: list[str]
     path: WorkspacePath
     spans: list[HighlightSpan]
 
 
 class FileAnalysis(BaseModel):
+    """Saved diagnostic and highlighting answers for one file."""
+
     path: WorkspacePath
     diagnostics: list[DiagnosticsResult]
     highlighting: list[HighlightingResult]
 
 
 class ClangdResource(BaseModel):
+    """The versioned payload of an immutable workspace analysis resource."""
+
     version: Literal[1] = 1
     files: list[FileAnalysis]
 
 
 @dataclass
 class RunningSession:
+    """A retained LSP session with its owned lifetime and configuration fingerprint."""
+
     session: ClangdSession
     lifetime: AsyncExitStack
     fingerprint: str
@@ -131,11 +151,15 @@ class RunningSession:
 
 @dataclass(frozen=True)
 class WorkspaceContext:
+    """The managed paths captured before a workspace operation."""
+
     paths: tuple[WorkspacePath, ...]
 
 
 @dataclass(frozen=True)
 class FileChange:
+    """A managed path and its LSP create, change, or delete event kind."""
+
     path: WorkspacePath
     kind: Literal[1, 2, 3]
 
@@ -206,6 +230,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         *,
         progress_interval: float = 1.0,
     ) -> None:
+        """Bind analysis dependencies and initialize session, subscription, and locking state."""
         self.workspace = workspace
         self.toolchains = toolchains
         self.cmake = cmake
@@ -239,6 +264,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         self,
         updates: AsyncGenerator[list[CompilationContext], None],
     ) -> None:
+        """Apply subscribed CMake snapshots and retain a background subscription failure."""
         try:
             async for contexts in updates:
                 async with self.lock:
@@ -292,6 +318,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 )
 
     def check_ready(self) -> None:
+        """Reject a closed, uninitialized, or failed analysis service."""
         if self.closed:
             raise ClangdSessionError("The clangd service is closed.")
         if self.configuration_task is None:
@@ -300,10 +327,12 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             raise self.subscription_failure
 
     async def configurations(self) -> list[CompilationContext]:
+        """Return independent copies of currently usable compilation contexts."""
         self.check_ready()
         return [context.model_copy(deep=True) for context in self.contexts.values()]
 
     async def selection(self, configurations: Sequence[str]) -> list[CompilationContext]:
+        """Validate requested configuration IDs, using all contexts for an empty selection."""
         contexts = await self.configurations()
         unknown = set(configurations) - self.contexts.keys()
         if unknown:
@@ -332,6 +361,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             raise ClangdError(str(error)) from error
 
     async def close_session(self, identifier: str) -> None:
+        """Remove a session, shut it down, and release its owned connection lifetime."""
         running = self.sessions.pop(identifier, None)
         if running is not None:
             try:
@@ -340,6 +370,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 await running.lifetime.aclose()
 
     async def close_sessions(self) -> None:
+        """Close all retained sessions and propagate any cleanup failure."""
         results = await asyncio.gather(
             *(self.close_session(identifier) for identifier in tuple(self.sessions)),
             return_exceptions=True,
@@ -349,6 +380,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 raise result
 
     async def close(self) -> None:
+        """Stop configuration updates and close all sessions under the analysis lock."""
         self.closed = True
         if self.configuration_task is not None:
             self.configuration_task.cancel()
@@ -359,6 +391,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             self.contexts.clear()
 
     def fingerprint(self, context: CompilationContext) -> str:
+        """Fingerprint the selected clangd executable and compilation database contents."""
         tool = self.toolchains.get_tool(context.toolset_id, "clangd")
         if tool is None:
             raise ClangdError(f"Configuration {context.id} has no clangd.")
@@ -375,6 +408,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> ClangdSession:
+        """Reuse a healthy context session or create and initialize its owned connection."""
         running = self.sessions.get(context.id)
         if running is not None and running.session.failure is not None:
             await self.close_session(context.id)
@@ -406,6 +440,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         return session
 
     def text(self, path: WorkspacePath) -> str:
+        """Read managed UTF-8 source and reject external paths or binary text."""
         if path.area == "root":
             raise ClangdError(
                 "Analysis inputs must be project/storage files; external locations are read-only results.",
@@ -420,6 +455,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
 
     @staticmethod
     def require_capability(session: ClangdSession, name: str) -> None:
+        """Reject an analysis operation whose server capability is absent or false."""
         value = session.capabilities.get(name)
         if value is None or value is False:
             raise ClangdError(f"clangd does not support {name}.")
@@ -431,6 +467,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> T:
+        """Run an operation in one context and discard its session on failure or cancellation."""
         try:
             session = await self.session(context, on_progress, timeout)
             return await operation(session)
@@ -474,11 +511,15 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> list[T]:
+        """Synchronize a source file and collect selected-context answers within one deadline."""
         async with self.operation(timeout):
             contexts = await self.selection(configurations)
             text = self.text(path)
 
             async def run(session: ClangdSession) -> T:
+                """Synchronize the selected session before executing the version-specific
+                operation.
+                """
                 version = await session.synchronize(
                     path,
                     text,
@@ -500,6 +541,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         path: WorkspacePath,
         position: Position,
     ) -> dict[str, JsonValue]:
+        """Validate a source position against retained text and build LSP request parameters."""
         uri = session.uri(path)
         lines = session.documents[uri].text.split("\n")
         if position.line > len(lines) or position.character > len(lines[position.line - 1].removesuffix("\r")):
@@ -514,6 +556,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> list[NavigationLocation]:
+        """Request navigation targets, attach saved excerpts, and sort them by source position."""
         raw = await session.request(method, params, on_progress=on_progress, timeout=timeout)
         if raw is None:
             return []
@@ -563,6 +606,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         return result
 
     def document_symbol(self, value: JsonValue) -> DocumentSymbol:
+        """Decode a symbol and recursively decode its child symbols."""
         data = object_value(value)
         return DocumentSymbol(
             name=string(data.get("name")),
@@ -582,6 +626,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> HighlightingResult:
+        """Decode full semantic tokens into source spans using the server's token legend."""
         self.require_capability(session, "semanticTokensProvider")
         provider = object_value(session.capabilities["semanticTokensProvider"])
         if provider.get("full") is None or provider.get("full") is False:
@@ -636,6 +681,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         *,
         subtree: bool = False,
     ) -> WorkspaceContext | None:
+        """Lock analysis and capture managed paths affected by a workspace operation."""
         if path.area == "root":
             return None
         await self.lock.acquire()
@@ -647,6 +693,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 self.workspace.check_path_links(native, path.area)
 
                 def raise_walk_error(error: OSError) -> None:
+                    """Propagate traversal failures instead of returning an incomplete subtree."""
                     raise error
 
                 for directory, directories, files in os.walk(
@@ -681,6 +728,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         start_line: int,
         end_line: int | None,
     ) -> WorkspaceContext | None:
+        """Capture and lock the file whose read result will receive analysis."""
         return await self.begin_workspace(path)
 
     async def after_workspace_read_file(
@@ -689,6 +737,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: FileContent,
     ) -> str | None:
+        """Save analysis for the completed read and release the analysis lock."""
         return await self.finish_workspace(call_id, context)
 
     async def before_workspace_write_file(
@@ -697,6 +746,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         path: WorkspacePath,
         text: str,
     ) -> WorkspaceContext | None:
+        """Capture and lock the source path before a write."""
         return await self.begin_workspace(path)
 
     async def after_workspace_write_file(
@@ -705,6 +755,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: FileWriteResult,
     ) -> str | None:
+        """Notify creation or modification and save analysis for the written file."""
         return await self.finish_workspace(
             call_id,
             context,
@@ -719,6 +770,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         new_text: str,
         replace_all: bool,
     ) -> WorkspaceContext | None:
+        """Capture and lock the source path before an exact edit."""
         return await self.begin_workspace(path)
 
     async def after_workspace_edit_file(
@@ -727,6 +779,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: FileEditResult,
     ) -> str | None:
+        """Notify modification and save analysis for the edited file."""
         return await self.finish_workspace(
             call_id,
             context,
@@ -739,6 +792,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         source: WorkspacePath,
         destination: WorkspacePath,
     ) -> WorkspaceContext | None:
+        """Capture and lock all managed paths under the move source."""
         return await self.begin_workspace(source, subtree=True)
 
     async def after_workspace_move(
@@ -747,6 +801,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: PathOperationResult,
     ) -> str | None:
+        """Notify old and new paths of a move and release the analysis lock."""
         try:
             origin = self.workspace.resolve_workspace_path(context.paths[0])
             destination = self.workspace.resolve_workspace_path(result.path)
@@ -773,6 +828,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         call_id: str,
         path: WorkspacePath,
     ) -> WorkspaceContext | None:
+        """Capture and lock the path before deletion."""
         return await self.begin_workspace(path)
 
     async def after_workspace_delete(
@@ -781,6 +837,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: PathOperationResult,
     ) -> str | None:
+        """Notify deletion without analyzing the removed file."""
         return await self.finish_workspace(
             call_id,
             context,
@@ -793,6 +850,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         call_id: str,
         path: WorkspacePath,
     ) -> WorkspaceContext | None:
+        """Capture and lock the directory path before creation."""
         return await self.begin_workspace(path)
 
     async def after_workspace_mkdir(
@@ -801,6 +859,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         context: WorkspaceContext,
         result: PathOperationResult,
     ) -> str | None:
+        """Notify a newly created directory without collecting file analysis."""
         return await self.finish_workspace(
             call_id,
             context,
@@ -809,6 +868,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         )
 
     async def error(self, call_id: str, context: WorkspaceContext) -> None:
+        """Release the analysis lock after a failed workspace operation."""
         self.lock.release()
 
     async def finish_workspace(
@@ -843,6 +903,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             self.lock.release()
 
     async def synchronize_changes(self, changes: Sequence[FileChange]) -> None:
+        """Refresh affected configurations and reopen retained documents after disk changes."""
         databases = {context.compilation_database for context in self.contexts.values()}
         if any(change.path in databases for change in changes):
             await self.cmake.publish_configurations(refresh=True)
@@ -875,6 +936,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 raise
 
     async def analyze_files(self, paths: Sequence[WorkspacePath]) -> list[FileAnalysis]:
+        """Collect diagnostic and highlighting snapshots for eligible managed source files."""
         files = []
         for path in dict.fromkeys(paths):
             if path.area == "root" or not self.contexts:
@@ -885,6 +947,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             text = self.text(path)
 
             async def run(session: ClangdSession) -> FileAnalysis:
+                """Synchronize one file and capture versioned diagnostics and semantic spans."""
                 version = await session.synchronize(path, text)
                 diagnostics = await session.diagnostics(
                     path,
@@ -938,10 +1001,12 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         read_only = ToolAnnotations(read_only_hint=True, destructive_hint=False)
 
         def analysis_progress(ctx: Context) -> Progress:
+            """Create a monotonically increasing progress callback for one analysis invocation."""
             report = progress(ctx, interval=self.progress_interval)
             updates = -1
 
             async def status(message: str) -> None:
+                """Advance the invocation's progress counter and report the supplied message."""
                 nonlocal updates
                 updates += 1
                 await report(updates, message=message)
@@ -980,6 +1045,9 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Starting clangd analysis")
             try:
                 async def run(session: ClangdSession, version: int) -> DiagnosticsResult:
+                    """Collect diagnostics for the synchronized document version in one
+                    configuration.
+                    """
                     return DiagnosticsResult(
                         configurations=[session.configuration.id],
                         path=path,
@@ -1020,6 +1088,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Starting clangd analysis")
             try:
                 async def run(session: ClangdSession, version: int) -> HoverResult:
+                    """Request and decode hover fragments for one configuration."""
                     self.require_capability(session, "hoverProvider")
                     raw = await session.request(
                         "textDocument/hover",
@@ -1088,6 +1157,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Starting clangd analysis")
             try:
                 async def run(session: ClangdSession, version: int) -> DefinitionResult:
+                    """Collect definition targets and source excerpts for one configuration."""
                     self.require_capability(session, "definitionProvider")
                     return DefinitionResult(
                         configurations=[session.configuration.id],
@@ -1130,6 +1200,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Starting clangd analysis")
             try:
                 async def run(session: ClangdSession, version: int) -> ReferencesResult:
+                    """Collect reference targets and source excerpts for one configuration."""
                     self.require_capability(session, "referencesProvider")
                     params = self.position_params(session, path, position)
                     params["context"] = {"includeDeclaration": include_declaration}
@@ -1172,6 +1243,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await status("Starting clangd analysis")
             try:
                 async def run(session: ClangdSession, version: int) -> DocumentSymbolsResult:
+                    """Decode hierarchical or flat document symbols for one configuration."""
                     self.require_capability(session, "documentSymbolProvider")
                     raw = await session.request(
                         "textDocument/documentSymbol",
@@ -1233,6 +1305,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 validate_timeout(timeout)
 
                 async def run(session: ClangdSession) -> WorkspaceSymbolsResult:
+                    """Decode matching workspace symbols and attach saved source excerpts."""
                     self.require_capability(session, "workspaceSymbolProvider")
                     raw = await session.request(
                         "workspace/symbol",

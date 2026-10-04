@@ -1,3 +1,5 @@
+"""In-process MCP registration, workspace lifecycle, resource, and completion tests."""
+
 import asyncio
 import base64
 import inspect
@@ -23,17 +25,20 @@ from forgemcp.workspace.diff import FileDiff
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 @pytest.fixture(autouse=True)
 def isolate_host_discovery(monkeypatch):
+    """Replace host tool discovery with an empty collection for deterministic protocol tests."""
     from forgemcp.toolchain import discovery
     from forgemcp.toolchain.providers import visual_studio
 
     monkeypatch.setattr(discovery, "load_tools", lambda: ())
 
     async def discover(*args):
+        """Return no host toolsets without launching discovery commands."""
         return ()
 
     monkeypatch.setattr(visual_studio, "discover", discover)
@@ -43,10 +48,12 @@ def isolate_host_discovery(monkeypatch):
 async def test_workspace_tools_have_apps_schemas_icons_and_progress(
     cpp_acceptance_project,
 ):
+    """Verify workspace tools expose Apps metadata, schemas, icons, and throttled progress."""
     server = create_server(cpp_acceptance_project, progress_interval=0)
     progress = []
 
     async def collect(value, total, message):
+        """Record workspace tool progress values for throttle assertions."""
         progress.append((value, total))
 
     async with Client(
@@ -88,6 +95,9 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
 async def test_clangd_tools_are_registered_and_unavailable_configurations_fail_cleanly(
     cpp_acceptance_project,
 ):
+    """Verify analysis tools are mounted and unavailable contexts produce recoverable tool
+    errors.
+    """
     async with Client(create_server(cpp_acceptance_project)) as client:
         tools = {
             tool.name: tool
@@ -118,11 +128,13 @@ async def test_external_read_requires_confirmation_and_never_creates_mirrors(
     cpp_acceptance_project,
     action,
 ):
+    """Verify external reads require elicitation and never expose managed mirror resources."""
     external = cpp_acceptance_project / "README.md"
     path = "root/" + external.as_posix()
     questions = []
 
     async def confirm(context, params):
+        """Record the external-read elicitation and return the parametrized operator decision."""
         questions.append(params.message)
         return ElicitResult(
             action=action,
@@ -151,9 +163,11 @@ async def test_external_read_requires_confirmation_and_never_creates_mirrors(
 
 @pytest.mark.anyio
 async def test_full_file_workflow_through_client(cpp_acceptance_project):
+    """Verify create, read, edit, move, search, metadata, and delete through the MCP client."""
     async with Client(create_server(cpp_acceptance_project)) as client:
 
         async def call(name, **arguments):
+            """Call a workspace tool and require a successful protocol result."""
             result = await client.call_tool("workspace_" + name, arguments)
             assert not result.is_error, result.content
             return result.structured_content
@@ -192,6 +206,7 @@ async def test_full_file_workflow_through_client(cpp_acceptance_project):
 
 @pytest.mark.anyio
 async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_project):
+    """Verify mutations link typed diffs and earlier result resources remain unchanged."""
     async with Client(create_server(cpp_acceptance_project)) as client:
         written = await client.call_tool(
             "workspace_write_file",
@@ -225,6 +240,7 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
 
 @pytest.mark.anyio
 async def test_mirrors_markdown_templates_regex_and_completions(cpp_acceptance_project):
+    """Verify file mirrors, Markdown templates, regex search, and resource completions."""
     workspace = WorkspaceService(cpp_acceptance_project)
     (cpp_acceptance_project / "resource data").mkdir()
     text = "α\r\nfoo(x)/../#&\r\n```\n"
@@ -298,6 +314,9 @@ async def test_default_project_custom_storage_and_resource_updates(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify default project selection, custom storage, and resources reflecting managed
+    mutations.
+    """
     monkeypatch.chdir(cpp_acceptance_project)
     storage = cpp_acceptance_project / "service-data"
     options = argument_parser().parse_args(["--workspace-storage", str(storage)])
@@ -320,6 +339,7 @@ async def test_default_project_custom_storage_and_resource_updates(
 
 @pytest.mark.anyio
 async def test_hidden_directories_and_find_schema(cpp_acceptance_project):
+    """Verify hidden-directory behavior and the public file-finder schema."""
     (cpp_acceptance_project / ".hidden").mkdir()
     (cpp_acceptance_project / ".visible-file").write_text("visible")
     async with Client(create_server(cpp_acceptance_project)) as client:
@@ -358,6 +378,7 @@ async def test_hidden_directories_and_find_schema(cpp_acceptance_project):
 async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
     cpp_acceptance_project,
 ):
+    """Verify unsupported resource roots fail promptly with actionable protocol errors."""
     async with Client(create_server(cpp_acceptance_project)) as client:
         for root in ("wrong", quote("цуацуа")):
             for suffix in (
@@ -389,6 +410,7 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
 
 @pytest.mark.anyio
 async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_project):
+    """Verify scan and read progress and exact Unicode match spans in search results."""
     (cpp_acceptance_project / "unicode.txt").write_text(
         "😀 Straße STRASSE\n",
         encoding="utf-8",
@@ -397,6 +419,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
     progress = []
 
     async def collect(value, total, message):
+        """Record progress values emitted during filesystem scanning and reading."""
         progress.append((value, total, message))
 
     async with Client(create_server(cpp_acceptance_project, progress_interval=0)) as client:
@@ -430,6 +453,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
 
 
 def test_progress_interval_cli(cpp_acceptance_project):
+    """Verify the CLI parses the configured progress interval."""
     assert argument_parser().parse_args([]).progress_interval == 1.0
     options = argument_parser().parse_args(["--progress-interval", "2.5"])
     assert options.progress_interval == 2.5
@@ -442,7 +466,9 @@ def test_invalid_progress_interval_is_rejected_before_service_creation(
     monkeypatch,
     interval,
 ):
+    """Verify invalid progress intervals fail before any service is constructed."""
     def unexpected_service(*args, **kwargs):
+        """Fail if validation incorrectly reaches service construction."""
         pytest.fail("Configuration must be validated before constructing services")
 
     monkeypatch.setattr("forgemcp.server.WorkspaceService", unexpected_service)
@@ -451,11 +477,13 @@ def test_invalid_progress_interval_is_rejected_before_service_creation(
 
 @pytest.mark.anyio
 async def test_completions_follow_qualified_path_and_storage_context(cpp_acceptance_project):
+    """Verify completions follow the selected managed root and surrounding resource arguments."""
     storage = cpp_acceptance_project / "service-data"
     (storage / "index").mkdir(parents=True)
     (storage / "index/data.xyz").write_text("data")
     async with Client(create_server(cpp_acceptance_project, storage_root=storage)) as client:
         async def complete(template, value, name="path", context=None):
+            """Request resource argument completions through the in-process client."""
             response = await client.complete(
                 ResourceTemplateReference(uri=template),
                 {"name": name, "value": value},

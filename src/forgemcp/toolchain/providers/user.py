@@ -21,10 +21,13 @@ from ..spec import ToolInfo, Toolset
 
 @dataclass(frozen=True)
 class UserToolset:
+    """An explicit operator toolset name and immutable executable path mapping."""
+
     name: str
     paths: Mapping[str, Path]
 
     def __post_init__(self) -> None:
+        """Copy executable paths into a read-only mapping."""
         object.__setattr__(self, "paths", MappingProxyType(dict(self.paths)))
 
 
@@ -32,6 +35,7 @@ def parse_toolsets(
     values: Sequence[Sequence[str]],
     specs: tuple[ToolInfo, ...],
 ) -> tuple[UserToolset, ...]:
+    """Validate CLI toolset groups and exact executable paths without discovery fallback."""
     known = {spec.name for spec in specs}
     names: set[str] = set()
     result = []
@@ -79,6 +83,7 @@ def discover(
     specs: tuple[ToolInfo, ...],
     processes: ProcessService,
 ) -> tuple[Toolset, ...]:
+    """Bind validated user executables and derive stable toolset IDs from their names."""
     by_name = {spec.name: spec for spec in specs}
     result = []
     for definition in definitions:

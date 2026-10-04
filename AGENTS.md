@@ -121,6 +121,10 @@ Before designing or changing a module, read:
 
 - Python 3.11+; use type annotations for public APIs.
 - Annotate async generator functions with `AsyncGenerator`, not `AsyncIterator`.
+- Write short docstrings for modules, classes, functions, and methods, including
+  test helpers and nested handlers. Read the implementation first and describe its
+  purpose and relevant behavior in one or two sentences; do not merely repeat the
+  name. Preserve model-facing capability guidance and public MCP descriptions.
 - For multiline Python calls and declarations, put the opening parenthesis at the
   end of the first line, indent the contents by four spaces, and put the closing
   parenthesis on its own line aligned with the start of the statement. Do not put
@@ -144,9 +148,16 @@ Before designing or changing a module, read:
 
 ## Validation
 
+After editing Python code, run pylint on all tracked Python files and compare its
+findings with the previous report. Resolve findings introduced by the changes and
+report remaining findings; do not suppress unrelated rules or broaden the change
+solely to improve the score.
+
 ```powershell
 .\.venv\Scripts\python.exe -m build --wheel
 .\.venv\Scripts\python.exe -m pytest -q
+$trackedPythonFiles = @(git ls-files '*.py')
+.\.venv\Scripts\python.exe -m pylint @trackedPythonFiles
 git diff --check
 ```
 

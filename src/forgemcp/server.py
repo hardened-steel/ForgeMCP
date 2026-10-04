@@ -87,6 +87,7 @@ def create_server(
 
     @asynccontextmanager
     async def lifespan(_: MCPServer) -> AsyncGenerator[dict[str, object]]:
+        """Initialize toolchains and analysis, then close analysis and processes on server exit."""
         try:
             await toolchains.initialize()
             await analysis.initialize()

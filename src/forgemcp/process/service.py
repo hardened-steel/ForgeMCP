@@ -101,6 +101,7 @@ class ProcessRecord:
         )
 
     async def terminate(self, process: Process) -> None:
+        """Request termination, escalate to kill after two seconds, and reap the process."""
         try:
             process.terminate()
             try:
@@ -113,6 +114,7 @@ class ProcessRecord:
             await process.wait()
 
     async def monitor(self, process: Process, stopping: asyncio.Event) -> None:
+        """Track exit, stop requests, and total or idle timeout while updating process status."""
         loop = asyncio.get_running_loop()
 
         summary = self.summary
@@ -191,6 +193,7 @@ class ProcessRecord:
         decoder: ChunkDecoder,
         queue: asyncio.Queue[ProcessOutput | None],
     ) -> None:
+        """Incrementally decode a process stream and record and queue each text chunk."""
         try:
             loop = asyncio.get_running_loop()
             while True:
@@ -229,6 +232,7 @@ class ProcessRecord:
         encoder: ChunkEncoder,
         queue: asyncio.Queue[str | None],
     ) -> None:
+        """Consume queued stdin in order, record written text, and close the pipe on EOF."""
         try:
             loop = asyncio.get_running_loop()
             while True:
@@ -260,7 +264,10 @@ class ProcessRecord:
 
 
 class ChunkDecoder:
+    """An incremental process-output decoder with the configured error policy."""
+
     def __init__(self, encoding: ProcessEncoding):
+        """Resolve the requested codec and initialize its incremental decoder."""
         selected_encoding = (
             locale.getencoding() if encoding.driver == "default" else encoding.driver
         )
@@ -275,14 +282,19 @@ class ChunkDecoder:
         )
 
     def decode(self, array: bytes) -> str:
+        """Decode a byte chunk while retaining incomplete character sequences."""
         return self.decoder.decode(array)
 
     def final(self) -> str:
+        """Flush the decoder at EOF using the configured error policy."""
         return self.decoder.decode(b"", final=True)
 
 
 class ChunkEncoder:
+    """An incremental stdin encoder with the configured error policy."""
+
     def __init__(self, encoding: ProcessEncoding):
+        """Resolve the requested codec and initialize its incremental encoder."""
         selected_encoding = (
             locale.getencoding() if encoding.driver == "default" else encoding.driver
         )
@@ -297,9 +309,11 @@ class ChunkEncoder:
         )
 
     def encode(self, string: str) -> bytes:
+        """Encode a text chunk while retaining any codec state."""
         return self.encoder.encode(string)
 
     def final(self) -> bytes:
+        """Flush remaining encoder bytes before closing stdin."""
         return self.encoder.encode("", final=True)
 
 
@@ -343,6 +357,7 @@ class ProcessService:
         allowed_roots: Sequence[Path] = (),
         progress_interval: float = 1.0,
     ) -> None:
+        """Validate allowed working roots and initialize empty process and session collections."""
         self.progress_interval = progress_interval
         self.id_counter = 0
         self.root = workspace_root.resolve()
@@ -635,6 +650,7 @@ class ProcessService:
             argument: CompletionArgument,
             context: CompletionContext | None,
         ) -> Completion | None:
+            """Complete retained process IDs for the process detail resource template."""
             if (
                 not isinstance(ref, ResourceTemplateReference)
                 or ref.uri != self.RESOURCE_URI
@@ -675,13 +691,16 @@ class ProcessSession:
 
     @property
     def process_id(self) -> int:
+        """Return the stable ForgeMCP identifier assigned to this session."""
         return self.record.summary.process_id
 
     @property
     def returncode(self) -> int | None:
+        """Return the native exit code or None while the process is running."""
         return self.process.returncode
 
     async def __aenter__(self) -> ProcessSession:
+        """Enter the session once, rejecting reused or already stopping sessions."""
         if self.entered or self.stopping.is_set():
             raise ProcessStreamError("A process session can only be entered once.")
         self.entered = True
@@ -693,6 +712,7 @@ class ProcessSession:
         exception: Any,
         traceback: Any,
     ) -> None:
+        """Finish session cleanup and propagate retained worker failure when the body succeeded."""
         await self.close()
         if exception is None and self.failure is not None:
             raise self.failure
@@ -733,8 +753,12 @@ class ProcessSession:
                 await monitor
                 writer.cancel()
         except Exception as error:
-            while isinstance(error, ExceptionGroup) and len(error.exceptions) == 1:
-                error = error.exceptions[0]
+            while True:
+                match error:
+                    case ExceptionGroup(exceptions=[nested]):
+                        error = nested
+                    case _:
+                        break
             self.failure = error
         finally:
             self.stdin_closed = True

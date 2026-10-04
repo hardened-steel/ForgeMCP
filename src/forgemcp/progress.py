@@ -30,6 +30,9 @@ def progress(
         total: float | None = None,
         message: str | None = None,
     ) -> None:
+        """Report progress immediately or drop updates inside this invocation's throttle
+        interval.
+        """
         nonlocal last_sent
         now = monotonic()
         if last_sent is not None and now - last_sent < interval:

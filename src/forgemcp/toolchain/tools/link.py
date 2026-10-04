@@ -10,7 +10,7 @@ from ..spec import ToolInfo, ToolKind, ToolSpec
 
 
 class Methods(TypedDict):
-    pass
+    """The typed operations supported by the bound link executable."""
 
 
 def create_spec(
@@ -19,6 +19,7 @@ def create_spec(
     environment: Mapping[str, str] | None = None,
     inherit_environment: bool = True,
 ) -> ToolSpec:
+    """Bind the resolved link executable to process execution and environment settings."""
     path = path.resolve()
     methods: Methods = {}
     return ToolSpec(INFO.name, INFO.kind, path, methods)

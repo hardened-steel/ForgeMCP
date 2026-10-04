@@ -39,6 +39,8 @@ from .models import Diagnostic, Location, Position, RelatedDiagnostic, SourceRan
 
 @dataclass
 class Document:
+    """Retained text, version, and latest versioned diagnostics for one document."""
+
     path: WorkspacePath
     text: str
     version: int = 0
@@ -47,30 +49,35 @@ class Document:
 
 
 def object_value(value: JsonValue) -> dict[str, JsonValue]:
+    """Require an LSP JSON object or raise a protocol error."""
     if not isinstance(value, dict):
         raise ClangdProtocolError("Expected an LSP object.")
     return value
 
 
 def list_value(value: JsonValue) -> list[JsonValue]:
+    """Require an LSP JSON array or raise a protocol error."""
     if not isinstance(value, list):
         raise ClangdProtocolError("Expected an LSP array.")
     return value
 
 
 def integer(value: JsonValue) -> int:
+    """Require a nonnegative integer, excluding boolean values."""
     if type(value) is not int or value < 0:
         raise ClangdProtocolError("Expected a nonnegative LSP integer.")
     return value
 
 
 def string(value: JsonValue) -> str:
+    """Require an LSP string or raise a protocol error."""
     if not isinstance(value, str):
         raise ClangdProtocolError("Expected LSP text.")
     return value
 
 
 def position(value: JsonValue) -> Position:
+    """Convert an LSP position to a one-based source line."""
     data = object_value(value)
     return Position(
         line=integer(data.get("line")) + 1,
@@ -79,6 +86,7 @@ def position(value: JsonValue) -> Position:
 
 
 def source_range(value: JsonValue) -> SourceRange:
+    """Decode an ordered LSP range and translate validation failures to protocol errors."""
     data = object_value(value)
     try:
         return SourceRange(
@@ -90,10 +98,12 @@ def source_range(value: JsonValue) -> SourceRange:
 
 
 def lsp_position(value: Position) -> dict[str, JsonValue]:
+    """Convert a source position to the zero-based LSP representation."""
     return {"line": value.line - 1, "character": value.character}
 
 
 def validate_timeout(timeout: float) -> None:
+    """Reject nonfinite or nonpositive analysis timeouts."""
     if not isfinite(timeout) or timeout <= 0:
         raise ClangdError("Analysis timeout must be finite and greater than zero.")
 
@@ -107,6 +117,7 @@ class ClangdSession:
         workspace: WorkspaceService,
         configuration: CompilationContext,
     ) -> None:
+        """Bind a connection and compilation context with empty request and document state."""
         self.connection = connection
         self.workspace = workspace
         self.configuration = configuration
@@ -123,16 +134,19 @@ class ClangdSession:
         self.closing = False
 
     async def report(self, callback: Progress | None, message: str) -> None:
+        """Send configuration-prefixed progress when a callback is supplied."""
         if callback is not None:
             await callback(f"{self.configuration.id}: {message}")
 
     def check_alive(self) -> None:
+        """Raise the retained connection failure or reject a closing session."""
         if self.failure is not None:
             raise self.failure
         if self.closing:
             raise ClangdSessionError("clangd session is closing.")
 
     def uri(self, path: WorkspacePath) -> str:
+        """Return the retained document URI or resolve a file path to a native URI."""
         for uri, document in self.documents.items():
             if document.path == path:
                 return uri
@@ -140,6 +154,7 @@ class ClangdSession:
         return native.resolve().as_uri()
 
     def path(self, uri: str) -> WorkspacePath:
+        """Validate a local file URI and convert it to a qualified workspace path."""
         parts = urlsplit(uri)
         if parts.scheme != "file" or parts.query or parts.fragment:
             raise ClangdProtocolError("clangd returned a non-file location.")
@@ -154,6 +169,7 @@ class ClangdSession:
         return self.workspace.workspace_path(native.resolve())
 
     def location(self, value: JsonValue) -> Location:
+        """Decode an LSP location or location link into a source target."""
         data = object_value(value)
         if "targetUri" in data:
             return Location(
@@ -166,6 +182,7 @@ class ClangdSession:
         )
 
     def diagnostic(self, value: JsonValue) -> Diagnostic:
+        """Decode a diagnostic and omit related locations outside managed roots."""
         data = object_value(value)
         levels = {1: "error", 2: "warning", 3: "information", 4: "hint"}
         severity = data.get("severity")
@@ -196,6 +213,7 @@ class ClangdSession:
             raise ClangdProtocolError("Invalid diagnostic from clangd.") from error
 
     async def receive(self) -> None:
+        """Dispatch responses and versioned diagnostics, then fail pending requests on closure."""
         failure: ClangdError = ClangdSessionError("clangd connection closed.")
         try:
             async for message in self.connection.messages():
@@ -253,6 +271,7 @@ class ClangdSession:
             await self.connection.close()
 
     async def answer(self, request: LspRequest) -> None:
+        """Answer supported server requests while refusing edits and unknown methods."""
         if request.method == "workspace/configuration":
             items = list_value(object_value(request.params).get("items"))
             await self.connection.send(LspResponse(request.id, [None for _ in items]))
@@ -281,6 +300,7 @@ class ClangdSession:
         on_progress: Progress | None = None,
         timeout: float = 30.0,
     ) -> None:
+        """Start the message reader and negotiate capabilities with UTF-32 positions."""
         if self.reader is not None:
             raise ClangdSessionError("A clangd session can only be initialized once.")
         self.reader = asyncio.create_task(self.receive())
@@ -374,6 +394,7 @@ class ClangdSession:
         on_progress: Progress | None = None,
         timeout: float = 30.0,
     ) -> JsonValue:
+        """Send a tracked request with progress, timeout cancellation, and pending-state cleanup."""
         validate_timeout(timeout)
         self.check_alive()
         if self.reader is None:
@@ -409,6 +430,7 @@ class ClangdSession:
                 future.exception()
 
     async def notify(self, method: str, params: JsonValue) -> None:
+        """Send an LSP notification and translate process communication failures."""
         self.check_alive()
         try:
             await self.connection.send(LspNotification(method, params))
@@ -422,6 +444,7 @@ class ClangdSession:
         *,
         on_progress: Progress | None = None,
     ) -> int:
+        """Open or update a document and return its retained text version."""
         self.check_alive()
         uri = self.uri(path)
         document = self.documents.get(uri)
@@ -460,6 +483,7 @@ class ClangdSession:
         return document.version
 
     async def forget(self, path: WorkspacePath) -> None:
+        """Close an opened document and wake diagnostic waiters."""
         uri = self.uri(path)
         if uri in self.documents:
             await self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
@@ -475,6 +499,7 @@ class ClangdSession:
         on_progress: Progress | None = None,
         timeout: float = 30.0,
     ) -> list[Diagnostic]:
+        """Wait for matching-version diagnostics and reject stale or timed-out requests."""
         validate_timeout(timeout)
         uri = self.uri(path)
         try:
@@ -501,6 +526,7 @@ class ClangdSession:
         return result
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
+        """Attempt graceful LSP shutdown before cancelling the message reader."""
         if self.closing:
             return
         try:

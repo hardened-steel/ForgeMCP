@@ -21,6 +21,7 @@ class ClangdRequestError(ClangdError):
     """The language server rejected an operation."""
 
     def __init__(self, method: str, code: int, message: str) -> None:
+        """Retain the server error code and describe the failed LSP method."""
         super().__init__(f"{method} failed ({code}): {message}")
         self.code = code
 

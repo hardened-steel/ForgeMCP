@@ -1,3 +1,5 @@
+"""Version banner parsing across fragmented streams and unsupported version probes."""
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,6 +34,7 @@ from forgemcp.toolchain.loader import load_tools
 )
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 async def test_versions_survive_chunk_boundaries(name, output, version, stream):
+    """Verify each version parser handles split stdout and stderr banners and closes its session."""
     info = next(info for info in load_tools() if info.name == name)
     session = Session([ProcessOutput(stream, char) for char in output])
     processes = SimpleNamespace(launch=AsyncMock(return_value=session))
@@ -43,31 +46,40 @@ async def test_versions_survive_chunk_boundaries(name, output, version, stream):
 
 
 class Session:
+    """A scripted session recording output consumption, wait, and context cleanup."""
+
     def __init__(self, chunks):
+        """Retain output chunks and reset the observable lifecycle flags."""
         self.chunks = chunks
         self.consumed = self.waited = self.closed_stdin = self.exited = False
 
     async def __aenter__(self):
+        """Return the scripted session for a version query."""
         return self
 
     async def __aexit__(self, *args):
+        """Record exit from the owned process context."""
         self.exited = True
 
     async def close_stdin(self):
+        """Record that the version query closed process stdin."""
         self.closed_stdin = True
 
     async def output(self):
+        """Yield scripted chunks and mark the stream fully consumed."""
         for chunk in self.chunks:
             yield chunk
         self.consumed = True
 
     async def wait(self):
+        """Record the wait and return a successful exit code."""
         self.waited = True
         return 0
 
 
 @pytest.mark.anyio
 async def test_unrecognized_version_raises():
+    """Verify unrecognized output raises a parser error after waiting and cleanup."""
     session = Session([ProcessOutput("stdout", "an unfamiliar banner")])
     processes = SimpleNamespace(launch=AsyncMock(return_value=session))
     info = next(info for info in load_tools() if info.name == "cmake")
@@ -80,6 +92,7 @@ async def test_unrecognized_version_raises():
 
 @pytest.mark.parametrize("name", ["cl", "link", "cppvsdbg", "lldb-dap"])
 def test_tools_without_version_have_empty_methods(name):
+    """Verify tools lacking a portable version probe expose no bound operations."""
     info = next(info for info in load_tools() if info.name == name)
     processes = SimpleNamespace(launch=AsyncMock())
     assert info.create_spec(Path("tool"), processes, None, True).methods == {}

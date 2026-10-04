@@ -24,6 +24,8 @@ type LspId = int | str
 
 @dataclass(frozen=True)
 class LspRequest:
+    """A JSON-RPC request with an identifier, method, and optional parameters."""
+
     id: LspId
     method: str
     params: JsonValue = None
@@ -31,18 +33,24 @@ class LspRequest:
 
 @dataclass(frozen=True)
 class LspNotification:
+    """A JSON-RPC notification without a response identifier."""
+
     method: str
     params: JsonValue = None
 
 
 @dataclass(frozen=True)
 class LspResponse:
+    """A successful JSON-RPC response with its request identifier."""
+
     id: LspId
     result: JsonValue
 
 
 @dataclass(frozen=True)
 class LspErrorResponse:
+    """A JSON-RPC failure with its identifier, code, message, and optional data."""
+
     id: LspId | None
     code: int
     message: str
@@ -91,6 +99,7 @@ def parse_message(value: object) -> LspMessage:
 
 
 def reject_constant(value: str) -> None:
+    """Reject nonfinite numeric constants while decoding JSON messages."""
     raise ValueError("Non-finite JSON number.")
 
 
@@ -98,12 +107,14 @@ class Connection:
     """A single-reader framed connection; process ownership stays in this module."""
 
     def __init__(self, session: ProcessSession) -> None:
+        """Bind the process session and initialize single-reader and serialized-write state."""
         self._session = session
         self.write_lock = asyncio.Lock()
         self.claimed = False
 
     @property
     def process_id(self) -> int:
+        """Return the process identifier for this framed connection."""
         return self._session.process_id
 
     async def close(self) -> None:
@@ -111,6 +122,7 @@ class Connection:
         await self._session.close()
 
     async def send(self, message: LspMessage) -> None:
+        """Validate and serialize a message with a UTF-8 byte-counted LSP header."""
         value = {"jsonrpc": "2.0", **asdict(message)}
         if isinstance(message, LspErrorResponse):
             value = {
@@ -144,6 +156,7 @@ class Connection:
             ) from error
 
     async def messages(self) -> AsyncGenerator[LspMessage]:
+        """Yield validated JSON-RPC messages from fragmented stdout frames with one reader."""
         if self.claimed:
             raise ToolCommandError("clangd messages already have a reader.")
         self.claimed = True
@@ -197,14 +210,20 @@ class Connection:
 
 
 class Connect(Protocol):
+    """The callable contract for opening an owned clangd connection."""
+
     def __call__(
         self,
         project: Path,
         compilation_database_directory: Path,
-    ) -> AbstractAsyncContextManager[Connection]: ...
+    ) -> AbstractAsyncContextManager[Connection]:
+        """Open a connection for the project and compilation database directory."""
+        ...
 
 
 class Methods(TypedDict):
+    """The typed operations supported by the bound clangd executable."""
+
     version: Callable[[], Awaitable[str]]
     connect: Connect
 
@@ -215,9 +234,11 @@ def create_spec(
     environment: Mapping[str, str] | None = None,
     inherit_environment: bool = True,
 ) -> ToolSpec:
+    """Bind the resolved clangd executable to process execution and environment settings."""
     path = path.resolve()
 
     async def version() -> str:
+        """Run a bounded version probe, drain both output streams, and parse the clangd banner."""
         output = {"stdout": "", "stderr": ""}
         try:
             async with await processes.launch(
@@ -251,6 +272,9 @@ def create_spec(
         project: Path,
         compilation_database_directory: Path,
     ) -> AsyncGenerator[Connection]:
+        """Launch clangd against an existing compilation database and own its connection
+        lifetime.
+        """
         if not (compilation_database_directory / "compile_commands.json").is_file():
             raise ToolCommandError("clangd requires an existing compilation database.")
         try:

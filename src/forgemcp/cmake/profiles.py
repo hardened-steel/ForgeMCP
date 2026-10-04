@@ -10,6 +10,8 @@ from .errors import CMakeError
 
 
 class ProfileDefinition(BaseModel):
+    """Operator settings for a manual CMake profile or independently selected native presets."""
+
     name: str
     toolset: str = "system"
     configure_presets: list[str] | None = None
@@ -25,6 +27,7 @@ class ProfileDefinition(BaseModel):
 
     @property
     def uses_presets(self) -> bool:
+        """Report whether any preset selection was explicitly supplied."""
         return any(
             presets is not None
             for presets in (self.configure_presets, self.build_presets, self.test_presets)

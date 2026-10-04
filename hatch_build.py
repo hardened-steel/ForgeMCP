@@ -14,6 +14,7 @@ class CustomBuildHook(BuildHookInterface):
     """Produce frontend assets as part of the wheel build."""
 
     def initialize(self, version: str, build_data: dict[str, object]) -> None:
+        """Build missing frontend assets and include them in the wheel artifacts."""
         frontend = Path(self.root) / "frontend"
         outputs = [
             *(

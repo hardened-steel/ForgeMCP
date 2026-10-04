@@ -13,6 +13,8 @@ ProcessStream = Literal["stdin", "stdout", "stderr"]
 
 @dataclass(frozen=True)
 class ProcessTimeout:
+    """Optional total and idle limits in seconds for one process."""
+
     total: float | None = Field(
         description="All allowed time (configured in seconds) for process.",
         default=None,
@@ -138,6 +140,7 @@ class LineRange(BaseModel):
 
     @model_validator(mode="after")
     def validate_range(self) -> LineRange:
+        """Reject inclusive line ranges whose end precedes the start."""
         if self.end < self.start:
             raise ValueError("Line range requires start <= end.")
         return self
@@ -166,6 +169,7 @@ class TimeRange(BaseModel):
 
     @model_validator(mode="after")
     def validate_range(self) -> TimeRange:
+        """Require a nonempty half-open interval in elapsed process seconds."""
         if self.end <= self.start:
             raise ValueError("Time range requires start < end.")
         return self

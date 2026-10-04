@@ -14,6 +14,8 @@ from ..spec import ToolInfo, ToolKind, ToolSpec
 
 
 class Methods(TypedDict):
+    """The typed operations supported by the bound lld executable."""
+
     version: Callable[[], Awaitable[str]]
 
 
@@ -23,9 +25,11 @@ def create_spec(
     environment: Mapping[str, str] | None = None,
     inherit_environment: bool = True,
 ) -> ToolSpec:
+    """Bind the resolved lld executable to process execution and environment settings."""
     path = path.resolve()
 
     async def version() -> str:
+        """Run a bounded version probe, drain both output streams, and parse the lld banner."""
         output = {"stdout": "", "stderr": ""}
         try:
             async with await processes.launch(

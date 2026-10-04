@@ -13,11 +13,13 @@ from forgemcp.toolchain.tools.clangd import Connection, LspNotification, LspResp
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 @pytest.mark.anyio
 async def test_fragmented_utf8_frames_and_serialization_use_byte_lengths():
+    """Verify fragmented UTF-8 LSP frames and outgoing Content-Length count bytes correctly."""
     values = [
         {"jsonrpc": "2.0", "id": 7, "result": "日本語 😀"},
         {"jsonrpc": "2.0", "method": "note", "params": {"text": "α"}},
@@ -28,6 +30,7 @@ async def test_fragmented_utf8_frames_and_serialization_use_byte_lengths():
         wire += f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
 
     async def output() -> AsyncGenerator[SimpleNamespace]:
+        """Yield scripted fragmented stdout and unrelated stderr chunks."""
         yield SimpleNamespace(stream="stderr", text="ordinary log")
         for offset in range(0, len(wire), 3):
             yield SimpleNamespace(stream="stdout", text=wire[offset:offset + 3].decode("latin_1"))
@@ -56,7 +59,9 @@ async def test_fragmented_utf8_frames_and_serialization_use_byte_lengths():
     ],
 )
 async def test_invalid_or_incomplete_frames_raise_parser_error(wire):
+    """Verify invalid headers, envelopes, and incomplete frames raise tool parser errors."""
     async def output() -> AsyncGenerator[SimpleNamespace]:
+        """Yield the parametrized invalid byte frame through lossless Latin-1 transport."""
         yield SimpleNamespace(stream="stdout", text=wire.decode("latin_1"))
 
     process = SimpleNamespace(process_id=1, output=output, wait=AsyncMock(return_value=0))

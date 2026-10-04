@@ -36,10 +36,12 @@ class Widget:
 
     @property
     def uri(self) -> str:
+        """Return the stable UI resource URI derived from the packaged filename."""
         return f"ui://forgemcp/{PurePosixPath(self.path).name}"
 
     @property
     def content(self) -> str:
+        """Read the packaged widget as UTF-8 HTML."""
         return package_file(self.path).read_text(encoding="utf-8")
 
 
@@ -52,6 +54,7 @@ class IconFile:
 
     @property
     def icon(self) -> Icon:
+        """Encode the packaged icon as portable MCP metadata with its MIME type and sizes."""
         resource = package_file(self.path)
         mime_type = mimetypes.guess_type(self.path)[0] or "application/octet-stream"
         encoded = base64.b64encode(resource.read_bytes()).decode("ascii")

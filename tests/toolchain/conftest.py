@@ -1,8 +1,11 @@
+"""Async backend and scripted real-process fixtures for toolchain tests."""
+
 import pytest
 
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
@@ -14,15 +17,23 @@ async def scripted_processes(cpp_acceptance_project):
     from forgemcp.process.service import ProcessService
 
     class ScriptedProcesses(ProcessService):
+        """A process service that replaces requested tools with deterministic Python scripts."""
+
         code = "print('cmake version 4.1.2')"
         timeout = None
 
         def __init__(self, root):
+            """Initialize isolated process execution with recorded calls and a default output
+            script.
+            """
             super().__init__(root)
             self.calls = []
             self.started = asyncio.Event()
 
         async def launch(self, executable, arguments=(), **kwargs):
+            """Record the requested executable and arguments, then launch the selected test
+            script.
+            """
             self.calls.append((executable, arguments, kwargs.copy()))
             if self.timeout is not None:
                 kwargs["timeout"] = self.timeout

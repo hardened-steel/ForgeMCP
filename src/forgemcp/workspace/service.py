@@ -47,10 +47,13 @@ from .path import WorkspacePath
 
 
 class ReadConfirmation(BaseModel):
+    """The operator's decision to allow reading an external file."""
+
     allow: bool = Field(description="Allow reading this external file.")
 
 
 async def confirm_read(path: WorkspacePath) -> ReadConfirmation | Elicit[ReadConfirmation]:
+    """Allow managed reads directly and request SDK elicitation for external reads."""
     if path.area != "root":
         return ReadConfirmation(allow=True)
     return Elicit(f"Allow reading external file {path.absolute}?", ReadConfirmation)
@@ -60,34 +63,46 @@ WorkspaceRoot = Literal["project", "storage"]
 
 
 class TreeEntry(BaseModel):
+    """A qualified filesystem entry with its kind and optional expanded children."""
+
     path: WorkspacePath
     kind: Literal["file", "directory", "symlink", "other"]
     children: list[TreeEntry] | None = None
 
 
 class DirectoryTree(ResultResources):
+    """A requested directory and its tree entries with linked provider resources."""
+
     path: WorkspacePath
     entries: list[TreeEntry]
 
 
 class FoundFile(BaseModel):
+    """One matching file with its path, modification time, and size."""
+
     path: WorkspacePath
     modified_at: datetime
     size_bytes: int
 
 
 class FilePaths(ResultResources):
+    """Matched qualified paths and file metadata with linked provider resources."""
+
     paths: list[WorkspacePath]
     files: list[FoundFile] = Field(default_factory=list)
 
 
 class FileContent(ResultResources):
+    """A UTF-8 file excerpt with its qualified path and first source line."""
+
     path: WorkspacePath
     text: str
     start_line: int
 
 
 class FileInfo(ResultResources):
+    """File timestamps, size, and optional owner with linked provider resources."""
+
     path: WorkspacePath
     created_at: datetime | None
     modified_at: datetime
@@ -96,6 +111,8 @@ class FileInfo(ResultResources):
 
 
 class SearchMatch(BaseModel):
+    """One matching source line with zero-based Unicode match spans."""
+
     path: WorkspacePath
     line: int
     text: str
@@ -105,11 +122,15 @@ class SearchMatch(BaseModel):
 
 
 class SearchResult(ResultResources):
+    """Matching source lines and skipped files with linked provider resources."""
+
     matches: list[SearchMatch]
     skipped_files: list[WorkspacePath]
 
 
 class FileWriteResult(ResultResources):
+    """A created or overwritten file with removed and added line counts."""
+
     path: WorkspacePath
     action: Literal["created", "overwritten"]
     lines_removed: int
@@ -117,11 +138,15 @@ class FileWriteResult(ResultResources):
 
 
 class FileEditResult(ResultResources):
+    """An edited file and the number of exact replacements performed."""
+
     path: WorkspacePath
     replacements: int
 
 
 class PathOperationResult(ResultResources):
+    """A path mutation outcome with an optional original move source."""
+
     path: WorkspacePath
     action: Literal["moved", "deleted", "created", "already_exists"]
     source: WorkspacePath | None = None
@@ -140,6 +165,7 @@ class ResultProvider(Generic[ContextT]):
         depth: int | None,
         include_hidden: bool,
     ) -> ContextT | None:
+        """Opt out of workspace_list enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_list(
@@ -148,6 +174,7 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: DirectoryTree,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_list call."""
         return None
 
     async def before_workspace_find_files(
@@ -156,6 +183,7 @@ class ResultProvider(Generic[ContextT]):
         pattern: str,
         path: WorkspacePath,
     ) -> ContextT | None:
+        """Opt out of workspace_find_files enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_find_files(
@@ -164,6 +192,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: FilePaths,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_find_files
+        call.
+        """
         return None
 
     async def before_workspace_file_info(
@@ -171,6 +202,7 @@ class ResultProvider(Generic[ContextT]):
         call_id: str,
         path: WorkspacePath,
     ) -> ContextT | None:
+        """Opt out of workspace_file_info enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_file_info(
@@ -179,6 +211,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: FileInfo,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_file_info
+        call.
+        """
         return None
 
     async def before_workspace_read_file(
@@ -189,6 +224,7 @@ class ResultProvider(Generic[ContextT]):
         start_line: int,
         end_line: int | None,
     ) -> ContextT | None:
+        """Opt out of workspace_read_file enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_read_file(
@@ -197,6 +233,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: FileContent,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_read_file
+        call.
+        """
         return None
 
     async def before_workspace_search(
@@ -208,6 +247,7 @@ class ResultProvider(Generic[ContextT]):
         extensions: list[str] | None,
         case_sensitive: bool,
     ) -> ContextT | None:
+        """Opt out of workspace_search enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_search(
@@ -216,6 +256,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: SearchResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_search
+        call.
+        """
         return None
 
     async def before_workspace_write_file(
@@ -224,6 +267,7 @@ class ResultProvider(Generic[ContextT]):
         path: WorkspacePath,
         text: str,
     ) -> ContextT | None:
+        """Opt out of workspace_write_file enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_write_file(
@@ -232,6 +276,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: FileWriteResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_write_file
+        call.
+        """
         return None
 
     async def before_workspace_edit_file(
@@ -242,6 +289,7 @@ class ResultProvider(Generic[ContextT]):
         new_text: str,
         replace_all: bool,
     ) -> ContextT | None:
+        """Opt out of workspace_edit_file enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_edit_file(
@@ -250,6 +298,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: FileEditResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_edit_file
+        call.
+        """
         return None
 
     async def before_workspace_move(
@@ -258,6 +309,7 @@ class ResultProvider(Generic[ContextT]):
         source: WorkspacePath,
         destination: WorkspacePath,
     ) -> ContextT | None:
+        """Opt out of workspace_move enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_move(
@@ -266,6 +318,7 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_move call."""
         return None
 
     async def before_workspace_delete(
@@ -273,6 +326,7 @@ class ResultProvider(Generic[ContextT]):
         call_id: str,
         path: WorkspacePath,
     ) -> ContextT | None:
+        """Opt out of workspace_delete enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_delete(
@@ -281,6 +335,9 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_delete
+        call.
+        """
         return None
 
     async def before_workspace_mkdir(
@@ -288,6 +345,7 @@ class ResultProvider(Generic[ContextT]):
         call_id: str,
         path: WorkspacePath,
     ) -> ContextT | None:
+        """Opt out of workspace_mkdir enrichment unless a provider overrides this hook."""
         return None
 
     async def after_workspace_mkdir(
@@ -296,10 +354,13 @@ class ResultProvider(Generic[ContextT]):
         context: ContextT,
         result: PathOperationResult,
     ) -> str | None:
+        """Return no linked resource unless a provider handles the completed workspace_mkdir
+        call.
+        """
         return None
 
     async def error(self, call_id: str, context: ContextT) -> None:
-        pass
+        """Provide a no-op cleanup hook for a failed participating workspace call."""
 
 
 @contextmanager
@@ -398,6 +459,7 @@ class WorkspaceService:
         *,
         progress_interval: float = 1.0,
     ) -> None:
+        """Validate project and storage roots and initialize provider, resource, and lock state."""
         self.progress_interval = progress_interval
         with filesystem_errors("project"):
             self.root = workspace_root.resolve()
@@ -514,6 +576,7 @@ class WorkspaceService:
 
         async def run(name: str, provider: ResultProvider) -> tuple[object]:
             # Keep arbitrary context values distinct from gather's exceptions.
+            """Invoke a provider with copied arguments and retain its participating context."""
             method = getattr(provider, f"before_{tool_name}")
             context = await method(
                 call_id,
@@ -553,6 +616,7 @@ class WorkspaceService:
         finished: set[str] = set()
 
         async def run(name: str) -> str | None:
+            """Run a participating provider with a copied result and mark its hook finished."""
             try:
                 provider = self.result_providers[name][0]
                 method = getattr(provider, f"after_{call.tool_name}")
@@ -620,6 +684,7 @@ class WorkspaceService:
         """Tell providers with a context that the Workspace tool failed."""
 
         async def run(name: str) -> None:
+            """Ask a participating provider to clean up after a failed call."""
             provider = self.result_providers[name][0]
             await provider.error(call.id, call.contexts[name])
 
@@ -635,6 +700,7 @@ class WorkspaceService:
             self.result_resources.pop(call.id, None)
 
     def root_path(self, root: WorkspaceRoot) -> Path:
+        """Resolve a managed area name to its configured native root."""
         if root == "project":
             return self.root
         if root == "storage":
@@ -664,6 +730,7 @@ class WorkspaceService:
         return candidate
 
     def relative_path(self, path: Path, *, root: WorkspaceRoot = "project") -> str:
+        """Return a validated POSIX path relative to the selected managed root."""
         try:
             relative = path.relative_to(self.root_path(root)).as_posix()
         except ValueError as error:
@@ -672,9 +739,11 @@ class WorkspaceService:
         return relative
 
     def is_link(self, path: Path) -> bool:
+        """Recognize both symbolic links and Windows directory junctions."""
         return path.is_symlink() or path.is_junction()
 
     def check_path_links(self, path: Path, root: WorkspaceRoot) -> None:
+        """Reject any link encountered between a candidate path and its managed root."""
         base = self.root_path(root)
         current = path
         while True:
@@ -687,6 +756,7 @@ class WorkspaceService:
             current = current.parent
 
     def check_tree_links(self, path: Path) -> None:
+        """Reject a tree containing links before moving or removing it."""
         for directory, dirs, files in os.walk(
             path,
             followlinks=False,
@@ -698,6 +768,7 @@ class WorkspaceService:
                 )
 
     def protect_path(self, path: WorkspacePath) -> None:
+        """Protect both the declared path and its resolved target from mutations."""
         candidate = self.resolve_workspace_path(path)
         self.protected_paths.update((candidate, candidate.resolve()))
 
@@ -708,6 +779,7 @@ class WorkspaceService:
         root: WorkspaceRoot,
         subtree: bool = False,
     ) -> Path:
+        """Validate a mutation target against roots, links, reserved names, and protected paths."""
         candidate = self.resolve_path(path, root=root)
         self.check_path_links(candidate, root)
         if candidate in (self.root, self.storage_root):
@@ -722,6 +794,7 @@ class WorkspaceService:
         return candidate
 
     def resolve_workspace_path(self, path: WorkspacePath) -> Path:
+        """Resolve a qualified managed path through the selected root's access checks."""
         return self.resolve_path(path.relative, root=path.area)
 
     def qualified_path(self, root: str, path: str) -> WorkspacePath:
@@ -745,15 +818,18 @@ class WorkspaceService:
         return WorkspacePath("root/" + candidate.as_posix())
 
     def require_file(self, path: str, root: WorkspaceRoot) -> Path:
+        """Require an existing regular file within the selected managed root."""
         candidate = self.resolve_path(path, root=root)
         if not candidate.is_file():
             raise WorkspaceError(f"{path}: expected an existing regular file.")
         return candidate
 
     def raise_walk_error(self, error: OSError) -> None:
+        """Propagate filesystem traversal errors instead of silently skipping unreadable entries."""
         raise error
 
     async def iter_files(self, path: str, root: WorkspaceRoot) -> AsyncGenerator[Path]:
+        """Yield eligible files cooperatively, excluding hidden directories and link traversal."""
         start = self.resolve_path(path, root=root)
         self.check_path_links(start, root)
         relative = start.relative_to(self.root_path(root))
@@ -784,11 +860,13 @@ class WorkspaceService:
                     await asyncio.sleep(0)
 
     def extension_matches(self, path: Path, extensions: Sequence[str] | None) -> bool:
+        """Match a file suffix against optional case-insensitive extensions."""
         return extensions is None or path.suffix.removeprefix(".").lower() in {
             extension.removeprefix(".").lower() for extension in extensions
         }
 
     def file_uri(self, path: WorkspacePath) -> str:
+        """Build a quoted managed text-mirror URI and reject external paths."""
         if path.area == "root":
             raise WorkspaceError("External files have no workspace mirror resources.")
         return f"forgemcp://workspace/file/{quote(str(path), safe='/')}"
@@ -803,6 +881,7 @@ class WorkspaceService:
             lines = [str(result.path)]
 
             def visit(entries: list[TreeEntry], prefix: str = "") -> None:
+                """Append indented tree rows while preserving directory and link markers."""
                 for index, entry in enumerate(entries):
                     last = index == len(entries) - 1
                     suffix = (
@@ -871,8 +950,10 @@ class WorkspaceService:
         def serialized[**P, R](
             handler: Callable[P, Awaitable[R]],
         ) -> Callable[P, Awaitable[R]]:
+            """Wrap a workspace handler in the service's reentrant operation lock."""
             @wraps(handler)
             async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+                """Execute the original handler while holding the serialized operation context."""
                 async with self.serialized_operation():
                     return await handler(*args, **kwargs)
 
@@ -931,6 +1012,9 @@ class WorkspaceService:
                     parent: Path,
                     remaining: int | None,
                 ) -> list[TreeEntry]:
+                    """Traverse eligible children to the requested depth and report visited
+                    entries.
+                    """
                     nonlocal visited
                     result: list[TreeEntry] = []
                     for child in sorted(parent.iterdir(), key=lambda item: item.name):
@@ -1525,6 +1609,7 @@ class WorkspaceService:
                 raise ResourceNotFoundError(str(error)) from error
 
         def resource_path(value: str) -> WorkspacePath:
+            """Decode a managed resource path and translate invalid roots to resource errors."""
             try:
                 # Directory completions end in '/', while WorkspacePath is canonical.
                 area, separator, relative = value.partition("/")
@@ -1667,6 +1752,7 @@ class WorkspaceService:
             argument: CompletionArgument,
             context: CompletionContext | None,
         ) -> Completion | None:
+            """Complete managed paths, filter options, and immutable result resource identifiers."""
             if isinstance(ref, ResourceTemplateReference) and ref.uri in (
                 self.RESULT_JSON_URI,
                 self.RESULT_MARKDOWN_URI,
