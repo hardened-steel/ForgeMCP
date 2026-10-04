@@ -52,12 +52,33 @@ the shared process service internally; its public MCP surface is read-only.
 ## Requirements
 
 - Python 3.13 or newer
-- Node.js `^20.19.0` or `>=22.12.0` for clean editable installs, wheel builds,
-  and widget development
+- Node.js `^20.19.0` or `>=22.12.0` for source builds, clean editable installs,
+  and widget development; it is not required to install or run the release wheel
 
 The server is built against MCP Python SDK `2.1.1`.
 
-## Setup
+## Install a release
+
+Download the `.whl` file from [GitHub Releases](https://github.com/hardened-steel/ForgeMCP/releases)
+and install it in a virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .\forgemcp-0.2.0-py3-none-any.whl
+.\.venv\Scripts\forgemcp.exe --help
+```
+
+The wheel includes the compiled HTML widgets and icons. No npm commands or separate
+frontend deployment are needed. CMake, Ninja, compilers, and clangd are external
+tools: install the ones needed by your workflows separately.
+
+After the package is published to PyPI, the install command can instead be:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install forgemcp==0.2.0
+```
+
+## Setup from source
 
 ```powershell
 python -m venv .venv
@@ -73,7 +94,9 @@ creates the Python wheel with its HTML and icon assets:
 .\.venv\Scripts\python.exe -m build --wheel
 ```
 
-The wheel is written to `dist/`. Generated HTML under `src/forgemcp/assets/` is build
+The wheel is written to `dist/`. To build both the source distribution and a wheel
+from that source distribution, use `python -m build` in the development environment.
+Generated HTML under `src/forgemcp/assets/` is build
 output; change its source under `frontend/`, never the HTML directly.
 
 ## Run
@@ -98,7 +121,7 @@ All MCP traffic uses stdout. Operational logs must go to stderr.
 
 ## Connect Codex or Claude Code
 
-After [setup](#setup), copy the appropriate example into the root of the C/C++
+After [installation](#install-a-release) or [source setup](#setup-from-source), copy the appropriate example into the root of the C/C++
 project you want ForgeMCP to work on:
 
 | Client | Example | Destination |
@@ -358,6 +381,8 @@ git diff --check
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and the
 registration lifecycle. Repository rules for coding agents live in [AGENTS.md](AGENTS.md).
+See [docs/releasing.md](docs/releasing.md) for distribution checks, GitHub Releases,
+and the separate final PyPI publishing step.
 
 ## Reading process logs
 

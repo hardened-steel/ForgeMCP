@@ -1,0 +1,63 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published GitHub release tag (for example v0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  download:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Download the published release without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = false
+          gh release download "$RELEASE_TAG" --dir dist \
+            --pattern '*.whl' --pattern '*.tar.gz' --pattern SHA256SUMS
+          python scripts/verify_release.py dist --tag "$RELEASE_TAG"
+          cd dist
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pypi-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: pypi
+      url: https://pypi.org/p/forgemcp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: pypi-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
