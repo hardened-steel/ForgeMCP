@@ -1,18 +1,18 @@
 {
-  "name": "forgemcp-frontend",
+  "name": "forgemcp-widgets",
   "private": true,
-  "version": "1.0.0",
-  "description": "Shared offline frontend toolchain for ForgeMCP MCP Apps.",
+  "type": "module",
   "scripts": {
-    "write:asset": "node git-status/build.mjs --write && node project-status/build.mjs && node core-workspace-apps/build.mjs --write && node cmake-apps/build.mjs --write && node quality-apps/build.mjs --write && node git-inspection-apps/build.mjs --write && node clangd-apps/build.mjs --write && node debugger-apps/build.mjs --write",
-    "build": "node git-status/build.mjs --check && node project-status/build.mjs --check && node core-workspace-apps/build.mjs --check && node cmake-apps/build.mjs --check && node quality-apps/build.mjs --check && node git-inspection-apps/build.mjs --check && node clangd-apps/build.mjs --check && node debugger-apps/build.mjs --check",
-    "test": "npm run build && node --test project-status/test.mjs core-workspace-apps/test.mjs quality-apps/test.mjs clangd-apps/test.mjs debugger-apps/test.mjs && node cmake-apps/test.mjs && node git-inspection-apps/test.mjs"
+    "build": "vite build --mode workspace && vite build --mode file && vite build --mode search && vite build --mode result && vite build --mode process && vite build --mode process-details && vite build --mode toolsets && vite build --mode cmake-profiles && vite build --mode cmake-configure && vite build --mode cmake-build && vite build --mode cmake-test && vite build --mode clangd",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "^1.7.5"
+    "@modelcontextprotocol/ext-apps": "^1.7.5",
+    "markdown-it": "^15.0.2"
   },
   "devDependencies": {
-    "@modelcontextprotocol/inspector": "2.4.0",
-    "esbuild": "^0.28.2"
+    "jsdom": "^26.1.0",
+    "vite": "^8.2.2",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }

@@ -1,83 +1,29 @@
-"""Expected safe errors owned by the clangd feature module."""
-
-from __future__ import annotations
-
-from forgemcp.core.errors import ForgeMCPError
+"""Expected language analysis failures, without protocol or transcript dumps."""
 
 
-class ClangdError(ForgeMCPError):
-    """Base class for safe clangd feature failures."""
-
-    code = "clangd_error"
+class ClangdError(Exception):
+    """Base error for an unavailable or unsuccessful analysis."""
 
 
-class ClangdRequestError(ClangdError):
-    """A request does not meet the public clangd tool contract."""
-
-    code = "clangd_request_error"
-
-
-class ClangdUnavailableError(ClangdError):
-    """clangd is absent or denied by the configured Process Runtime."""
-
-    code = "clangd_unavailable"
-
-
-class ClangdNotStartedError(ClangdError):
-    """A navigation operation requires a running managed clangd session."""
-
-    code = "clangd_not_started"
-
-
-class ClangdFailedError(ClangdError):
-    """The managed clangd session crashed or its protocol failed."""
-
-    code = "clangd_failed"
-
-
-class ClangdProtocolError(ClangdError):
-    """clangd returned a malformed or unsupported protocol result."""
-
-    code = "clangd_protocol_error"
+class ClangdSessionError(ClangdError):
+    """A language-server session could not be established or was lost."""
 
 
 class ClangdTimeoutError(ClangdError):
-    """A bounded clangd request did not finish in time."""
-
-    code = "clangd_timeout"
+    """A request or version-specific diagnostic exceeded its deadline."""
 
 
-class ClangdEditConflictError(ClangdError):
-    """A WorkspaceEdit no longer matches the snapshots it was computed from."""
-
-    code = "clangd_edit_conflict"
+class ClangdProtocolError(ClangdError):
+    """The language server returned an unsupported or malformed result."""
 
 
-class ClangdUnsupportedWorkspaceEditError(ClangdError):
-    """A server edit contains an unsafe resource operation or external target."""
+class ClangdRequestError(ClangdError):
+    """The language server rejected an operation."""
 
-    code = "clangd_workspace_edit_unsupported"
-
-
-class ClangdUnsupportedActionError(ClangdError):
-    """A code action would require a command or unsupported execution path."""
-
-    code = "clangd_code_action_unsupported"
+    def __init__(self, method: str, code: int, message: str) -> None:
+        super().__init__(f"{method} failed ({code}): {message}")
+        self.code = code
 
 
-class ClangdHandleExpiredError(ClangdError):
-    """An opaque action or hierarchy handle is stale, expired, or from another session."""
-
-    code = "clangd_handle_expired"
-
-
-class ClangdRequestCancelledError(ClangdError):
-    """clangd cancelled the request before producing a stable result."""
-
-    code = "clangd_request_cancelled"
-
-
-class ClangdContentModifiedError(ClangdError):
-    """clangd rejected a request because its document state changed."""
-
-    code = "clangd_content_modified"
+class ClangdStaleResultError(ClangdError):
+    """Workspace content changed while an analysis snapshot was being produced."""

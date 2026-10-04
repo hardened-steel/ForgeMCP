@@ -1,612 +1,855 @@
 # ForgeMCP architecture
 
-## Core
-
-`forgemcp.core` is the composition root for the MCP server. It owns explicit configuration, workspace-root validation, the small service registry, application lifecycle, expected domain errors, and structured stderr logging.
-
-### Configuration and toolchain discovery (Phase A)
-
-`ForgeConfig` is immutable and is composed only in Core from CLI, then
-`FORGEMCP_*` environment, then defaults. It stores safe provenance categories
-but no public raw environment values. `forgemcp` remains a stdio server with no
-subcommand; stdlib-argparse `doctor` and `print-config` are local sanitized
-commands. `ToolchainDiscoveryService` is another application-scoped Core
-service. It supplies exact approved executables to CMake, clangd, Quality and
-Debugger; feature modules do not independently inspect environment/PATH.
-
-It caches discovery at startup, so `project__status` observes cached state only.
-On Windows it uses trusted standard-location `vswhere.exe`, deterministic VS
-instance/component/architecture selection, and a fixed-script filtered
-Developer environment capture. Only exact selected CMake/CTest commands receive
-that bounded build environment; clangd, Quality, and debugger retain their
-stricter executable/environment policies. Its public diagnostics contain availability,
-source category and rejection category, never host paths or raw environment.
-See [ADR 0012](adr/0012-configuration-cli-and-windows-toolchain-discovery.md).
-
-Phase D1 derives immutable path-free `CMakeKit` records from that same cached
-service; it does not introduce a second compiler scanner. Public kits contain
-only opaque identity, safe compiler/VS metadata, architectures, environment
-profile category, qualified generator/capability state, and fixed reasons.
-Exact compiler paths and filtered environments are private `ToolchainProfile`
-capabilities consumed only by CMake argv/process composition. Application-local
-kit selection is owned by the CMake service, is CAS-generation guarded, and is
-cleared at application shutdown. `project__status` reads only its cache.
-
-The Core does **not** implement project-file reads or edits, configure or build CMake projects, run processes, communicate with clangd, or debug binaries. It composes the Workspace service but leaves Workspace filesystem policy and business logic in `forgemcp.workspace`. Other modules must receive dependencies through `ServiceRegistry` rather than constructing global state.
-
-`server.py` is a deliberately thin adapter: FastMCP's async lifespan creates and starts `ForgeApplication`, exposes it as the lifespan context for Core's `server_status` diagnostic operation, adapts already-registered tool/resource/template/prompt/completion contributions to the MCP SDK, bridges one optional connection log sink, and always awaits `application.aclose()` in `finally`. This covers normal transport shutdown and failures without creating a nested event loop. SDK request/session types do not cross this adapter.
-
-## Domain models
-
-`forgemcp.models` is an independent, transport-neutral contract package for Workspace, process-runtime, and future shared service models. It depends only on Pydantic and the Python standard library; in particular, it does not import Core, MCP, CMake, LSP, DAP, or process-library types. CMake- and clangd-specific result and metadata models deliberately live in their feature packages, rather than making the shared package depend on one feature.
-
-The public API is exported from `forgemcp.models`:
-
-- `Position`, `Range`, and `Location` describe source coordinates. Lines and columns are zero-based Unicode code points; ranges are half-open and cannot run backwards. A location's URI is opaque to this package, so each adapter owns its path-to-URI mapping and any protocol-specific encoding conversion.
-- `Severity` and `Diagnostic` describe bounded, user-facing findings without adopting any producer's wire format.
-- `TaskState` and terminal-only `TaskResult` describe the outcome of background work.
-- `ProcessOutput` and `ProcessResult` keep stdout and stderr separate. Each captured stream is capped at 65,536 Unicode code points and signals loss with `truncated`. Output is opaque text, so leading and trailing whitespace (including line terminators) is preserved.
-- `FileSnapshot`, `FileChangeKind`, `FileChange`, and `PatchResult` report file state and atomic patch effects using metadata only. These models deliberately have no source-content or patch-text field, so they may be used as structured log context. Process output is not log-safe; call `ProcessOutput.log_summary()` when logging it.
-
-Every model is immutable, rejects unknown fields, and has Pydantic field descriptions for JSON-schema consumers. All timestamps are timezone-aware `datetime` values normalized to UTC. Naive timestamps are invalid; `model_dump(mode="json")` and `model_dump_json()` render the UTC values as ISO-8601 strings. Models are value objects, not services, and must not inspect the workspace or execute processes.
-
-## Feature plugins
-
-`forgemcp.plugins` is the public, transport-neutral extension contract for optional CMake, clangd, debugger, and future integrations. `ForgeApplication.create()` always composes a `PluginManager` as `application.services["plugins"]`; it registers ForgeMCP's `CMakePlugin` explicitly during composition and accepts `builtin_plugins=` for additional owned feature plugins. CMake's state belongs to that plugin instance and therefore to one application instance.
-
-Workspace and Process Runtime are foundational Core services. Workspace's MCP adapter is the builtin `WorkspacePlugin`; filesystem policy and mutation logic remain in `forgemcp.workspace`. The explicitly composed builtin plugins are Workspace, CMake, clangd, debugger, Project, and Quality. clangd and Quality start only lightweight services at application startup, never a tool process, so a missing executable does not prevent ForgeApplication from running.
-
-A plugin subclasses `ForgePlugin` and supplies immutable `PluginMetadata`:
-
-- `plugin_id` is a unique lower-case stable identifier and its namespace for all contributed tools.
-- `api_version` must equal the stable `PLUGIN_API_VERSION` (`"1"`).
-- `requires` names other feature plugins; `requires_services` names Core services; and `provides` declares globally unique capabilities.
-- `async start(context)` receives a `PluginContext` with the immutable configuration, structured logger, a declaration-scoped service facade, and a plugin-scoped tool facade. It never receives `ForgeApplication` or the raw `ServiceRegistry`.
-- `async stop()` releases resources. `PluginManager` invokes it in reverse startup order.
-
-Before starting any plugin, `PluginManager` validates API versions, plugin IDs, capabilities, Core-service requirements, and the entire dependency graph. It starts a deterministic lexical topological order, rolls back successfully started plugins if a later startup fails, and makes `aclose()` idempotent. `PluginStatus` exposes each plugin's ID, source, capabilities, state, and safe exception class name for diagnostics. Application shutdown closes plugins before the Process Runtime, so adapters can release their protocol handles before the runtime terminates any remaining child processes.
-
-Plugins may register a `ToolContribution` through `context.tools`. A contribution is a mapping-based Python handler plus a description and may name an optional Pydantic input model; it has no MCP, FastMCP, LSP, CMake, or DAP implementation type. `ToolRegistry` normally qualifies its local name as `<plugin_id>__<tool_name>` and rejects duplicates. A contribution may use another validated stable namespace only when its plugin metadata declares it; Quality uses `quality`, `clang_format`, `clang_tidy`, and `sanitizer` under one lifecycle. A legacy handler remains `handler(arguments)`. A handler opts into context only with the exact keyword-only `execution_context: ToolExecutionContext`; positional/default `context` parameters remain legacy input and are never rebound. Contexts are constructed by `server.py` for one invocation, never stored by services, reused, serialized, or placed in schemas, and contain no SDK request/session/transport objects. `ProgressUpdate` is immutable, bounded and path/control-text-safe; its private request state keeps phase, heartbeat, exact parser and terminal numbers monotonic. `NoOpProgressReporter` keeps in-process and token-less clients behaviourally identical. After application startup, `server.py` wraps each contribution in a FastMCP handler and projects the optional input model, including Pydantic required fields and bounds, into a flat MCP JSON schema. Thus external and builtin plugins cannot receive a FastMCP instance or register arbitrary transport objects.
-
-Phase C extends the same API version 1 context with application-owned
-`ResourceContribution`, `ResourceTemplateContribution`, `PromptContribution`,
-and `CompletionContribution` facades. Existing mapping-only
-`ToolContribution` plugins are unchanged. Static URI, URI-template, prompt name,
-and completion reference/argument keys are unique; each registry has a fixed
-capacity and returns lexical snapshots. A plugin startup failure unregisters
-all of that plugin's contribution kinds before reverse dependency rollback.
-Normal shutdown unregisters them in reverse lifecycle order and closes the
-application registry. There is no global mutable registry.
-
-MCP Apps adds a parallel transport-neutral App registry with
-`AppResourceContribution` and `ToolAppBinding`. Static App resources have
-unique `ui://` URIs, immutable bounded HTML, explicit CSP/permission/domain/
-border metadata, and plugin ownership; one binding links an existing public
-tool name to one registered App resource and declares `model`/`app` visibility.
-The historical Core `server_status` is the only non-namespaced binding; all
-others remain qualified. Resource and binding caps are separate (32 and 128),
-so the 18 shared resources can cover the complete 72-tool surface. The registry
-validates every reference after startup, removes contributions on failed-start
-rollback and reverse shutdown, and has no connection state. See ADR 0019.
-
-The discovery registry admits at most 128 static resources, 128 templates, 128
-prompts, and 256 completion providers. Resource reads share an eight-slot gate,
-have a two-second cooperative deadline, and produce at most 256 KiB UTF-8.
-Prompt messages and arguments have independent count/character/byte limits.
-Completion has a 750 ms cooperative deadline, validates at most 16 context
-arguments, performs prefix filtering and deterministic deduplication, and emits
-at most the protocol maximum of 100 values with `total`/`hasMore`. A trusted
-in-process plugin can still block the event loop or bypass Python architectural
-boundaries; the external allow-list trust decision in ADR 0005 is unchanged.
-
-The built-in CMake plugin owns the stable contributions `cmake__status`,
-`cmake__list_kits`, `cmake__select_kit`, `cmake__list_build_trees`,
-`cmake__list_presets`, `cmake__configure`, `cmake__list_targets`,
-`cmake__build`, `cmake__ctest_list_tests`, and `cmake__ctest_run`. Its local
-CMake service receives only the declared `workspace` and `process_runtime`
-services, never an application object or a transport object. Existing build
-tree inspection is bounded to conventional patterns and validates every cache
-path through Workspace before adopting metadata.
-
-External plugins use Python entry points in the `forgemcp.plugins` group. Discovery is disabled by default and is enabled only by both `ForgeConfig.external_plugins_enabled=True` (or `FORGEMCP_EXTERNAL_PLUGINS_ENABLED=true`) and a non-empty explicit `ForgeConfig.external_plugin_allowlist` (or comma-separated `FORGEMCP_EXTERNAL_PLUGIN_ALLOWLIST`). The allow-list contains entry-point names, which must exactly equal the loaded plugin's `plugin_id`. ForgeMCP does not enumerate entry-point metadata while discovery is disabled and calls `EntryPoint.load()` only for listed names; all other advertised packages remain unimported.
-
-## Extension points
-
-Feature integrations use `PluginContext` rather than `application.services`. The always-present Core service names they can explicitly require are:
-
-- `config` — `ForgeConfig`
-- `logger` — `StructuredLogger`
-- `workspace` — `WorkspaceService`, the safe filesystem capability for the configured workspace
-- `process_runtime` — `ProcessRuntime`, the safe asynchronous external-tool capability for the configured workspace
-- `toolchain_discovery` — cached `ToolchainDiscoveryService` exact tool choices and its private filtered build environment; plugins may use executable selections but must not serialize host paths/environment
-- `plugins` — `PluginManager`, when a future plugin has a valid reason to depend on manager-owned status or registry data
-- `project_status_registry` — `ProjectStatusRegistry`, optionally declared by a
-  feature plugin that can expose a bounded cached `ComponentStatus`
-- `project_status_service` — `ProjectStatusService`, consumed only by the
-  builtin ProjectPlugin that contributes `project__status`
-
-## Project Intelligence Phase 1
-
-`forgemcp.project` is transport-neutral and application-scoped. One
-`ForgeApplication` remains the one-workspace session boundary; there is no
-`ProjectSession`. `ProjectStatusRegistry` owns uniquely identified providers and
-collects them concurrently in deterministic order with bounded per-provider and
-aggregate deadlines. Overlapping requests share exactly one in-flight snapshot;
-one client's cancellation does not cancel it, and a call after completion starts
-a fresh snapshot. Timeout and shutdown cancel providers and attempt a 50 ms
-bounded join. A provider that suppresses cancellation remains tracked until
-completion and its eventual exception is consumed. Cooperative async providers
-therefore cannot extend the response indefinitely; CPU-blocking or malicious
-in-process code cannot be safely pre-empted by asyncio. A provider failure
-produces a safe partial result and cannot fail the complete `project__status`
-response.
-
-The builtin provider IDs are `core`, `workspace`, `process_runtime`,
-`plugin_manager`, `cmake`, `clangd`, `debugger`, and `quality`. Feature plugins
-register adapters through the declaration-scoped `project_status_registry`
-service and unregister on stop; the aggregator has no imports of concrete
-feature services. This uses the existing PluginContext/service mechanism and
-does not change plugin API version 1. External plugins may optionally declare
-and use the registry; not providing status does not affect plugin startup.
-
-Every provider copies only cached state. Status performs no filesystem/source
-read, process/version probe, build/test/configure, format/tidy, clangd/debugger
-start or request, lifecycle mutation, polling, or refresh. Strict immutable
-models allow bounded scalar facts only and omit argv/environment, output,
-diagnostic messages, source/patch content, PIDs, debugger data, executable and
-external-plugin paths, and raw exceptions. Build and compilation-database paths
-are workspace-relative; only the configured root is absolute.
-
-External providers are trusted in-process extensions, not sandboxed code, but
-their result is still revalidated at the MCP boundary. The registry accepts only
-`ComponentStatus`, revalidates its serialized fields, requires the registered
-and returned IDs to match, rejects observations over five seconds in the future
-or over 24 hours old, and forces age-based staleness after five minutes.
-Construction bypasses, unknown fields, invalid enums/scalars, duplicate facts or
-capabilities, naive timestamps, and oversize fields become fixed failed-provider
-categories without exception text.
-
-Health and activity are independent. A failed, missing, or invalid foundational
-component makes health failed; optional provider loss/timeouts, failed optional
-sessions/plugins, and observed unavailable explicitly configured capabilities
-make it degraded. Optional
-unconfigured tools and unsuccessful project operations do not mean ForgeMCP is
-unhealthy. A paused debugger wins activity, active CMake/Quality/debugger work
-or clangd startup is busy, and all other cases are idle. Component timestamps
-make the bounded result explicitly partial/non-transactional. Capacity is 64
-providers/components, 128 aggregate capabilities, 32 facts and 32 warnings per
-component, and 32 aggregate warnings. The complete response is capped at
-100,000 UTF-8 bytes; overflow omits components in reverse lexical order and
-reports `response_truncated` and sorted `omitted_components`. See
-[ADR 0011](adr/0011-project-status-provider-and-health-model.md).
-
-clangd status counts at most 64 cached document records (each already bounded
-to 1,000 diagnostics) while holding its document-state lock. If more documents
-are open, the exact open-document count remains available but diagnostic counts
-are marked `diagnostic_counts_truncated` and the component is stale; status does
-not scan an unbounded cache or acquire the WorkspaceEdit mutation lock.
-
-## Workspace module
-
-`forgemcp.workspace` is a transport-neutral filesystem service for exactly `ForgeConfig.workspace_root`; it has no MCP dependency. `WorkspacePlugin` contributes `workspace__list_files`, `workspace__read_text`, `workspace__get_snapshot`, `workspace__apply_unified_patch`, and `workspace__apply_text_edits` through the normal ToolContribution contract. It returns relative paths and content-free snapshot metadata; mutation texts never enter logs/errors. Delete and rename are deliberately absent from this public tool surface.
-
-Its public `WorkspaceService` API is:
-
-- `list_files(path=".", recursive=False) -> tuple[FileSnapshot, ...]`
-- `read_text(path) -> tuple[str, FileSnapshot]`
-- `get_snapshot(path) -> FileSnapshot`
-- `apply_unified_patch(patch, expected_snapshots) -> PatchResult`
-- `require_directory(path=".") -> str`
-- `open_generated_directory(path, create=False) -> GeneratedWorkspaceDirectory`
-- `validate_reported_path(path, relative_to=".") -> str`
-
-All supplied paths are workspace-relative strings. Absolute, drive-relative,
-UNC/device, alternate-data-stream, reserved-device, trailing-dot/space, and
-parent-traversal spellings are rejected. A requested path containing a symlink,
-junction, or other reparse point is rejected; directory listing omits them and
-is capped at 1,000 regular files. The default immutable `WorkspacePolicy`
-excludes `.git`, `.venv`, `build`, `build-*`, and `cmake-build-*` directories,
-and provides bounded UTF-8 reads and patch input. Callers can compose
-`WorkspaceService` with another policy when their generated-directory
-conventions differ.
-
-After a successful staged commit and staging cleanup, Workspace emits exactly
-one deterministically path-ordered, application-local mutation batch. It
-contains only an application-local monotonic generation, operation ID,
-relative path, change kind, and prior/current snapshot metadata. Publication
-and every subscriber run after the Workspace filesystem lock is released. Each
-subscriber has one bounded worker/queue; failure, timeout, cancellation
-suppression, or saturation is sticky degraded integration state and cannot undo
-the filesystem commit. The bounded history lets configure detect a relevant
-batch that arrived after its generation capture; a history gap is conservatively
-stale. The bus is owned by one ForgeApplication and is not an external
-filesystem watcher.
-
-Every patch target must carry a compare-and-swap expectation: preferably the
-`FileSnapshot` returned by `get_snapshot`, or its SHA-256 for an existing file;
-`None` represents an expected absent file for creation. A snapshot conflict or
-hunk mismatch returns `PatchResult(applied=False)` before source files are
-changed. Patches are text-only unified diffs, staged beside their targets and
-committed with rollback backups; patch input and file content never enter
-Workspace log context, errors, status, progress, or mutation events. A
-validated no-op returns success without replacement or a mutation batch. The
-public listing and edit collections are bounded (1,000 files/edits), as are
-patch/replacement input and aggregate staged UTF-8 output before the first
-write.
-
-`GeneratedWorkspaceDirectory` is an intentionally narrow capability for a caller-declared generated directory: it can write and read bounded UTF-8 files, list direct non-symlink files, and snapshot generated files without exposing a `Path`. It applies the same workspace and symlink checks even when the directory matches the ordinary Workspace ignore policy. CMake uses it for `.cmake/api/v1/query/codemodel-v2` and File API replies; it does not directly manipulate build-tree paths.
-
-Workspace I/O itself is isolated in the separately composed Workspace module.
-The builtin Workspace adapter exposes only bounded list/read/snapshot,
-unified-patch creation/modification, and existing-file text edits; its strict
-input and success/error result schemas forbid unknown fields. The debugger uses only
-`validate_execution_path`, a separate validation-only capability for
-workspace-contained generated execution paths; it grants neither file reads
-nor writes.
-
-## LSP transport and clangd feature
-
-`forgemcp.lsp` is a transport-neutral JSON-RPC 2.0/LSP stream adapter. It has no MCP SDK, Core, Workspace, or Process Runtime imports. `LspClient` owns Content-Length framing, one reader task, a monotonically increasing request-ID table, out-of-order response delivery, bounded inbound messages, request timeout/cancellation with `$/cancelRequest`, and safe failure propagation on malformed messages or EOF. It answers only minimal server-to-client requests (`workspace/configuration`, progress creation, capability registration, and a denied `workspace/applyEdit`); it is not a general LSP proxy.
-
-`forgemcp.clangd` is an application-scoped builtin feature plugin with capability `clangd`. Its `ClangdService` receives only the declared `workspace`, `process_runtime`, and cached `toolchain_discovery` services through `PluginContext`; it does not receive FastMCP, ForgeApplication, or a raw registry. Every clangd child is launched through Process Runtime. `FORGEMCP_CLANGD` may set an absolute executable path; otherwise the central discovery service chooses one exact policy-approved candidate. No MCP argument can supply executable flags, `--query-driver`, or a path outside the workspace.
-
-`clangd__start` may receive an explicit workspace-contained, non-symlink compilation-database directory, otherwise it uses the latest CMake-validated profile. `off` permits fallback command inference. It launches only fixed clangd arguments and performs `initialize` followed by `initialized`. A validated database fingerprint change triggers one bounded controlled restart/reinitialize and reopens only previously tracked documents; a restart failure degrades clangd but does not revise the CMake configure result. clangd is an untrusted, fallible protocol peer: all incoming messages are size-bounded, parsed into normalized models at the adapter boundary, and neither raw payloads, compiler arguments, source/replacement text, nor stderr are logged. On close, it sends `didClose` for every opened document, then `shutdown` and `exit`, closes the LSP streams, and waits before asking ProcessHandle to terminate the tree. Closing is idempotent. An unexpected process exit or failed protocol stream places the service in `failed`; there is no automatic restart loop. clangd stderr is continuously drained with a fixed discard limit.
-
-Document text is read only through WorkspaceService. On first use ForgeMCP sends
-`didOpen`; for each committed changed snapshot it sends at most one full
-`didChange` with a strictly increasing version. Workspace mutations (including
-clangd's own WorkspaceEdit) invalidate cached actions/hierarchy/diagnostics,
-resynchronize only already tracked documents, and keep untracked paths
-dirty/lazy. A notification failure leaves the older synchronized snapshot in
-place, marks synchronization pending/degraded, and is retried from the next
-safe document request; it never claims the stale snapshot was synchronized.
-Only snapshot, URI, version, and normalized diagnostics are retained, never a
-permanent source-text cache. `publishDiagnostics` is associated with the active
-snapshot/version. `clangd__diagnostics` reports completeness, timeout, and
-staleness; an empty current publication is a successful empty result.
-
-The public coordinate policy is Unicode code-point columns. LSP's negotiated `utf-8`, `utf-16`, or `utf-32` character offset is converted only at the LSP adapter boundary, rejecting positions that split an encoded character. Input document paths are workspace-relative and checked by WorkspaceService. Incoming file URIs are percent-decoded and revalidated through WorkspaceService; results outside the workspace are omitted and reported only through an omitted-result count. See [ADR 0007](adr/0007-managed-lsp-lifecycle-document-synchronization-and-uri-policy.md).
-
-Phase 2 extends the same `LspClient` and `ClangdService`, rather than adding a second LSP transport. It exposes normalized completion and signature help; declaration/type-definition/implementation navigation; prepare/rename; code-action summaries and controlled application; document/range formatting; call/type hierarchy; and source/header switching. Completion snippets are proposals only and are never written automatically. Raw LSP payloads are not exposed.
-
-All mutating clangd tools share one WorkspaceEdit engine. It accepts only LSP `changes` and `TextDocumentEdit` entries from `documentChanges`; CreateFile, RenameFile, DeleteFile, external URIs, stale LSP document versions, malformed ranges, and overlapping edits reject the whole operation. Null and empty edit lists are no-ops. A request is capped at 100 files, 1,000 text edits, and 1 MiB of UTF-8 replacement text. The engine converts negotiated LSP positions back to public code points, reads every target through WorkspaceService, captures expected snapshots, then invokes `WorkspaceService.apply_text_edits`. Mutations are serialized only through commit: delayed responses must still match the original anchor snapshot, so concurrent mutations of one snapshot yield at most one commit and the rest conflict. Read-only requests remain concurrent. A stop marks the session closing before acquiring the commit boundary, so a request that completes after shutdown starts cannot write files. After a successful commit, open affected documents receive full `didChange` synchronization, cached handles are invalidated, and older diagnostics become stale.
-
-The multi-file guarantee is deliberately narrower than crash-atomic filesystem transactions. Detected validation and snapshot conflicts are all-or-nothing: no target is changed. The service stages replacement files, then attempts rollback if an I/O failure occurs during `os.replace`; rollback is best effort and may itself fail, notably for locked files on Windows. A crash, power loss, or an external writer racing between the final snapshot check and replacement can still leave a partial or externally modified result. The API reports a commit error rather than claiming absolute atomicity.
-
-Code actions and hierarchy items are represented by opaque random handles, not client-supplied LSP objects. Handles are application-session-bound, backed by a 100-entry-per-kind cache with 64 KiB maximum payload per entry, expire after two minutes on a monotonic clock, and are cleared on stop, crash, or any document change. After expiry removal, capacity uses FIFO eviction; an evicted, cross-kind, arbitrary, or prior-session ID is a safe handle-expired error. `clangd__apply_code_action` resolves an action only to obtain a pure WorkspaceEdit and revalidates its document snapshot after resolve; command-only actions and `workspace/executeCommand` are unsupported. LSP RequestCancelled and ContentModified map to distinct safe domain errors. Semantic tokens, inlay hints, code lenses, arbitrary execute-command, and all DAP capabilities remain unsupported. See [ADR 0008](adr/0008-atomic-workspace-edits-and-opaque-clangd-handles.md).
-
-## Process Runtime module
-
-`forgemcp.processes` owns safe asyncio execution for CMake, CTest, and later clangd and DAP modules. It is transport-neutral and registers no MCP tools; `server.py` remains a thin stdio adapter. `ForgeApplication.create()` composes it under `application.services["process_runtime"]`.
-
-Short-command `run` optionally accepts a trusted local `ProcessOutputObserver`. It receives independently incrementally decoded 4,096-character-bounded stdout/stderr chunks through one 32-event bounded queue and worker; stream ordering is not promised. Pipe drain and `ProcessResult` capture remain independent of observer speed. Overflow drops observations and marks safe `ProcessResult.observer_overflow`; observer exceptions, a slow observer, or cancellation suppression are isolated and mark `observer_failed` without delaying the process result. A local observer may provide an optional bounded `aclose()` flush for an EOF-terminated partial line. Raw chunks are never logged, retained after dispatch, or forwarded automatically to MCP. This is solely a local parser hook for fixed progress derivation; protocol `start` streams and stdin ownership remain unchanged.
-
-Its public API has normal and trusted-adapter paths:
-
-- `await ProcessRuntime.run(argv, cwd=".", environment=None, inherit_environment=None, timeout_seconds=None, input_data=None) -> ProcessResult` runs a short command, optionally feeds at most 1 MiB of opaque stdin bytes, closes stdin, captures bounded UTF-8 stdout and stderr independently, and returns a completed result. Stdin bytes are never logged. A timeout returns `timed_out=True` and `exit_code=None`; caller cancellation is re-raised after process cleanup.
-- `await ProcessRuntime.start(argv, ...) -> ProcessHandle` starts a long-lived protocol process. `ProcessHandle.stdin`, `.stdout`, and `.stderr` expose asyncio streams directly for clangd or a DAP adapter. `await handle.wait()`, `await handle.terminate()`, `await handle.kill()`, and `await handle.aclose()` provide explicit lifecycle control. A handle never accumulates a `ProcessResult`.
-- `await ProcessRuntime.run_toolchain(argv, cwd=".", timeout_seconds=None) -> ProcessResult` is internal build integration: it admits only exact discovery-pinned CMake/CTest executables and has no caller environment parameter. When a filtered VS environment exists, only this path receives it.
-- `await ProcessRuntime.start_trusted_adapter(argv, approved_path_directories=...) -> ProcessHandle` and its bounded `run_trusted_adapter` counterpart require an exact approved absolute executable, a scrubbed environment, and OS tree containment before returning. `ProcessHandle.required_ownership`, `.ownership_established`, and `.environment_mode` expose only those safe lifecycle facts.
-
-Every command is a non-empty NUL-free argv sequence and is launched only with `asyncio.create_subprocess_exec(..., shell=False)`. There is deliberately no `run_shell` API. The runtime resolves a bare executable against the environment captured at composition time, then invokes its resolved path; a per-launch `PATH` override cannot redirect the executable. An exact `ProcessPolicy.allowed_executable_paths` approval requires an existing regular executable, rejects symlink/reparse traversal, records canonical-path and file metadata, compares Windows paths case-insensitively, and detects a replaced file at launch. The immutable policy also controls executable names, workspace-relative CWD allow-list, default and maximum short-command timeouts, output limit (up to the domain-model maximum), termination grace period, and environment inheritance/override keys. Environment inheritance is enabled by default; overrides are denied unless the policy names their keys. CWD is required to exist beneath the configured workspace and cannot be absolute, traverse `..`, or cross a symlink.
-
-Process output and complete argv/environment values are never logged. Completion logs contain only exit/timeout state and each stream's character count plus truncation bit. The runtime retains all live `ProcessHandle` instances; callers should await `ProcessRuntime.aclose()` during asynchronous host shutdown. `ForgeApplication.aclose()` provides the corresponding application-level hook. The MCP stdio adapter already awaits it in FastMCP's lifespan. `ForgeApplication.stop()` can bridge to the asynchronous lifecycle only when no event loop is active; async hosts must await `ForgeApplication.aclose()`.
-
-On POSIX each child starts a new session and process group. Graceful cleanup signals the group with `SIGTERM`, then escalates after the policy grace period to `SIGKILL`. On Windows each child gets `CREATE_NEW_PROCESS_GROUP`; the runtime creates a private standard-library `ctypes` Job Object with `KILL_ON_JOB_CLOSE` and no breakaway flags before launching, then verifies assignment. Closing that job removes non-detached descendants even when the direct child has already exited. Normal callers retain a `taskkill /PID <pid> /T /F` fallback after observed Job-assignment failure. A trusted adapter does not: if the Job cannot be created or assigned, its direct process is immediately reaped, no handle is returned, and `ProcessOwnershipError` reports that required ownership was unavailable. Its scrubbed environment inherits no ForgeMCP variables; Windows receives only present `SystemRoot`, `WINDIR`, `ComSpec`, `TEMP`, `TMP`, and `PATHEXT`, plus a `PATH` built from the approved executable/companion directories. ForgeMCP removes all `FORGEMCP_*` variables from ordinary child inheritance. When VS discovery succeeds, CMake/CTest alone receive the separately filtered Developer environment; clangd, Quality, and debugger do not. argv, environment, and raw process output never enter logs. This contains the owned normal process tree, including adapter descendants on adapter crash; it cannot absolutely cover OS/power crashes or a trusted compromised process deliberately escaping the platform containment primitive.
-
-`LldbDapQualifier` is a transport-neutral, internal Phase-0 helper, not a DAP client or MCP tool. Production backend executable selection comes from the central discovery service; qualifier tests retain fixed `--version`/`--help` probes and a start/close cycle through `run_trusted_adapter`/`start_trusted_adapter`. Its `AdapterQualification` separates runnable-process facts from unverified DAP, object-format, and debug-information capabilities, and retains only safe probe exit statuses and a parsed version. An opt-in test-local `initialize`/`disconnect` gate can check a real installed adapter without introducing a second production DAP transport. Debuggee environment is intentionally not part of this adapter environment; a future DAP launch policy owns it.
-
-## DAP debugger feature
-
-`forgemcp.dap` is a production, transport-neutral DAP client, separate from
-`forgemcp.lsp`. Its `framing`, `protocol`, and `client` modules own bounded
-`Content-Length` parsing (8 KiB headers/1 MiB bodies), sequential outbound
-frames, monotonic client sequences, command-correlated concurrent out-of-order
-response routing, events, timeout/cancellation, and safe EOF/malformed-message
-failure. Pre-normalization event and reverse-request queues are bounded to 16
-and 8 records respectively (with four fixed reverse workers); saturation,
-malformed input, a wrong response command, or an unexpected EOF fails pending
-requests with a bounded error, closes adapter stdin, and tears down workers.
-The
-client never owns a process or imports Core, Workspace, MCP, or LLDB code.
-It denies every reverse request: `runInTerminal` and `startDebugging` have
-explicit policy failures and all other reverse requests are unsupported.
-
-`forgemcp.debugger` owns the one-session state machine, workspace launch
-validation, opaque-handle lifetime, normalized debug models, event buffering,
-and builtin `DebuggerPlugin`. It receives only declared Workspace and Process
-Runtime services; it never receives FastMCP or a raw registry. Every adapter
-starts only through `ProcessRuntime.start_trusted_adapter` after exact
-executable approval, scrubbed environment construction, and required process
-tree ownership. The service continuously drains adapter stderr into a bounded
-discard counter; no raw DAP, stdout, stderr, argv, environment value, source
-contents, variable value, evaluation expression, or evaluation result is
-logged.
-
-The primary Phase 1 backend is a separately installed, policy-approved LLVM
-`lldb-dap` executable over stdio.  The default Windows source-debugging target
-is a compatible PE/COFF build with DWARF; a particular MSVC/PDB combination is
-not promised until it passes its own real-adapter integration gate.  The
-Microsoft `cppvsdbg`/`OpenDebugAD7` adapter is a later optional Windows PDB
-backend that must be discovered from a compatible installed C/C++ extension
-and never redistributed.  GDB DAP and CodeLLDB are deferred; WinDbg has no
-verified standalone DAP adapter in this design.
-
-Phase 1 implements `UNAVAILABLE → STOPPED → STARTING → INITIALIZED →
-CONFIGURING → RUNNING/PAUSED → TERMINATING → TERMINATED`, with `FAILED` as a
-safe terminal failure path. `initialized` is awaited before initial source
-breakpoints and `configurationDone` when the adapter explicitly advertises
-`supportsConfigurationDoneRequest`; the launch response is awaited afterwards,
-which avoids LLDB-DAP's configuration-sequence deadlock. `debugger__stop`
-pre-empts a pending `STARTING`/`CONFIGURING` launch by cancellation, then uses
-the same bounded disconnect/tree-close path; a new launch is accepted only
-after the previous resource cleanup reaches `TERMINATED`. `stopped`,
-`continued`, `exited`, `terminated`, `output`, and breakpoint events enter a
-256-record/512-KiB normalized cursor ring. `debugger__events` returns only
-bounded normalized events, `next_cursor`, eviction count, and truncation.
-`debugger__stop` retains one normalized terminal event for post-stop reading;
-the ring is cleared before the next session and on full application shutdown.
-All handles are cleared on close.
-
-Only workspace-relative existing program, CWD, and source breakpoint paths are
-accepted. `WorkspaceService.validate_execution_path` is a validation-only
-capability that safely includes ignored generated build trees while refusing
-links/reparse traversal; executable replacement after validation is the
-documented residual race. A launch has at most 64 separate NUL-free arguments,
-always uses LLDB `console="internalConsole"`, and currently accepts only an
-empty debuggee environment map because no environment allow-list is configured.
-Source breakpoint sets are full replacements and accept only zero-based
-line/column positions. Adapter-reported external sources are returned only as
-omitted metadata; their contents are never read.
-
-Native DAP IDs never leave the service. Random bounded-TTL opaque handles are
-typed (`thread`, `frame`, `scope`, `variables`, `breakpoint`), bound to the
-application session and, for paused data, stop generation. Continue/step,
-pause/continued events, stop, crash, or session exit invalidate stopped-data
-handles and cancel pending paused reads. Read-only inspection runs only while
-paused and confirms its captured stop generation before returning. Evaluate
-uses `context="hover"` and accepts only one ASCII identifier lookup; member
-access, indexing, dereference, casts, overloaded operators, calls, assignment,
-comments, whitespace/confusables, REPL/watch contexts, and LLDB command escape
-are unavailable. This deliberately small grammar reduces egress and mutation
-surface but does **not** make native evaluate side-effect-free: LLDB may still
-execute debuggee evaluation semantics. Variables/scopes are the primary
-read-only inspection path. Attach, PDB claims, terminal brokering,
-memory/disassembly/mutation, restart, conditional/function/data breakpoints,
-source/symbol download, and arbitrary adapter/LLDB commands remain unsupported.
-
-The builtin tool surface is `debugger__status`, `debugger__list_adapters`,
-`debugger__launch`, `debugger__stop`, `debugger__set_breakpoints`,
-`debugger__continue`, `debugger__pause`, `debugger__step_over`,
-`debugger__step_in`, `debugger__step_out`, `debugger__threads`,
-`debugger__stack_trace`, `debugger__scopes`, `debugger__variables`,
-`debugger__evaluate`, and `debugger__events`. All source coordinates exposed
-by ForgeMCP are zero-based; DAP's one-based coordinates are translated only at
-the LLDB/backend boundary.
-
-## CMake feature module
-
-`forgemcp.cmake` is a transport-neutral builtin feature plugin. `CMakeService` discovers `cmake` and `ctest`, parses versions, and supports CMake 3.23 or later. It lists safe summaries from `CMakePresets.json` and `CMakeUserPresets.json`, intentionally omitting `environment` and `cacheVariables`; CMake itself remains responsible for preset inheritance, conditions, and macro expansion.
-
-Every configure request supplies a workspace-contained `source_dir` and an explicitly selected workspace-contained generated `binary_dir`. Configure writes the File API `codemodel-v2` query via `GeneratedWorkspaceDirectory` and invokes `cmake -S ... -B ...` through Process Runtime. When a preset is selected, CMake receives `--preset`, but ForgeMCP still passes the validated `-B` value so the preset cannot direct execution to an external build tree. No raw shell command or generic extra-argument field is exposed. Optional cache values are restricted to CMake-style identifier keys and NUL-free scalar values.
-
-The immutable compile-commands policy is CLI, then environment, then default
-`auto`; the allowed modes are `auto`, `required`, and `off`. `auto` adds
-`CMAKE_EXPORT_COMPILE_COMMANDS=ON`; qualified Ninja is selected only with no
-explicit generator/preset or cached generator, in an empty generated tree, and
-with a compatible selected toolchain environment. An explicit preset is
-preserved even when its inherited generator is not locally expanded. Existing
-CMake cache generator changes are rejected with an empty-build-directory
-suggestion. Only exact Ninja/Ninja Multi-Config and named Makefile generator
-families are database-capable; Visual Studio is not claimed to produce one.
-After configure ForgeMCP reads the actual cache generator, then validates a
-byte-bounded regular UTF-8 JSON database inside the generated build tree before
-parsing and exposes availability/support/count/fingerprint metadata only.
-Database commands and external paths are trusted project input for native
-tools, not sandboxed input, and are never returned or logged. Configure captures
-the Workspace generation before execution; a relevant later mutation keeps the
-successful result stale. Workspace CMake-file mutations only mark cached
-configuration stale; they do not configure automatically.
-
-Targets come only from CMake File API codemodel v2 replies, never `--target help`. Missing, stale, malformed, unsupported-version, symlinked, or out-of-workspace replies return a CMake domain error. Reported source, artifact, and build paths are revalidated through Workspace before they are exposed as workspace-relative strings. Build preserves a non-zero CMake exit as a `ProcessResult`, with optional multi-config name and bounded `parallel_jobs`. CTest test discovery uses `ctest --show-only=json-v1`; execution supports all tests or a generated escaped exact-name selection and exposes no client-supplied regex or arbitrary CTest arguments. Timeout and output bounds are those of Process Runtime.
-
-Long CMake operations consume only their invocation's execution context. Configure/build/test use fixed phase labels and a two-second bounded heartbeat. Exact values are emitted solely for strict Ninja `[completed/total]` and strict CTest completion formats; a reset, changed total, oversized line, unrecognized/MSBuild/localized output remains heartbeat-only. Local parsers never copy process lines or project-controlled CTest names into progress. Terminal failure/cancellation does not claim completion; exact `total/total` is deferred until success. Before terminal configure success ForgeMCP validates its bounded File API model, compilation database, and post-config workspace generation; unavailable/invalid File API and stale generation become fixed warning semantics for a successful process result. `ProcessResult` additionally exposes derived duration and safe observer-health metadata.
-
-Running configure, build, or tests is not sandboxing: CMake project scripts, custom commands, generators, build tools, and test executables may execute project-controlled code. The configured workspace is therefore a trust boundary, not an untrusted-input boundary. See ADR 0006.
-
-## Git Intelligence Phase 1
-
-`forgemcp.git` is a builtin transport-neutral feature plugin. `GitService`
-owns the fixed read-only Git grammar and immutable Pydantic response models;
-`GitPlugin` contributes six tools, `forgemcp://git/status`, the static
-`ui://forgemcp/git/status` App, the
-`forgemcp_review_changes` prompt, and cached legacy prompt completions. No
-FastMCP type, public `Path`, Git config value, gitdir path, raw argv, or raw
-process output crosses this boundary.
-
-Configuration follows CLI `--git`, then `FORGEMCP_GIT`, then qualified Git for
-Windows/known host discovery. An explicit invalid path is terminal for that
-selection and does not fall back. Discovery approves a canonical absolute,
-regular, non-link/reparse executable outside the workspace; ProcessPolicy
-captures file metadata and rejects later replacement. Git version qualification
-is bounded through ProcessRuntime. All commands use the exact qualified file,
-`shell=False`, a workspace CWD, bounded timeout/output, process-tree cleanup,
-and a scrubbed environment with disabled global/system configuration, prompts,
-and optional locks. Fixed `-c` controls disable fsmonitor, credential helper,
-external diff, and submodule recursion; diff/show additionally use
-`--no-ext-diff` and `--no-textconv`. Network and mutation grammars are absent.
-
-The service first proves `rev-parse --show-toplevel` equals the configured
-workspace. It accepts a normal `.git` directory or a linked-worktree `.git`
-file, but internal metadata outside the workspace remains private. Git-reported
-paths are revalidated through WorkspaceService before publication. No nested
-repository/submodule traversal occurs. Porcelain v2 `-z` and NUL-delimited
-formats are strictly parsed; malformed, non-UTF, contradictory, oversized, or
-truncated protocol data becomes an incomplete/error result. Patch and commit
-metadata are intentional but untrusted tool data and are never logged.
-
-Git status is cached at application scope. A successful Workspace mutation
-batch invalidates that cache; failed/no-op changes publish no batch. Git tools
-explicitly refresh their own bounded data, whereas the Git ProjectStatus
-provider returns cached scalar counts only and never launches Git. Dirty trees
-and conflicts are warnings, not Core failures; explicit unavailable Git or a
-malformed/provider failure is degraded, while an unconfigured unavailable Git
-does not worsen health. There is no filesystem watcher.
-
-## Error and logging policy
-
-Expected operational errors inherit from `ForgeMCPError` and are converted with `to_mcp_error_response`. The response includes only a stable code and an intentional public message.
-
-One `StructuredLogger` belongs to one `ForgeApplication`; it does not use the
-global Python logger registry. It creates one sanitized immutable event and
-fans that value to an independently thresholded JSON stderr sink, a 256-event/
-512-KiB deterministic recent ring, and any active connection-scoped MCP sink.
-Categories and scalar metadata keys are allow-listed and bounded. Source/file
-content, patch/edit text, raw subprocess output, argv/environment, absolute
-paths, compile commands, LSP/DAP payloads, diagnostic text, raw exception
-messages, PIDs/handles, and secret-like values cannot reach a sink.
-
-`FORGEMCP_LOG_LEVEL` controls stderr only. The ring retains all accepted levels
-and is cleared after the final application shutdown event. `logging/setLevel`
-replaces only that session's notification threshold; it never replays the ring.
-The SDK adapter's MCP sink has a 64-event queue, one worker and one active send,
-a 20-per-second rate ceiling, and a 500 ms delivery deadline. Saturation,
-timeout, disconnect, or cancellation suppression disables/drops observational
-delivery without delaying a tool or shutdown. Progress is never copied into
-logs, the recent-log read does not log itself, and ProjectStatus has no logging
-side effect.
-
-## MCP discovery surface
-
-The low-level SDK identity is explicitly `ForgeMCP` plus installed
-`forgemcp` package metadata, rather than the MCP SDK distribution version.
-Initialization contains a static 904-byte instruction string whose first 512
-characters contain the complete trust/workflow summary. Capabilities are
-handler-derived: Tools, Resources, Prompts, Logging, and Completions are present;
-Tasks and empty Experimental are absent. The supported wire protocol remains
-SDK 1.x legacy `2025-11-25` stdio. Apps Phase 1 adds the stable
-`capabilities.extensions.io.modelcontextprotocol/ui={}` wire extension, never
-`experimental`. SDK 1.x has no typed Apps capability surface, so `server.py`
-holds the isolated temporary initialization and current-request capability
-adapter described in ADR 0018. It accepts UI behavior only when a connection
-declares `text/html;profile=mcp-app`; no capability state crosses connections.
-
-The versioned JSON resources are `forgemcp://about`,
-`forgemcp://project/status`, `forgemcp://workspace/files`,
-`forgemcp://cmake/targets`, `forgemcp://git/status`, and `forgemcp://logs/recent`. Git status
-is explicitly cached/no-process; Git log remains a tool-only bounded read. Workspace manifests
-retain at most 1,000 metadata entries and page 50 at a time. Opaque random
-cursors are application-local, stored in a 32-entry TTL cache, bound to the
-Workspace mutation generation, and reveal no offset, path, or generation.
-External filesystem changes are not watched, so a walk is explicitly
-non-transactional. CMake target profiles are opaque 10-minute application-local
-IDs for cached already-validated File API models; reads never configure, create
-a query, or run a process. Target resources expose only bounded name/type and
-validated workspace-relative artifact data.
-
-All 18 App resources are package assets read with `importlib.resources` during
-Core or feature-plugin composition, never from the current directory or
-workspace. Each uses exact MIME `text/html;profile=mcp-app`, empty
-`connectDomains`, `resourceDomains`, `frameDomains`, and `baseUriDomains`, no
-permissions/domain, and a requested border. Shared resources are assigned by
-public result family, not by tool: server/workspace, CMake, Quality, Git,
-clangd, and debugger each retain the mapping recorded in the acceptance
-manifest. Views receive only ordinary tool results, render untrusted fields by
-safe DOM construction with `textContent`, and provide local selection/filtering
-only. Neither views nor frontend sources make host bridge calls.
-
-The six prompts are fixed ForgeMCP-authored workflows. Handlers only render
-messages and never invoke tools. Bounded project identifiers occupy a separate
-JSON-labeled data message and unknown arguments fail. Completion exists only
-for prompt and resource-template references because that is the legacy MCP
-contract; tool JSON arguments retain enums/defaults/descriptions and use list/
-status tools for dynamic discovery. Server instructions and prompt control text
-are trusted ForgeMCP code. Filenames, targets, tests, resource values, and log
-metadata are untrusted model-facing data. Allow-listed external plugin code is
-trusted in-process, but its authored resources/prompts remain a model-facing
-injection boundary operators must review.
-
-SDK 1.x advertises `resources.subscribe=false`; Phase C does not add an ad-hoc
-subscription protocol or resource-change notifications. Workspace/CMake/status
-state is therefore refreshed by ordinary reads. See ADR 0015.
-
-## Quality feature
-
-`forgemcp.quality` is a transport-neutral builtin feature module containing
-`ClangFormatService`, `ClangTidyService`, `SanitizerReportParser`, immutable
-Quality models, and `QualityPlugin`. It receives only Workspace, Process
-Runtime, and cached Toolchain Discovery through `PluginContext`; it neither imports FastMCP nor receives
-ForgeApplication. Its tools are `quality__status`, `clang_format__check`,
-`clang_format__apply`, `clang_tidy__list_checks`, `clang_tidy__run`, and
-`sanitizer__parse_report`.
-
-Quality executable selection is fixed by the central discovery service, with an
-absolute explicit CLI/environment choice
-considered first, followed by Developer environment, selected VS, safe PATH,
-and a small conventional installed LLVM location. Empty/relative PATH entries,
-Windows current-directory search, and candidates inside the workspace are
-excluded. Discovery records a
-canonical regular non-link path and file metadata; qualification uses bounded
-fixed `--version` and tool-specific `--help` probes, and every later launch uses
-that exact approved path with replacement detection. Availability is reported
-in status instead of failing startup. Executable paths, argv values, environment
-values, source text, replacement data, and raw tool output are never logged. No
-MCP argument can select an executable.
-
-Formatter checks use `clang-format --output-replacements-xml` rather than
-stdout full-file output or `-i`. The exact Workspace snapshot is supplied as
-bounded stdin and a validated workspace-relative `--assume-filename` controls
-language/config discovery, so a formatter never rereads a raced source path.
-The XML rejects DTD/entities and unexpected structure, and only complete,
-bounded, ordered, non-overlapping in-file ranges aligned to UTF-8 boundaries are
-accepted. Clang tooling replacement offsets and lengths are bytes; they are
-converted to Workspace Unicode code-point positions before commit. LF, CRLF,
-mixed line endings, non-BMP code points, combining characters, EOF edits, missing
-final newline, empty files, and a UTF-8 BOM are covered; BOM is preserved.
-Apply first formats every requested file, requires and revalidates a SHA-256 for
-every source snapshot (including no-op files), rejects a process/parse failure
-before calling Workspace, then sends one non-overlapping `apply_text_edits`
-batch. Detected snapshot conflict therefore changes no file. Ordinary commit I/O
-failure triggers Workspace best-effort rollback; locks, rollback failure,
-external final-replacement races, crash, and power loss remain outside any
-filesystem-atomic guarantee.
-
-With its default `style=file` behavior, clang-format may search parent
-directories above the workspace and may follow a project-supplied symlinked
-`.clang-format`/`_clang-format`; `InheritParentConfig` can extend that search.
-Those format configurations are explicitly trusted operator/project input. They
-are never returned to MCP or logged. ForgeMCP does not claim a sandbox boundary
-for format configuration discovery.
-
-clang-tidy accepts explicit source paths and one validated generated workspace
-directory containing a regular non-link `compile_commands.json`. ForgeMCP
-supplies only fixed `-p=<directory>`, optional one-element bounded
-`--checks=<pattern>`, and option-safe relative source arguments. It never
-publishes fixes, plugin loading, response files, the compiler-argument `--`
-delimiter, extra compiler arguments, arbitrary config/header filters, or a
-generic runner. Phase 1 parses compiler-style diagnostic output strictly instead
-of adding a YAML dependency or applying export-fixes replacements. Drive-colon,
-space/parenthesis, and relative paths are handled; ANSI/control syntax and
-source/caret excerpts are discarded, and absolute paths embedded in semantic
-messages are redacted. Clang diagnostic columns are one-based
-UTF-8 byte columns and are boundary-checked and converted to code points.
-External locations are counted and omitted; malformed/unmappable records are
-counted separately. Capture/parser loss makes `complete=false`; `execution_state`
-separates findings from timeout/tool failure. Stream order is stdout followed by
-stderr because Process Runtime intentionally captures them separately.
-
-The workspace project, parent/project `.clang-tidy` configuration, and its
-CMake-generated compilation database are trusted inputs, not a sandbox boundary.
-Database commands may contain frontend/plugin flags and external include paths,
-and clang-tidy may read external headers; ForgeMCP adds none of those flags,
-never returns an external diagnostic path/content or a raw command, and makes no
-safety claim for analysis of an untrusted project.
-
-The sanitizer parser consumes bounded supplied text only. It recognizes
-AddressSanitizer, UndefinedBehaviorSanitizer, and an unknown fallback; strips
-terminal controls; emits fixed normalized summaries/categories rather than raw
-report lines; returns at most 32 findings and 64 bounded workspace-only frames
-per finding with opaque addresses; omits path-like external frames; and marks
-partial or truncated parsing. The unknown fallback never copies its input. It
-performs no process launch, symbolizer/network/source access, source/symbol
-download, or instrumented-binary execution.
+## Status
+
+ForgeMCP is intentionally at foundation stage. The `workspace` feature manages
+project files and a separate service-storage root. The shared `process` service adds asynchronous
+external-program lifecycle, text transcripts, timeouts, and a read-only inspection
+surface for development commands. CMake now configures, builds, and tests operator
+profiles. Read-only clangd analysis is mounted through MCP tools and workspace
+result providers, with a shared analysis widget. Quality and debugger remain future work.
+The `toolchain` service discovers independent toolsets once at startup and exposes
+their paths and on-demand versions through a read-only MCP surface.
+
+The design goal is a small composition root plus independent feature services. There
+is no plugin system, service locator, event bus, repository layer, or transport-neutral
+adapter hierarchy. Add one only when concrete behavior makes it necessary.
+
+## Source layout
+
+```text
+src/forgemcp/
+  server.py                     # composition root, CLI, MCPServer
+  assets.py                     # package-relative Widget and IconFile helpers
+  completion.py                 # one server-wide completion dispatcher
+  assets/*.html                 # generated single-file widgets
+  icons/*                       # source icon files packaged with the server
+  <feature>/
+    service.py                  # business logic, service class, MCP handlers
+    errors.py                   # expected feature errors
+  process/
+    service.py                  # subprocess lifecycle, streams, state, MCP inspection
+    models.py                   # session results and MCP-facing process state
+    errors.py                   # expected process failures
+  toolchain/
+    service.py                  # toolset container, Python API, MCP registration
+    discovery.py                # provider orchestration and ready spec assembly
+    loader.py                   # deterministic pkgutil built-in enumeration
+    spec.py                     # tool metadata, ready specs, and toolset containers
+    errors.py                   # expected configuration and command errors
+    providers/                  # system PATH, explicit CLI, Visual Studio layouts
+    tools/                      # INFO, create_spec, and typed methods per tool
+tests/
+  conftest.py                   # isolated copy of the C++ acceptance workspace
+  <feature>/test_service.py     # direct business behavior
+  test_server.py                # MCP surface and protocol behavior
+frontend/
+  src/shared/                   # common TUI styles, renderer, formatting, Apps bridge
+  src/*.js                      # small feature widget entrypoints
+  tests/                        # Node + jsdom behavior tests; no browser required
+  *.html                        # Vite entry points
+examples/cpp-acceptance-project # portable CMake fixture
+```
+
+Create extra feature files only around a concrete responsibility. For example, a
+CMake module may grow `output_parser.py` and `kits.py`; it should not start with
+interfaces and factories for hypothetical parsers or kit providers.
+
+## Composition and dependency injection
+
+`src/forgemcp/server.py` is the only composition root:
+
+1. Resolve operator configuration such as the workspace root.
+2. Construct `WorkspaceService`, then `ProcessService` with the project and storage
+   directories as allowed working roots, then feature services with explicit dependencies.
+3. Create one `Apps` instance.
+4. Create one `Complete` completion collector.
+5. Construct `MCPServer(extensions=[apps])`, composing its instructions from the base
+   text and every service class docstring.
+6. Call each service's single `register(mcp, apps, complete)` method.
+7. Mount the validated Apps tools and resources through their public bindings and
+   register the one server-wide completion handler.
+8. Run the selected transport; stdio is the default and the workspace defaults to the
+   server process working directory. Before accepting requests, the server lifespan
+   awaits toolchain discovery; it closes remaining managed processes during shutdown,
+   including when discovery fails.
+
+Steps 3-7 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
+construction and consumes their bindings at that point. The empty `Apps` extension is
+therefore supplied to the constructor for capability negotiation, then the bindings
+collected by service registration are mounted through the SDK's public APIs. This
+keeps one feature registration method without a generic plugin framework or private
+SDK access.
+
+A service may depend on another service, but receives it in `__init__`. It never
+creates that dependency itself. This keeps tests local and makes application state
+ownership visible in `server.py`.
+
+## Feature service contract
+
+A typical feature has these methods:
+
+```python
+class ExampleService:
+    """Describe this feature for the model-facing server instructions."""
+
+    WIDGET = Widget("assets/example.html")
+    ICON = IconFile("icons/example.svg")
+
+    def __init__(self, dependency: DependencyService) -> None: ...
+
+    def business_operation(self, ...) -> Result: ...
+
+    def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
+        @apps.tool(resource_uri=self.WIDGET.uri, icons=[self.ICON.icon])
+        async def example_tool(value: str, ctx: Context) -> Result:
+            """Describe the tool; the SDK infers its public metadata and schema."""
+            ...
+```
+
+Only methods that the feature actually needs are present. The nested MCP entrypoints
+close over the long-lived service instance, so intentional state survives calls while
+the class remains focused on reusable business operations. The SDK derives names,
+descriptions, schemas, and structured output from the entrypoint signatures and
+docstrings. A local completion function returns `None` for references the feature does
+not own and is added to the shared `Complete` collector.
+
+## Current MCP surface
+
+### Workspace files
+
+`WorkspaceService` owns path checks, directory trees, metadata, UTF-8 reading,
+literal/regex searching, mutations, and storage directories. The ten tools are
+`workspace_list`, `workspace_find_files`, `workspace_file_info`, `workspace_read_file`,
+`workspace_search`, `workspace_write_file`, `workspace_edit_file`, `workspace_move`,
+`workspace_delete`, and `workspace_mkdir`. The former overview, file-extension
+resource, and inspection prompt are removed. There are no workspace prompts.
+
+Tree and search operations live in async handlers inside `register`, reused by
+Markdown resources. They yield during traversal and report visited entries/files
+without an invented total. Workspace, process, and toolchain use the same progress helper. Each tool
+invocation has its own progress throttle,
+using a monotonic clock and the shared `forgemcp.progress.progress(ctx, interval=1.0)` helper. The CLI
+option is `--progress-interval`; zero disables throttling. `create_server` validates the interval once before constructing services, then
+injects it into all services. Services and reporters use the validated setting directly. All progress
+notifications, including start/completion, obey the minimum interval. The first
+notification is immediate, skipped updates are not queued, and counters still
+advance for every work unit. No timer, delayed send, or operation wrapper is used.
+The tool response signals completion. File reading reports bytes as chunks are read. Small
+reusable filesystem operations remain service methods; their tool handlers report
+completion of one operation. No generic runner or thread offloading is used.
+Individual filesystem calls are synchronous; traversal yields cooperatively between
+work units. Results remain small Pydantic models. The SDK derives structured output and useful JSON text fallback.
+Expected `WorkspaceError` failures become `ToolError` or `ResourceError` at the
+corresponding boundary. OS errors retain the system-provided `strerror`, which may be localized. Resource roots are explicitly checked before filesystem access,
+including mirrors without a path, to avoid opaque SDK validation errors. Platform-specific file ownership is isolated in
+`workspace/metadata.py`; unavailable owner or creation time is null.
+
+Project/storage paths shared between modules and in tool arguments/results use
+`WorkspacePath`, serialized as a string such as `project/src/main.cpp` or
+`storage/build/debug`. The roots themselves are `project/` and `storage/`.
+Executable locations and low-level filesystem APIs still use native `Path` values.
+There is no separate `root` tool argument. Path traversal,
+absolute paths, and resolutions outside the selected root are rejected. Trees
+display symlinks/junctions without descending into them. Trees hide dot-prefixed
+directories by default (`include_hidden=true` includes them); dot files stay visible. Explicit reads may follow
+in-root links; mutations reject linked path components. Moving a directory
+containing links is rejected. Workspace roots cannot be
+mutated. `protect_path(WorkspacePath(...))` lets dependent modules protect files or
+directories, including paths that do not exist yet. Protection also blocks moving
+or deleting their ancestors. Read access remains
+available; there is no owner bypass or protection registry framework.
+
+Reads optionally select inclusive one-based lines and return their first line
+number. Writes create or overwrite using a sibling temporary file and `os.replace`,
+reporting whole-file removed/added line counts. Edits require a nonempty exact
+`old_text`: zero matches or multiple matches without `replace_all` leave the file
+unchanged. There are no revision hashes, optimistic-concurrency parameters, or
+multi-file transactions. UTF-8 and existing line endings are preserved outside
+the replaced text. Move supports files/directories and rejects existing destinations.
+Delete supports files and empty directories. Mkdir creates missing parents.
+
+Filename searches use a basename glob unless the pattern contains `/`, in which
+case it matches a path relative to the search directory; `**` supports nested
+directories. Text search uses the `regex` package, is line-oriented, and returns
+one result per matching line, with `spans` containing zero-based Unicode-code-point
+[start, end) pairs produced by the same regex engine, including zero-width matches. Both searches skip dot directories and links but
+include ordinary build directories and dot files. Only text search has an extension
+filter; filename search uses its glob alone. Extension filters accept a
+leading dot and compare case-insensitively. Binary/non-UTF-8 files are reported in
+`skipped_files`. By explicit design, workspace scans currently have no application
+timeout, output cap, index, or pagination.
+
+### Service storage and future consumers
+
+The default storage root is `.<project-name>.forgemcp` beside the project; the CLI
+can override it with `--workspace-storage`. It is created lazily. Storage must not
+equal or contain the project root. Each feature creates and removes its own
+directories under the injected storage root; Workspace exposes no storage-directory
+wrapper or filesystem tool methods for other modules. Persistent directories
+survive restarts. The owning module must stop processes before deleting their
+directories. Workspace knows neither build configuration nor index lifecycle.
+Git can register `.git` with `protect_path`
+in its constructor. ProcessService receives plain allowed root paths, not a
+dependency on WorkspaceService. Its check restricts cwd, not OS-level file access.
+Watchers, Git change callbacks, and language-server synchronization/highlighting
+are deferred until those consumers are implemented.
+
+### Workspace resources
+
+Six file templates use one qualified `path`, including `project/` or `storage/`:
+
+```text
+forgemcp://workspace/file{/path*}
+forgemcp://workspace/raw{/path*}
+forgemcp://workspace/list{?path,depth,include_hidden}
+forgemcp://workspace/find-files{?pattern,path}
+forgemcp://workspace/file-info{?path}
+forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}
+```
+
+Text mirrors return complete UTF-8 text with `text/plain`; raw mirrors return exact
+bytes with `application/octet-stream`. The other four render the same business
+results as `text/markdown` through the shared Markdown helpers. Embedded code fences
+are escaped by choosing a longer fence. No per-file resource registration or cache
+is needed. Mirrors read current files regardless of search exclusions; tree and search
+resources use the same filtering policy as their tools.
+
+Query parameters use RFC 6570 percent encoding, including `%20` for spaces; `+`
+remains a literal plus. Resource depth `all` maps to tool depth null. Text-search extensions use
+a comma-separated string; an omitted value means any extension, an empty value
+means extensionless files. Regex works in URI parameters. SDK path-security checks
+are exempted only for `query`/`pattern`, which are data; actual paths still pass SDK
+and workspace checks. Path completions first suggest `project/` and `storage/`, then qualified child
+paths. Directory inputs suggest directories; file inputs also suggest files.
+Extension completions scan the directory selected by `path` in completion context.
+Completions also cover depth and booleans;
+only completion responses observe the protocol's 100-value cap.
+
+### Workspace result providers
+
+Each Workspace tool implements its filesystem operation in the local decorated
+MCP handler. It calls `before_providers` with every operation argument, then
+`after_providers` with its typed result on success or `error_providers` when the
+operation raises, including cancellation. Expected Workspace errors become
+`ToolError`; unexpected failures retain the SDK's sanitization. The handler
+attaches the saved resource descriptors after all providers finish. Providers
+receive no progress callback and cannot change the operation's result or flow.
+Shared low-level UTF-8 reading and atomic replacement helpers serve multiple
+Workspace callers; there are no public service methods implementing file tools.
+
+`ResultProvider[ContextT]` has a typed `before_workspace_*` and
+`after_workspace_*` pair for each Workspace tool. Before receives that tool's
+arguments and returns provider-owned context; after receives the same context
+and that tool's concrete result model. Default methods do nothing, with before
+returning `None`; this skips its after and error hooks for that operation.
+Providers override only operations they use. On tool failure,
+`error(call_id, context)` receives each non-`None` before context.
+If cancellation interrupts before while another provider is still running,
+Workspace also calls error for providers that already returned a context.
+If cancellation prevents an after hook from starting, its context is released
+through error as well; hooks that did run own their cleanup.
+
+Workspace uses one random ID for all providers in a tool call. It runs each stage
+concurrently, waits for every provider, and logs provider failures without changing
+the tool outcome. Each provider receives its own copy of the input arguments and
+result. `register_provider(name, provider, tools=...)` limits which tool methods
+are invoked. `save_result_resource(call_id, provider, mime_type, text)` stores
+immutable JSON or Markdown under that ID and returns its URI. Workspace accepts
+only a URI saved by the matching provider for that call. The result's `resources`
+mapping contains provider names and descriptors with `uri` and `mime_type`.
+There is no separate manifest or `extensions_uri`.
+
+```text
+forgemcp://workspace/results/{result_id}/{name}.json
+forgemcp://workspace/results/{result_id}/{name}.md
+```
+
+`DiffProvider` from `workspace/diff.py` is registered in `server.py` for write/edit.
+Before captures the previous complete file text; after reads the resulting text,
+saves `diff.json` under the shared call ID, and returns its URI. The resource is a
+typed `FileDiff`: qualified path, compact change ranges, and hunks with three
+context lines. Each hunk contains typed context/added/removed lines with nullable
+before/after numbers, exact text (including line endings), and character spans.
+Spans use zero-based Unicode code-point [start, end) offsets; zero-width spans mark
+insertions/deletions. Replacement lines are paired in their original order for
+character comparison; unpaired added/removed lines are wholly changed. Starts are
+one-based; a zero count denotes the next insertion position. Identical text produces
+empty changes/hunks. Failed operations publish no diff resource.
+
+Published resources remain immutable in memory until shutdown; reads never rerun
+providers. Unknown IDs/names raise ResourceNotFoundError. No resources are created
+when no provider contributes. Persistent result storage remains deferred.
+
+Workspace serializes its MCP tool handlers, dynamic resource handlers, and path
+completion handler with one lock. The lock remains held while a handler waits for
+providers. A resource handler may call a tool handler in the same task without
+deadlocking; requests from other tasks still wait. File-info, list, find, and
+search resource handlers delegate to the corresponding tool handlers; file/raw
+mirrors directly read their managed files.
+
+Clangd registers a typed result provider alongside diff. The former extension
+contract and Workspace revision counter have been removed. Resource descriptors
+contain only URI and MIME type; provider-specific data belongs in the resource.
+Widgets load diff and clangd from these descriptors independently through the App
+bridge. Diff validates its concrete payload; clangd's resource version is inside
+its JSON payload rather than the link.
+
+## CMake profiles and operations
+
+`CMakeService` receives project/storage roots and protected paths directly, plus
+`ToolchainService` for tool selection. It owns its build-tree filesystem operations.
+Operator profiles are parsed from repeated
+`--cmake-profile NAME KEY=VALUE ...` arguments; the default
+toolset is selected by `--cmake-toolset`. There is no environment-based profile
+configuration, persistent profile registry, or directory lock.
+
+Without explicit profiles, projects with a presets file receive one `presets`
+profile containing all available configure/build/test presets. Names come from
+the selected CMake's `--list-presets=all`; CMake handles hidden presets, conditions,
+includes, inheritance, macros, and environment settings. ForgeMCP only reads its
+textual name listing. Without presets files, Debug and Release profiles use
+separate directories under `storage/build/`.
+
+Explicit profiles bind a toolset and either native preset names or ordinary
+configure settings. Native configure uses `cmake --preset`, build uses
+`cmake --build --preset`, and test uses `ctest --preset`. ForgeMCP does not resolve
+or constrain native `binaryDir`. The bound toolset environment is supplied to
+CMake/CTest, which then applies preset environment rules. A missing build/test
+preset requires an explicit `build-directory` for that operation; this fallback
+does not reconstruct a configure preset's environment. Plain profiles accept
+generator, compiler tool names, a WorkspacePath toolchain file, and cache definitions.
+Their source is always the project root and their build path passes workspace checks.
+Plain profiles default to Ninja; its executable is taken from the chosen toolset.
+Missing Ninja is an error, not a reason to change generators. For a plain profile,
+changing the generator completely removes and recreates its build directory.
+Settings and cache ownership are checked first. CMake checks roots, protected
+subtrees, and links before removing its build directory. Native presets are unchanged.
+
+`cmake_profiles` lists the effective profiles. `cmake_configure`, `cmake_build`, and
+`cmake_test` run all profiles unless a subset is supplied. Operations run sequentially,
+report failures per profile/preset, and continue other profiles. Repeated native
+configure presets within one call are configured once. Existing plain build caches
+must belong to this project, and build/test configurations must match their cache.
+Known plain build directories receive CMake File API queries and request a compilation
+database. Native presets retain control over these settings and directories.
+
+Commands are typed methods on bound CMake/CTest ToolSpecs and launch only through
+ProcessService. Callable protocols preserve their positional and keyword signatures.
+Tool files own process consumption and parsing: CMake presets/cache/configure/build
+output lives in `toolchain/tools/cmake.py`, and CTest progress/JUnit parsing lives
+in `toolchain/tools/ctest.py`. Methods return typed parsed results, never sessions.
+Each invocation defaults to a 600-second total timeout. Progress callbacks carry
+configure steps, build actions, and test case status; the MCP layer adds the profile
+name and applies the common throttle. Its monotonic counter counts status updates,
+without an invented percentage across multiple commands. Each MCP operation returns
+a list of its own result model: `CMakeConfigureResult`, `CMakeBuildResult`, or
+`CMakeTestResult`. `error` is the sole outcome field (null on success); there is no
+batch status, repeated operation name, or separate exit-code field. Configure adds
+known build/compilation-database paths, build adds parsed step counts, and test adds
+JUnit cases. Results carry `process_id` instead of copied output; use `process_get`
+for command logs. ToolSpec results retain exit codes for the service to interpret.
+Execution/parser failures after launch also retain the process identifier. CTest writes
+JUnit into a CMake-owned temporary directory under storage; parsed cases are returned
+before cleanup.
+
+CMake registers all four tools through Apps with separate packaged widgets:
+profiles, configure, build, and test. They share `cmake-view.js` and the common
+result renderer: profile/mode filters, Fields/JSON, full-value copying,
+process identifiers for log retrieval, and expandable test cases. Fields used as
+record headings are not repeated in the body; JSON and copying retain all fields.
+The widgets display the original
+invocation only and issue no tool calls or resource reads. CMake highlighting remains deferred.
+Unit and in-process MCP tests cover operator profiles, parsed command results,
+generator-change cleanup, error isolation, qualified resource
+paths, and completions. They use fake ToolSpecs/process streams and isolated fixture
+copies; installed compilers are not required. Workspace/server tests still
+target the former service methods and extension API; their migration follows the
+widget work as the last refactoring stage.
+
+## External process execution
+
+`ProcessService` is the only module that calls `asyncio.create_subprocess_exec`.
+Feature services receive it through constructor injection, select executables, and
+construct explicit argument lists. `launch` uses exec mode; interpreters such as
+`cmd.exe` must be selected explicitly by the owning feature. ForgeMCP does not expose
+a generic command-execution MCP tool.
+
+`launch` supports `inherit_environment=True`, which
+copies the server environment then overlays `env`. With `False`, only `env` is passed
+to the child. No environment values are added to operational lifecycle logs.
+
+`async with await processes.launch(...) as session` is the shared API for short
+commands and long-running sessions. Launch starts a supervisor coroutine owned by
+the session. Its TaskGroup owns stdout and stderr readers, a stdin writer, and a
+monitor. Worker failures do not cancel the consumer directly: the supervisor first
+cleans up the process, then exposes the retained failure through `output()`, `wait()`,
+or an otherwise successful context exit.
+
+`output()` has one consumer and yields `ProcessOutput(stream, text)` chunks from both
+pipes through one currently unbounded queue. It ends after both pipes reach EOF;
+failed reads and timeouts are not successful EOF. Cross-stream ordering is the order
+ForgeMCP observed, not an operating-system ordering guarantee. Unconsumed output and
+the full transcript remain an in-memory retention limitation.
+
+`write_stdin(text)` queues text for the stdin writer without waiting for transport
+drain. The queue carries `str | None`; `close_stdin()` queues `None` after prior
+writes and is repeatable. `wait()` waits
+for process exit and completed readers, returns the exit code, and can be repeated;
+it does not implicitly close stdin. Nonzero exit codes are interpreted by the tool
+module. `close()` and context exit stop a remaining process and await all workers.
+`ProcessService.close()` closes remaining sessions during server shutdown. The
+session exposes `process_id` and `returncode` without exposing its queue protocol as
+the consumer API.
+
+Each pipe owns an incremental decoder so a multibyte character split across OS reads
+is reconstructed correctly. The default encoding is `locale.getencoding()` and each
+consumer may select an explicit encoding. Replacement decoding is the resilient
+default for human-facing tool output; strict decoding is available for formal
+protocols. All consumer I/O is text. A tool can choose strict `latin_1` for a reversible
+one-character-per-byte representation, then frame and decode protocol messages in its
+own module. Such transcripts retain that Latin-1 representation, not decoded UTF-8
+protocol text. There is no separate raw mode or protocol session class.
+
+Every stdin write and stdout/stderr read is appended to a process transcript in
+memory. The record also retains identifiers, command metadata, lifecycle timestamps,
+encoding, timeout policy, state, and return code. This is inspection state, not an
+operational log: stderr logging contains only process identifiers and lifecycle
+summaries and never copies transcript content or environments.
+
+`ProcessTimeout(total=None, idle=None)` disables both timeouts. Each non-null field
+sets seconds for its limit; total and idle may be enabled together. Total time uses
+the monitor's monotonic start time. Idle measures time since the latest transcript
+entry, including stdin. Timeout raises the existing `ProcessError` after termination;
+stream failures use `ProcessStreamError`.
+
+On timeout or explicit termination, the directly managed asyncio process receives
+`terminate()`, followed by `kill()` if it remains alive after a short grace period.
+Cancellation of an individual I/O or wait operation does not close the session.
+Explicit `close()` and context exit await cleanup, including during cancellation.
+Launch directly awaits `asyncio.create_subprocess_exec` without a separate task or
+custom cancellation handler. Cleanup after worker failure drains unread pipes without
+retaining the discarded tail. Process
+groups and descendant-tree management are intentionally outside the current scope.
+
+The read-only MCP surface consists of `processes_overview(status)`,
+`process_get(process_id)`, their widgets, `forgemcp://processes`, and
+`forgemcp://processes/{process_id}`. Overview entries pair `ProcessSummary` with a
+transcript-free `ProcessStatus`; `current_status` is a return code, `running`,
+`interrupted` (timeout), `stopped`, or `stream_failure`. The complete transcript stays
+on `ProcessRecord` and is sliced by the detail tool according to the requested limits. The detail view derives
+elapsed seconds from each entry's timestamp and the process start timestamp. The
+detail tool exposes a point-in-time state and selected ordered text fragments;
+the resource retains the full transcript. Neither starts or stops a process. The detail widget provides combined
+and per-stream views, with basic ANSI SGR color
+rendering. Completion suggests retained process IDs.
+A well-formed URI whose process ID is not retained raises
+`ResourceNotFoundError`; other unexpected exceptions remain unwrapped so the SDK
+sanitizes them as resource crashes.
+
+## Toolset discovery and command execution
+
+`ProcessService -> ToolchainService` is wired explicitly in `server.py`. The lifespan
+awaits `ToolchainService.initialize()` before requests; an initialization lock prevents
+duplicate discovery. A complete sorted tuple is published atomically and retained
+for the server lifetime. There is no automatic refresh, watcher, global selection,
+service locator, or plugin framework.
+
+`loader.py` enumerates `forgemcp.toolchain.tools` with `pkgutil.iter_modules`, skips
+private names, sorts module names, and requires exactly one valid `INFO: ToolInfo`
+per module. `ToolInfo` contains the logical name, kind, and `create_spec` callable. Duplicate logical names and invalid modules raise domain errors. Adding a
+built-in module automatically enables system and user discovery; VS-specific paths
+are added only in the VS provider.
+
+Providers own platform policy. System uses executable PATH lookup, including OS
+suffix handling, and creates one possibly empty toolset. Visual Studio uses the
+Installer's `vswhere`, checks shallow known installation layouts without PE inspection,
+and captures each instance's `VsDevCmd` environment through `cmd /c call ... && set`.
+The entire mapping is retained without an allowlist or per-value limits. Every such
+process uses `ProcessService`; its complete output remains in the normal transcript.
+One broken instance cannot suppress others. A failed environment capture leaves that
+instance visible with no bound tools, avoiding execution with an incorrect environment.
+
+Repeated CLI definitions are validated before discovery launches processes. Names
+and tool keys cannot repeat; paths must identify executable files, including inside
+the workspace. User toolsets inherit the server environment and never fall back to
+PATH on configuration errors. Discovery creates specs without querying tool versions.
+
+`ToolSpec` is created with its name, kind, executable path, and `methods` dictionary.
+It has no partially initialized state, bind/replace step, or stored version. Providers
+call `ToolInfo.create_spec(path, processes, environment, inherit_environment)` after
+finding an executable. Toolsets contain ready specs and their environment; the service
+contains the discovered toolsets. `list_toolsets()` and `get_toolset(id)` return these
+containers, and `get_tool(id, name)` returns a spec or None. There are no `selected`,
+`current`, or `preferred` fields.
+
+Each tool module declares its own `Methods` TypedDict and implements callables locally
+inside `create_spec`. Toolchain sees only an optional, read-only `version` callable in
+`ToolMethods`; concrete consumers import the tool module's `Methods` and cast
+`spec.methods` to that type. No inheritance between these TypedDicts is required.
+Argument conversion, process execution, and parsing stay inside the tool module.
+There is no generic ToolCommand, parser registry, or CommandExecution wrapper.
+
+Current implementations provide only version methods, with a 15-second process limit
+and a small retained banner from each output stream. They consume both streams and
+check exit status before returning a parsed version string. `cl`, `link`, `cppvsdbg`,
+and `lldb-dap` currently have empty method dictionaries. Longer sessions can later be
+exposed through explicitly typed iterator or context-manager methods without changing
+the containers.
+
+Only MCP detail handlers call `methods["version"]()` when available. Versions are not
+cached: each details request obtains fresh values; unsupported, failed, or unrecognized
+versions appear as null in structured output. Pydantic response models omit toolset
+environments and expose absolute executable paths. Resource documents use the shared
+`markdown` module; the former manual Markdown formatting helpers are removed.
+
+`toolsets_list` returns summaries (the SDK wraps a list in `structuredContent.result`),
+and `toolset_get` returns one details object. Both report progress and carry read-only
+annotations, icons, Apps metadata, and SDK text fallback. The toolsets widget displays
+only the supplied result: summaries for a list call, or details of one toolset for a
+get call. It never requests details or selects server-wide state. The static list
+resource and details template return markdown, and completion
+offers discovered toolset IDs. Unknown IDs become ToolError or ResourceNotFoundError at
+the corresponding boundary; unexpected exceptions remain SDK-sanitized.
+
+## Clangd business API
+
+`ClangdService` receives `WorkspaceService`, `ToolchainService`, and `CMakeService`
+explicitly. `server.py` registers its seven MCP tools and typed Workspace provider.
+After toolset discovery, the server initializes analysis and its CMake subscription;
+shutdown unsubscribes and closes all sessions before `ProcessService`.
+All seven tools bind the packaged `clangd-result.html` widget with the clangd icon.
+It renders the original per-configuration answers, including empty results, with
+local text filtering, Fields/JSON, and copying. It never reads source files or calls tools.
+Diagnostics use severity badges, source ranges, and separate related-location notes.
+Hover renders Markdown headings, emphasis, lists, tables, and highlighted C/C++ code
+blocks. The bundled markdown-it parser has HTML disabled; link/image rendering is
+inert so descriptions cannot navigate or load external content.
+Definition/reference locations and workspace-symbol locations additionally carry
+`preview: SourceExcerpt(start_line, text) | None`, captured during the analysis call.
+The service reads each managed target file once per answer and captures up to seven
+lines around the target's start; missing, unreadable, and external files keep their
+locations without a preview. These excerpts are part of the original structured
+result, so the widget never reads a source file later or observes newer edits.
+Navigation widgets group targets by file, with scope headings for workspace symbols,
+and switch a highlighted source preview when a saved target is selected. Document
+symbols render a collapsible outline preserving clangd's nesting, kinds, signatures,
+deprecation tags, and ranges. Closed files and outline branches create their DOM
+only when opened. External locations remain visible without bypassing read approval.
+
+CMake retains successful configurations as
+`CompilationContext(id, toolset_id, build_directory, compilation_database)`.
+It starts from existing compilation databases, updates entries after configure,
+and drops entries whose databases disappear. Build directories come from profile parameters;
+a single native preset can use an explicitly configured build directory (`-B`).
+Unknown directories are omitted rather than parsing command output or guessing
+CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
+Empty configuration selections mean all available contexts; executables never fall
+back to another toolset or a system installation.
+
+`configuration_updates()` is CMake's in-process subscription stream. It yields the
+current list immediately and then yields changed snapshots when configure adds or
+removes a configuration. A slow subscriber keeps only the newest pending snapshot;
+it does not delay CMake. Successful configure also publishes unchanged lists so
+subscribers can detect changed database contents at the same paths. Subscribers
+close their generators to unregister. Missing CMake tooling produces an empty
+initial list rather than blocking server startup.
+
+The typed clangd ToolSpec method `connect` owns `ProcessSession` and JSON-RPC/LSP
+framing. Callers exchange typed request, notification, response, and error envelopes.
+UTF-8 message bodies are framed by byte length without an added frame-size limit.
+The process text transport uses reversible Latin-1 encoding for those bytes; its
+transcript is therefore not a decoded UTF-8 LSP log. Clangd uses its normal index
+locations, including the cache beside the compilation database.
+
+`ClangdSession` handles initialization, request correlation, cancellation, document
+versions, diagnostics, and shutdown. Progress callbacks reach the session layer.
+Positions use one-based lines and zero-based Unicode code-point offsets. The session
+requires UTF-32 position negotiation so external locations can be returned without
+reading their contents to convert offsets.
+
+`ClangdService` starts and retains one session per available context. Its subscription
+applies CMake snapshots under the same lock used by analysis. Removed contexts close
+their sessions; a changed configuration or database fingerprint replaces only the
+affected session. Failed sessions can be recreated by the next operation.
+Diagnostics, hover, definition, references, document symbols, and workspace symbols
+are implemented in their decorated MCP handlers; shared session and collection
+behavior stays on the service.
+Each operation has its own result model with `configurations: list[str]`. Equal
+complete answers are grouped with their configuration IDs; differing answers remain
+separate. An analysis failure raises a domain error rather than silently returning
+an incomplete multi-configuration answer. Progress from explicit analysis tools
+reaches `ClangdSession`; Workspace provider hooks receive no progress callback.
+
+Clangd's before hooks retain its analysis lock until after or error, preventing
+explicit analysis and configuration updates from overlapping a Workspace mutation.
+Move captures the source subtree's file paths before it disappears. After writes,
+edits, moves, deletes, and directory creation, the provider notifies retained sessions
+and reopens their existing documents from disk. This rebuilds dependent headers and
+obtains fresh versioned diagnostics without restarting clangd processes. Deleted or
+moved source documents are closed. Moves synchronize sessions without producing
+diagnostic/highlighting result resources. Pure reads
+reuse unchanged document versions instead of requesting diagnostics for a no-op
+change that clangd may not publish.
+
+After read/write/edit, managed C/C++ files are analyzed across available
+configurations. Diagnostics and semantic highlighting are separately grouped and
+saved as `ClangdResource` in Workspace under the shared invocation ID. Later edits
+never change these resources. Provider failures close potentially stale sessions and
+are isolated by Workspace without changing a successful file operation. Compilation
+database changes observed through Workspace also refresh CMake's snapshot and reconcile
+sessions. Clangd owns its file reads; it does not watch external edits or manage
+editor buffers.
+
+`WorkspacePath` can also represent external absolute locations with `root/`, for
+example `root/C:/SDK/include/header.h` or `root//usr/include/header.h`. Managed
+filesystem operations reject this area. `workspace_read_file` uses an injected
+`confirm` parameter with SDK `Resolve`/`Elicit`: managed paths need no question,
+external paths require explicit approval, and declining or cancelling stops the
+read. The confirmation is requested for each external read; no separate permission
+service is used. Clangd's own include reads do not require these confirmations.
+External diagnostics are excluded, but symbol locations may reference external files.
+The path type exposes an inline JSON Schema string, without a `$ref` indirection.
+External files never have text/raw mirror resources, even after reading is approved;
+resource requests for them raise `ResourceNotFoundError`.
+
+## MCP Apps and widget packaging
+
+Each model-visible tool must bind exactly one `ui://` resource through
+`_meta.ui.resourceUri`. The HTML is an optional human view; the tool result remains
+complete for the model and text-only clients.
+
+Widget source imports `@modelcontextprotocol/ext-apps`, installs handlers before
+connecting, and reacts to host theme, style variables, fonts, and safe-area insets.
+Vite plus `vite-plugin-singlefile` produces self-contained HTML under
+`src/forgemcp/assets/`. `Widget` locates it relative to the installed package. The
+Hatch wheel hook runs `npm ci` and the frontend build, then includes generated assets
+even when they are ignored as build output. The frontend lockfile controls reproducible
+UI builds.
+
+Icons are separate files under `src/forgemcp/icons/`. `IconFile` converts a packaged
+file to portable `data:` metadata at runtime, preserving offline operation without
+hardcoded blobs in Python. Each tool still chooses an icon that identifies its
+operation rather than relying only on the server logo.
+
+### Shared widget implementation
+
+Every widget uses the same compact console/TUI presentation. The current workspace,
+process, and toolsets views share these files under `frontend/src/shared/`:
+
+| File | Responsibility |
+| --- | --- |
+| `widget.css` | Geometry, host-aware palette, typography, controls, field grids, scrolling and syntax colors |
+| `copy-icon.js` | Shared inline SVG copy icon, with no image requests or CSS masks |
+| `presentation.js` | Pure formatting and process/toolset snapshot projections |
+| `result-view.js` | Shared DOM renderer, local filters, Fields/JSON switch, tooltips and copying |
+| `app.js` | Apps connection, result lifecycle and host context; imports the shared CSS |
+
+Workspace's four HTML entrypoints use `workspace-view.js` for projections and
+specialized tree/source values, passed through the shared renderer's optional
+`renderValue` callback. File/source values carry line numbers without altering
+the original text used by copying and JSON. Search/find results reuse the shared
+collection filters. Metadata and mutation results use the shared fields view.
+
+The App bridge loads only the linked `diff.json` and `clangd.json` resources, in
+parallel, and ignores late responses after cancellation or teardown. Each resource
+has its own loading/error state; failures leave the original operation result
+visible. The Resources view includes the descriptors and full decoded JSON with
+copy controls. It never replaces the original result used by JSON and Copy all.
+
+`clangd-view.js` supplies the analysis projection and standalone diagnostic rendering.
+`source-view.js` supplies configuration controls, lexical C/C++ coloring, and
+code-point annotations indexed by line in each immutable file. Workspace source/diff
+views choose one explicitly displayed configuration for semantic tokens and diagnostics.
+Diagnostics appear in selectable hover panels on underlined source ranges, including
+source/code and related messages with locations; they are not repeated below the source.
+Symbol signatures and documentation require saved clangd hover data, which the
+Workspace analysis resource does not currently contain. Diff combines change
+spans and local search with annotations on new/context lines only, since clangd
+analyzes the resulting file. Move results have a minimal, content-sized view with
+only source and destination, without header, controls, footer, or analysis.
+Resource reads remain limited to the original
+invocation's immutable links.
+
+Fields, Resources, and JSON retain their DOM and scroll positions between tab
+switches. File reads draw source lines in short animation-frame batches; a newer
+result or teardown cancels pending work. Large JSON (over 100,000 UTF-16 units) uses
+one plain-text node instead of individual colored token elements; every value
+remains visible and copyable, without truncation. Long lines in that large-JSON
+view scroll horizontally instead of wrapping a potentially huge source string.
+
+An HTML entrypoint contains `<main id="widget" aria-label="Descriptive name"></main>`
+and one module script. Its JavaScript supplies the tool name and a pure projection:
+
+```javascript
+import { connectWidget } from "./shared/app.js";
+import { processPresentation } from "./shared/presentation.js";
+
+await connectWidget({
+  toolName: "processes_overview",
+  describe: processPresentation,
+});
+```
+
+The projection returns `toolName`, `summary`, and `records`. Use `records: null`
+for a field-oriented result. For collections, return the complete array, all other
+top-level fields in `summary`, and `titleKey` plus an optional `categoryKey` for
+record headings and local filtering. It must not modify or discard original fields.
+The original structured object remains the source for JSON and copying.
+
+Use the existing renderer for new results that fit these two forms. If a future
+feature needs a specialized view, reuse `widget.css` and the shared controls and
+formatters; add only its actual presentation needs. Do not copy a stylesheet into a
+feature directory or introduce per-widget palettes, sizes or spacing. Change common
+tokens and rules centrally so all widgets stay consistent. This is shared
+presentation for concrete callers, not a widget registry or plugin framework.
+
+### Visual and interaction contract
+
+These requirements apply to all existing and future widgets:
+
+- **Geometry:** the outer widget is always 420 CSS pixels high and fills 100% of the
+  width supplied by the host, with no fixed or maximum width. Safe-area padding is
+  included inside that height. Switching views, filtering, receiving a result and
+  expanding data must not resize it. The content area scrolls vertically; header,
+  controls and footer remain in place. No horizontal scrollbar.
+  The `workspace_move` confirmation is an exception: its two rows determine the
+  height, capped at 420px for long paths, and there are no header or controls.
+- **Density:** use 13px monospace text with a 1.35 line height, compact rows, small
+  control padding and thin neutral separators. Avoid large cards, generous blank
+  space, rounded dashboard panels and oversized headings. Touch controls can have
+  larger hit areas without increasing the outer widget height.
+- **Palette:** neutral graphite surfaces in dark mode and neutral pale surfaces in
+  light mode, with host background/text/border variables and host monospace fonts.
+  Cyan marks active controls and JSON keys, amber marks booleans and warnings,
+  lavender marks numbers, and muted green marks successful completion. Red marks
+  `failed`, `timed_out` and nonzero exit codes; `terminated` is amber. Use color
+  sparingly and retain the literal status text so color is never the only signal.
+- **Complete text:** render every supplied field and record, including unknown
+  fields, nulls, empty collections and backend flags such as `scan_truncated`.
+  Do not add row/character limits, slicing, pagination caps, ellipsis, line clamps
+  or hidden overflow that clips data. Long names, labels, paths and JSON wrap within
+  their column and remain selectable. Key/value columns must have independent
+  wrapping and a gap: `had_decoding_errors` cannot overlap its value. Backend scan
+  limits are a separate contract; show the returned truncation flag explicitly.
+- **Readable fields:** scalar arrays appear as compact comma-separated wrapping
+  lists; objects use nested labeled values, not serialized JSON pasted into a cell.
+  Preserve all entries and distinguish empty list, empty object, empty string and
+  null. Process timestamps show a readable date/time to whole seconds with explicit
+  UTC and ISO 8601 in parentheses, for example
+  `7 Sept 2026, 12:45:12 UTC (2026-09-07T12:45:12Z)`. Display conversion does not
+  alter the original timestamp, precision or offset in JSON/copy.
+- **JSON:** provide a syntax-highlighted JSON view of the complete original
+  structured result, unaffected by local filters. Highlight keys, strings, numbers,
+  booleans, null and punctuation. Insert untrusted text with DOM text nodes, never
+  interpret result strings as HTML. Line wrapping must preserve selectable content.
+- **Local interaction:** allow category filters, view switches, tooltips,
+  keyboard navigation and copying. Show matched/total counts and an explicit
+  no-match state. Filters are reversible and have no effect on the source result.
+  All supplied records are visible by default; none is silently omitted.
+- **Copying:** provide small labeled copy icons for individual original values
+  and a Copy all action for the entire original result, including filtered records.
+  Render the icon as inline SVG with a visible `currentColor` stroke even before
+  hover. Do not use CSS image masks: embedded hosts may block their image URLs.
+  Copy strings verbatim and objects/arrays as JSON. If clipboard permission is
+  unavailable, try the local selection fallback; if that also fails, select the
+  complete original value for manual copying and explain the keyboard shortcut.
+  Never claim a copy succeeded when it did not.
+- **One invocation:** widgets display one particular tool invocation's
+  `structuredContent`. They may repeatedly read immutable resources linked by that
+  result under `forgemcp://workspace/results/*`. Other resource reads, tool calls,
+  external fetches, polling, and refresh buttons are not allowed. Resource loading
+  belongs in the App connection code, which passes decoded data to rendering code.
+  The shared renderer receives no App or
+  transport object. A `toolsets_list` result contains summaries only; detailed
+  fields appear only when `toolset_get` itself supplies them. Interactivity does
+  not authorize additional MCP calls beyond these result-resource reads.
+- **Lifecycle and accessibility:** register handlers before `app.connect()`,
+  apply initial and changed host theme, fonts, style variables and safe-area insets.
+  A widget remains bound to its original invocation; it is not reused for a later
+  call. Ignore late clipboard completion after teardown. Show useful waiting,
+  empty, error and missing-structured-data states; do not parse text fallback into
+  invented structured data. Use semantic controls, visible focus, accessible icon
+  labels and copy/status feedback. Load no external assets; host fonts are applied
+  through the SDK. Useful MCP text fallback remains independent of the widget.
+
+When adding a widget, wire its source into the Vite build and Python `Widget` binding,
+and verify its generated HTML and icon are packaged. Build with
+`npm run build --prefix frontend` or the wheel build. Do not add or run automated
+widget tests; the user reviews appearance and behavior visually.
+
+## Errors and trust boundaries
+
+Expected business failures use exceptions from the feature's `errors.py`. MCP-facing
+methods translate them according to who can recover:
+
+- `ToolError`: the model can change arguments or sequence and retry;
+- `ResourceNotFoundError` or another MCP error: the resource/request cannot be served;
+- any other exception: unexpected bug, logged server-side and sanitized by the SDK.
+
+Project-controlled text is data. It must not change server instructions, choose an
+executable, escape the workspace, or be copied into operational logs. Process
+consumers must explicitly select executables, construct arguments, choose timeout and
+encoding policy, and handle cancellation. The current process transcript is retained
+in memory; persistent storage and configurable retention limits remain future work.
+
+## Testing strategy
+
+Business tests call service methods directly. The function-scoped
+`cpp_acceptance_project` fixture copies the complete
+`examples/cpp-acceptance-project/` tree into pytest's `tmp_path`, giving every test an
+independent workspace it may modify. Existing scenarios should use this shared fixture
+instead of constructing ad-hoc C++ directory trees.
+
+Protocol tests use the SDK's in-process `Client` and the same isolated workspace to
+assert the public contract: schemas, Apps metadata, icons, progress, structured
+output, resources, prompts, and completions. The source acceptance project remains a
+portable fixture for later checks against real CMake, compilers, clangd, sanitizers,
+and debuggers; tests never operate on it in place.
+
+`.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
+frontend and Python wheel together. Python changes must also pass
+`.\.venv\Scripts\python.exe -m pytest -q`, and the built wheel must contain every
+referenced widget and icon. VS Code's `ForgeMCP: server` launch configuration invokes
+the build task before starting the server.
+
+## Expected next modules
+
+The likely order is:
+
+1. Refactor Workspace result providers around before/after/error notifications and
+   sequential Workspace MCP entrypoints. Move tool-specific filesystem work into
+   the decorated handlers. CMake already owns its build-tree filesystem work;
+   process launches continue through ProcessService.
+2. finish migrating backend tests for Workspace providers and clangd lifecycle;
+3. formatting, static analysis, and sanitizer parsing;
+4. debugger adapter lifecycle and DAP operations;
+5. persistent process transcripts and configurable retention limits.
+
+This ordering is guidance, not a framework contract. Add the smallest end-to-end slice
+needed by the next user-visible workflow.
+
+### Process transcript selection
+
+`ProcessRecord.append_log` records decoded text under its lock and maintains a
+single LF-based line cursor across stdin/stdout/stderr. Each immutable entry has
+inclusive `start_line`/`end_line`; a line spanning chunks overlaps their ranges.
+Empty text does not create an entry, and a trailing LF creates no phantom line.
+
+`process_get` snapshots and selects under the same lock. Its selectors are unions:
+`FirstLines | LastLines | LineRange` and `FirstSeconds | LastSeconds | TimeRange`.
+Each variant requires its own fields and forbids other fields; ranges require both
+bounds. JSON remains `{"first": N}`, `{"last": N}`, or `{"start": N, "end": M}`. Time is monotonic elapsed process time. Completed processes use the later
+of their recorded duration and final entry time for tail selection, so drained
+output remains available. Explicit time intervals are half-open.
+
+`process/transcript.py` implements time filtering, line selection over merged
+entry ranges, and a UTF-8 text byte budget. It slices only returned fragments and
+preserves their timestamp/stream and absolute line numbers. It does not merge or
+rewrite stored chunks. Byte clipping retains a prefix or suffix according to the
+line selector (or time selector when lines is absent), preserving Unicode characters.
+Responses add only the returned inclusive `lines` range, null when empty. No
+truncation flags or total counters are added. Without selectors the default is
+last 100 lines; the default text budget is 64 KiB. The full journal stays in memory.
+The shared widget view omits the generic text filter and repeated heading fields.
+Adaptation of the process widget to sliced logs remains deferred.

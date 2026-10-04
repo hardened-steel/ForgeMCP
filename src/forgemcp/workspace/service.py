@@ -1,1345 +1,1766 @@
-"""Safe, transport-neutral filesystem operations for one ForgeMCP workspace."""
+"""Workspace files, storage directories, and MCP registration."""
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
+from copy import deepcopy
+import fnmatch
+import json
+import logging
 import os
-import re
+import stat
 import tempfile
-import threading
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TypeAlias
+from typing import Annotated, Generator, Generic, Literal, TypeVar
+from types import MappingProxyType
+from urllib.parse import quote
+from uuid import uuid4
 
-from forgemcp.core.config import ForgeConfig
-from forgemcp.core.logging import StructuredLogger
-from forgemcp.models import FileChange, FileChangeKind, FileSnapshot, PatchResult, Position, Range
-from forgemcp.workspace.errors import (
-    ExpectedSnapshotError,
-    IgnoredWorkspacePathError,
-    InvalidUnifiedPatchError,
-    PatchCommitError,
-    SymlinkWorkspacePathError,
-    WorkspaceEncodingError,
-    WorkspaceConcurrentModificationError,
-    WorkspaceFileNotFoundError,
-    WorkspaceFileTooLargeError,
-    WorkspaceNotDirectoryError,
-    WorkspaceNotFileError,
-    WorkspacePathError,
-    WorkspaceTextEditError,
+import regex as regex_engine
+from mcp.server import MCPServer
+from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context, Elicit, Resolve
+from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
+from mcp.server.mcpserver.resources.templates import ResourceSecurity
+from mcp.types import (
+    Completion,
+    CompletionArgument,
+    CompletionContext,
+    ResourceTemplateReference,
+    ToolAnnotations,
 )
-from forgemcp.workspace.policy import WorkspacePolicy
-from forgemcp.workspace.events import WorkspaceMutationBus
+from pydantic import BaseModel, Field
+
+from forgemcp import markdown
+from forgemcp.assets import IconFile, Widget
+from forgemcp.completion import Complete
+from forgemcp.progress import progress
+
+from .errors import WorkspaceError
+from .providers import ProviderCall, ResultResource, ResultResources
+from .metadata import file_owner
+from .path import WorkspacePath
 
 
-_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
-_HUNK_HEADER = re.compile(
-    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
-    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?: .*)?$"
-)
-_PATCH_METADATA_PREFIXES = ("diff --git ", "index ", "new file mode ", "deleted file mode ")
-_WINDOWS_RESERVED_COMPONENT = re.compile(
-    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE
-)
-MAX_WORKSPACE_LIST_FILES = 1_000
-MAX_WORKSPACE_MUTATION_EDITS = 1_000
-MAX_GENERATED_DIRECTORY_FILES = 4_096
-
-ExpectedSnapshot: TypeAlias = FileSnapshot | str | None
+class ReadConfirmation(BaseModel):
+    allow: bool = Field(description="Allow reading this external file.")
 
 
-def _is_link_or_reparse_point(path: Path) -> bool:
-    """Return whether a path is a symlink or Windows reparse point without traversal."""
-    if path.is_symlink():
-        return True
-    try:
-        attributes = path.lstat().st_file_attributes
-    except (AttributeError, FileNotFoundError, OSError):
-        return False
-    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+async def confirm_read(path: WorkspacePath) -> ReadConfirmation | Elicit[ReadConfirmation]:
+    if path.area != "root":
+        return ReadConfirmation(allow=True)
+    return Elicit(f"Allow reading external file {path.absolute}?", ReadConfirmation)
 
 
-@dataclass(frozen=True, slots=True)
-class WorkspaceTextEdit:
-    """One replacement in public zero-based Unicode code-point coordinates.
-
-    This intentionally lives in the Workspace package rather than shared
-    domain models because ``new_text`` can contain source content and must not
-    be treated as log-safe structured data.
-    """
-
-    range: Range
-    new_text: str
+WorkspaceRoot = Literal["project", "storage"]
 
 
-@dataclass(frozen=True, slots=True)
-class _PatchLine:
-    """One parsed hunk line, without file content in logs or errors."""
+class TreeEntry(BaseModel):
+    path: WorkspacePath
+    kind: Literal["file", "directory", "symlink", "other"]
+    children: list[TreeEntry] | None = None
 
-    kind: str
+
+class DirectoryTree(ResultResources):
+    path: WorkspacePath
+    entries: list[TreeEntry]
+
+
+class FoundFile(BaseModel):
+    path: WorkspacePath
+    modified_at: datetime
+    size_bytes: int
+
+
+class FilePaths(ResultResources):
+    paths: list[WorkspacePath]
+    files: list[FoundFile] = Field(default_factory=list)
+
+
+class FileContent(ResultResources):
+    path: WorkspacePath
     text: str
-    ends_with_newline: bool
+    start_line: int
 
 
-@dataclass(frozen=True, slots=True)
-class _Hunk:
-    """One validated unified-diff hunk."""
-
-    old_start: int
-    old_count: int
-    new_start: int
-    new_count: int
-    lines: tuple[_PatchLine, ...]
+class FileInfo(ResultResources):
+    path: WorkspacePath
+    created_at: datetime | None
+    modified_at: datetime
+    size_bytes: int
+    owner: str | None
 
 
-@dataclass(frozen=True, slots=True)
-class _FilePatch:
-    """A non-renaming create, modify, or delete patch for one relative path."""
-
-    old_path: str | None
-    new_path: str | None
-    hunks: tuple[_Hunk, ...]
-
-    @property
-    def target_path(self) -> str:
-        """Return the path whose expected snapshot guards this change."""
-        return self.new_path if self.new_path is not None else self.old_path  # type: ignore[return-value]
+class SearchMatch(BaseModel):
+    path: WorkspacePath
+    line: int
+    text: str
+    spans: list[tuple[int, int]] = Field(
+        description="Match ranges as zero-based Unicode code point [start, end) pairs.",
+    )
 
 
-@dataclass(frozen=True, slots=True)
-class _PlannedChange:
-    """An entirely in-memory desired filesystem transition."""
-
-    target: Path
-    before: FileSnapshot
-    kind: FileChangeKind
-    after_text: str | None
-    no_op: bool = False
+class SearchResult(ResultResources):
+    matches: list[SearchMatch]
+    skipped_files: list[WorkspacePath]
 
 
-@dataclass(slots=True)
-class _StagedChange:
-    """One staged replacement and, after commit starts, its rollback backup."""
-
-    plan: _PlannedChange
-    temporary_path: Path | None
-    backup_path: Path | None = None
-    after_snapshot: FileSnapshot | None = None
+class FileWriteResult(ResultResources):
+    path: WorkspacePath
+    action: Literal["created", "overwritten"]
+    lines_removed: int
+    lines_added: int
 
 
-@dataclass(frozen=True, slots=True)
-class GeneratedWorkspaceDirectory:
-    """Capability for one explicit, non-symlink generated workspace directory.
-
-    It deliberately exposes only the small set of generated-tree operations
-    needed by integrations such as CMake's File API.  It never exposes a
-    ``Path`` for a caller to use outside the Workspace boundary.
-    """
-
-    _service: "WorkspaceService"
-    relative_path: str
-
-    def write_text(self, path: str, text: str) -> None:
-        """Atomically write a UTF-8 generated file below this directory."""
-        self._service._write_generated_text(self.relative_path, path, text)
-
-    def read_text(self, path: str) -> str:
-        """Read one bounded UTF-8 generated file below this directory."""
-        return self._service._read_generated_text(self.relative_path, path)
-
-    def read_text_with_snapshot(self, path: str, *, maximum_bytes: int) -> tuple[str, FileSnapshot]:
-        """Read bounded generated metadata and the snapshot of those exact bytes."""
-        return self._service._read_generated_text_with_snapshot(
-            self.relative_path, path, maximum_bytes=maximum_bytes
-        )
-
-    def is_empty(self) -> bool:
-        """Return whether the generated directory contains no entries."""
-        return self._service._generated_directory_is_empty(self.relative_path)
-
-    def list_files(
-        self, path: str = ".", *, maximum: int = MAX_GENERATED_DIRECTORY_FILES
-    ) -> tuple[str, ...]:
-        """List direct regular, non-symlink file names below one generated directory."""
-        return self._service._list_generated_files(
-            self.relative_path, path, maximum=maximum
-        )
-
-    def get_snapshot(self, path: str) -> FileSnapshot:
-        """Return metadata for one generated file without exposing its contents."""
-        return self._service._get_generated_snapshot(self.relative_path, path)
+class FileEditResult(ResultResources):
+    path: WorkspacePath
+    replacements: int
 
 
-@dataclass(frozen=True, slots=True)
-class ValidatedExecutionPath:
-    """A checked execution location without exposing a public ``pathlib.Path``.
+class PathOperationResult(ResultResources):
+    path: WorkspacePath
+    action: Literal["moved", "deleted", "created", "already_exists"]
+    source: WorkspacePath | None = None
 
-    The capability has no read or write operations.  It deliberately permits
-    generated build directories that ordinary workspace listing ignores.
-    Replacement between validation and adapter launch remains a documented
-    residual OS race.
-    """
 
-    relative_path: str
-    native_path: str
-    kind: str
+ContextT = TypeVar("ContextT")
+
+
+class ResultProvider(Generic[ContextT]):
+    """Typed hooks for Workspace tools; override only operations of interest."""
+
+    async def before_workspace_list(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        depth: int | None,
+        include_hidden: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_list(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: DirectoryTree,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_find_files(
+        self,
+        call_id: str,
+        pattern: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_find_files(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: FilePaths,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_file_info(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_file_info(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: FileInfo,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_read_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        confirm: ReadConfirmation,
+        start_line: int,
+        end_line: int | None,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_read_file(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: FileContent,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_search(
+        self,
+        call_id: str,
+        query: str,
+        path: WorkspacePath,
+        regex: bool,
+        extensions: list[str] | None,
+        case_sensitive: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_search(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: SearchResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_write_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        text: str,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_write_file(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: FileWriteResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_edit_file(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_edit_file(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: FileEditResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_move(
+        self,
+        call_id: str,
+        source: WorkspacePath,
+        destination: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_move(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_delete(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_delete(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def before_workspace_mkdir(
+        self,
+        call_id: str,
+        path: WorkspacePath,
+    ) -> ContextT | None:
+        return None
+
+    async def after_workspace_mkdir(
+        self,
+        call_id: str,
+        context: ContextT,
+        result: PathOperationResult,
+    ) -> str | None:
+        return None
+
+    async def error(self, call_id: str, context: ContextT) -> None:
+        pass
+
+
+@contextmanager
+def filesystem_errors(path: str | WorkspacePath) -> Generator[None]:
+    """Translate expected failures without exposing absolute filesystem paths."""
+    try:
+        yield
+    except UnicodeError as error:
+        raise WorkspaceError(f"{path}: expected valid UTF-8 text.") from error
+    except OSError as error:
+        raise WorkspaceError(
+            f"{path}: {error.strerror or type(error).__name__}."
+        ) from error
+
+
+def read_text(candidate: Path, path: WorkspacePath) -> str:
+    """Read complete UTF-8 text without newline conversion for Workspace and diff."""
+    with filesystem_errors(path):
+        if not candidate.is_file():
+            raise WorkspaceError(f"{path}: expected an existing regular file.")
+        text = candidate.read_bytes().decode("utf-8")
+        if "\0" in text:
+            raise WorkspaceError(f"{path}: expected UTF-8 text, found a binary file.")
+        return text
+
+
+def replace_text(path: Path, text: str) -> None:
+    """Write UTF-8 without newline translation, then replace the destination."""
+    data = text.encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=".forgemcp-",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+        if path.exists():
+            temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.chmod(temporary.stat().st_mode | stat.S_IWUSR)
+            temporary.unlink(missing_ok=True)
 
 
 class WorkspaceService:
-    """Safely inspect and patch regular UTF-8 files below one workspace root.
+    """Workspace: access and modify project files and separate service storage.
 
-    Public methods use workspace-relative strings and return only existing
-    transport-neutral file models.  Text itself is returned only by
-    :meth:`read_text`, and is deliberately never attached to a log record.
+    Paths use / separators: project/... is relative to the project root,
+    storage/... to the storage root. Neither permits . or .. segments.
+    root/<absolute-path> identifies an external file; each explicit read requires
+    approval, and writes and file mirror resources are unavailable there.
+
+    Text is UTF-8; file resources mirror text or raw bytes. Searches skip dot
+    directories and links. Read existing files before editing. Protected paths
+    remain readable but cannot be modified.
     """
+
+    TREE_WIDGET = Widget("assets/workspace-tree.html")
+    FILE_WIDGET = Widget("assets/workspace-file.html")
+    SEARCH_WIDGET = Widget("assets/workspace-search.html")
+    RESULT_WIDGET = Widget("assets/workspace-result.html")
+    ICON = IconFile("icons/workspace.svg")
+    FILE_ICON = IconFile("icons/workspace-file.svg")
+    SEARCH_ICON = IconFile("icons/workspace-search.svg")
+    EDIT_ICON = IconFile("icons/workspace-edit.svg")
+    FILE_URI = "forgemcp://workspace/file{/path*}"
+    RAW_URI = "forgemcp://workspace/raw{/path*}"
+    LIST_URI = "forgemcp://workspace/list{?path,depth,include_hidden}"
+    FIND_URI = "forgemcp://workspace/find-files{?pattern,path}"
+    INFO_URI = "forgemcp://workspace/file-info{?path}"
+    SEARCH_URI = "forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}"
+    RESULT_JSON_URI = "forgemcp://workspace/results/{result_id}/{name}.json"
+    RESULT_MARKDOWN_URI = "forgemcp://workspace/results/{result_id}/{name}.md"
+    PROVIDER_TOOLS = frozenset(
+        (
+            "workspace_list",
+            "workspace_find_files",
+            "workspace_file_info",
+            "workspace_read_file",
+            "workspace_search",
+            "workspace_write_file",
+            "workspace_edit_file",
+            "workspace_move",
+            "workspace_delete",
+            "workspace_mkdir",
+        ),
+    )
 
     def __init__(
         self,
-        config: ForgeConfig,
-        logger: StructuredLogger,
+        workspace_root: Path,
+        storage_root: Path | None = None,
         *,
-        policy: WorkspacePolicy | None = None,
-        mutations: WorkspaceMutationBus | None = None,
+        progress_interval: float = 1.0,
     ) -> None:
-        """Bind the service to validated configuration and an explicit policy."""
-        self._root = config.workspace_root
-        self._logger = logger
-        self._policy = WorkspacePolicy() if policy is None else policy
-        self._mutations = mutations
-        self._mutation_operation = 0
-        self._mutation_lock = threading.RLock()
-        self._filesystem_lock = threading.RLock()
+        self.progress_interval = progress_interval
+        with filesystem_errors("project"):
+            self.root = workspace_root.resolve()
+            if not self.root.is_dir():
+                raise WorkspaceError("Project root must be an existing directory.")
+            self.storage_root = (
+                storage_root or self.root.parent / f".{self.root.name}.forgemcp"
+            ).resolve()
+            if self.root.is_relative_to(self.storage_root):
+                raise WorkspaceError(
+                    "Storage must not be the project root or its ancestor."
+                )
+            if self.storage_root.exists() and not self.storage_root.is_dir():
+                raise WorkspaceError("Storage root must be a directory.")
+        self.protected_paths: set[Path] = set()
+        self.result_providers: dict[
+            str,
+            tuple[ResultProvider, frozenset[str] | None],
+        ] = {}
+        self.result_resources: dict[str, dict[str, tuple[str, str]]] = {}
+        self.operation_lock = asyncio.Lock()
+        self.operation_owner: asyncio.Task[object] | None = None
 
-    @property
-    def workspace_root(self) -> Path:
-        """Return the resolved workspace root without inspecting file contents."""
-        return self._root
+    @asynccontextmanager
+    async def serialized_operation(self) -> AsyncGenerator[None]:
+        """Serialize Workspace entrypoints, allowing same-task resource delegation."""
+        task = asyncio.current_task()
+        if task is self.operation_owner:
+            yield
+            return
+        async with self.operation_lock:
+            self.operation_owner = task
+            try:
+                yield
+            finally:
+                self.operation_owner = None
 
-    @property
-    def policy(self) -> WorkspacePolicy:
-        """Return the immutable policy active for this service."""
-        return self._policy
+    def read_result_resource(self, result_id: str, name: str) -> str:
+        """Return an immutable resource without invoking its provider again."""
+        try:
+            return self.result_resources[result_id][name][1]
+        except KeyError as error:
+            raise WorkspaceError("Workspace result resource does not exist.") from error
 
-    def list_files(self, path: str = ".", recursive: bool = False) -> tuple[FileSnapshot, ...]:
-        """List regular, non-symlink files below a workspace-relative directory.
-
-        Excluded directories and all symlinks are omitted.  Asking to list a
-        symlink or an excluded directory raises a domain error rather than
-        traversing it.
-        """
-        directory = self._resolve_path(path)
-        if not directory.exists():
-            raise WorkspaceFileNotFoundError("The requested workspace directory does not exist.")
-        if not directory.is_dir():
-            raise WorkspaceNotDirectoryError("The requested workspace path is not a directory.")
-
-        snapshots: list[FileSnapshot] = []
-        self._collect_files(directory, recursive, snapshots)
-        return tuple(snapshots)
-
-    def list_manifest_files(
-        self, path: str = ".", *, maximum: int = MAX_WORKSPACE_LIST_FILES
-    ) -> tuple[tuple[FileSnapshot, ...], bool]:
-        """Return a deterministic bounded recursive metadata manifest.
-
-        The boolean is false when more regular files existed than the retained
-        prefix. External filesystem changes can still make the walk slightly
-        inconsistent; this is not a transactional filesystem snapshot.
-        """
-        paths, complete = self._bounded_file_paths(path, recursive=True, maximum=maximum)
-        return tuple(self._snapshot_path(target) for target in paths), complete
-
-    def list_file_paths(
+    def register_provider(
         self,
-        path: str = ".",
+        name: str,
+        provider: ResultProvider,
         *,
-        recursive: bool = True,
-        maximum: int = MAX_WORKSPACE_LIST_FILES,
-    ) -> tuple[tuple[str, ...], bool]:
-        """List a bounded prefix of workspace-relative paths without reading contents."""
-        paths, complete = self._bounded_file_paths(path, recursive=recursive, maximum=maximum)
-        return tuple(self._relative_key(target) for target in paths), complete
-
-    def _bounded_file_paths(
-        self, path: str, *, recursive: bool, maximum: int
-    ) -> tuple[tuple[Path, ...], bool]:
-        """Collect internal safe path objects for metadata operations."""
+        tools: Sequence[str] | None = None,
+    ) -> None:
+        """Register a before/after/error observer for selected Workspace tools."""
         if (
-            not isinstance(maximum, int)
-            or isinstance(maximum, bool)
-            or not 1 <= maximum <= MAX_WORKSPACE_LIST_FILES
+            not name
+            or not name.isascii()
+            or any(not (char.isalnum() or char in "_-") for char in name)
+            or name in self.result_providers
         ):
-            raise ValueError("Workspace path-list maximum is invalid.")
-        directory = self._resolve_path(path)
-        if not directory.exists():
-            raise WorkspaceFileNotFoundError("The requested workspace directory does not exist.")
-        if not directory.is_dir():
-            raise WorkspaceNotDirectoryError("The requested workspace path is not a directory.")
-        paths: list[Path] = []
-        complete = self._collect_paths_bounded(directory, recursive, paths, maximum)
-        return tuple(paths), complete
-
-    def read_text(self, path: str) -> tuple[str, FileSnapshot]:
-        """Read one regular UTF-8 file and a snapshot matching the returned text."""
-        target = self._resolve_path(path)
-        for _ in range(3):
-            snapshot = self._snapshot_path(target)
-            if not snapshot.exists:
-                raise WorkspaceFileNotFoundError("The requested workspace file does not exist.")
-            if snapshot.size_bytes is not None and snapshot.size_bytes > self._policy.max_read_bytes:
-                raise WorkspaceFileTooLargeError("The requested file exceeds the configured read limit.")
-            data = self._read_bytes_limited(target, self._policy.max_read_bytes)
-            if hashlib.sha256(data).hexdigest() != snapshot.sha256:
-                continue
-            try:
-                return data.decode("utf-8"), snapshot
-            except UnicodeDecodeError as error:
-                raise WorkspaceEncodingError("The requested file is not valid UTF-8.") from error
-        raise WorkspaceConcurrentModificationError(
-            "The file changed while it was being read; retry the operation."
+            raise WorkspaceError("Provider needs a unique ASCII name.")
+        if tools is not None and any(tool not in self.PROVIDER_TOOLS for tool in tools):
+            raise WorkspaceError("Provider names an unknown Workspace tool.")
+        self.result_providers[name] = (
+            provider,
+            frozenset(tools) if tools is not None else None,
         )
 
-    def get_snapshot(self, path: str) -> FileSnapshot:
-        """Capture content-free metadata and SHA-256 for a regular file or absence."""
-        return self._snapshot_path(self._resolve_path(path))
-
-    def require_directory(self, path: str = ".") -> str:
-        """Validate and normalize an existing ordinary workspace directory.
-
-        The returned path is always workspace-relative and can safely be passed
-        to another capability that accepts only workspace-relative paths.  The
-        ordinary Workspace ignore policy remains in force for this operation.
-        """
-        directory = self._resolve_path(path)
-        if not directory.exists():
-            raise WorkspaceFileNotFoundError("The requested workspace directory does not exist.")
-        if not directory.is_dir():
-            raise WorkspaceNotDirectoryError("The requested workspace path is not a directory.")
-        return self._relative_key(directory) or "."
-
-    def open_generated_directory(
-        self, path: str, *, create: bool = False
-    ) -> GeneratedWorkspaceDirectory:
-        """Open one explicit generated build directory inside this workspace.
-
-        Generated directories may match the normal Workspace ignore policy, but
-        still receive the exact same lexical workspace-boundary and symlink
-        checks.  ``create=True`` creates missing non-symlink ancestors below
-        the workspace; it never creates or follows a path outside it.
-        """
-        directory = self._resolve_path(path, apply_ignore_policy=False)
-        if create:
-            self._create_directory_without_symlinks(directory)
-        if not directory.exists():
-            raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
-        if _is_link_or_reparse_point(directory):
-            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-        if not directory.is_dir():
-            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
-        return GeneratedWorkspaceDirectory(self, self._relative_key(directory) or ".")
-
-    def validate_generated_directory_path(self, path: str) -> str:
-        """Validate a possibly-not-yet-created build path without writing it.
-
-        This is intentionally narrower than ``open_generated_directory`` and
-        lets status/profile resolution apply the same lexical, containment and
-        symlink policy without creating a build tree as an observation effect.
-        """
-        directory = self._resolve_path(path, apply_ignore_policy=False)
-        self._assert_no_symlink_components(directory)
-        return self._relative_key(directory) or "."
-
-    def validate_reported_path(self, path: str, *, relative_to: str = ".") -> str:
-        """Validate an untrusted absolute or relative path reported by a tool.
-
-        Unlike normal caller-supplied workspace paths, a tool may report an
-        absolute path.  This method accepts it only when it resolves beneath
-        the configured workspace and neither its lexical path nor resolved
-        path crosses a symlink.  The safe result is a workspace-relative path.
-        """
-        base = self._resolve_path(relative_to, apply_ignore_policy=False)
-        if not base.exists() or not base.is_dir():
-            raise WorkspaceNotDirectoryError("The reported-path base must be an existing workspace directory.")
-        if not isinstance(path, str) or not path or "\x00" in path:
-            raise WorkspacePathError("Reported paths must be non-empty NUL-free strings.")
-        native = Path(path)
-        windows = PureWindowsPath(path)
-        posix = PurePosixPath(path)
-        if bool(windows.drive) and not windows.is_absolute():
-            raise WorkspacePathError("Drive-relative reported paths are not allowed.")
-        if windows.is_absolute() or posix.is_absolute() or native.is_absolute() or bool(native.anchor):
-            candidate = native
-        else:
-            candidate = base / native
-        candidate_parts = candidate.parts[1:] if candidate.anchor else candidate.parts
-        self._reject_windows_special_components(candidate_parts)
-        self._assert_no_symlink_components(candidate)
-        try:
-            resolved = candidate.resolve(strict=False)
-            relative = resolved.relative_to(self._root)
-        except (OSError, ValueError) as error:
-            raise WorkspacePathError("The reported path is outside the configured workspace.") from error
-        self._assert_no_symlink_components(self._root / relative)
-        return relative.as_posix() or "."
-
-    def validate_execution_path(self, path: str, *, kind: str) -> ValidatedExecutionPath:
-        """Validate an existing workspace file or directory for debugger launch.
-
-        This bypasses only the normal listing ignore policy, so a generated
-        build tree can be launched while all lexical, containment, symlink, and
-        Windows reparse-point restrictions remain in force.
-        """
-        if kind not in {"file", "directory"}:
-            raise WorkspacePathError("Execution paths must request file or directory validation.")
-        candidate = self._resolve_path(path, apply_ignore_policy=False)
-        self._assert_no_symlink_components(candidate)
-        if not candidate.exists():
-            raise WorkspaceFileNotFoundError("The requested execution path does not exist.")
-        if _is_link_or_reparse_point(candidate):
-            raise SymlinkWorkspacePathError("Execution paths must not be links or reparse points.")
-        try:
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(self._root)
-        except (FileNotFoundError, OSError, ValueError) as error:
-            raise WorkspacePathError("The requested execution path is not safely inside the workspace.") from error
-        if kind == "file" and not resolved.is_file():
-            raise WorkspaceNotFileError("The requested execution path is not a regular file.")
-        if kind == "directory" and not resolved.is_dir():
-            raise WorkspaceNotDirectoryError("The requested execution path is not a directory.")
-        return ValidatedExecutionPath(
-            relative_path=self._relative_key(resolved) or ".",
-            native_path=str(resolved),
-            kind=kind,
-        )
-
-    def apply_unified_patch(
+    def save_result_resource(
         self,
-        patch: str,
-        expected_snapshots: Mapping[str, ExpectedSnapshot],
-    ) -> PatchResult:
-        """Serialize one guarded unified patch through commit and publication."""
-        with self._mutation_lock:
-            return self._apply_unified_patch_locked(patch, expected_snapshots)
-
-    def _apply_unified_patch_locked(
-        self,
-        patch: str,
-        expected_snapshots: Mapping[str, ExpectedSnapshot],
-    ) -> PatchResult:
-        """Apply a guarded unified patch or report an unchanged failed result.
-
-        Every touched path must have an expected snapshot.  A matching
-        :class:`FileSnapshot` is preferred; a lowercase SHA-256 string is
-        accepted for existing files, and ``None`` expresses an expected absent
-        target for file creation.  Snapshot conflicts and hunk mismatches
-        return ``PatchResult(applied=False)`` without mutating any source file.
-        Invalid input and inaccessible paths raise domain errors.
-        """
-        file_patches = self._parse_unified_patch(patch)
-        expected_by_target = self._normalize_expected_snapshots(expected_snapshots)
-
-        targets: dict[str, Path] = {}
-        patches_by_target: dict[str, _FilePatch] = {}
-        for file_patch in file_patches:
-            target = self._resolve_path(file_patch.target_path)
-            key = self._path_identity(target)
-            if key in targets:
-                raise InvalidUnifiedPatchError("A unified patch may touch each file at most once.")
-            targets[key] = target
-            patches_by_target[key] = file_patch
-        if set(targets) != set(expected_by_target):
-            raise ExpectedSnapshotError("Expected snapshots must cover exactly the files in the patch.")
-
-        plans: list[_PlannedChange] = []
-        total_output_bytes = 0
-        for key in sorted(targets):
-            file_patch = patches_by_target[key]
-            target = targets[key]
-            current = self._snapshot_path(target)
-            expected = expected_by_target[key]
-            if not self._matches_expected_snapshot(target, current, expected):
-                self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
-                return PatchResult(applied=False)
-            planned = self._plan_file_change(file_patch, target, current)
-            if planned is None:
-                self._logger.warning("workspace_patch_not_applied", reason="hunk_mismatch")
-                return PatchResult(applied=False)
-            total_output_bytes = self._add_bounded_mutation_output(
-                total_output_bytes, planned.after_text
-            )
-            plans.append(planned)
-
-        actionable = [plan for plan in plans if not plan.no_op]
-        if not actionable:
-            return PatchResult(applied=True)
-        staged = self._stage_changes(actionable)
-        try:
-            if not self._commit_staged_changes(staged):
-                self._logger.warning("workspace_patch_not_applied", reason="snapshot_conflict")
-                return PatchResult(applied=False)
-        finally:
-            self._cleanup_staging(staged)
-
-        changes = tuple(self._to_file_change(item) for item in staged)
-        self._publish_mutations(actionable, changes)
-        self._logger.info("workspace_patch_applied", changed_files=len(changes))
-        return PatchResult(applied=True, changes=changes)
-
-    def apply_text_edits(
-        self,
-        edits_by_path: Mapping[str, Sequence[WorkspaceTextEdit]],
-        expected_snapshots: Mapping[str, ExpectedSnapshot],
-    ) -> PatchResult:
-        """Serialize one guarded text-edit batch through commit and publication."""
-        with self._mutation_lock:
-            return self._apply_text_edits_locked(edits_by_path, expected_snapshots)
-
-    def _apply_text_edits_locked(
-        self,
-        edits_by_path: Mapping[str, Sequence[WorkspaceTextEdit]],
-        expected_snapshots: Mapping[str, ExpectedSnapshot],
-    ) -> PatchResult:
-        """Atomically apply non-overlapping source-coordinate replacements.
-
-        Every target must be an existing, ordinary workspace file with an
-        expected snapshot.  Ranges use Unicode code points, matching the
-        public location contract.  The entire batch is planned in memory and
-        committed through the same staged rollback mechanism as unified
-        patches, so any validation or compare-and-swap conflict leaves every
-        file unchanged.  Replacement text is never logged.
-        """
-        if not isinstance(edits_by_path, Mapping):
-            raise WorkspaceTextEditError("Text edits must be a mapping by workspace-relative path.")
-        expected_by_target = self._normalize_expected_snapshots(expected_snapshots)
-        targets: dict[str, tuple[Path, tuple[WorkspaceTextEdit, ...]]] = {}
-        for supplied_path, supplied_edits in edits_by_path.items():
-            if not isinstance(supplied_path, str):
-                raise WorkspaceTextEditError("Text-edit paths must be workspace-relative strings.")
-            target = self._resolve_path(supplied_path)
-            key = self._path_identity(target)
-            if key in targets:
-                raise WorkspaceTextEditError("Text edits must not name a file more than once.")
-            if isinstance(supplied_edits, (str, bytes)):
-                raise WorkspaceTextEditError("Text edits for a file must be a sequence of structured edits.")
-            try:
-                edits = tuple(supplied_edits)
-            except TypeError as error:
-                raise WorkspaceTextEditError(
-                    "Text edits for a file must be a sequence of structured edits."
-                ) from error
-            if not edits or any(not isinstance(edit, WorkspaceTextEdit) for edit in edits):
-                raise WorkspaceTextEditError("Every target file must contain one or more structured text edits.")
-            targets[key] = (target, edits)
-        if set(targets) != set(expected_by_target):
-            raise ExpectedSnapshotError("Expected snapshots must cover exactly the files in the text-edit batch.")
-        if sum(len(edits) for _, edits in targets.values()) > MAX_WORKSPACE_MUTATION_EDITS:
-            raise WorkspaceTextEditError("The text-edit batch exceeds the configured edit collection limit.")
-        total_replacement_bytes = 0
-        for _, edits in targets.values():
-            for edit in edits:
-                if not isinstance(edit.new_text, str) or "\x00" in edit.new_text:
-                    raise WorkspaceTextEditError("Text-edit replacements must be NUL-free UTF-8 text.")
-                try:
-                    total_replacement_bytes += len(edit.new_text.encode("utf-8"))
-                except UnicodeEncodeError as error:
-                    raise WorkspaceTextEditError("Text-edit replacements must be valid UTF-8 text.") from error
-                if total_replacement_bytes > self._policy.max_patch_bytes:
-                    raise WorkspaceFileTooLargeError(
-                        "Text-edit replacement data exceeds the configured batch size limit."
-                    )
-
-        plans: list[_PlannedChange] = []
-        total_output_bytes = 0
-        for key in sorted(targets):
-            target, edits = targets[key]
-            current = self._snapshot_path(target)
-            expected = expected_by_target[key]
-            if not self._matches_expected_snapshot(target, current, expected):
-                self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
-                return PatchResult(applied=False)
-            if not current.exists:
-                raise WorkspaceTextEditError("Text edits can only modify existing workspace files.")
-            source_text = self._read_text_for_snapshot(target, current)
-            replacement = self._apply_text_replacements(source_text, edits)
-            if replacement != source_text:
-                plan = _PlannedChange(
-                    target=target,
-                    before=current,
-                    kind=FileChangeKind.MODIFIED,
-                    after_text=replacement,
-                )
-                total_output_bytes = self._add_bounded_mutation_output(
-                    total_output_bytes, plan.after_text
-                )
-                plans.append(plan)
-
-        if not plans:
-            return PatchResult(applied=True)
-        staged = self._stage_changes(plans)
-        try:
-            if not self._commit_staged_changes(staged):
-                self._logger.warning("workspace_text_edits_not_applied", reason="snapshot_conflict")
-                return PatchResult(applied=False)
-        finally:
-            self._cleanup_staging(staged)
-        changes = tuple(self._to_file_change(item) for item in staged)
-        self._publish_mutations(plans, changes)
-        self._logger.info("workspace_text_edits_applied", changed_files=len(changes))
-        return PatchResult(applied=True, changes=changes)
-
-    def _collect_files(self, directory: Path, recursive: bool, snapshots: list[FileSnapshot]) -> None:
-        """Append a stable-order, non-following directory walk to ``snapshots``."""
-        with os.scandir(directory) as entries:
-            ordered_entries = sorted(entries, key=lambda entry: entry.name)
-        for entry in ordered_entries:
-            entry_path = Path(entry.path)
-            if _is_link_or_reparse_point(entry_path):
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                if self._policy.ignores_directory(entry.name):
-                    continue
-                if recursive:
-                    self._collect_files(entry_path, True, snapshots)
-            elif entry.is_file(follow_symlinks=False):
-                if len(snapshots) >= MAX_WORKSPACE_LIST_FILES:
-                    raise WorkspaceFileTooLargeError(
-                        "The workspace file listing exceeds the configured collection limit."
-                    )
-                snapshots.append(self._snapshot_path(entry_path))
-
-    def _collect_paths_bounded(
-        self, directory: Path, recursive: bool, paths: list[Path], maximum: int
-    ) -> bool:
-        """Collect a stable prefix and stop immediately after the first omitted file."""
-        with os.scandir(directory) as entries:
-            ordered_entries = sorted(entries, key=lambda entry: entry.name)
-        for entry in ordered_entries:
-            entry_path = Path(entry.path)
-            if _is_link_or_reparse_point(entry_path):
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                if self._policy.ignores_directory(entry.name):
-                    continue
-                if recursive and not self._collect_paths_bounded(
-                    entry_path, True, paths, maximum
-                ):
-                    return False
-            elif entry.is_file(follow_symlinks=False):
-                if len(paths) >= maximum:
-                    return False
-                paths.append(entry_path)
-        return True
-
-    def _resolve_path(self, path: str, *, apply_ignore_policy: bool = True) -> Path:
-        """Validate a relative path lexically and reject every symlink component."""
-        if not isinstance(path, str) or not path or "\x00" in path:
-            raise WorkspacePathError("Workspace paths must be non-empty relative strings.")
-        native_path = Path(path)
-        windows_path = PureWindowsPath(path)
-        posix_path = PurePosixPath(path)
-        if (
-            native_path.is_absolute()
-            or bool(native_path.anchor)
-            or bool(windows_path.drive)
-            or bool(windows_path.root)
-            or windows_path.is_absolute()
-            or posix_path.is_absolute()
-        ):
-            raise WorkspacePathError("Absolute workspace paths are not allowed.")
-        parts = tuple(part for part in native_path.parts if part not in {".", ""})
-        if any(part == ".." for part in parts):
-            raise WorkspacePathError("Workspace paths must not contain parent traversal.")
-        self._reject_windows_special_components(parts)
-
-        candidate = self._root
-        for index, part in enumerate(parts):
-            candidate = candidate / part
-            if _is_link_or_reparse_point(candidate):
-                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-            if apply_ignore_policy and index < len(parts) - 1 and self._policy.ignores_directory(part):
-                raise IgnoredWorkspacePathError("The requested path is excluded by workspace policy.")
-        if (
-            apply_ignore_policy
-            and candidate != self._root
-            and candidate.is_dir()
-            and self._policy.ignores_directory(candidate.name)
-        ):
-            raise IgnoredWorkspacePathError("The requested path is excluded by workspace policy.")
-        return candidate
-
-    def _create_directory_without_symlinks(self, directory: Path) -> None:
-        """Create a generated directory while rejecting every existing symlink component."""
-        relative = directory.relative_to(self._root)
-        candidate = self._root
-        for part in relative.parts:
-            candidate = candidate / part
-            if _is_link_or_reparse_point(candidate):
-                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-            if not candidate.exists():
-                try:
-                    candidate.mkdir()
-                except FileExistsError:
-                    # A concurrent creator may have installed a symlink or a file.
-                    if _is_link_or_reparse_point(candidate):
-                        raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-                    if not candidate.is_dir():
-                        raise WorkspaceNotDirectoryError(
-                            "A generated-directory path component is not a directory."
-                        )
-            elif not candidate.is_dir():
-                raise WorkspaceNotDirectoryError(
-                    "A generated-directory path component is not a directory."
-                )
-
-    def _resolve_generated_child(self, directory: str, path: str) -> Path:
-        """Resolve a relative child below a generated directory without policy bypasses."""
-        root = self._resolve_path(directory, apply_ignore_policy=False)
-        if not isinstance(path, str) or not path or "\x00" in path:
-            raise WorkspacePathError("Generated-file paths must be non-empty relative strings.")
-        native = Path(path)
-        windows = PureWindowsPath(path)
-        posix = PurePosixPath(path)
-        if (
-            native.is_absolute()
-            or bool(native.anchor)
-            or bool(windows.drive)
-            or bool(windows.root)
-            or windows.is_absolute()
-            or posix.is_absolute()
-        ):
-            raise WorkspacePathError("Generated-file paths must be relative to their generated directory.")
-        parts = tuple(part for part in native.parts if part not in {"", "."})
-        if any(part == ".." for part in parts):
-            raise WorkspacePathError("Generated-file paths must not contain parent traversal.")
-        self._reject_windows_special_components(parts)
-        candidate = root
-        for part in parts:
-            candidate = candidate / part
-            if _is_link_or_reparse_point(candidate):
-                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-        return candidate
-
-    def _write_generated_text(self, directory: str, path: str, text: str) -> None:
-        """Atomically replace one bounded UTF-8 generated file without logging content."""
+        call_id: str,
+        provider: str,
+        mime_type: Literal["application/json", "text/markdown"],
+        text: str,
+    ) -> str:
+        """Store one immutable resource for a provider under the tool call ID."""
+        if len(call_id) != 32 or any(char not in "0123456789abcdef" for char in call_id):
+            raise WorkspaceError("Invalid Workspace call ID.")
+        if provider not in self.result_providers:
+            raise WorkspaceError("Unknown Workspace result provider.")
         if not isinstance(text, str):
-            raise WorkspaceEncodingError("Generated file contents must be UTF-8 text.")
-        try:
-            encoded = text.encode("utf-8")
-        except UnicodeEncodeError as error:
-            raise WorkspaceEncodingError("Generated file contents must be valid UTF-8 text.") from error
-        if len(encoded) > self._policy.max_patch_bytes:
-            raise WorkspaceFileTooLargeError("Generated file contents exceed the configured size limit.")
-        target = self._resolve_generated_child(directory, path)
-        self._create_directory_without_symlinks(target.parent)
-        if _is_link_or_reparse_point(target):
-            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".forgemcp-generated-", dir=target.parent)
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(encoded)
-                output.flush()
-                os.fsync(output.fileno())
-            if target.exists() and not target.is_file():
-                raise WorkspaceNotFileError("The generated path is not a regular file.")
-            os.replace(temporary, target)
-        finally:
-            if temporary.exists() and not _is_link_or_reparse_point(temporary):
-                temporary.unlink()
-
-    def _read_generated_text(self, directory: str, path: str) -> str:
-        """Read one generated regular file using the standard Workspace limits."""
-        target = self._resolve_generated_child(directory, path)
-        snapshot = self._snapshot_path(target)
-        if not snapshot.exists:
-            raise WorkspaceFileNotFoundError("The requested generated file does not exist.")
-        data = self._read_bytes_limited(target, self._policy.max_read_bytes)
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise WorkspaceEncodingError("The requested generated file is not valid UTF-8.") from error
-
-    def _read_generated_text_with_snapshot(
-        self, directory: str, path: str, *, maximum_bytes: int
-    ) -> tuple[str, FileSnapshot]:
-        """Read bounded generated metadata while binding its digest to those bytes."""
-        if not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool) or maximum_bytes <= 0:
-            raise WorkspaceFileTooLargeError("Generated file limit must be a positive byte count.")
-        target = self._resolve_generated_child(directory, path)
-        for _ in range(3):
-            if _is_link_or_reparse_point(target):
-                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-            if not target.exists():
-                raise WorkspaceFileNotFoundError("The requested generated file does not exist.")
-            if not target.is_file():
-                raise WorkspaceNotFileError("The requested generated path is not a regular file.")
-            before = target.stat()
-            if before.st_size > maximum_bytes:
-                raise WorkspaceFileTooLargeError("The requested generated file exceeds the configured read limit.")
-            data = self._read_bytes_limited(target, maximum_bytes)
-            after = target.stat()
-            if (
-                before.st_size != after.st_size
-                or before.st_mtime_ns != after.st_mtime_ns
-                or before.st_dev != after.st_dev
-                or before.st_ino != after.st_ino
-            ):
-                continue
+            raise WorkspaceError("Result resource must contain text.")
+        if mime_type == "application/json":
             try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise WorkspaceEncodingError("The requested generated file is not valid UTF-8.") from error
-            return (
-                text,
-                FileSnapshot(
-                    uri=target.as_uri(),
-                    exists=True,
-                    size_bytes=after.st_size,
-                    sha256=hashlib.sha256(data).hexdigest(),
-                    modified_at=datetime.fromtimestamp(after.st_mtime, UTC),
-                    captured_at=datetime.now(UTC),
+                json.loads(text)
+            except ValueError as error:
+                raise WorkspaceError("Result resource must contain valid JSON.") from error
+            suffix = ".json"
+        elif mime_type == "text/markdown":
+            suffix = ".md"
+        else:
+            raise WorkspaceError("Result resource must be JSON or Markdown.")
+        stored = self.result_resources.setdefault(call_id, {})
+        if any(f"{provider}{extension}" in stored for extension in (".json", ".md")):
+            raise WorkspaceError("Provider already saved a resource for this call.")
+        name = provider + suffix
+        stored[name] = (mime_type, text)
+        return f"forgemcp://workspace/results/{call_id}/{name}"
+
+    async def before_providers(
+        self,
+        tool_name: str,
+        parameters: Mapping[str, object],
+    ) -> ProviderCall:
+        """Start every eligible provider with the same randomly generated ID."""
+        if tool_name not in self.PROVIDER_TOOLS:
+            raise WorkspaceError("Unknown Workspace provider operation.")
+        call_id = uuid4().hex
+        providers = {
+            name: provider
+            for name, (provider, tools) in self.result_providers.items()
+            if tools is None or tool_name in tools
+        }
+
+        completed: dict[str, object] = {}
+
+        async def run(name: str, provider: ResultProvider) -> tuple[object]:
+            # Keep arbitrary context values distinct from gather's exceptions.
+            method = getattr(provider, f"before_{tool_name}")
+            context = await method(
+                call_id,
+                **deepcopy(dict(parameters)),
+            )
+            if context is not None:
+                completed[name] = context
+            return (context,)
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(name, provider) for name, provider in providers.items()),
+                return_exceptions=True,
+            )
+        except BaseException:
+            # Completed before hooks may hold locks until after/error, even if
+            # another provider is still running when this call is cancelled.
+            await self.error_providers(
+                ProviderCall(call_id, tool_name, MappingProxyType(completed)),
+            )
+            raise
+        contexts = {}
+        for name, outcome in zip(providers, outcomes):
+            if isinstance(outcome, BaseException):
+                logging.getLogger(__name__).warning("Workspace provider before failed: %s", name)
+            elif outcome[0] is not None:
+                contexts[name] = outcome[0]
+        return ProviderCall(call_id, tool_name, MappingProxyType(contexts))
+
+    async def after_providers(
+        self,
+        call: ProviderCall,
+        result: BaseModel,
+    ) -> ResultResources:
+        """Wait for all successful before providers and attach their saved URIs."""
+        names = list(call.contexts)
+        finished: set[str] = set()
+
+        async def run(name: str) -> str | None:
+            try:
+                provider = self.result_providers[name][0]
+                method = getattr(provider, f"after_{call.tool_name}")
+                return await method(
+                    call.id,
+                    call.contexts[name],
+                    result.model_copy(deep=True),
+                )
+            finally:
+                finished.add(name)
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(name) for name in names),
+                return_exceptions=True,
+            )
+        except BaseException:
+            # Cancellation can prevent an after task from starting at all.
+            await self.error_providers(
+                ProviderCall(
+                    call.id,
+                    call.tool_name,
+                    MappingProxyType({
+                        name: call.contexts[name]
+                        for name in names
+                        if name not in finished
+                    }),
                 ),
             )
-        raise WorkspaceConcurrentModificationError(
-            "The generated file changed while it was being read; retry the operation."
-        )
-
-    def _generated_directory_is_empty(self, directory: str) -> bool:
-        """Inspect entry names only; never traverse a generated build tree."""
-        target = self._resolve_path(directory, apply_ignore_policy=False)
-        if not target.exists() or not target.is_dir():
-            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
-        with os.scandir(target) as entries:
-            return next(entries, None) is None
-
-    def _list_generated_files(
-        self, directory: str, path: str, *, maximum: int
-    ) -> tuple[str, ...]:
-        """List direct regular files in a generated directory without following links."""
-        if (
-            not isinstance(maximum, int)
-            or isinstance(maximum, bool)
-            or not 1 <= maximum <= MAX_GENERATED_DIRECTORY_FILES
-        ):
-            raise WorkspaceFileTooLargeError(
-                "Generated-directory listing limit is outside the supported bound."
-            )
-        target = self._resolve_generated_child(directory, path)
-        if not target.exists():
-            raise WorkspaceFileNotFoundError("The requested generated directory does not exist.")
-        if not target.is_dir():
-            raise WorkspaceNotDirectoryError("The requested generated path is not a directory.")
-        names: list[str] = []
-        with os.scandir(target) as entries:
-            for entry in entries:
-                if _is_link_or_reparse_point(Path(entry.path)) or not entry.is_file(follow_symlinks=False):
-                    continue
-                names.append(entry.name)
-                if len(names) > maximum:
-                    raise WorkspaceFileTooLargeError(
-                        "The generated directory contains more files than this operation permits."
-                    )
-        return tuple(sorted(names))
-
-    def _get_generated_snapshot(self, directory: str, path: str) -> FileSnapshot:
-        """Capture metadata for one generated regular file with normal boundary checks."""
-        return self._snapshot_path(self._resolve_generated_child(directory, path))
-
-    @staticmethod
-    def _assert_no_symlink_components(candidate: Path) -> None:
-        """Reject a lexical path that names any existing symlink component."""
-        anchor = Path(candidate.anchor)
-        current = anchor
-        parts = candidate.parts[1:] if candidate.anchor else candidate.parts
-        for part in parts:
-            current = current / part
-            if _is_link_or_reparse_point(current):
-                raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-
-    def _relative_key(self, target: Path) -> str:
-        """Return the canonical forward-slash workspace-relative key for a safe path."""
-        return target.relative_to(self._root).as_posix()
-
-    def _path_identity(self, target: Path) -> str:
-        """Return a platform-canonical key for duplicate detection and ordering."""
-        return os.path.normcase(self._relative_key(target))
-
-    def _snapshot_path(self, target: Path) -> FileSnapshot:
-        """Snapshot an existing regular file, or represent an absent safe target."""
-        if _is_link_or_reparse_point(target):
-            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-        if not target.exists():
-            return FileSnapshot(uri=target.as_uri(), exists=False, captured_at=datetime.now(UTC))
-        if not target.is_file():
-            raise WorkspaceNotFileError("The requested workspace path is not a regular file.")
-        for _ in range(3):
-            before = target.stat()
-            digest = self._hash_file(target)
-            after = target.stat()
-            if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
-                return FileSnapshot(
-                    uri=target.as_uri(),
-                    exists=True,
-                    size_bytes=after.st_size,
-                    sha256=digest,
-                    modified_at=datetime.fromtimestamp(after.st_mtime, UTC),
-                    captured_at=datetime.now(UTC),
-                )
-        raise WorkspaceConcurrentModificationError(
-            "The file changed while its snapshot was being captured; retry the operation."
-        )
-
-    @staticmethod
-    def _hash_file(target: Path) -> str:
-        """Stream a SHA-256 without retaining file contents in service state."""
-        digest = hashlib.sha256()
-        with target.open("rb") as source:
-            for chunk in iter(lambda: source.read(65_536), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def _read_bytes_limited(self, target: Path, maximum: int) -> bytes:
-        """Read at most one configured byte limit plus a sentinel byte."""
-        if _is_link_or_reparse_point(target):
-            raise SymlinkWorkspacePathError("Workspace paths must not traverse symlinks.")
-        with target.open("rb") as source:
-            data = source.read(maximum + 1)
-        if len(data) > maximum:
-            raise WorkspaceFileTooLargeError("The requested file exceeds the configured read limit.")
-        return data
-
-    def _read_text_for_snapshot(self, target: Path, snapshot: FileSnapshot) -> str:
-        """Read source text only when it still matches a prevalidated snapshot."""
-        data = self._read_bytes_limited(target, self._policy.max_read_bytes)
-        if hashlib.sha256(data).hexdigest() != snapshot.sha256:
-            raise WorkspaceConcurrentModificationError(
-                "The file changed while text edits were being planned; retry the operation."
-            )
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise WorkspaceEncodingError("The requested file is not valid UTF-8.") from error
-
-    def _apply_text_replacements(
-        self, source_text: str, edits: tuple[WorkspaceTextEdit, ...]
-    ) -> str:
-        """Validate, order, and apply one non-overlapping batch without logging text."""
-        indexed: list[tuple[int, int, str]] = []
-        total_replacement_bytes = 0
-        for edit in edits:
-            if not isinstance(edit.new_text, str) or "\x00" in edit.new_text:
-                raise WorkspaceTextEditError("Text-edit replacements must be NUL-free UTF-8 text.")
-            try:
-                total_replacement_bytes += len(edit.new_text.encode("utf-8"))
-            except UnicodeEncodeError as error:
-                raise WorkspaceTextEditError("Text-edit replacements must be valid UTF-8 text.") from error
-            start = self._position_offset(source_text, edit.range.start)
-            end = self._position_offset(source_text, edit.range.end)
-            if end < start:
-                raise WorkspaceTextEditError("A text-edit range must not run backwards.")
-            indexed.append((start, end, edit.new_text))
-        if total_replacement_bytes > self._policy.max_patch_bytes:
-            raise WorkspaceFileTooLargeError("Text-edit replacement data exceeds the configured size limit.")
-        ordered = sorted(indexed, key=lambda item: (item[0], item[1], item[2]))
-        previous_start = -1
-        previous_end = -1
-        for start, end, _ in ordered:
-            if start < previous_end or (start == previous_start and end == previous_end):
-                raise WorkspaceTextEditError("Text edits for one file must not overlap.")
-            previous_start, previous_end = start, end
-        output = source_text
-        for start, end, replacement in reversed(ordered):
-            output = output[:start] + replacement + output[end:]
-        try:
-            if len(output.encode("utf-8")) > self._policy.max_patch_bytes:
-                raise WorkspaceFileTooLargeError("Text-edit output exceeds the configured size limit.")
-        except UnicodeEncodeError as error:
-            raise WorkspaceTextEditError("Text-edit output must be valid UTF-8 text.") from error
-        return output
-
-    @staticmethod
-    def _position_offset(source_text: str, position: Position) -> int:
-        """Translate a code-point line/column into a Python string offset."""
-        raw_lines = source_text.splitlines(keepends=True)
-        if not raw_lines:
-            raw_lines = [""]
-        elif source_text.endswith(("\n", "\r")):
-            raw_lines.append("")
-        if position.line >= len(raw_lines):
-            raise WorkspaceTextEditError("A text-edit line is outside the current document.")
-        line = raw_lines[position.line]
-        if line.endswith("\r\n"):
-            visible = line[:-2]
-        elif line.endswith(("\n", "\r")):
-            visible = line[:-1]
-        else:
-            visible = line
-        if position.column > len(visible):
-            raise WorkspaceTextEditError("A text-edit column is outside the current document line.")
-        return sum(len(item) for item in raw_lines[: position.line]) + position.column
-
-    def _normalize_expected_snapshots(
-        self, expected_snapshots: Mapping[str, ExpectedSnapshot]
-    ) -> dict[str, ExpectedSnapshot]:
-        """Canonicalize expected-snapshot keys before any file content is read."""
-        if not isinstance(expected_snapshots, Mapping):
-            raise ExpectedSnapshotError("Expected snapshots must be a mapping by workspace-relative path.")
-        normalized: dict[str, ExpectedSnapshot] = {}
-        for supplied_path, expected in expected_snapshots.items():
-            if not isinstance(supplied_path, str):
-                raise ExpectedSnapshotError("Expected snapshot paths must be strings.")
-            target = self._resolve_path(supplied_path)
-            key = self._path_identity(target)
-            if key in normalized:
-                raise ExpectedSnapshotError("Expected snapshots must not name a file more than once.")
-            if not isinstance(expected, (FileSnapshot, str)) and expected is not None:
-                raise ExpectedSnapshotError("Expected snapshots must be FileSnapshot, SHA-256, or None.")
-            normalized[key] = expected
-        return normalized
-
-    def _matches_expected_snapshot(
-        self, target: Path, current: FileSnapshot, expected: ExpectedSnapshot
-    ) -> bool:
-        """Check optimistic-concurrency input without accepting an ambiguous digest."""
-        if isinstance(expected, FileSnapshot):
-            if expected.uri != target.as_uri():
-                raise ExpectedSnapshotError("An expected FileSnapshot belongs to a different workspace path.")
-            if expected.exists and expected.sha256 is None:
-                raise ExpectedSnapshotError("Existing expected snapshots require a SHA-256 digest.")
-            return expected.exists == current.exists and expected.sha256 == current.sha256
-        if isinstance(expected, str):
-            if not _SHA256_HEX.fullmatch(expected):
-                raise ExpectedSnapshotError("Expected SHA-256 values must be 64 lowercase hexadecimal characters.")
-            return current.exists and current.sha256 == expected
-        return not current.exists
-
-    @staticmethod
-    def _same_snapshot(left: FileSnapshot, right: FileSnapshot) -> bool:
-        """Compare the state relevant to safe compare-and-swap commits."""
-        return left.exists == right.exists and left.sha256 == right.sha256
-
-    def _plan_file_change(
-        self, file_patch: _FilePatch, target: Path, before: FileSnapshot
-    ) -> _PlannedChange | None:
-        """Apply one parsed patch in memory and produce a desired file transition."""
-        creating = file_patch.old_path is None
-        deleting = file_patch.new_path is None
-        if creating and before.exists:
-            return None
-        if not creating and not before.exists:
-            return None
-        if creating and not target.parent.is_dir():
-            raise WorkspaceFileNotFoundError("Patch target parent directory does not exist.")
-        if deleting:
-            source_text = self._read_patch_text(target, before)
-            new_text = self._apply_hunks(source_text, file_patch.hunks)
-            if new_text is None or new_text:
-                return None
-            return _PlannedChange(target=target, before=before, kind=FileChangeKind.DELETED, after_text=None)
-
-        source_text = "" if creating else self._read_patch_text(target, before)
-        new_text = self._apply_hunks(source_text, file_patch.hunks)
-        if new_text is None:
-            return None
-        kind = FileChangeKind.CREATED if creating else FileChangeKind.MODIFIED
-        return _PlannedChange(
-            target=target,
-            before=before,
-            kind=kind,
-            after_text=new_text,
-            no_op=not creating and new_text == source_text,
-        )
-
-    def _read_patch_text(self, target: Path, snapshot: FileSnapshot) -> str:
-        """Read a bounded UTF-8 patch source and ensure it still matches its snapshot."""
-        if snapshot.size_bytes is not None and snapshot.size_bytes > self._policy.max_read_bytes:
-            raise WorkspaceFileTooLargeError("The patch source exceeds the configured read limit.")
-        data = self._read_bytes_limited(target, self._policy.max_read_bytes)
-        if hashlib.sha256(data).hexdigest() != snapshot.sha256:
-            raise WorkspaceConcurrentModificationError(
-                "The file changed while the patch source was being read; retry the operation."
-            )
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise WorkspaceEncodingError("The patch source is not valid UTF-8.") from error
-
-    def _add_bounded_mutation_output(self, total: int, text: str | None) -> int:
-        """Cap aggregate staged UTF-8 data before the first filesystem write."""
-        if text is None:
-            return total
-        try:
-            next_total = total + len(text.encode("utf-8"))
-        except UnicodeEncodeError as error:
-            raise WorkspaceEncodingError("Workspace mutation output must be valid UTF-8 text.") from error
-        if next_total > self._policy.max_patch_bytes:
-            raise WorkspaceFileTooLargeError(
-                "The workspace mutation exceeds the configured aggregate output limit."
-            )
-        return next_total
-
-    def _stage_changes(self, plans: list[_PlannedChange]) -> list[_StagedChange]:
-        """Write all desired files beside their targets before changing any target."""
-        staged: list[_StagedChange] = []
-        try:
-            for plan in plans:
-                current = _StagedChange(plan=plan, temporary_path=None)
-                staged.append(current)
-                if current.plan.after_text is not None:
-                    descriptor, temporary_name = tempfile.mkstemp(
-                        prefix=".forgemcp-", suffix=".tmp", dir=plan.target.parent
-                    )
-                    current.temporary_path = Path(temporary_name)
-                    with os.fdopen(descriptor, "wb") as temporary_file:
-                        temporary_file.write(current.plan.after_text.encode("utf-8"))
-                        temporary_file.flush()
-                        os.fsync(temporary_file.fileno())
-            return staged
-        except OSError as error:
-            self._cleanup_staging(staged)
-            raise PatchCommitError("Patch staging failed before any source file changed.") from error
-
-    def _commit_staged_changes(self, staged: list[_StagedChange]) -> bool:
-        """Replace every target, restoring earlier targets if a later replace fails."""
-        with self._filesystem_lock:
-            # The final compare-and-swap happens under the application-local
-            # filesystem lock.  A cross-process writer remains a documented
-            # OS race, but concurrent ForgeMCP requests cannot interleave the
-            # check and replacement boundary.
-            for item in staged:
-                current = self._snapshot_path(item.plan.target)
-                if not self._same_snapshot(current, item.plan.before):
-                    return False
-            committed: list[_StagedChange] = []
-            try:
-                for item in staged:
-                    plan = item.plan
-                    committed.append(item)
-                    if plan.before.exists:
-                        descriptor, backup_name = tempfile.mkstemp(
-                            prefix=".forgemcp-", suffix=".backup", dir=plan.target.parent
-                        )
-                        os.close(descriptor)
-                        item.backup_path = Path(backup_name)
-                        os.replace(plan.target, item.backup_path)
-                    if item.temporary_path is not None:
-                        os.replace(item.temporary_path, plan.target)
-                        item.temporary_path = None
-                    if plan.kind is not FileChangeKind.DELETED:
-                        item.after_snapshot = self._snapshot_path(plan.target)
-            except OSError as error:
-                self._restore_committed_changes(committed)
-                raise PatchCommitError("Patch commit failed; ForgeMCP restored the previous file state.") from error
-        return True
-
-    def _restore_committed_changes(self, committed: list[_StagedChange]) -> None:
-        """Best-effort rollback for targets already replaced during this operation."""
-        rollback_failed = False
-        for item in reversed(committed):
-            try:
-                if item.backup_path is not None and item.backup_path.exists():
-                    os.replace(item.backup_path, item.plan.target)
-                    item.backup_path = None
-                elif (
-                    item.plan.kind is FileChangeKind.CREATED
-                    and item.temporary_path is None
-                    and item.plan.target.exists()
-                ):
-                    item.plan.target.unlink()
-            except OSError:
-                rollback_failed = True
-        if rollback_failed:
-            raise PatchCommitError("Patch commit failed and automatic rollback could not complete safely.")
-
-    def _cleanup_staging(self, staged: list[_StagedChange]) -> None:
-        """Remove only ForgeMCP-created temporary and backup files."""
-        for item in staged:
-            for path in (item.temporary_path, item.backup_path):
-                if path is None:
-                    continue
-                try:
-                    if path.exists() and not _is_link_or_reparse_point(path):
-                        path.unlink()
-                except OSError:
-                    self._logger.warning("workspace_temporary_cleanup_failed")
-
-    def _to_file_change(self, item: _StagedChange) -> FileChange:
-        """Build a content-free success report after the staged commit completes."""
-        plan = item.plan
-        after = None if plan.kind is FileChangeKind.DELETED else item.after_snapshot
-        before = None if plan.kind is FileChangeKind.CREATED else plan.before
-        return FileChange(uri=plan.target.as_uri(), kind=plan.kind, before=before, after=after)
-
-    def _publish_mutations(
-        self, plans: Sequence[_PlannedChange], changes: Sequence[FileChange]
-    ) -> None:
-        """Queue one ordered post-commit batch after staging cleanup is complete."""
-        if self._mutations is None or not changes:
-            return
-        with self._filesystem_lock:
-            self._mutation_operation += 1
-            operation_id = f"workspace-{self._mutation_operation}"
-        event_changes: list[tuple[str, FileChangeKind, FileSnapshot | None, FileSnapshot | None]] = []
-        for plan, change in zip(plans, changes, strict=True):
-            event_changes.append(
-                (self._relative_key(plan.target), change.kind, change.before, change.after)
-            )
-        # Publication never invokes a subscriber while Workspace has staging
-        # state. Failure or saturation is contained by the application bus.
-        self._mutations.publish(tuple(event_changes), operation_id=operation_id)
-
-    @staticmethod
-    def _reject_windows_special_components(parts: Sequence[str]) -> None:
-        """Deny ADS and reserved device spellings on every platform."""
-        for part in parts:
-            if ":" in part or part.rstrip(" .") != part or _WINDOWS_RESERVED_COMPONENT.fullmatch(part):
-                raise WorkspacePathError(
-                    "Workspace paths must not use Windows device or alternate-data-stream names."
-                )
-
-    def _parse_unified_patch(self, patch: str) -> tuple[_FilePatch, ...]:
-        """Parse the deliberately small, text-only unified-diff subset we support."""
-        if not isinstance(patch, str):
-            raise InvalidUnifiedPatchError("Unified patches must be UTF-8 text strings.")
-        try:
-            patch_bytes = patch.encode("utf-8")
-        except UnicodeEncodeError as error:
-            raise InvalidUnifiedPatchError("Unified patches must be valid UTF-8 text.") from error
-        if len(patch_bytes) > self._policy.max_patch_bytes:
-            raise WorkspaceFileTooLargeError("The supplied patch exceeds the configured patch limit.")
-        lines = patch.splitlines(keepends=True)
-        if not lines:
-            raise InvalidUnifiedPatchError("A unified patch must contain at least one file change.")
-
-        parsed: list[_FilePatch] = []
-        index = 0
-        while index < len(lines):
-            line = self._strip_line_ending(lines[index])
-            if line.startswith(_PATCH_METADATA_PREFIXES):
-                index += 1
+            raise
+        stored = self.result_resources.get(call.id, {})
+        links = {}
+        for name, outcome in zip(names, outcomes):
+            if isinstance(outcome, BaseException):
+                logging.getLogger(__name__).warning("Workspace provider after failed: %s", name)
                 continue
-            if not line.startswith("--- "):
-                raise InvalidUnifiedPatchError("Patch input must use unified-diff file headers.")
-            old_path = self._parse_patch_header(line[4:], "a/")
-            index += 1
-            if index >= len(lines) or not self._strip_line_ending(lines[index]).startswith("+++ "):
-                raise InvalidUnifiedPatchError("Each old file header must be followed by a new file header.")
-            new_path = self._parse_patch_header(self._strip_line_ending(lines[index])[4:], "b/")
-            if old_path is None and new_path is None:
-                raise InvalidUnifiedPatchError("A patch cannot use /dev/null for both file headers.")
-            if old_path is not None and new_path is not None and old_path != new_path:
-                raise InvalidUnifiedPatchError("File renames are not supported by the workspace patch format.")
-            index += 1
-
-            hunks: list[_Hunk] = []
-            while index < len(lines):
-                line = self._strip_line_ending(lines[index])
-                if line.startswith("--- ") or line.startswith(_PATCH_METADATA_PREFIXES):
-                    break
-                if not line.startswith("@@ "):
-                    raise InvalidUnifiedPatchError("Unified patches may contain only hunks after file headers.")
-                hunk, index = self._parse_hunk(lines, index)
-                hunks.append(hunk)
-            if not hunks:
-                raise InvalidUnifiedPatchError("Each patched file must contain at least one hunk.")
-            parsed.append(_FilePatch(old_path=old_path, new_path=new_path, hunks=tuple(hunks)))
-        return tuple(parsed)
-
-    def _parse_hunk(self, lines: list[str], index: int) -> tuple[_Hunk, int]:
-        """Parse and count-check one hunk without retaining it outside this call."""
-        match = _HUNK_HEADER.fullmatch(self._strip_line_ending(lines[index]))
-        if match is None:
-            raise InvalidUnifiedPatchError("A hunk header has invalid unified-diff coordinates.")
-        old_start = int(match.group("old_start"))
-        old_count = int(match.group("old_count") or "1")
-        new_start = int(match.group("new_start"))
-        new_count = int(match.group("new_count") or "1")
-        if (old_start == 0 and old_count != 0) or (new_start == 0 and new_count != 0):
-            raise InvalidUnifiedPatchError("Zero hunk coordinates are valid only for empty ranges.")
-        index += 1
-        hunk_lines: list[_PatchLine] = []
-        while index < len(lines):
-            raw_line = lines[index]
-            line = self._strip_line_ending(raw_line)
-            old_lines = sum(item.kind in {" ", "-"} for item in hunk_lines)
-            new_lines = sum(item.kind in {" ", "+"} for item in hunk_lines)
-            if line.startswith("@@ ") or (
-                (line.startswith("--- ") or line.startswith(_PATCH_METADATA_PREFIXES))
-                and old_lines == old_count
-                and new_lines == new_count
+            expected = {
+                f"forgemcp://workspace/results/{call.id}/{name}.json",
+                f"forgemcp://workspace/results/{call.id}/{name}.md",
+            }
+            if outcome is None:
+                continue
+            if (
+                not isinstance(outcome, str)
+                or outcome not in expected
+                or outcome.rsplit("/", 1)[-1] not in stored
             ):
+                logging.getLogger(__name__).warning(
+                    "Workspace provider returned no saved URI: %s",
+                    name,
+                )
+                continue
+            filename = outcome.rsplit("/", 1)[-1]
+            links[name] = ResultResource(uri=outcome, mime_type=stored[filename][0])
+        if links:
+            kept = {link.uri.rsplit("/", 1)[-1] for link in links.values()}
+            self.result_resources[call.id] = {
+                name: value for name, value in stored.items() if name in kept
+            }
+        else:
+            self.result_resources.pop(call.id, None)
+        return ResultResources(resources=links)
+
+    async def error_providers(self, call: ProviderCall) -> None:
+        """Tell providers with a context that the Workspace tool failed."""
+
+        async def run(name: str) -> None:
+            provider = self.result_providers[name][0]
+            await provider.error(call.id, call.contexts[name])
+
+        try:
+            outcomes = await asyncio.gather(
+                *(run(name) for name in call.contexts),
+                return_exceptions=True,
+            )
+            for name, outcome in zip(call.contexts, outcomes):
+                if isinstance(outcome, BaseException):
+                    logging.getLogger(__name__).warning("Workspace provider error failed: %s", name)
+        finally:
+            self.result_resources.pop(call.id, None)
+
+    def root_path(self, root: WorkspaceRoot) -> Path:
+        if root == "project":
+            return self.root
+        if root == "storage":
+            return self.storage_root
+        raise WorkspaceError("Root must be 'project' or 'storage'.")
+
+    def resolve_path(self, path: str, *, root: WorkspaceRoot = "project") -> Path:
+        """Return a checked absolute path, retaining its lexical link components."""
+        if not path or "\0" in path:
+            raise WorkspaceError("Path must be a nonempty relative path.")
+        portable = PurePosixPath(path.replace("\\", "/"))
+        windows = PureWindowsPath(path)
+        if (
+            portable.is_absolute()
+            or windows.drive
+            or windows.root
+            or ".." in portable.parts
+        ):
+            raise WorkspaceError("Path must be relative and cannot contain '..'.")
+        if os.name == "nt" and any(os.path.isreserved(part) for part in portable.parts):
+            raise WorkspaceError("Path contains a reserved Windows name.")
+        base = self.root_path(root)
+        candidate = base.joinpath(*portable.parts)
+        with filesystem_errors(path):
+            if not candidate.resolve().is_relative_to(base):
+                raise WorkspaceError("Path resolves outside the selected root.")
+        return candidate
+
+    def relative_path(self, path: Path, *, root: WorkspaceRoot = "project") -> str:
+        try:
+            relative = path.relative_to(self.root_path(root)).as_posix()
+        except ValueError as error:
+            raise WorkspaceError("Path is outside the selected root.") from error
+        self.resolve_path(relative, root=root)
+        return relative
+
+    def is_link(self, path: Path) -> bool:
+        return path.is_symlink() or path.is_junction()
+
+    def check_path_links(self, path: Path, root: WorkspaceRoot) -> None:
+        base = self.root_path(root)
+        current = path
+        while True:
+            if self.is_link(current):
+                raise WorkspaceError(
+                    "This operation cannot traverse symbolic links or junctions."
+                )
+            if current == base:
                 break
-            if line == "\\ No newline at end of file":
-                raise InvalidUnifiedPatchError("Patches without a final newline are not supported yet.")
-            if not line or line[0] not in {" ", "+", "-"}:
-                raise InvalidUnifiedPatchError("A hunk contains an invalid line prefix.")
-            hunk_lines.append(
-                _PatchLine(
-                    kind=line[0],
-                    text=line[1:],
-                    ends_with_newline=raw_line.endswith(("\n", "\r")),
+            current = current.parent
+
+    def check_tree_links(self, path: Path) -> None:
+        for directory, dirs, files in os.walk(
+            path,
+            followlinks=False,
+            onerror=self.raise_walk_error,
+        ):
+            if any(self.is_link(Path(directory) / name) for name in [*dirs, *files]):
+                raise WorkspaceError(
+                    "This operation cannot move or remove a tree containing links."
+                )
+
+    def protect_path(self, path: WorkspacePath) -> None:
+        candidate = self.resolve_workspace_path(path)
+        self.protected_paths.update((candidate, candidate.resolve()))
+
+    def writable_path(
+        self,
+        path: str,
+        *,
+        root: WorkspaceRoot,
+        subtree: bool = False,
+    ) -> Path:
+        candidate = self.resolve_path(path, root=root)
+        self.check_path_links(candidate, root)
+        if candidate in (self.root, self.storage_root):
+            raise WorkspaceError("Cannot change a workspace root.")
+        for protected in self.protected_paths:
+            if candidate.is_relative_to(protected) or (
+                subtree and protected.is_relative_to(candidate)
+            ):
+                raise WorkspaceError(f"{path}: path is protected.")
+        if subtree and self.storage_root.is_relative_to(candidate):
+            raise WorkspaceError("Cannot move or remove a parent of the storage root.")
+        return candidate
+
+    def resolve_workspace_path(self, path: WorkspacePath) -> Path:
+        return self.resolve_path(path.relative, root=path.area)
+
+    def qualified_path(self, root: str, path: str) -> WorkspacePath:
+        """Adapt a resource URI's root/path pair to the shared path type."""
+        self.root_path(root)
+        if not path:
+            raise WorkspaceError("Path must not be empty.")
+        try:
+            return WorkspacePath(f"{root}/{'' if path == '.' else path}")
+        except ValueError as error:
+            raise WorkspaceError("Expected a canonical relative workspace path.") from error
+
+    def workspace_path(self, path: Path) -> WorkspacePath:
+        """Represent a native path without granting permission to access it."""
+        candidate = path.absolute()
+        for area in ("storage", "project"):
+            base = self.root_path(area)
+            if candidate.is_relative_to(base):
+                relative = self.relative_path(candidate, root=area)
+                return WorkspacePath(f"{area}/{'' if relative == '.' else relative}")
+        return WorkspacePath("root/" + candidate.as_posix())
+
+    def require_file(self, path: str, root: WorkspaceRoot) -> Path:
+        candidate = self.resolve_path(path, root=root)
+        if not candidate.is_file():
+            raise WorkspaceError(f"{path}: expected an existing regular file.")
+        return candidate
+
+    def raise_walk_error(self, error: OSError) -> None:
+        raise error
+
+    async def iter_files(self, path: str, root: WorkspaceRoot) -> AsyncGenerator[Path]:
+        start = self.resolve_path(path, root=root)
+        self.check_path_links(start, root)
+        relative = start.relative_to(self.root_path(root))
+        directory_parts = relative.parts if start.is_dir() else relative.parts[:-1]
+        if any(part.startswith(".") for part in directory_parts):
+            return
+        if start.is_file():
+            yield start
+            return
+        if not start.is_dir():
+            raise WorkspaceError(f"{path}: expected an existing file or directory.")
+        for directory, dirs, files in os.walk(
+            start,
+            followlinks=False,
+            onerror=self.raise_walk_error,
+        ):
+            await asyncio.sleep(0)
+            parent = Path(directory)
+            dirs[:] = sorted(
+                name
+                for name in dirs
+                if not name.startswith(".") and not self.is_link(parent / name)
+            )
+            for name in sorted(files):
+                child = parent / name
+                if not self.is_link(child) and child.is_file():
+                    yield child
+                    await asyncio.sleep(0)
+
+    def extension_matches(self, path: Path, extensions: Sequence[str] | None) -> bool:
+        return extensions is None or path.suffix.removeprefix(".").lower() in {
+            extension.removeprefix(".").lower() for extension in extensions
+        }
+
+    def file_uri(self, path: WorkspacePath) -> str:
+        if path.area == "root":
+            raise WorkspaceError("External files have no workspace mirror resources.")
+        return f"forgemcp://workspace/file/{quote(str(path), safe='/')}"
+
+    def render_markdown(
+        self,
+        result: DirectoryTree | FilePaths | FileInfo | SearchResult,
+    ) -> str:
+        """Render the same business results served by tools as Markdown resources."""
+        nodes: list[markdown.Node] = []
+        if isinstance(result, DirectoryTree):
+            lines = [str(result.path)]
+
+            def visit(entries: list[TreeEntry], prefix: str = "") -> None:
+                for index, entry in enumerate(entries):
+                    last = index == len(entries) - 1
+                    suffix = (
+                        "/"
+                        if entry.kind == "directory"
+                        else " @" if entry.kind == "symlink" else ""
+                    )
+                    lines.append(
+                        f"{prefix}{'└── ' if last else '├── '}{PurePosixPath(entry.path.relative).name}{suffix}"
+                    )
+                    if entry.children is not None:
+                        visit(entry.children, prefix + ("    " if last else "│   "))
+
+            visit(result.entries)
+            nodes.extend(
+                [
+                    markdown.Heading("Directory tree"),
+                    markdown.CodeBlock("\n".join(lines)),
+                ]
+            )
+        elif isinstance(result, FilePaths):
+            nodes.extend(
+                [
+                    markdown.Heading("Files"),
+                    markdown.UnorderedList(
+                        markdown.Link(str(path), self.file_uri(path))
+                        for path in result.paths
+                    ),
+                ]
+            )
+        elif isinstance(result, FileInfo):
+            nodes.append(markdown.Heading("File information"))
+            nodes.append(
+                markdown.Table(
+                    ["Field", "Value"],
+                    [
+                        [key, str(value) if value is not None else "Unavailable"]
+                        for key, value in result.model_dump(mode="json").items()
+                    ],
                 )
             )
-            index += 1
-        if sum(line.kind in {" ", "-"} for line in hunk_lines) != old_count:
-            raise InvalidUnifiedPatchError("A hunk's old range does not match its line count.")
-        if sum(line.kind in {" ", "+"} for line in hunk_lines) != new_count:
-            raise InvalidUnifiedPatchError("A hunk's new range does not match its line count.")
-        return (
-            _Hunk(
-                old_start=old_start,
-                old_count=old_count,
-                new_start=new_start,
-                new_count=new_count,
-                lines=tuple(hunk_lines),
-            ),
-            index,
+        else:
+            nodes.append(markdown.Heading("Search results"))
+            for match in result.matches:
+                nodes.extend(
+                    [
+                        markdown.Paragraph(
+                            f"{markdown.Link(str(match.path), self.file_uri(match.path))}, line {match.line}"
+                        ),
+                        markdown.CodeBlock(match.text),
+                    ]
+                )
+            if not result.matches:
+                nodes.append(markdown.Paragraph("No matches."))
+            nodes.extend(
+                [
+                    markdown.Heading("Skipped files", level=2),
+                    markdown.UnorderedList(str(path) for path in result.skipped_files),
+                ]
+            )
+        return markdown.Document(nodes).render()
+
+    def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
+        """Register file tools, mirrors, Markdown resources, and completions."""
+
+        def serialized[**P, R](
+            handler: Callable[P, Awaitable[R]],
+        ) -> Callable[P, Awaitable[R]]:
+            @wraps(handler)
+            async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+                async with self.serialized_operation():
+                    return await handler(*args, **kwargs)
+
+            return wrapped
+
+        read_only = ToolAnnotations(
+            read_only_hint=True,
+            destructive_hint=False,
+            open_world_hint=False,
+        )
+        modifying = ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=True,
+            open_world_hint=False,
         )
 
-    @staticmethod
-    def _strip_line_ending(line: str) -> str:
-        """Remove only the line terminator, preserving all source text characters."""
-        return line[:-2] if line.endswith("\r\n") else line[:-1] if line.endswith(("\n", "\r")) else line
+        @apps.tool(
+            resource_uri=self.TREE_WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
+        @serialized
+        async def workspace_list(
+            ctx: Context,
+            path: WorkspacePath = WorkspacePath("project/"),
+            depth: int | None = 1,
+            include_hidden: bool = False,
+        ) -> DirectoryTree:
+            """Show a directory tree; null depth expands every directory.
 
-    @staticmethod
-    def _parse_patch_header(value: str, expected_prefix: str) -> str | None:
-        """Extract a single text path from a standard unified-diff header."""
-        raw_path = value.split("\t", 1)[0]
-        if raw_path == "/dev/null":
-            return None
-        if not raw_path:
-            raise InvalidUnifiedPatchError("Patch file headers must name one path or /dev/null.")
-        return raw_path[len(expected_prefix) :] if raw_path.startswith(expected_prefix) else raw_path
+            File paths are errors. include_hidden controls dot directories;
+            dot files remain visible and links are listed without traversal.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_list",
+                {
+                    "path": path,
+                    "depth": depth,
+                    "include_hidden": include_hidden,
+                },
+            )
+            try:
+                visited = 0
+                await report_progress(0, message="Starting directory scan")
+                if depth is not None and depth < 1:
+                    raise WorkspaceError(
+                        "Depth must be positive or null for the complete tree."
+                    )
+                directory = self.resolve_workspace_path(path)
+                self.check_path_links(directory, path.area)
+                if not directory.is_dir():
+                    raise WorkspaceError(f"{path}: expected an existing directory.")
 
-    @staticmethod
-    def _apply_hunks(source_text: str, hunks: tuple[_Hunk, ...]) -> str | None:
-        """Apply coordinate-checked hunks to text in memory, returning None on mismatch."""
-        source_lines = source_text.splitlines()
-        line_ending = "\r\n" if "\r\n" in source_text else "\n"
-        final_newline = source_text.endswith(("\n", "\r"))
-        output: list[str] = []
-        cursor = 0
-        for hunk in hunks:
-            position = hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1
-            if position < cursor or position > len(source_lines):
+                async def entries(
+                    parent: Path,
+                    remaining: int | None,
+                ) -> list[TreeEntry]:
+                    nonlocal visited
+                    result: list[TreeEntry] = []
+                    for child in sorted(parent.iterdir(), key=lambda item: item.name):
+                        if (
+                            not include_hidden
+                            and child.name.startswith(".")
+                            and child.is_dir()
+                        ):
+                            continue
+                        children = None
+                        if self.is_link(child):
+                            kind = "symlink"
+                        elif child.is_dir():
+                            kind = "directory"
+                            if remaining is None or remaining > 1:
+                                children = await entries(
+                                    child,
+                                    None if remaining is None else remaining - 1,
+                                )
+                        elif child.is_file():
+                            kind = "file"
+                        else:
+                            kind = "other"
+                        entry = TreeEntry(
+                            path=self.qualified_path(
+                                path.area,
+                                child.relative_to(self.root_path(path.area)).as_posix(),
+                            ),
+                            kind=kind,
+                            children=children,
+                        )
+                        result.append(entry)
+                        visited += 1
+                        await report_progress(visited, message=f"process {entry.path}")
+                        await asyncio.sleep(0)
+                    return result
+
+                with filesystem_errors(path):
+                    result = DirectoryTree(
+                        path=path,
+                        entries=await entries(directory, depth),
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
+
+        @apps.tool(
+            resource_uri=self.TREE_WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=read_only,
+        )
+        @serialized
+        async def workspace_find_files(
+            ctx: Context,
+            pattern: str = "*",
+            path: WorkspacePath = WorkspacePath("project/"),
+        ) -> FilePaths:
+            """Find file paths recursively by case-sensitive glob, skipping dot directories and links.
+
+            Patterns without / match basenames; patterns with / match paths
+            relative to the search directory.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_find_files",
+                {
+                    "pattern": pattern,
+                    "path": path,
+                },
+            )
+            try:
+                visited = 0
+                await report_progress(0, message="Files visited")
+                start = self.resolve_workspace_path(path)
+                base = start if start.is_dir() else start.parent
+                if not pattern:
+                    raise WorkspaceError("File pattern must not be empty.")
+                paths = []
+                files = []
+                with filesystem_errors(path):
+                    async for candidate in self.iter_files(path.relative, path.area):
+                        visited += 1
+                        await report_progress(visited, message="Files visited")
+                        target = candidate.relative_to(base).as_posix()
+                        matches = (
+                            PurePosixPath(target).full_match(
+                                pattern,
+                                case_sensitive=True,
+                            )
+                            if "/" in pattern
+                            else fnmatch.fnmatchcase(candidate.name, pattern)
+                        )
+                        if matches:
+                            found = self.qualified_path(
+                                path.area,
+                                self.relative_path(candidate, root=path.area),
+                            )
+                            paths.append(found)
+                            metadata = candidate.stat()
+                            files.append(
+                                FoundFile(
+                                    path=found,
+                                    modified_at=datetime.fromtimestamp(metadata.st_mtime, UTC),
+                                    size_bytes=metadata.st_size,
+                                )
+                            )
+                result = FilePaths(
+                    paths=sorted(paths, key=str),
+                    files=sorted(files, key=lambda file: str(file.path)),
+                )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.FILE_ICON.icon],
+            annotations=read_only,
+        )
+        @serialized
+        async def workspace_file_info(
+            path: WorkspacePath,
+            ctx: Context,
+        ) -> FileInfo:
+            """Read creation/modification times, byte size, and owner of one file."""
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers("workspace_file_info", {"path": path})
+            try:
+                await report_progress(0, total=1, message="Starting file info")
+                with filesystem_errors(path):
+                    candidate = self.require_file(path.relative, path.area)
+                    metadata = candidate.stat()
+                    birth = getattr(metadata, "st_birthtime", None)
+                    result = FileInfo(
+                        path=path,
+                        created_at=(
+                            datetime.fromtimestamp(birth, UTC) if birth is not None else None
+                        ),
+                        modified_at=datetime.fromtimestamp(metadata.st_mtime, UTC),
+                        size_bytes=metadata.st_size,
+                        owner=file_owner(candidate),
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed file info")
+            return result
+
+        @apps.tool(
+            resource_uri=self.FILE_WIDGET.uri,
+            icons=[self.FILE_ICON.icon],
+            annotations=read_only,
+        )
+        @serialized
+        async def workspace_read_file(
+            path: WorkspacePath,
+            ctx: Context,
+            confirm: Annotated[ReadConfirmation, Resolve(confirm_read)],
+            start_line: int = 1,
+            end_line: int | None = None,
+        ) -> FileContent:
+            """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_read_file",
+                {
+                    "path": path,
+                    "confirm": confirm,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                },
+            )
+            try:
+                if start_line < 1 or (end_line is not None and end_line < start_line):
+                    raise WorkspaceError(
+                        "Line range must start at 1 or later and end at or after its start."
+                    )
+                with filesystem_errors(path):
+                    if not confirm.allow:
+                        raise WorkspaceError("External file reading was not permitted.")
+                    candidate = (
+                        path.absolute if path.area == "root"
+                        else self.require_file(path.relative, path.area)
+                    )
+                    if not candidate.is_file():
+                        raise WorkspaceError(f"{path}: expected an existing regular file.")
+                    text = bytearray()
+                    await report_progress(0, message="Bytes read")
+                    with candidate.open("rb") as stream:
+                        while chunk := stream.read(64 * 1024):
+                            text.extend(chunk)
+                            await report_progress(len(text), message="Bytes read")
+                            await asyncio.sleep(0)
+                    decoded = text.decode("utf-8")
+                    if "\0" in decoded:
+                        raise WorkspaceError(
+                            f"{path}: expected UTF-8 text, found a binary file."
+                        )
+                    result = FileContent(
+                        path=path,
+                        text="".join(
+                            decoded.splitlines(keepends=True)[start_line - 1 : end_line]
+                        ),
+                        start_line=start_line,
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
+
+        @apps.tool(
+            resource_uri=self.SEARCH_WIDGET.uri,
+            icons=[self.SEARCH_ICON.icon],
+            annotations=read_only,
+        )
+        @serialized
+        async def workspace_search(
+            query: str,
+            ctx: Context,
+            path: WorkspacePath = WorkspacePath("project/"),
+            regex: bool = False,
+            extensions: list[str] | None = None,
+            case_sensitive: bool = True,
+        ) -> SearchResult:
+            """Search lines by literal text or regex; report skipped binary/non-UTF-8 files.
+
+            extensions accepts suffixes with or without a leading dot;
+            null selects all files, while an empty list selects none.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_search",
+                {
+                    "query": query,
+                    "path": path,
+                    "regex": regex,
+                    "extensions": extensions,
+                    "case_sensitive": case_sensitive,
+                },
+            )
+            try:
+                visited = 0
+                await report_progress(0, message="Files visited")
+                if not query:
+                    raise WorkspaceError("Search query must not be empty.")
+                try:
+                    expression = regex_engine.compile(
+                        query if regex else regex_engine.escape(query),
+                        flags=regex_engine.VERSION1
+                        | (0 if case_sensitive else regex_engine.IGNORECASE),
+                    )
+                except regex_engine.error as error:
+                    raise WorkspaceError(
+                        f"Invalid regular expression: {error}"
+                    ) from error
+                matches, skipped = [], []
+                with filesystem_errors(path):
+                    async for candidate in self.iter_files(path.relative, path.area):
+                        visited += 1
+                        current = self.qualified_path(
+                            path.area,
+                            self.relative_path(candidate, root=path.area),
+                        )
+                        await report_progress(visited, message=f"Searching {current}")
+                        if not self.extension_matches(candidate, extensions):
+                            continue
+                        relative = self.qualified_path(
+                            path.area,
+                            self.relative_path(candidate, root=path.area),
+                        )
+                        data = candidate.read_bytes()
+                        try:
+                            text = data.decode("utf-8")
+                        except UnicodeDecodeError:
+                            skipped.append(relative)
+                            continue
+                        if "\0" in text:
+                            skipped.append(relative)
+                            continue
+                        for line, value in enumerate(text.splitlines(), 1):
+                            if line % 256 == 0:
+                                await asyncio.sleep(0)
+                            spans = [
+                                match.span() for match in expression.finditer(value)
+                            ]
+                            if spans:
+                                matches.append(
+                                    SearchMatch(
+                                        path=relative,
+                                        line=line,
+                                        text=value,
+                                        spans=spans,
+                                    )
+                                )
+                result = SearchResult(
+                    matches=sorted(matches, key=lambda item: (str(item.path), item.line)),
+                    skipped_files=sorted(skipped, key=str),
+                )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.EDIT_ICON.icon],
+            annotations=modifying,
+        )
+        @serialized
+        async def workspace_write_file(
+            path: WorkspacePath,
+            text: str,
+            ctx: Context,
+        ) -> FileWriteResult:
+            """Create or fully overwrite a UTF-8 file; its parent directory must exist.
+
+            Return removed/added line counts and linked change resources.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_write_file",
+                {
+                    "path": path,
+                    "text": text,
+                },
+            )
+            try:
+                await report_progress(0, total=1, message="Starting write file")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    existed = candidate.exists()
+                    previous = read_text(candidate, path) if existed else ""
+                    replace_text(candidate, text)
+                    result = FileWriteResult(
+                        path=path,
+                        action="overwritten" if existed else "created",
+                        lines_removed=len(previous.splitlines()),
+                        lines_added=len(text.splitlines()),
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed write file")
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.EDIT_ICON.icon],
+            annotations=modifying,
+        )
+        @serialized
+        async def workspace_edit_file(
+            path: WorkspacePath,
+            old_text: str,
+            new_text: str,
+            ctx: Context,
+            replace_all: bool = False,
+        ) -> FileEditResult:
+            """Replace one exact text occurrence, or all with replace_all=true.
+
+            old_text must be nonempty. Missing or ambiguous matches leave the
+            file unchanged. Text and line endings outside replacements are preserved.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_edit_file",
+                {
+                    "path": path,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "replace_all": replace_all,
+                },
+            )
+            try:
+                await report_progress(0, total=1, message="Starting edit file")
+                if not old_text:
+                    raise WorkspaceError("old_text must not be empty.")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    text = read_text(candidate, path)
+                    count = text.count(old_text)
+                    if count == 0:
+                        raise WorkspaceError(
+                            "Exact text was not found; the file was not changed."
+                        )
+                    if count > 1 and not replace_all:
+                        raise WorkspaceError(
+                            f"Found {count} occurrences; use replace_all or a more specific old_text."
+                        )
+                    replace_text(candidate, text.replace(old_text, new_text))
+                    result = FileEditResult(
+                        path=path,
+                        replacements=count,
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed edit file")
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.EDIT_ICON.icon],
+            annotations=modifying,
+        )
+        @serialized
+        async def workspace_move(
+            source: WorkspacePath,
+            destination: WorkspacePath,
+            ctx: Context,
+        ) -> PathOperationResult:
+            """Move a file or directory within project/ or within storage/.
+
+            The destination must not exist, and its parent directory must exist.
+            """
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers(
+                "workspace_move",
+                {
+                    "source": source,
+                    "destination": destination,
+                },
+            )
+            try:
+                await report_progress(0, total=1, message="Starting move")
+                if source.area != destination.area:
+                    raise WorkspaceError("Move source and destination must use the same root.")
+                with filesystem_errors(source):
+                    origin = self.writable_path(
+                        source.relative,
+                        root=source.area,
+                        subtree=True,
+                    )
+                    target = self.writable_path(
+                        destination.relative,
+                        root=destination.area,
+                        subtree=True,
+                    )
+                    if not origin.exists():
+                        raise WorkspaceError(f"{source}: path does not exist.")
+                    if target.exists() or target.is_symlink():
+                        raise WorkspaceError(f"{destination}: destination already exists.")
+                    if origin.is_dir():
+                        if target.is_relative_to(origin):
+                            raise WorkspaceError("Cannot move a directory into itself.")
+                        self.check_tree_links(origin)
+                    origin.rename(target)
+                    result = PathOperationResult(
+                        path=destination,
+                        action="moved",
+                        source=source,
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed move")
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.EDIT_ICON.icon],
+            annotations=modifying,
+        )
+        @serialized
+        async def workspace_delete(
+            path: WorkspacePath,
+            ctx: Context,
+        ) -> PathOperationResult:
+            """Delete a file or empty directory; protected paths and roots cannot be deleted."""
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers("workspace_delete", {"path": path})
+            try:
+                await report_progress(0, total=1, message="Starting delete")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(
+                        path.relative,
+                        root=path.area,
+                        subtree=True,
+                    )
+                    if candidate.is_dir():
+                        candidate.rmdir()
+                    else:
+                        self.require_file(path.relative, path.area).unlink()
+                    result = PathOperationResult(
+                        path=path,
+                        action="deleted",
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed delete")
+            return result
+
+        @apps.tool(
+            resource_uri=self.RESULT_WIDGET.uri,
+            icons=[self.ICON.icon],
+            annotations=ToolAnnotations(
+                read_only_hint=False,
+                destructive_hint=False,
+                idempotent_hint=True,
+                open_world_hint=False,
+            ),
+        )
+        @serialized
+        async def workspace_mkdir(
+            path: WorkspacePath,
+            ctx: Context,
+        ) -> PathOperationResult:
+            """Create a directory and missing parents, or report that it already exists."""
+            report_progress = progress(ctx, interval=self.progress_interval)
+            call = await self.before_providers("workspace_mkdir", {"path": path})
+            try:
+                await report_progress(0, total=1, message="Starting mkdir")
+                with filesystem_errors(path):
+                    candidate = self.writable_path(path.relative, root=path.area)
+                    existed = candidate.is_dir()
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    result = PathOperationResult(
+                        path=path,
+                        action="already_exists" if existed else "created",
+                    )
+            except BaseException as error:
+                await self.error_providers(call)
+                if isinstance(error, WorkspaceError):
+                    raise ToolError(str(error)) from error
+                raise
+            result.resources = (await self.after_providers(call, result)).resources
+            await report_progress(1, total=1, message="Completed mkdir")
+            return result
+
+        for widget in (
+            self.TREE_WIDGET,
+            self.FILE_WIDGET,
+            self.SEARCH_WIDGET,
+            self.RESULT_WIDGET,
+        ):
+            apps.add_html_resource(widget.uri, widget.content)
+
+        @mcp.resource(
+            self.RESULT_JSON_URI,
+            mime_type="application/json",
+            icons=[self.FILE_ICON.icon],
+        )
+        @serialized
+        async def workspace_result_json(result_id: str, name: str) -> str:
+            """Read immutable provider JSON from one tool invocation."""
+            try:
+                return self.read_result_resource(result_id, name + ".json")
+            except WorkspaceError as error:
+                raise ResourceNotFoundError(str(error)) from error
+
+        @mcp.resource(
+            self.RESULT_MARKDOWN_URI,
+            mime_type="text/markdown",
+            icons=[self.FILE_ICON.icon],
+        )
+        @serialized
+        async def workspace_result_markdown(result_id: str, name: str) -> str:
+            """Read a provider's immutable Markdown, independently of syntax token data."""
+            try:
+                return self.read_result_resource(result_id, name + ".md")
+            except WorkspaceError as error:
+                raise ResourceNotFoundError(str(error)) from error
+
+        def resource_path(value: str) -> WorkspacePath:
+            try:
+                # Directory completions end in '/', while WorkspacePath is canonical.
+                area, separator, relative = value.partition("/")
+                if area == "root":
+                    raise ResourceNotFoundError("External files have no workspace mirror resources.")
+                if not separator:
+                    raise WorkspaceError("Path must start with project/ or storage/.")
+                return self.qualified_path(area, relative.rstrip("/") or ".")
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(
+            self.FILE_URI,
+            mime_type="text/plain",
+            icons=[self.FILE_ICON.icon],
+        )
+        @serialized
+        async def workspace_file_resource(
+            path: list[str] | None = None,
+        ) -> str:
+            """Read the complete UTF-8 file without formatting or metadata."""
+            selected = resource_path("/".join(path or []))
+            try:
+                return read_text(self.resolve_workspace_path(selected), selected)
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(
+            self.RAW_URI,
+            mime_type="application/octet-stream",
+            icons=[self.FILE_ICON.icon],
+        )
+        @serialized
+        async def workspace_raw_resource(
+            path: list[str] | None = None,
+        ) -> bytes:
+            """Read the exact bytes of any file."""
+            selected = resource_path("/".join(path or []))
+            try:
+                with filesystem_errors(selected):
+                    return self.require_file(selected.relative, selected.area).read_bytes()
+            except WorkspaceError as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(self.LIST_URI, mime_type="text/markdown", icons=[self.ICON.icon])
+        @serialized
+        async def workspace_list_resource(
+            ctx: Context,
+            path: str = "project/",
+            depth: int | Literal["all"] = 1,
+            include_hidden: bool = False,
+        ) -> str:
+            """Read a directory tree as Markdown; depth=all expands the whole tree."""
+            try:
+                result = await workspace_list(
+                    ctx=ctx,
+                    path=resource_path(path),
+                    depth=None if depth == "all" else depth,
+                    include_hidden=include_hidden,
+                )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(
+            self.FIND_URI,
+            mime_type="text/markdown",
+            icons=[self.ICON.icon],
+            security=ResourceSecurity(exempt_params={"pattern"}),
+        )
+        @serialized
+        async def workspace_find_files_resource(
+            ctx: Context,
+            pattern: str = "*",
+            path: str = "project/",
+        ) -> str:
+            """Read matching file links as Markdown."""
+            try:
+                result = await workspace_find_files(
+                    ctx=ctx,
+                    pattern=pattern,
+                    path=resource_path(path),
+                )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(
+            self.INFO_URI,
+            mime_type="text/markdown",
+            icons=[self.FILE_ICON.icon],
+        )
+        @serialized
+        async def workspace_file_info_resource(
+            ctx: Context,
+            path: str = "",
+        ) -> str:
+            """Read one file's metadata as a Markdown table; path is required."""
+            selected = resource_path(path)
+            try:
+                result = await workspace_file_info(
+                    path=selected,
+                    ctx=ctx,
+                )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
+
+        @mcp.resource(
+            self.SEARCH_URI,
+            mime_type="text/markdown",
+            icons=[self.SEARCH_ICON.icon],
+            security=ResourceSecurity(exempt_params={"query"}),
+        )
+        @serialized
+        async def workspace_search_resource(
+            ctx: Context,
+            query: str = "",
+            path: str = "project/",
+            regex: bool = False,
+            extensions: str | None = None,
+            case_sensitive: bool = True,
+        ) -> str:
+            """Read text/regex matches and skipped files as Markdown; query is required."""
+            try:
+                result = await workspace_search(
+                    ctx=ctx,
+                    query=query,
+                    path=resource_path(path),
+                    regex=regex,
+                    extensions=None if extensions is None else extensions.split(","),
+                    case_sensitive=case_sensitive,
+                )
+                return self.render_markdown(result)
+            except (WorkspaceError, ToolError) as error:
+                raise ResourceError(str(error)) from error
+
+        async def workspace_completion(
+            ref: ResourceTemplateReference,
+            argument: CompletionArgument,
+            context: CompletionContext | None,
+        ) -> Completion | None:
+            if isinstance(ref, ResourceTemplateReference) and ref.uri in (
+                self.RESULT_JSON_URI,
+                self.RESULT_MARKDOWN_URI,
+            ):
+                if argument.name == "result_id":
+                    values = list(self.result_resources)
+                elif argument.name == "name":
+                    result_id = (context.arguments or {}).get("result_id", "") if context else ""
+                    suffix = ".json" if ref.uri == self.RESULT_JSON_URI else ".md"
+                    values = [
+                        name.removesuffix(suffix)
+                        for name in self.result_resources.get(result_id, {})
+                        if name.endswith(suffix)
+                    ]
+                else:
+                    values = []
+                matches = [value for value in values if value.startswith(argument.value)]
+                return Completion(
+                    values=matches[:100],
+                    total=len(matches),
+                    has_more=len(matches) > 100,
+                )
+            uris = (
+                self.FILE_URI,
+                self.RAW_URI,
+                self.LIST_URI,
+                self.FIND_URI,
+                self.INFO_URI,
+                self.SEARCH_URI,
+            )
+            if not isinstance(ref, ResourceTemplateReference) or ref.uri not in uris:
                 return None
-            output.extend(source_lines[cursor:position])
-            cursor = position
-            hunk_new_lines: list[_PatchLine] = []
-            for line in hunk.lines:
-                if line.kind in {" ", "-"}:
-                    if cursor >= len(source_lines) or source_lines[cursor] != line.text:
-                        return None
-                    cursor += 1
-                if line.kind in {" ", "+"}:
-                    output.append(line.text)
-                    hunk_new_lines.append(line)
-            if cursor == len(source_lines) and hunk_new_lines:
-                final_newline = hunk_new_lines[-1].ends_with_newline
-        output.extend(source_lines[cursor:])
-        if not output:
-            return ""
-        return line_ending.join(output) + (line_ending if final_newline else "")
+            values: list[str] = []
+            if argument.name in ("regex", "case_sensitive", "include_hidden"):
+                values = ["false", "true"]
+            elif argument.name == "depth":
+                values = ["1", "2", "3", "all"]
+            elif argument.name == "extensions" and ref.uri == self.SEARCH_URI:
+                selected_path = (
+                    (context.arguments or {}).get("path", "project/")
+                    if context
+                    else "project/"
+                )
+                try:
+                    selected = resource_path(selected_path)
+                    extensions = sorted(
+                        {
+                            candidate.suffix.removeprefix(".")
+                            async for candidate in self.iter_files(selected.relative, selected.area)
+                        }
+                    )
+                    prefix, separator, tail = argument.value.rpartition(",")
+                    values = [
+                        prefix + separator + value
+                        for value in extensions
+                        if value.startswith(tail)
+                    ]
+                except (WorkspaceError, ResourceError):
+                    values = []
+            elif argument.name == "path":
+                if "/" not in argument.value:
+                    values = ["project/", "storage/"]
+                else:
+                    try:
+                        parent = argument.value.rpartition("/")[0]
+                        if parent in ("project", "storage"):
+                            parent += "/"
+                        selected = resource_path(parent)
+                        directory = self.resolve_workspace_path(selected)
+                        self.check_path_links(directory, selected.area)
+                        with filesystem_errors(parent):
+                            for child in sorted(directory.iterdir()):
+                                await asyncio.sleep(0)
+                                if self.is_link(child):
+                                    continue
+                                is_directory = child.is_dir()
+                                if (
+                                    ref.uri in (self.LIST_URI, self.FIND_URI, self.SEARCH_URI)
+                                    and not is_directory
+                                ):
+                                    continue
+                                if is_directory or child.is_file():
+                                    relative = self.relative_path(child, root=selected.area)
+                                    values.append(
+                                        str(self.qualified_path(selected.area, relative))
+                                        + ("/" if is_directory else "")
+                                    )
+                    except (WorkspaceError, ResourceError):
+                        values = []
+            matches = [value for value in values if value.startswith(argument.value)]
+            return Completion(
+                values=matches[:100],
+                total=len(matches),
+                has_more=len(matches) > 100,
+            )
+
+        complete.add_completion(serialized(workspace_completion))

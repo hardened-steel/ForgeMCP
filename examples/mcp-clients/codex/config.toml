@@ -1,0 +1,5 @@
+# Copy this file to <C++ project>/.codex/config.toml.
+# Replace both paths with absolute paths on your machine.
+[mcp_servers.forgemcp]
+command = 'C:/path/to/ForgeMCP/.venv/Scripts/forgemcp.exe'
+args = ['--workspace', 'C:/path/to/cpp-project']
