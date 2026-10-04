@@ -126,6 +126,44 @@ async def test_stdin_fifo_eof_both_outputs_and_repeat_wait(processes):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("send_eof", [False, True])
+async def test_stdin_cleanup_after_child_exit(processes, send_eof):
+    async with await processes.launch(
+        sys.executable,
+        ("-c", "print('finished')"),
+    ) as session:
+        if send_eof:
+            await session.close_stdin()
+        assert await session.wait() == 0
+        assert session.failure is None
+        writer = session.process.stdin
+        assert writer.is_closing()
+        await writer.wait_closed()
+
+
+@pytest.mark.anyio
+async def test_shutdown_with_buffered_stdin_does_not_hang(processes):
+    session = await processes.launch(
+        sys.executable,
+        ("-c", "import time; print('ready', flush=True); time.sleep(30)"),
+    )
+    try:
+        assert (await anext(session.output())).text.strip() == "ready"
+        await session.write_stdin("x" * (4 * 1024 * 1024))
+        async with asyncio.timeout(5):
+            while not session.process.stdin.transport.get_write_buffer_size():
+                await asyncio.sleep(0)
+            await session.close()
+        assert session.task.done()
+        assert session.returncode is not None
+        # Terminating a child with unread input may report a broken pipe; the
+        # cleanup must still finish instead of waiting forever for stdin drain.
+        assert session.failure is None or isinstance(session.failure, ProcessStreamError)
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
 async def test_wait_drains_large_output_without_consumer(processes):
     code = "import sys; sys.stdout.write('x'*200000); sys.stderr.write('y'*200000); sys.exit(7)"
     async with await processes.launch(sys.executable, ("-c", code)) as session:

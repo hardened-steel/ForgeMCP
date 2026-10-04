@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.2.0"
 description = "A safe MCP server for structured C++ project development workflows."
 readme = "README.md"
 requires-python = ">=3.13"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "ForgeMCP contributors" }]
 dependencies = [
     "mcp[cli]==2.1.1",
@@ -26,6 +27,28 @@ dev = [
 
 [project.scripts]
 forgemcp = "forgemcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/hardened-steel/ForgeMCP"
+Repository = "https://github.com/hardened-steel/ForgeMCP"
+Issues = "https://github.com/hardened-steel/ForgeMCP/issues"
+Changelog = "https://github.com/hardened-steel/ForgeMCP/releases"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/forgemcp",
+    "/frontend",
+    "/hatch_build.py",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+]
+exclude = [
+    "/frontend/node_modules",
+    "/src/forgemcp/assets/*.html",
+    "**/__pycache__",
+    "**/*.pyc",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/forgemcp"]

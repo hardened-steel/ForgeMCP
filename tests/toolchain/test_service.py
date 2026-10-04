@@ -310,7 +310,7 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
         )
         assert progress == ([0.0, 1.0] if interval == 0 else [0.0])
         tool_info = result.structured_content["tools"][0]
-        assert Path(tool_info["path"]) == Path(sys.executable).resolve()
+        assert Path(tool_info["path"]).resolve() == Path(sys.executable).resolve()
         assert tool_info == dict(
             name="python",
             kind="other",

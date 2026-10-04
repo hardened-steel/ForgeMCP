@@ -813,6 +813,18 @@ frontend and Python wheel together. Python changes must also pass
 referenced widget and icon. VS Code's `ForgeMCP: server` launch configuration invokes
 the build task before starting the server.
 
+### Distribution and release verification
+
+The sdist explicitly includes Python sources, frontend sources, the npm lockfile,
+and the wheel build hook. Generated HTML and local npm dependencies are excluded.
+`python -m build` builds the wheel from the sdist; installing a wheel requires no Node.js.
+Release verification checks metadata, runtime version, and every statically declared
+Widget/IconFile asset. CI tests the installed wheel on Windows/Linux and Python
+3.13/3.14, and exercises MCP resource availability through an isolated smoke check.
+Tag pushes create a draft GitHub release after those checks pass. PyPI publication
+is a separate manual workflow using existing release files and Trusted Publishing.
+See [releasing.md](releasing.md) for operator commands and account setup.
+
 ## Expected next modules
 
 The likely order is:
