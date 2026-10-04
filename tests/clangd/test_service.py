@@ -24,6 +24,7 @@ from forgemcp.workspace.service import WorkspaceService
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
@@ -31,6 +32,7 @@ class LspPeer:
     """Respond to the exercised LSP methods without launching an installed clangd."""
 
     def __init__(self, root):
+        """Initialize a scripted peer with queues, recorded messages, and a shared sample range."""
         self.root = root
         self.incoming = asyncio.Queue()
         self.sent = []
@@ -42,6 +44,7 @@ class LspPeer:
         }
 
     async def send(self, message):
+        """Record a client message and enqueue the scripted response or versioned diagnostic."""
         self.sent.append(message)
         if message.method in self.ignore:
             return
@@ -108,20 +111,24 @@ class LspPeer:
             await self.incoming.put(None)
 
     async def messages(self) -> AsyncGenerator[LspMessage]:
+        """Yield queued server messages until the exit sentinel arrives."""
         while (message := await self.incoming.get()) is not None:
             yield message
 
     async def close(self):
+        """Mark the scripted connection as closed."""
         self.closed = True
 
 
 @pytest.fixture
 async def setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace]:
+    """Provide two compilation contexts and retained sessions backed by deterministic LSP peers."""
     workspace = WorkspaceService(cpp_acceptance_project)
     peers = []
 
     @asynccontextmanager
     async def connect(project, database) -> AsyncGenerator[LspPeer]:
+        """Validate the requested project and database and yield a tracked scripted peer."""
         assert project == workspace.root
         assert (database / "compile_commands.json").is_file()
         peer = LspPeer(project)
@@ -183,6 +190,7 @@ async def setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace]:
 
 
 def test_equal_answers_merge_configuration_ids_but_different_answers_stay_separate():
+    """Verify grouping merges only identical answers and leaves input provenance unchanged."""
     empty = HoverResult(
         configurations=["debug"],
         path=WorkspacePath("project/src/math.cpp"),
@@ -204,9 +212,11 @@ def test_equal_answers_merge_configuration_ids_but_different_answers_stay_separa
 
 @pytest.mark.anyio
 async def test_read_only_tools_group_configurations_and_decode_language_values(setup):
+    """Verify MCP analysis schemas, progress, grouping, and decoded language results."""
     progress = []
 
     async def report(value, total, message):
+        """Record analysis progress values and messages for monotonicity checks."""
         progress.append((value, message))
 
     async with Client(setup.server) as client:
@@ -274,6 +284,9 @@ async def test_read_only_tools_group_configurations_and_decode_language_values(s
 
 @pytest.mark.anyio
 async def test_workspace_edits_sync_sessions_and_keep_old_analysis_immutable(setup):
+    """Verify workspace mutations synchronize sessions while earlier analysis resources remain
+    unchanged.
+    """
     async with Client(setup.server) as client:
         read = await client.call_tool("workspace_read_file", {"path": "project/src/math.cpp"})
         uri = read.structured_content["resources"]["clangd"]["uri"]
@@ -310,6 +323,7 @@ async def test_workspace_edits_sync_sessions_and_keep_old_analysis_immutable(set
 
 @pytest.mark.anyio
 async def test_database_refresh_restarts_only_affected_session_and_removal_closes_it(setup):
+    """Verify database changes replace only the affected session and removals close it."""
     original = setup.service.sessions["debug"].session
     retained = setup.service.sessions["release"].session
     setup.workspace.resolve_path("build/debug/compile_commands.json").write_text('[{"file":"changed.cpp"}]')
@@ -334,6 +348,7 @@ async def test_database_refresh_restarts_only_affected_session_and_removal_close
 
 @pytest.mark.anyio
 async def test_request_timeout_sends_cancellation_and_cleans_pending_state(setup):
+    """Verify timed-out LSP requests send cancellation and leave no pending request state."""
     peer = setup.peers[0]
     peer.ignore.add("textDocument/hover")
     session = setup.service.sessions["debug"].session

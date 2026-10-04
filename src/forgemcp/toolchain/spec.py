@@ -13,6 +13,8 @@ from .errors import ToolCommandError
 
 
 class ToolKind(StrEnum):
+    """The development role used to classify a discovered executable."""
+
     BUILD_SYSTEM = "build_system"
     BUILD_RUNNER = "build_runner"
     TEST_RUNNER = "test_runner"
@@ -32,6 +34,8 @@ class ToolMethods(TypedDict):
 
 @dataclass(frozen=True)
 class ToolSpec:
+    """A resolved executable and its bound typed operations."""
+
     name: str
     kind: ToolKind
     path: Path
@@ -51,6 +55,8 @@ class ToolInfo:
 
 @dataclass(frozen=True)
 class Toolset:
+    """An independent collection of executables and their execution environment."""
+
     id: str
     name: str
     tools: tuple[ToolSpec, ...]
@@ -58,6 +64,7 @@ class Toolset:
     inherit_environment: bool
 
     def __post_init__(self) -> None:
+        """Reject duplicate tool names, sort tools, and freeze a copy of the environment."""
         if len({tool.name for tool in self.tools}) != len(self.tools):
             raise ToolCommandError("Toolset contains duplicate tool names.")
         object.__setattr__(

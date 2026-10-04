@@ -18,12 +18,14 @@ MAX_LAYOUT_ENTRIES = 512
 
 
 def vswhere_path() -> Path | None:
+    """Locate the standard Visual Studio Installer discovery executable when present."""
     folder = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     path = Path(folder) / "Microsoft Visual Studio/Installer/vswhere.exe"
     return path.resolve() if path.is_file() else None
 
 
 async def instance_environment(root: Path, processes: ProcessService) -> dict[str, str]:
+    """Run VsDevCmd and decode the instance's developer environment from stdout."""
     batch = root / "Common7/Tools/VsDevCmd.bat"
     if not batch.is_file():
         raise ToolCommandError("Visual Studio developer environment is unavailable.")
@@ -72,6 +74,7 @@ async def instance_environment(root: Path, processes: ProcessService) -> dict[st
 
 
 def directories(root: Path) -> list[Path]:
+    """List a bounded set of shallow layout directories in descending order."""
     if not root.is_dir():
         return []
     # Only enumerate known shallow layout directories, never a recursive tree scan.
@@ -82,6 +85,7 @@ def directories(root: Path) -> list[Path]:
 
 
 def locate(root: Path, name: str) -> Path | None:
+    """Find an executable in known Visual Studio installation layouts."""
     candidates: list[Path] = []
     if name in {"cl", "link"}:
         for version in directories(root / "VC/Tools/MSVC"):
@@ -130,6 +134,7 @@ async def discover(
     specs: tuple[ToolInfo, ...],
     processes: ProcessService,
 ) -> tuple[Toolset, ...]:
+    """Discover bounded Visual Studio instances and bind tools to each instance's environment."""
     if os.name != "nt":
         return ()
     executable = vswhere_path()

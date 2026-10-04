@@ -1,3 +1,5 @@
+"""Bound executable execution, environment, draining, failure, and cancellation tests."""
+
 import asyncio
 import sys
 from dataclasses import FrozenInstanceError
@@ -12,6 +14,7 @@ from forgemcp.toolchain.tools import cmake
 
 @pytest.mark.anyio
 async def test_ready_spec_environment_and_no_result_cache(scripted_processes):
+    """Verify bound specs pass their environment and query versions afresh on each call."""
     processes = scripted_processes
     processes.code = "import os; print('cmake version '+os.environ['TOOLCHAIN_TEST'])"
     tool = cmake.INFO.create_spec(
@@ -34,6 +37,7 @@ async def test_ready_spec_environment_and_no_result_cache(scripted_processes):
 @pytest.mark.anyio
 @pytest.mark.parametrize("failure", ["exit", "parser", "timeout"])
 async def test_failures_do_not_expose_transcript(scripted_processes, failure):
+    """Verify command and parser failures omit private process transcripts from error text."""
     processes = scripted_processes
     processes.code = "import sys,time; print('PRIVATE_TRANSCRIPT',flush=True); "
     processes.code += {
@@ -57,6 +61,7 @@ async def test_failures_do_not_expose_transcript(scripted_processes, failure):
 
 @pytest.mark.anyio
 async def test_valid_banner_does_not_hide_failed_exit(scripted_processes):
+    """Verify a recognizable version banner does not mask a nonzero command exit."""
     scripted_processes.code = "import sys; print('cmake version 4.1.2'); sys.exit(7)"
     tool = cmake.create_spec(Path(sys.executable), scripted_processes)
     with pytest.raises(ToolCommandError, match="exit 7"):
@@ -65,6 +70,7 @@ async def test_valid_banner_does_not_hide_failed_exit(scripted_processes):
 
 @pytest.mark.anyio
 async def test_version_drains_both_pipes(scripted_processes):
+    """Verify bounded banner retention still drains both process output streams completely."""
     scripted_processes.code = "import sys; print('cmake version 4.1.2',flush=True); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)"
     tool = cmake.create_spec(Path(sys.executable), scripted_processes)
     assert await tool.methods["version"]() == "4.1.2"
@@ -82,6 +88,7 @@ async def test_version_drains_both_pipes(scripted_processes):
 
 @pytest.mark.anyio
 async def test_cancellation_exits_process_context(scripted_processes):
+    """Verify cancelling a version query closes its owned process context."""
     scripted_processes.code = "import time; time.sleep(30)"
     tool = cmake.create_spec(Path(sys.executable), scripted_processes)
     task = asyncio.create_task(tool.methods["version"]())

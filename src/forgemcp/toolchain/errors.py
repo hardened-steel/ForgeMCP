@@ -33,6 +33,7 @@ class ToolCommandError(ToolchainError):
     """Tool arguments or process execution failed."""
 
     def __init__(self, message: str, *, process_id: int | None = None) -> None:
+        """Retain a command failure explanation and optional process transcript identifier."""
         super().__init__(message)
         self.process_id = process_id
 

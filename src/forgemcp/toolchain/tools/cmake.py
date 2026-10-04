@@ -19,12 +19,16 @@ type Progress = Callable[[str], Awaitable[None]]
 
 
 class PresetsResult(BaseModel):
+    """The configure, build, and test preset names reported by CMake."""
+
     configure: list[str] = Field(default_factory=list)
     build: list[str] = Field(default_factory=list)
     test: list[str] = Field(default_factory=list)
 
 
 class ConfigureResult(BaseModel):
+    """Configure and generation status with exit code and process reference."""
+
     return_code: int = 0
     process_id: int | None = None
     configured: bool = False
@@ -32,6 +36,8 @@ class ConfigureResult(BaseModel):
 
 
 class BuildResult(BaseModel):
+    """Build progress counts with exit code and process reference."""
+
     return_code: int = 0
     process_id: int | None = None
     completed_steps: int | None = None
@@ -39,10 +45,16 @@ class BuildResult(BaseModel):
 
 
 class Presets(Protocol):
-    async def __call__(self, source: Path) -> PresetsResult: ...
+    """The callable contract for querying native CMake presets."""
+
+    async def __call__(self, source: Path) -> PresetsResult:
+        """List the selected source project's native presets."""
+        ...
 
 
 class Configure(Protocol):
+    """The callable contract for configuring a source project or native preset."""
+
     async def __call__(
         self,
         source: Path,
@@ -53,10 +65,14 @@ class Configure(Protocol):
         definitions: Mapping[str, str] | None = None,
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
-    ) -> ConfigureResult: ...
+    ) -> ConfigureResult:
+        """Configure using explicit settings and return progress flags and a process reference."""
+        ...
 
 
 class Build(Protocol):
+    """The callable contract for building selected targets or a native preset."""
+
     async def __call__(
         self,
         source: Path,
@@ -68,10 +84,14 @@ class Build(Protocol):
         parallel: int | None = None,
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
-    ) -> BuildResult: ...
+    ) -> BuildResult:
+        """Build with the supplied selection and return step counts and a process reference."""
+        ...
 
 
 class Methods(TypedDict):
+    """The typed operations supported by the bound cmake executable."""
+
     version: Callable[[], Awaitable[str]]
     presets: Presets
     configure: Configure
@@ -79,6 +99,7 @@ class Methods(TypedDict):
 
 
 def parse_cache(text: str) -> dict[str, str]:
+    """Parse noncomment CMake cache assignments into untyped key-value entries."""
     entries = {}
     for line in text.splitlines():
         if line.startswith(("//", "#")):
@@ -96,9 +117,11 @@ def create_spec(
     environment: Mapping[str, str] | None = None,
     inherit_environment: bool = True,
 ) -> ToolSpec:
+    """Bind the resolved cmake executable to process execution and environment settings."""
     path = path.resolve()
 
     async def version() -> str:
+        """Run a bounded version probe, drain both output streams, and parse the cmake banner."""
         output = {"stdout": "", "stderr": ""}
         try:
             async with await processes.launch(
@@ -133,6 +156,7 @@ def create_spec(
         timeout: ProcessTimeout,
         on_line: Progress,
     ) -> tuple[int, int]:
+        """Run CMake, dispatch complete stream lines, and retain the process ID on failure."""
         buffers = {"stdout": "", "stderr": ""}
         session = None
         try:
@@ -162,10 +186,12 @@ def create_spec(
             ) from error
 
     async def presets(source: Path) -> PresetsResult:
+        """Query CMake's native preset listing and classify names by operation."""
         result = PresetsResult()
         kind = None
 
         async def parse(line: str) -> None:
+            """Track preset section headings and append the listed names."""
             nonlocal kind
             heading = re.fullmatch(r"Available (\w+) presets:", line.strip())
             if heading:
@@ -195,6 +221,9 @@ def create_spec(
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
     ) -> ConfigureResult:
+        """Construct configure arguments and capture configuration and generation completion
+        flags.
+        """
         arguments = ["--preset", preset] if preset is not None else ["-S", str(source)]
         if preset is None and build_directory is None:
             raise ToolCommandError("A plain configure requires a build directory.")
@@ -207,6 +236,7 @@ def create_spec(
         result = ConfigureResult()
 
         async def parse(line: str) -> None:
+            """Update configure flags and forward relevant configure progress lines."""
             if line.startswith("-- Configuring done"):
                 result.configured = True
             if line.startswith("-- Generating done"):
@@ -233,6 +263,7 @@ def create_spec(
         timeout: ProcessTimeout = ProcessTimeout(total=600),
         on_progress: Progress | None = None,
     ) -> BuildResult:
+        """Construct build arguments and capture supported native runner step counts."""
         arguments = ["--build"]
         if preset is None:
             if build_directory is None:
@@ -249,6 +280,7 @@ def create_spec(
         result = BuildResult()
 
         async def parse(line: str) -> None:
+            """Update Ninja step counts and forward supported build progress lines."""
             step = re.match(r"\[(\d+)/(\d+)\]\s+", line)
             if step:
                 result.completed_steps = int(step.group(1))

@@ -34,6 +34,8 @@ from .profiles import ProfileDefinition
 
 
 class CMakeProfile(BaseModel):
+    """A resolved operator profile with toolset, build directory, and preset selections."""
+
     name: str
     toolset_id: str
     mode: Literal["plain", "presets"] = "plain"
@@ -46,6 +48,8 @@ class CMakeProfile(BaseModel):
 
 
 class CompilationContext(BaseModel):
+    """A successful build configuration with its toolset and compilation database."""
+
     id: str
     toolset_id: str
     build_directory: WorkspacePath
@@ -53,6 +57,8 @@ class CompilationContext(BaseModel):
 
 
 class CMakeConfigureResult(BaseModel):
+    """One configure outcome with discovered paths, failure explanation, and process reference."""
+
     profile: str
     preset: str | None = None
     build_directory: WorkspacePath | None = None
@@ -65,6 +71,8 @@ class CMakeConfigureResult(BaseModel):
 
 
 class CMakeBuildResult(BaseModel):
+    """One build outcome with progress counts, failure explanation, and process reference."""
+
     profile: str
     preset: str | None = None
     configuration: str | None = None
@@ -78,6 +86,8 @@ class CMakeBuildResult(BaseModel):
 
 
 class CMakeTestResult(BaseModel):
+    """One test outcome with parsed cases, failure explanation, and process reference."""
+
     profile: str
     preset: str | None = None
     configuration: str | None = None
@@ -123,6 +133,7 @@ class CMakeService:
         default_toolset: str = "system",
         progress_interval: float = 1.0,
     ) -> None:
+        """Bind toolchains and managed roots with empty configuration and subscription state."""
         self.project_root = project_root.resolve()
         self.storage_root = storage_root.resolve()
         self.protected_paths = protected_paths
@@ -138,6 +149,7 @@ class CMakeService:
         self.configuration_lock = asyncio.Lock()
 
     def toolset(self, selector: str) -> Toolset:
+        """Resolve a toolset name or ID and require exactly one match."""
         matches = [
             item
             for item in self.toolchains.list_toolsets()
@@ -148,18 +160,21 @@ class CMakeService:
         return matches[0]
 
     def cmake_methods(self, toolset_id: str) -> cmake.Methods:
+        """Return typed CMake operations or reject a toolset without CMake."""
         tool = self.toolchains.get_tool(toolset_id, "cmake")
         if tool is None:
             raise CMakeError(f"Toolset {toolset_id!r} has no cmake executable.")
         return cast(cmake.Methods, tool.methods)
 
     def ctest_methods(self, toolset_id: str) -> ctest.Methods:
+        """Return typed CTest operations or reject a toolset without CTest."""
         tool = self.toolchains.get_tool(toolset_id, "ctest")
         if tool is None:
             raise CMakeError(f"Toolset {toolset_id!r} has no ctest executable.")
         return cast(ctest.Methods, tool.methods)
 
     async def available_presets(self, toolset_id: str) -> cmake.PresetsResult:
+        """Ask the selected CMake executable for the project's preset catalog."""
         methods = self.cmake_methods(toolset_id)
         return await methods["presets"](self.project_root)
 
@@ -167,6 +182,7 @@ class CMakeService:
         self,
         names: list[str] | None,
     ) -> tuple[list[ProfileDefinition], dict[str, cmake.PresetsResult | CMakeError]]:
+        """Choose explicit or automatic profiles and collect their available preset catalogs."""
         catalogs = {}
         if self.definitions:
             definitions = list(self.definitions)
@@ -220,6 +236,7 @@ class CMakeService:
         definition: ProfileDefinition,
         catalogs: dict[str, cmake.PresetsResult | CMakeError],
     ) -> CMakeProfile:
+        """Validate selected presets and produce a resolved manual or preset profile."""
         if not definition.uses_presets:
             return self.plain_profile(definition)
         toolset = self.toolset(definition.toolset)
@@ -249,6 +266,7 @@ class CMakeService:
         )
 
     def operation_presets(self, profile: CMakeProfile, operation: str) -> list[str | None]:
+        """Choose operation presets or a permitted ordinary build-directory invocation."""
         if profile.mode == "plain":
             return [None]
         selected = getattr(profile, operation + "_presets")
@@ -263,6 +281,7 @@ class CMakeService:
         )
 
     def plain_profile(self, definition: ProfileDefinition) -> CMakeProfile:
+        """Resolve a manual profile with a safe build directory and default Ninja generator."""
         toolset = self.toolset(definition.toolset)
         directory = definition.build_directory
         if directory is None:
@@ -283,6 +302,7 @@ class CMakeService:
         )
 
     def build_path(self, directory: WorkspacePath) -> Path:
+        """Validate a managed build path against root, link, and protected-path restrictions."""
         if directory.area == "root":
             raise CMakeError("Build directory must be inside the project or storage root.")
         base = self.project_root if directory.area == "project" else self.storage_root
@@ -310,6 +330,7 @@ class CMakeService:
         return path
 
     def cache(self, directory: WorkspacePath) -> dict[str, str]:
+        """Read and parse a managed build directory's UTF-8 CMake cache."""
         path = self.build_path(directory) / "CMakeCache.txt"
         base = self.project_root if directory.area == "project" else self.storage_root
         try:
@@ -323,6 +344,7 @@ class CMakeService:
         return cmake.parse_cache(text)
 
     def require_configured(self, profile: CMakeProfile) -> dict[str, str]:
+        """Require a readable cache whose source directory belongs to this project."""
         if profile.build_directory is None:
             raise CMakeError("Set build-directory for operations without a preset.")
         try:
@@ -339,6 +361,7 @@ class CMakeService:
         cache: dict[str, str],
         configuration: str | None,
     ) -> None:
+        """Validate the requested configuration against single- or multi-config cache settings."""
         choices = cache.get("CMAKE_CONFIGURATION_TYPES", "").split(";")
         if choices != [""] and configuration not in choices:
             raise CMakeError(
@@ -355,6 +378,7 @@ class CMakeService:
             )
 
     def configure_definitions(self, definition: ProfileDefinition) -> dict[str, str]:
+        """Resolve compiler and toolchain settings and reject conflicting cache overrides."""
         result = dict(definition.definitions)
         reserved = {"CMAKE_HOME_DIRECTORY", "CMAKE_CACHEFILE_DIR"}
         if reserved.intersection(key.partition(":")[0] for key in result):
@@ -405,6 +429,7 @@ class CMakeService:
         return result
 
     def prepare_file_api(self, directory: WorkspacePath) -> None:
+        """Create managed File API query files for codemodel, cache, and toolchains."""
         build_directory = self.build_path(directory)
         reference = WorkspacePath(f"{directory}/.cmake/api/v1/query/client-forgemcp")
         query = self.build_path(reference)
@@ -419,6 +444,7 @@ class CMakeService:
             raise CMakeError(f"Cannot prepare CMake File API in {directory}.") from error
 
     def compilation_database(self, directory: WorkspacePath) -> WorkspacePath | None:
+        """Return the qualified compilation database path when the file exists."""
         path = self.build_path(directory) / "compile_commands.json"
         return WorkspacePath(f"{directory}/compile_commands.json") if path.is_file() else None
 
@@ -509,6 +535,7 @@ class CMakeService:
                 self.configuration_subscribers[queue] = signature
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
+        """Register profile inspection, configure, build, and test tools with their widgets."""
         icon = self.ICON.icon
         changes_files = ToolAnnotations(
             read_only_hint=False,
@@ -563,6 +590,7 @@ class CMakeService:
             updates = 0
 
             async def report_status(message: str) -> None:
+                """Advance configure progress with the current profile and preset prefix."""
                 nonlocal updates
                 updates += 1
                 label = profile.name if preset is None else f"{profile.name}/{preset}"
@@ -640,6 +668,9 @@ class CMakeService:
                                         raise CMakeError("Build directory contains a protected path.")
                                     if build_directory.exists():
                                         def raise_walk_error(error: OSError) -> None:
+                                            """Propagate errors while checking a build tree before
+                                            generator replacement.
+                                            """
                                             raise error
 
                                         try:
@@ -733,6 +764,7 @@ class CMakeService:
             updates = 0
 
             async def report_status(message: str) -> None:
+                """Advance build progress with the current profile and preset prefix."""
                 nonlocal updates
                 updates += 1
                 label = profile.name if preset is None else f"{profile.name}/{preset}"
@@ -816,6 +848,7 @@ class CMakeService:
             updates = 0
 
             async def report_status(message: str) -> None:
+                """Advance test progress with the current profile and preset prefix."""
                 nonlocal updates
                 updates += 1
                 label = profile.name if preset is None else f"{profile.name}/{preset}"

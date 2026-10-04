@@ -22,11 +22,13 @@ from forgemcp.workspace.service import WorkspaceService
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 @pytest.fixture
 def setup(cpp_acceptance_project):
+    """Create an isolated CMake service with scripted tool operations and captured invocations."""
     workspace = WorkspaceService(cpp_acceptance_project)
     configure = AsyncMock(return_value=cmake.ConfigureResult(process_id=40))
     build = AsyncMock(return_value=cmake.BuildResult(completed_steps=2, total_steps=2))
@@ -78,6 +80,7 @@ def setup(cpp_acceptance_project):
 
 
 def server(service):
+    """Mount the service's Apps bindings on an in-process MCP server."""
     apps = Apps()
     mcp = MCPServer("cmake-unit", extensions=[apps])
     service.register(mcp, apps, Complete())
@@ -89,6 +92,7 @@ def server(service):
 
 
 def test_profile_options_keep_operator_choices():
+    """Verify CLI profile parsing preserves exact operator settings and cache values."""
     profile, = parse_profiles(
         [
             [
@@ -117,12 +121,14 @@ def test_profile_options_keep_operator_choices():
     ],
 )
 def test_conflicting_profiles_rejected(groups):
+    """Verify incompatible manual and preset settings raise a CMake domain error."""
     with pytest.raises(CMakeError):
         parse_profiles(groups)
 
 
 @pytest.mark.anyio
 async def test_automatic_native_presets_and_plain_defaults(setup):
+    """Verify automatic profiles select native presets or separate Debug and Release builds."""
     definitions, catalogs = await setup.service.selection(None)
     assert definitions[0].configure_presets == ["native"]
     profile = setup.service.resolve_profile(definitions[0], catalogs)
@@ -141,6 +147,7 @@ async def test_automatic_native_presets_and_plain_defaults(setup):
 @pytest.mark.anyio
 @pytest.mark.parametrize("blocked", [None, "protected", "foreign"])
 async def test_generator_change_cleans_only_eligible_build_directory(setup, blocked):
+    """Verify generator replacement cleans owned build trees and rejects unsafe targets."""
     setup.service.definitions = (ProfileDefinition(name="debug", configuration="Debug"),)
     directory = setup.workspace.storage_root / "build/cmake-debug"
     (directory / "nested").mkdir(parents=True)
@@ -154,6 +161,9 @@ async def test_generator_change_cleans_only_eligible_build_directory(setup, bloc
         setup.workspace.protect_path(WorkspacePath("storage/build/cmake-debug/nested/old.obj"))
 
     async def configure(*args, **kwargs):
+        """Simulate successful configuration by writing the expected cache in the isolated build
+        tree.
+        """
         assert not stale.exists()
         assert (directory / ".cmake/api/v1/query/client-forgemcp/codemodel-v2").is_file()
         assert kwargs["generator"] == "Ninja"
@@ -177,6 +187,7 @@ async def test_generator_change_cleans_only_eligible_build_directory(setup, bloc
 
 @pytest.mark.anyio
 async def test_native_batch_continues_after_failure_and_tools_have_distinct_results(setup):
+    """Verify a failed preset does not stop the batch and each tool returns its own result shape."""
     setup.service.definitions = tuple(
         ProfileDefinition(
             name=name,
@@ -221,6 +232,7 @@ async def test_native_batch_continues_after_failure_and_tools_have_distinct_resu
 @pytest.mark.anyio
 @pytest.mark.parametrize("operation", ["configure", "build", "test"])
 async def test_command_errors_keep_log_reference_in_tool_result(setup, operation):
+    """Verify failed commands preserve their process ID in the model-visible result."""
     command = getattr(setup, operation)
     command.side_effect = ToolCommandError("Timed out", process_id=73)
     async with Client(server(setup.service)) as client:
@@ -234,12 +246,16 @@ async def test_command_errors_keep_log_reference_in_tool_result(setup, operation
 
 @pytest.mark.anyio
 async def test_subscription_reports_successful_configs_and_removes_failed_or_missing_databases(setup):
+    """Verify subscriptions retain successful databases and remove failed or vanished
+    configurations.
+    """
     setup.service.definitions = (ProfileDefinition(name="debug", configuration="Debug"),)
     updates = setup.service.configuration_updates()
     assert await anext(updates) == []
     directory = setup.workspace.storage_root / "build/cmake-debug"
 
     async def configure(*args, **kwargs):
+        """Create a scripted compilation database or return a failed configure outcome."""
         (directory / "compile_commands.json").write_text("[]")
         return cmake.ConfigureResult(process_id=40)
 

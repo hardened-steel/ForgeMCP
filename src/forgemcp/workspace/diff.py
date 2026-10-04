@@ -16,6 +16,8 @@ from .service import (
 
 
 class DiffLine(BaseModel):
+    """A context, added, or removed line with source numbers and Unicode change spans."""
+
     kind: Literal["context", "added", "removed"]
     before_line: int | None = Field(ge=1)
     after_line: int | None = Field(ge=1)
@@ -24,6 +26,8 @@ class DiffLine(BaseModel):
 
 
 class DiffRange(BaseModel):
+    """A compact insert, delete, or replace range in the old and new text."""
+
     kind: Literal["replace", "insert", "delete"]
     before_start: int = Field(ge=1)
     before_count: int = Field(ge=0)
@@ -32,6 +36,8 @@ class DiffRange(BaseModel):
 
 
 class DiffHunk(BaseModel):
+    """A group of changed and surrounding lines with old and new range bounds."""
+
     before_start: int = Field(ge=1)
     before_count: int = Field(ge=0)
     after_start: int = Field(ge=1)
@@ -40,6 +46,8 @@ class DiffHunk(BaseModel):
 
 
 class FileDiff(BaseModel):
+    """A qualified file path with compact changes and context-preserving diff hunks."""
+
     path: WorkspacePath
     changes: list[DiffRange]
     hunks: list[DiffHunk]
@@ -133,6 +141,7 @@ class DiffProvider(ResultProvider[str]):
     """Capture the old text before a write/edit and publish its immutable diff."""
 
     def __init__(self, workspace: WorkspaceService) -> None:
+        """Bind the workspace used to resolve files and retain immutable diff resources."""
         self.workspace = workspace
 
     async def before_workspace_write_file(
@@ -141,6 +150,7 @@ class DiffProvider(ResultProvider[str]):
         path: WorkspacePath,
         text: str,
     ) -> str:
+        """Capture the original text, using empty text for a newly created file."""
         candidate = self.workspace.resolve_workspace_path(path)
         return read_text(candidate, path) if candidate.exists() else ""
 
@@ -150,6 +160,7 @@ class DiffProvider(ResultProvider[str]):
         context: str,
         result: FileWriteResult,
     ) -> str:
+        """Save an immutable diff between the captured and written text."""
         return self.save_diff(call_id, result.path, context)
 
     async def before_workspace_edit_file(
@@ -160,6 +171,7 @@ class DiffProvider(ResultProvider[str]):
         new_text: str,
         replace_all: bool,
     ) -> str:
+        """Capture the existing text before an exact edit."""
         return read_text(self.workspace.resolve_workspace_path(path), path)
 
     async def after_workspace_edit_file(
@@ -168,9 +180,11 @@ class DiffProvider(ResultProvider[str]):
         context: str,
         result: FileEditResult,
     ) -> str:
+        """Save an immutable diff between the captured and edited text."""
         return self.save_diff(call_id, result.path, context)
 
     def save_diff(self, call_id: str, path: WorkspacePath, before: str) -> str:
+        """Read the resulting text and register its typed diff as a result JSON resource."""
         after = read_text(self.workspace.resolve_workspace_path(path), path)
         diff = create_diff(path, before, after)
         return self.workspace.save_result_resource(

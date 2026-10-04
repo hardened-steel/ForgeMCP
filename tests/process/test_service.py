@@ -1,3 +1,5 @@
+"""Process lifecycle, stream encoding, timeout, and read-only MCP contract tests."""
+
 import asyncio
 import json
 import os
@@ -7,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from forgemcp.process.service import ProcessService, ChunkDecoder
+from forgemcp.process.service import ProcessService, ChunkDecoder, ProcessRecord
 from forgemcp.process.models import ProcessEncoding, ProcessTimeout
 from forgemcp.process.errors import (
     ProcessError,
@@ -19,11 +21,13 @@ from forgemcp.process.errors import (
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 @pytest.fixture
 async def processes(cpp_acceptance_project):
+    """Yield an isolated process service and close every session within a bounded test lifetime."""
     service = ProcessService(cpp_acceptance_project)
     async with asyncio.timeout(15):
         try:
@@ -35,6 +39,7 @@ async def processes(cpp_acceptance_project):
 @pytest.mark.anyio
 @pytest.mark.parametrize("inherit", [True, False])
 async def test_environment_modes(processes, monkeypatch, inherit):
+    """Verify child variables are explicit and parent inheritance follows the requested mode."""
     monkeypatch.setenv("FORGEMCP_PARENT_TEST", "parent")
     async with await processes.launch(
         sys.executable,
@@ -51,6 +56,7 @@ async def test_environment_modes(processes, monkeypatch, inherit):
 
 @pytest.mark.anyio
 async def test_arguments_are_literal_and_retained(processes, cpp_acceptance_project):
+    """Verify shell-like arguments reach the process literally and remain in its summary."""
     values = [
         "hello world",
         "a&b",
@@ -77,6 +83,7 @@ async def test_arguments_are_literal_and_retained(processes, cpp_acceptance_proj
 @pytest.mark.anyio
 @pytest.mark.skipif(os.name != "nt", reason="Windows executable paths")
 async def test_executable_path_is_literal(processes, cpp_acceptance_project):
+    """Verify Windows executable paths containing shell characters launch literally."""
     folder = cpp_acceptance_project / "Tools %FORGEMCP_SHELL_TEST% & more"
     folder.mkdir()
     executable = folder / "python.exe"
@@ -100,6 +107,7 @@ async def test_executable_path_is_literal(processes, cpp_acceptance_project):
 
 @pytest.mark.anyio
 async def test_stdin_fifo_eof_both_outputs_and_repeat_wait(processes):
+    """Verify ordered stdin, idempotent EOF and wait, and single-consumer output behavior."""
     code = "import sys; data=sys.stdin.read(); print(data,end=''); print('err',file=sys.stderr)"
     async with await processes.launch(sys.executable, ("-c", code)) as session:
         await session.write_stdin("first")
@@ -165,6 +173,7 @@ async def test_shutdown_with_buffered_stdin_does_not_hang(processes):
 
 @pytest.mark.anyio
 async def test_wait_drains_large_output_without_consumer(processes):
+    """Verify waiting drains large stdout and stderr without a concurrent output consumer."""
     code = "import sys; sys.stdout.write('x'*200000); sys.stderr.write('y'*200000); sys.exit(7)"
     async with await processes.launch(sys.executable, ("-c", code)) as session:
         assert await session.wait() == 7
@@ -176,6 +185,7 @@ async def test_wait_drains_large_output_without_consumer(processes):
 
 @pytest.mark.anyio
 async def test_cancel_wait_does_not_stop_session(processes):
+    """Verify cancelling a waiter leaves the process and its stream workers alive."""
     async with await processes.launch(
         sys.executable,
         ("-c", "import sys; sys.stdin.read()"),
@@ -193,10 +203,12 @@ async def test_cancel_wait_does_not_stop_session(processes):
 
 @pytest.mark.anyio
 async def test_context_cancellation_stops_workers(processes):
+    """Verify cancellation of the context owner stops the process and all stream workers."""
     ready = asyncio.Event()
     sessions = []
 
     async def owner():
+        """Own a long-running session until the test cancels its context task."""
         async with await processes.launch(
             sys.executable,
             ("-c", "import time; time.sleep(30)"),
@@ -218,6 +230,7 @@ async def test_context_cancellation_stops_workers(processes):
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["total", "idle"])
 async def test_timeout_reaches_output_and_wait(processes, mode):
+    """Verify total and idle timeouts surface through both output and wait after cleanup."""
     session = await processes.launch(
         sys.executable,
         ("-c", "import time; time.sleep(30)"),
@@ -239,6 +252,7 @@ async def test_timeout_reaches_output_and_wait(processes, mode):
 
 @pytest.mark.anyio
 async def test_decode_failure_is_not_eof(processes):
+    """Verify strict decoding failures remain process errors rather than successful stream EOF."""
     with pytest.raises(ProcessStreamError):
         async with await processes.launch(
             sys.executable,
@@ -253,7 +267,57 @@ async def test_decode_failure_is_not_eof(processes):
         await session.wait()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["plain", "nested", "multiple"])
+@pytest.mark.usefixtures("processes")
+async def test_worker_failure_preserves_single_exception_or_multiple_group(
+    request,
+    monkeypatch,
+    kind,
+):
+    """Verify worker failures unwrap singleton groups but preserve groups with multiple errors."""
+    service = request.getfixturevalue("processes")
+    first = ProcessStreamError("first stream failure")
+    expected = first
+    failure = first
+    if kind == "nested":
+        failure = ExceptionGroup(
+            "outer",
+            [ExceptionGroup("inner", [first])],
+        )
+    elif kind == "multiple":
+        expected = ExceptionGroup(
+            "multiple stream failures",
+            [first, ProcessStreamError("second stream failure")],
+        )
+        failure = expected
+    read_stream = ProcessRecord.read_stream
+
+    async def fail_stdout(record, stream, reader, decoder, queue):
+        """Inject the selected stdout failure while keeping the stderr worker unchanged."""
+        if stream == "stdout":
+            raise failure
+        await read_stream(record, stream, reader, decoder, queue)
+
+    monkeypatch.setattr(ProcessRecord, "read_stream", fail_stdout)
+    with pytest.raises(type(expected)) as caught:
+        async with await service.launch(
+            sys.executable,
+            ("-c", "import time; time.sleep(30)"),
+        ) as session:
+            await session.wait()
+    assert caught.value is expected
+    assert session.failure is expected
+    assert session.returncode is not None
+    assert session.task.done()
+    assert session.record.status.current_status == "stream_failure"
+    with pytest.raises(type(expected)) as repeated:
+        await session.wait()
+    assert repeated.value is expected
+
+
 def test_incremental_decoder_and_latin1():
+    """Verify fragmented multibyte decoding and lossless Latin-1 byte transport."""
     decoder = ChunkDecoder(ProcessEncoding("utf-8", errors="strict"))
     data = "日本語".encode()
     assert (
@@ -266,6 +330,7 @@ def test_incremental_decoder_and_latin1():
 
 @pytest.mark.anyio
 async def test_service_close_stops_all_sessions(processes):
+    """Verify service shutdown terminates every retained session."""
     sessions = [
         await processes.launch(sys.executable, ("-c", "import time; time.sleep(30)"))
         for _ in range(2)
@@ -279,6 +344,7 @@ async def test_service_close_stops_all_sessions(processes):
 
 @pytest.mark.anyio
 async def test_invalid_launch_has_no_records(processes, cpp_acceptance_project):
+    """Verify invalid executable, codec, or working-directory inputs create no process records."""
     for kwargs in (
         {"cwd": cpp_acceptance_project.parent},
         {"encoding": ProcessEncoding("invalid-codec")},
@@ -294,6 +360,9 @@ async def test_invalid_launch_has_no_records(processes, cpp_acceptance_project):
 async def test_configured_storage_is_an_allowed_working_directory(
     cpp_acceptance_project,
 ):
+    """Verify the configured storage root is allowed and unrelated working directories are
+    rejected.
+    """
     from forgemcp.workspace.service import WorkspaceService
 
     workspace = WorkspaceService(
@@ -318,6 +387,7 @@ async def test_configured_storage_is_an_allowed_working_directory(
 
 @pytest.mark.anyio
 async def test_cancel_output_does_not_close_session(processes):
+    """Verify cancelling an output consumer does not terminate its process session."""
     async with await processes.launch(
         sys.executable,
         ("-c", "import sys; sys.stdin.read()"),
@@ -334,10 +404,12 @@ async def test_cancel_output_does_not_close_session(processes):
 
 @pytest.mark.anyio
 async def test_launch_cancellation_delegates_to_asyncio(processes, monkeypatch):
+    """Verify launch cancellation propagates through the injected asyncio subprocess operation."""
     entered = asyncio.Event()
     cancelled = asyncio.Event()
 
     async def launch(*args, **kwargs):
+        """Signal that subprocess creation began and block until cancelled."""
         entered.set()
         try:
             await asyncio.Event().wait()
@@ -357,6 +429,7 @@ async def test_launch_cancellation_delegates_to_asyncio(processes, monkeypatch):
 @pytest.mark.anyio
 @pytest.mark.parametrize("interval", [0, 1])
 async def test_process_overview_uses_shared_progress(processes, monkeypatch, interval):
+    """Verify overview progress follows the shared per-invocation throttle."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from mcp.server import MCPServer
@@ -380,6 +453,7 @@ async def test_process_overview_uses_shared_progress(processes, monkeypatch, int
 
 @pytest.mark.anyio
 async def test_process_inspection_tools_and_markdown_resources(processes):
+    """Verify read-only process tools, resources, metadata, progress, and ID completions."""
     from mcp import Client
     from mcp.server import MCPServer
     from mcp.server.apps import Apps
@@ -444,6 +518,7 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
 
 @pytest.mark.anyio
 async def test_process_snapshot_distinguishes_running_and_nonzero_exit(processes):
+    """Verify snapshots distinguish running state from a completed nonzero exit."""
     async with await processes.launch(
         sys.executable,
         ("-c", "import sys; sys.stdin.read(); sys.exit(7)"),

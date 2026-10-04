@@ -11,11 +11,15 @@ from forgemcp.toolchain.tools import cmake, ctest
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 class Session:
+    """A scripted command session emitting deliberately fragmented stdout."""
+
     def __init__(self, text, code=0):
+        """Retain output and exit code with observable close state and mocked stdin closure."""
         self.process_id = 42
         self.text = text
         self.code = code
@@ -23,21 +27,28 @@ class Session:
         self.close_stdin = AsyncMock()
 
     async def __aenter__(self):
+        """Return the scripted session for command execution."""
         return self
 
     async def __aexit__(self, *args):
+        """Record that command context cleanup completed."""
         self.closed = True
 
     async def output(self):
+        """Yield the scripted stdout in three-character fragments."""
         for offset in range(0, len(self.text), 3):
             yield SimpleNamespace(stream="stdout", text=self.text[offset:offset + 3])
 
     async def wait(self):
+        """Return the scripted command exit code."""
         return self.code
 
 
 @pytest.mark.anyio
 async def test_cmake_parses_split_lines_and_preserves_native_arguments(cpp_acceptance_project):
+    """Verify CMake parses fragmented output and passes native configure and build arguments
+    literally.
+    """
     session = Session(
         'Available configure presets:\r\n  "debug" - Debug\n'
         'Available build presets:\n  "build-debug"\n'
@@ -89,6 +100,7 @@ async def test_cmake_parses_split_lines_and_preserves_native_arguments(cpp_accep
 
 @pytest.mark.anyio
 async def test_ctest_report_statuses_and_exact_name_filter(cpp_acceptance_project):
+    """Verify JUnit outcome parsing and escaped exact-name CTest filtering."""
     report = cpp_acceptance_project / "report.xml"
     report.write_text(
         '<testsuite><testcase name="ok" time="0.25"/>'
@@ -131,6 +143,7 @@ async def test_ctest_report_statuses_and_exact_name_filter(cpp_acceptance_projec
 
 @pytest.mark.anyio
 async def test_command_failure_preserves_process_id_and_closes_session(cpp_acceptance_project):
+    """Verify process failures retain a log reference and close the command context."""
     session = Session("partial output")
     session.wait = AsyncMock(side_effect=ProcessError("Timed out"))
     methods = cmake.create_spec(

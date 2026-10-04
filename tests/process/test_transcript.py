@@ -24,6 +24,7 @@ from forgemcp.process.transcript import select_transcript
 
 @pytest.fixture
 def record():
+    """Build a process record and append supplied stream chunks with deterministic timestamps."""
     return ProcessRecord(
         summary=ProcessSummary(
             process_id=1,
@@ -39,10 +40,12 @@ def record():
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 def select(record, *, lines=None, time=None, max_bytes=65536):
+    """Select transcript fragments with test defaults and explicit selector overrides."""
     return select_transcript(
         record.transcript,
         process_start=10,
@@ -54,6 +57,7 @@ def select(record, *, lines=None, time=None, max_bytes=65536):
 
 
 def test_line_numbers_span_chunks_and_streams(record):
+    """Verify all stream chunks share absolute line numbering without phantom trailing lines."""
     record.append_log("stdout", "one\r", 10)
     record.append_log("stderr", "\ntwo\nthree", 11)
     record.append_log("stdin", " end\n", 12)
@@ -80,6 +84,7 @@ def test_line_numbers_span_chunks_and_streams(record):
     ],
 )
 def test_distinct_lines_count_split_chunks_once(record, lines, expected):
+    """Verify overlapping chunk ranges count each physical line only once."""
     for text in ("on", "e\nt", "wo\nthree\n"):
         record.append_log("stdout", text, 10)
     assert "".join(item.text for item in select(record, lines=lines)) == expected
@@ -95,12 +100,14 @@ def test_distinct_lines_count_split_chunks_once(record, lines, expected):
     ],
 )
 def test_time_windows_use_chunk_timestamps_and_exclude_end(record, time, expected):
+    """Verify elapsed-time filtering includes the lower bound and excludes the upper bound."""
     for offset, text in enumerate("abcd"):
         record.append_log("stdout", text + "\n", 10 + offset)
     assert "".join(item.text for item in select(record, time=time)) == expected
 
 
 def test_combined_limits_filter_time_then_lines_then_bytes(record):
+    """Verify combined selection applies time, line, and byte limits in that order."""
     record.append_log("stdout", "old\n", 10)
     record.append_log("stderr", "alpha\nbeta\ngamma\n", 13)
     selected = select(
@@ -133,6 +140,7 @@ def test_combined_limits_filter_time_then_lines_then_bytes(record):
     ],
 )
 def test_byte_budget_never_splits_unicode_character(record, lines, budget, expected):
+    """Verify clipping preserves complete Unicode characters at either end of a selection."""
     record.append_log("stdout", "a😀я", 10)
     selected = select(record, lines=lines, max_bytes=budget)
     text = "".join(item.text for item in selected)
@@ -142,6 +150,7 @@ def test_byte_budget_never_splits_unicode_character(record, lines, budget, expec
 
 
 def test_default_returns_last_100_lines_in_original_order(record):
+    """Verify default tail selection returns the last hundred lines in transcript order."""
     for number in range(1, 121):
         record.append_log("stdout", f"{number}\n", 10)
     selected = select(record)
@@ -164,6 +173,7 @@ def test_default_returns_last_100_lines_in_original_order(record):
     ],
 )
 def test_invalid_line_selectors(value):
+    """Verify malformed line selector variants and ranges fail validation."""
     with pytest.raises(ValidationError):
         TypeAdapter(FirstLines | LastLines | LineRange).validate_python(value)
 
@@ -181,6 +191,7 @@ def test_invalid_line_selectors(value):
     ],
 )
 def test_invalid_time_selectors(value):
+    """Verify malformed, nonfinite, and empty time selectors fail validation."""
     with pytest.raises(ValidationError):
         TypeAdapter(FirstSeconds | LastSeconds | TimeRange).validate_python(value)
 
@@ -197,6 +208,7 @@ def test_invalid_time_selectors(value):
     ],
 )
 def test_selector_union_preserves_variant_and_json(variant, value):
+    """Verify selector unions retain their specific variants and expected JSON representation."""
     adapter = TypeAdapter(
         FirstLines | LastLines | LineRange
         if variant in (FirstLines, LastLines, LineRange)
@@ -214,6 +226,7 @@ async def test_process_get_combines_limits_and_anchors_finished_tail(
     cpp_acceptance_project,
     duration,
 ):
+    """Verify MCP selection combines limits and anchors tail windows to final process output."""
     record.start = 10
     record.status.work_time = duration
     record.append_log("stdout", "old\n", 10)

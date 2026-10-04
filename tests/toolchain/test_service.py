@@ -1,3 +1,5 @@
+"""Toolset discovery, operator configuration, and read-only MCP inspection tests."""
+
 import asyncio
 import json
 import os
@@ -25,8 +27,11 @@ from forgemcp.toolchain.spec import ToolInfo, ToolKind, ToolSpec
 
 
 def python_info():
+    """Build discovery metadata for a Python executable acting as a test tool."""
     def create_spec(path, processes, environment, inherit_environment):
+        """Bind a Python executable and its environment to a scripted version operation."""
         async def version():
+            """Run the Python version script, drain output, and require a successful exit."""
             async with await processes.launch(
                 path,
                 ("-c", "import sys; print('12.3',file=sys.stderr)"),
@@ -48,6 +53,7 @@ async def test_system_controlled_path_and_empty_toolset(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify PATH discovery binds exact executables and permits an empty system toolset."""
     processes = ProcessService(cpp_acceptance_project)
     monkeypatch.setenv("PATH", str(Path(sys.executable).parent))
     spec = python_info()
@@ -67,6 +73,9 @@ def test_user_configuration_multiple_exact_paths_and_stable_ids(
     monkeypatch,
 ):
     # Executable content isn't probed while validating an explicit path.
+    """Verify explicit toolsets retain exact paths and deterministic IDs without discovery
+    commands.
+    """
     executable = cpp_acceptance_project / (
         "compiler.exe" if os.name == "nt" else "compiler"
     )
@@ -105,6 +114,7 @@ def test_user_configuration_multiple_exact_paths_and_stable_ids(
     ],
 )
 def test_bad_user_configuration_has_no_fallback(groups, error):
+    """Verify invalid explicit tool names, paths, and assignments are rejected without fallback."""
     groups = [
         [value.format(path=sys.executable) for value in group] for group in groups
     ]
@@ -117,11 +127,13 @@ async def test_discovery_does_not_query_versions_and_returns_containers(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify discovery runs once and returns retained toolset containers without version probes."""
     processes = ProcessService(cpp_acceptance_project)
     monkeypatch.setattr(discovery, "load_tools", lambda: (python_info(),))
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
 
     async def no_vs(*args):
+        """Disable Visual Studio discovery for this deterministic toolset test."""
         return ()
 
     monkeypatch.setattr(visual_studio, "discover", no_vs)
@@ -150,6 +162,7 @@ async def test_visual_studio_not_run_on_non_windows(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify Visual Studio discovery returns immediately on non-Windows hosts."""
     monkeypatch.setattr(visual_studio, "os", SimpleNamespace(name="posix"))
     monkeypatch.setattr(
         visual_studio,
@@ -171,6 +184,9 @@ async def test_vsdevcmd_environment_preserves_values_and_transcript(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify developer-environment parsing preserves Unicode, equals signs, long values, and the
+    transcript.
+    """
     monkeypatch.setenv("FORGEMCP_UNICODE", "Лаборатория 日本語")
     root = cpp_acceptance_project / "Visual Studio & test"
     batch = root / "Common7/Tools/VsDevCmd.bat"
@@ -201,6 +217,9 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify separate instance environments, partial toolsets, and isolation of failed Visual
+    Studio setup.
+    """
     roots = [cpp_acceptance_project / f"VS {index}" for index in range(3)]
     for root in roots:
         (root / "VC/Tools/Llvm/x64/bin").mkdir(parents=True)
@@ -217,7 +236,10 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(
     ]
 
     class ListingProcesses(ProcessService):
+        """A process service that substitutes a scripted Visual Studio instance listing."""
+
         async def launch(self, executable, arguments=(), **kwargs):
+            """Replace vswhere with a Python JSON emitter and delegate other launches unchanged."""
             if str(executable) == "vswhere.exe":
                 return await super().launch(
                     sys.executable,
@@ -235,6 +257,7 @@ async def test_multiple_vs_instances_partial_tools_env_and_failure_isolation(
     monkeypatch.setattr(visual_studio, "vswhere_path", lambda: Path("vswhere.exe"))
 
     async def environment(root, service):
+        """Return an instance-specific environment or fail the selected broken installation."""
         if root == roots[1]:
             raise ToolCommandError("broken instance")
         return {"INSTANCE": str(root)}
@@ -271,10 +294,12 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
     monkeypatch,
     interval,
 ):
+    """Verify toolset tools, resources, progress, completions, and retained version process logs."""
     monkeypatch.setattr(discovery, "load_tools", lambda: (python_info(),))
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
 
     async def no_vs(*args):
+        """Disable Visual Studio discovery to isolate the test toolset."""
         return ()
 
     monkeypatch.setattr(visual_studio, "discover", no_vs)
@@ -284,6 +309,7 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
     progress = []
 
     async def collect(value, total, message):
+        """Record toolset progress values for invocation-specific throttle checks."""
         progress.append(value)
 
     async with Client(
@@ -343,12 +369,14 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
 
 @pytest.mark.anyio
 async def test_unknown_ids_at_mcp_boundary(cpp_acceptance_project, monkeypatch):
+    """Verify unknown toolset IDs become actionable MCP tool and resource errors."""
     from mcp.shared.exceptions import MCPError
     from forgemcp.server import create_server
 
     monkeypatch.setattr(discovery, "load_tools", lambda: ())
 
     async def no_vs(*args):
+        """Disable Visual Studio discovery while testing invalid toolset identifiers."""
         return ()
 
     monkeypatch.setattr(visual_studio, "discover", no_vs)
@@ -364,6 +392,7 @@ async def test_unknown_ids_at_mcp_boundary(cpp_acceptance_project, monkeypatch):
 
 @pytest.mark.anyio
 async def test_invalid_user_path_launches_nothing(cpp_acceptance_project, monkeypatch):
+    """Verify invalid operator paths fail before discovery launches or publishes toolsets."""
     processes = ProcessService(cpp_acceptance_project)
     service = ToolchainService(processes, [["bad", "git=does-not-exist"]])
     with pytest.raises(InvalidToolPathError):
@@ -373,6 +402,7 @@ async def test_invalid_user_path_launches_nothing(cpp_acceptance_project, monkey
 
 
 def test_cli_repeated_option():
+    """Verify repeated toolset CLI options retain separate groups and exact assignments."""
     from forgemcp.server import argument_parser
 
     parsed = argument_parser().parse_args(
@@ -397,14 +427,20 @@ async def test_mcp_version_failures_are_isolated_and_not_cached(
     cpp_acceptance_project,
     monkeypatch,
 ):
+    """Verify version failures stay isolated, omit transcripts, and are retried on later
+    requests.
+    """
     from forgemcp.server import create_server
     from forgemcp.toolchain.errors import ToolParserError
 
     calls = []
 
     def info(name, failure=None, available=True):
+        """Build test tool metadata with an optional failing or unavailable version operation."""
         def create_spec(path, processes, environment, inherit_environment):
+            """Bind the instrumented version operation only when it is available."""
             async def version():
+                """Record each probe and return a changing value or raise the configured failure."""
                 calls.append(name)
                 if failure:
                     raise failure("PRIVATE_TRANSCRIPT")
@@ -429,6 +465,7 @@ async def test_mcp_version_failures_are_isolated_and_not_cached(
     monkeypatch.setattr(system, "locate", lambda spec: Path(sys.executable))
 
     async def no_vs(*args):
+        """Disable Visual Studio discovery while exercising scripted version failures."""
         return ()
 
     monkeypatch.setattr(visual_studio, "discover", no_vs)

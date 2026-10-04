@@ -11,6 +11,7 @@ from ..spec import ToolInfo, Toolset
 
 
 def locate(spec: ToolInfo) -> Path | None:
+    """Find a named executable through PATH and supported platform-specific adapter locations."""
     name = spec.name
     # POSIX link is a filesystem utility, not Microsoft's linker.
     if os.name != "nt" and name in {"cl", "link", "msbuild", "cppvsdbg"}:
@@ -41,6 +42,7 @@ def locate(spec: ToolInfo) -> Path | None:
 
 
 def discover(specs: tuple[ToolInfo, ...], processes: ProcessService) -> Toolset:
+    """Bind all available system executables into a toolset inheriting the server environment."""
     found = []
     for spec in specs:
         try:

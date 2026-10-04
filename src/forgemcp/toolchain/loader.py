@@ -11,6 +11,9 @@ from .spec import ToolInfo, ToolKind
 
 
 def load_tools(package: ModuleType = tools) -> tuple[ToolInfo, ...]:
+    """Enumerate public built-in tool modules deterministically and validate their discovery
+    metadata.
+    """
     specs = []
     names: set[str] = set()
     for info in sorted(

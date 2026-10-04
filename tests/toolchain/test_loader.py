@@ -1,3 +1,5 @@
+"""Dynamic built-in tool discovery and metadata validation tests."""
+
 import importlib
 from pathlib import Path
 
@@ -8,6 +10,7 @@ from forgemcp.toolchain.loader import load_tools
 
 
 def test_load_all_builtin_modules():
+    """Verify all built-in tools have unique names and callable spec factories."""
     specs = load_tools()
     assert len(specs) == 19
     assert len({spec.name for spec in specs}) == 19
@@ -18,6 +21,9 @@ def test_load_all_builtin_modules():
 
 
 def test_enumeration_is_dynamic_sorted_and_skips_private(tmp_path, monkeypatch):
+    """Verify enumeration sees added public modules in deterministic order and skips private
+    names.
+    """
     package = tmp_path / "fixture_tools"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -48,6 +54,7 @@ def test_enumeration_is_dynamic_sorted_and_skips_private(tmp_path, monkeypatch):
     ],
 )
 def test_invalid_modules_are_domain_errors(tmp_path, monkeypatch, source):
+    """Verify invalid tool metadata raises sanitized domain errors."""
     import types
 
     package = types.ModuleType("invalid_tools")

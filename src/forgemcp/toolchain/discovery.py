@@ -14,6 +14,7 @@ async def discover(
     processes: ProcessService,
     definitions: Sequence[Sequence[str]] = (),
 ) -> tuple[Toolset, ...]:
+    """Assemble system, Visual Studio, and explicit user toolsets without querying versions."""
     specs = load_tools()
     # Validate all explicit configuration before launching discovery processes.
     users = user.parse_toolsets(definitions, specs)

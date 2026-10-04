@@ -15,6 +15,7 @@ from .models import (
 
 
 def fragment(entry: ProcessLogEntry, start: int, end: int) -> ProcessLogEntry:
+    """Copy a text slice with recalculated absolute line bounds and unchanged provenance."""
     text = entry.text[start:end]
     first = entry.start_line + entry.text.count("\n", 0, start)
     return replace(
@@ -26,6 +27,7 @@ def fragment(entry: ProcessLogEntry, start: int, end: int) -> ProcessLogEntry:
 
 
 def line_offset(text: str, count: int) -> int:
+    """Return the character offset after a requested number of LF-terminated lines."""
     offset = 0
     for _ in range(count):
         index = text.find("\n", offset)

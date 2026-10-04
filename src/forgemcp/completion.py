@@ -27,9 +27,11 @@ class Complete:
     """Collect feature completion handlers behind one MCP handler."""
 
     def __init__(self) -> None:
+        """Start an empty ordered collection of feature completion handlers."""
         self.handlers: list[CompletionHandler] = []
 
     def add_completion(self, handler: CompletionHandler) -> None:
+        """Append a feature's completion handler in dispatch order."""
         self.handlers.append(handler)
 
     async def complete(
@@ -38,6 +40,7 @@ class Complete:
         argument: CompletionArgument,
         context: CompletionContext | None,
     ) -> Completion | None:
+        """Return the first feature answer that handles the requested completion."""
         for handler in self.handlers:
             result = await handler(ref, argument, context)
             if result is not None:
@@ -45,5 +48,6 @@ class Complete:
         return None
 
     def register(self, mcp: MCPServer) -> None:
+        """Mount the shared SDK completion handler when features have registered callbacks."""
         if self.handlers:
             mcp.completion()(self.complete)

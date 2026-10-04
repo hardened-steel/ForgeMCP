@@ -31,12 +31,16 @@ from .spec import ToolKind, Toolset, ToolSpec
 
 
 class ToolsetSummary(BaseModel):
+    """A toolset's public identity and available tool names."""
+
     id: str
     name: str
     tools: list[str]
 
 
 class ToolDetails(BaseModel):
+    """One executable's kind, absolute path, and optional queried version."""
+
     name: str
     kind: ToolKind
     path: str
@@ -44,6 +48,8 @@ class ToolDetails(BaseModel):
 
 
 class ToolsetDetails(BaseModel):
+    """A toolset identity and its per-executable public details."""
+
     id: str
     name: str
     tools: list[ToolDetails]
@@ -71,6 +77,7 @@ class ToolchainService:
         *,
         progress_interval: float = 1.0,
     ) -> None:
+        """Bind process execution and operator definitions with empty discovery state."""
         self.progress_interval = progress_interval
         self.processes = processes
         self.definitions = tuple(tuple(group) for group in definitions)
@@ -87,15 +94,18 @@ class ToolchainService:
                 self.initialized = True
 
     def list_toolsets(self) -> tuple[Toolset, ...]:
+        """Return the retained collection of independently discovered toolsets."""
         return self.toolsets
 
     def get_toolset(self, toolset_id: str) -> Toolset:
+        """Find a toolset by stable ID or raise a domain error."""
         for toolset in self.toolsets:
             if toolset.id == toolset_id:
                 return toolset
         raise ToolsetNotFoundError(f"Unknown toolset ID {toolset_id!r}.")
 
     def get_tool(self, toolset_id: str, tool_name: str) -> ToolSpec | None:
+        """Return a named tool from the selected toolset, or None when absent."""
         return next(
             (
                 tool
@@ -106,6 +116,7 @@ class ToolchainService:
         )
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
+        """Register read-only toolset tools, Markdown resources, and ID completions."""
         icon = self.ICON.icon
         annotations = ToolAnnotations(
             read_only_hint=True,
@@ -116,6 +127,9 @@ class ToolchainService:
 
         async def read_tool(tool: ToolSpec) -> ToolDetails:
             # Versions belong only to the current MCP response, never the spec.
+            """Query an available version for this response while tolerating command and parser
+            failures.
+            """
             version = None
             if "version" in tool.methods:
                 try:
@@ -208,6 +222,7 @@ class ToolchainService:
             argument: CompletionArgument,
             context: CompletionContext | None,
         ) -> Completion | None:
+            """Complete retained toolset IDs for the toolset details resource."""
             if (
                 not isinstance(ref, ResourceTemplateReference)
                 or ref.uri != self.DETAILS_URI

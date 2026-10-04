@@ -18,11 +18,13 @@ from forgemcp.workspace.service import ResultProvider, WorkspaceService
 
 @pytest.fixture
 def anyio_backend():
+    """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
 
 
 @pytest.fixture
 def setup(cpp_acceptance_project):
+    """Mount an isolated workspace service and its immutable result resources for provider tests."""
     workspace = WorkspaceService(cpp_acceptance_project)
     apps = Apps()
     mcp = MCPServer("providers", extensions=[apps])
@@ -47,6 +49,7 @@ def setup(cpp_acceptance_project):
     ],
 )
 def test_qualified_path_rejects_ambiguous_or_escaping_values(value):
+    """Verify qualified paths reject ambiguous syntax and traversal outside their area."""
     with pytest.raises(ValueError):
         WorkspacePath(value)
 
@@ -61,6 +64,7 @@ def test_qualified_path_rejects_ambiguous_or_escaping_values(value):
     ],
 )
 def test_qualified_path_is_a_json_string(value):
+    """Verify qualified paths serialize and validate as inline JSON strings."""
     adapter = TypeAdapter(WorkspacePath)
     assert json.loads(adapter.dump_json(WorkspacePath(value))) == value
     assert adapter.json_schema()["type"] == "string"
@@ -69,17 +73,26 @@ def test_qualified_path_is_a_json_string(value):
 
 @pytest.mark.anyio
 async def test_context_and_immutable_resource_belong_to_one_call(setup):
+    """Verify provider context and immutable resources stay bound to one copied tool result."""
     workspace, mcp = setup
     calls = []
     token = object()
 
     class Provider(ResultProvider[object]):
+        """A provider that captures call context and publishes an immutable JSON resource."""
+
         async def before_workspace_write_file(self, call_id, path, text):
+            """Capture the call arguments before file creation and return the shared context
+            token.
+            """
             calls.append((call_id, path, text))
             assert not workspace.resolve_workspace_path(path).exists()
             return token
 
         async def after_workspace_write_file(self, call_id, context, result):
+            """Validate the context and saved file, mutate the copied result, and publish a
+            resource.
+            """
             assert context is token and call_id == calls[0][0]
             assert result.action == "created"
             assert workspace.resolve_workspace_path(result.path).read_text() == "original"
@@ -114,22 +127,33 @@ async def test_context_and_immutable_resource_belong_to_one_call(setup):
 
 @pytest.mark.anyio
 async def test_opt_out_and_provider_failures_preserve_successful_operation(setup):
+    """Verify opting out and failing provider hooks do not change a successful file operation."""
     workspace, mcp = setup
     after_calls = []
 
     class OptOut(ResultProvider):
+        """A provider whose inherited before hook opts out of the invocation."""
+
         async def after_workspace_write_file(self, *args):
+            """Record an unexpected after hook call for an opted-out provider."""
             after_calls.append("optout")
 
     class BrokenBefore(ResultProvider):
+        """A provider that fails before the underlying write."""
+
         async def before_workspace_write_file(self, *args, **kwargs):
+            """Raise a private before-hook failure to test provider isolation."""
             raise RuntimeError("private before failure")
 
     class BrokenAfter(ResultProvider[bool]):
+        """A participating provider that fails after saving a result resource."""
+
         async def before_workspace_write_file(self, *args, **kwargs):
+            """Return a false-valued context that still participates in the call."""
             return False  # Only None opts out.
 
         async def after_workspace_write_file(self, call_id, context, result):
+            """Record context, save a resource, and raise a private after-hook failure."""
             after_calls.append(context)
             workspace.save_result_resource(call_id, "after", "application/json", "{}")
             raise RuntimeError("private after failure")
@@ -151,11 +175,14 @@ async def test_opt_out_and_provider_failures_preserve_successful_operation(setup
 
 @pytest.mark.anyio
 async def test_failed_tool_calls_error_and_keeps_original_file(setup):
+    """Verify a failed edit calls provider cleanup and preserves both file and resource state."""
     workspace, mcp = setup
     workspace.resolve_path("edit.txt").write_text("original")
     errors = []
 
     class Provider(ResultProvider[str]):
+        """A provider recording cleanup for a deliberately failed edit."""
+
         async def before_workspace_edit_file(
             self,
             call_id,
@@ -164,13 +191,16 @@ async def test_failed_tool_calls_error_and_keeps_original_file(setup):
             new_text,
             replace_all,
         ):
+            """Validate exact edit arguments and return a cleanup context."""
             assert (old_text, new_text, replace_all) == ("missing", "new", False)
             return "context"
 
         async def after_workspace_edit_file(self, *args):
+            """Fail if a rejected edit incorrectly reaches its success hook."""
             pytest.fail("A failed operation must not call after")
 
         async def error(self, call_id, context):
+            """Record the failed call's identifier and participating context."""
             errors.append((call_id, context))
 
     workspace.register_provider("observer", Provider())
@@ -187,22 +217,28 @@ async def test_failed_tool_calls_error_and_keeps_original_file(setup):
 
 @pytest.mark.anyio
 async def test_providers_run_in_parallel_and_share_call_id(setup):
+    """Verify before and after hooks overlap and share the same invocation identifier."""
     workspace, mcp = setup
     before = [asyncio.Event(), asyncio.Event()]
     after = [asyncio.Event(), asyncio.Event()]
     ids = {}
 
     class Provider(ResultProvider[int]):
+        """A barrier-based provider that proves hooks execute concurrently."""
+
         def __init__(self, index):
+            """Retain the provider's index in the paired barrier state."""
             self.index = index
 
         async def before_workspace_mkdir(self, call_id, path):
+            """Record the shared call ID and wait for the other provider's before hook."""
             ids[self.index] = call_id
             before[self.index].set()
             await before[1 - self.index].wait()
             return self.index
 
         async def after_workspace_mkdir(self, call_id, context, result):
+            """Validate context and wait for the other provider's after hook."""
             assert context == self.index and call_id == ids[self.index]
             after[self.index].set()
             await after[1 - self.index].wait()
@@ -222,10 +258,12 @@ async def test_providers_run_in_parallel_and_share_call_id(setup):
 
 @pytest.mark.anyio
 async def test_lock_serializes_tasks_and_allows_nested_delegation(setup):
+    """Verify workspace locking serializes tasks while allowing reentry by the owning task."""
     workspace, _ = setup
     entered = asyncio.Event()
 
     async def other_operation():
+        """Mark entry only after acquiring the serialized workspace operation context."""
         async with workspace.serialized_operation():
             entered.set()
 

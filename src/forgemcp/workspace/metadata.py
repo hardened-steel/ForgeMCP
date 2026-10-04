@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 def file_owner(path: Path) -> str | None:
+    """Resolve the native file owner name, returning None when owner metadata is unavailable."""
     if os.name != "nt":
         try:
             return path.owner()

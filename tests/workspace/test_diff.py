@@ -1,3 +1,5 @@
+"""Typed diff reconstruction, context grouping, and Unicode change-span tests."""
+
 import pytest
 
 from forgemcp.workspace.diff import create_diff
@@ -17,6 +19,7 @@ from forgemcp.workspace.path import WorkspacePath
     ],
 )
 def test_typed_diff_preserves_exact_text_and_line_numbers(before, after):
+    """Verify diff lines reconstruct both texts exactly with their original line numbers."""
     result = create_diff(WorkspacePath("project/example.cpp"), before, after)
     lines = [line for hunk in result.hunks for line in hunk.lines]
     assert "".join(line.text for line in lines if line.kind != "added") == before
@@ -32,6 +35,7 @@ def test_typed_diff_preserves_exact_text_and_line_numbers(before, after):
 
 
 def test_distant_changes_have_separate_hunks_and_compact_ranges():
+    """Verify distant edits produce separate context hunks and compact replacement ranges."""
     before = [f"line {number}\n" for number in range(40)]
     after = before.copy()
     after[1] = "first change\n"
@@ -48,11 +52,13 @@ def test_distant_changes_have_separate_hunks_and_compact_ranges():
 
 
 def test_unchanged_text_has_empty_diff():
+    """Verify identical input texts produce no changes or hunks."""
     diff = create_diff(WorkspacePath("project/a"), "same", "same")
     assert diff.hunks == diff.changes == []
 
 
 def test_character_spans_use_unicode_code_points_and_preserve_unchanged_parts():
+    """Verify changed spans use Unicode offsets and exclude unchanged surrounding characters."""
     diff = create_diff(
         WorkspacePath("project/a"),
         "😀 value = old;\n",

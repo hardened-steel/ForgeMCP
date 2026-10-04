@@ -13,6 +13,7 @@ class WorkspacePath(str):
     """A project/storage path, or root/ followed by an absolute native path."""
 
     def __new__(cls, value: str) -> WorkspacePath:
+        """Create a string path only after validating its area and path syntax."""
         instance = super().__new__(cls, value)
         instance.validate_path()
         return instance
@@ -23,6 +24,7 @@ class WorkspacePath(str):
         source_type: object,
         handler: GetCoreSchemaHandler,
     ) -> CoreSchema:
+        """Validate qualified paths as strings and serialize them without schema indirection."""
         return core_schema.no_info_after_validator_function(
             cls,
             core_schema.str_schema(),
@@ -30,6 +32,7 @@ class WorkspacePath(str):
         )
 
     def validate_path(self) -> WorkspacePath:
+        """Reject unknown areas, ambiguous separators, and paths escaping their declared root."""
         area, separator, relative = self.partition("/")
         if area not in ("project", "storage", "root") or not separator:
             raise ValueError("Workspace path must start with project/, storage/, or root/.")
@@ -54,15 +57,18 @@ class WorkspacePath(str):
 
     @property
     def area(self) -> Literal["project", "storage", "root"]:
+        """Return the project, storage, or external root area prefix."""
         return cast(Literal["project", "storage", "root"], self.partition("/")[0])
 
     @property
     def relative(self) -> str:
         # The root/ suffix stays absolute and is rejected by managed-root APIs.
+        """Return the path suffix, using a dot for an empty root-relative path."""
         return self.partition("/")[2] or "."
 
     @property
     def absolute(self) -> Path:
+        """Return a native absolute external path and reject other areas or host-relative values."""
         if self.area != "root":
             raise ValueError("Only root/ paths contain a native absolute path.")
         path = Path(self.relative)
