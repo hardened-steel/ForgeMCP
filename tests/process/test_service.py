@@ -143,10 +143,11 @@ async def test_stdin_cleanup_after_child_exit(processes, send_eof):
 
 @pytest.mark.anyio
 async def test_shutdown_with_buffered_stdin_does_not_hang(processes):
-    async with await processes.launch(
+    session = await processes.launch(
         sys.executable,
         ("-c", "import time; print('ready', flush=True); time.sleep(30)"),
-    ) as session:
+    )
+    try:
         assert (await anext(session.output())).text.strip() == "ready"
         await session.write_stdin("x" * (4 * 1024 * 1024))
         async with asyncio.timeout(5):
@@ -155,6 +156,11 @@ async def test_shutdown_with_buffered_stdin_does_not_hang(processes):
             await session.close()
         assert session.task.done()
         assert session.returncode is not None
+        # Terminating a child with unread input may report a broken pipe; the
+        # cleanup must still finish instead of waiting forever for stdin drain.
+        assert session.failure is None or isinstance(session.failure, ProcessStreamError)
+    finally:
+        await session.close()
 
 
 @pytest.mark.anyio
