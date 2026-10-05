@@ -252,19 +252,19 @@ def test_search_match_limit_and_exact_counts(request, limit):
     invoke = request.getfixturevalue("call")
     (search_workspace.root / "a.txt").write_text("needle needle\n" * 3, encoding="utf-8")
     (search_workspace.root / "z.bin").write_bytes(b"needle\0")
-    result = invoke("workspace_search", "needle", max_matches=limit)
+    result = invoke("workspace_text_search", "needle", max_matches=limit)
     assert len(result.matches) == min(limit, 3)
     assert result.matches_count == 3
     assert result.matches_truncated is (limit < 3)
     assert result.skipped_files_count == 1
     assert result.matches[0].spans == [(0, 6), (7, 13)]
     assert "skipped_files" not in result.model_dump()
-    empty = invoke("workspace_search", "absent", path="a.txt", max_matches=limit)
+    empty = invoke("workspace_text_search", "absent", path="a.txt", max_matches=limit)
     assert empty.matches_count == 0
     assert not empty.matches_truncated
     assert not empty.resources
     with pytest.raises(ToolError, match="max_matches"):
-        invoke("workspace_search", "needle", max_matches=0)
+        invoke("workspace_text_search", "needle", max_matches=0)
 
 
 def test_search_literals_regex_extensions_and_skips(workspace, call):
@@ -274,7 +274,7 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
     call("workspace_write_file", WorkspacePath("project/search/b.txt"), "a.b")
     (workspace.root / "search/binary").write_bytes(b"a.b\0")
     (workspace.root / "search/invalid").write_bytes(b"\xff")
-    result = call("workspace_search", "a.b", path="search")
+    result = call("workspace_text_search", "a.b", path="search")
     assert [(item.path.relative, item.line) for item in result.matches] == [
         ("search/a.cpp", 1),
         ("search/b.txt", 1),
@@ -286,7 +286,7 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
         "skipped_files": ["project/search/binary", "project/search/invalid"],
     }
     result = call(
-        "workspace_search",
+        "workspace_text_search",
         "a.b",
         regex=True,
         case_sensitive=False,
@@ -295,14 +295,14 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
     )
     assert [item.line for item in result.matches] == [1, 2]
     assert (
-        call("workspace_search", "foo\\(x\\)", regex=True, path="search/a.cpp")
+        call("workspace_text_search", "foo\\(x\\)", regex=True, path="search/a.cpp")
         .matches[0]
         .line
         == 3
     )
     for query, use_regex in (("", False), ("[", True)):
         with pytest.raises(ToolError):
-            call("workspace_search", query=query, regex=use_regex)
+            call("workspace_text_search", query=query, regex=use_regex)
     for path in ("search/binary", "search/invalid"):
         with pytest.raises(ToolError):
             call("workspace_read_file", WorkspacePath("project/" + path))
@@ -401,7 +401,7 @@ def test_markdown_escapes_source_fences_and_link_characters(workspace, call):
     """Verify source fences remain data and managed mirror paths are URL-quoted."""
     call("workspace_write_file", WorkspacePath("project/fence.txt"), "```\n<script>unsafe</script>\n")
     result = workspace.render_markdown(
-        call("workspace_search", "```", path="fence.txt")
+        call("workspace_text_search", "```", path="fence.txt")
     )
     assert "````\n```\n````" in result
     assert workspace.file_uri(WorkspacePath("project/a#b%[x].cpp")).endswith("a%23b%25%5Bx%5D.cpp")
@@ -451,7 +451,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
     for name, arguments in (
         ("workspace_list", {"depth": None}),
         ("workspace_find_files", {}),
-        ("workspace_search", {"query": "needle", "path": "large.txt"}),
+        ("workspace_text_search", {"query": "needle", "path": "large.txt"}),
         ("workspace_read_file", {"path": "large.txt"}),
         ("workspace_mkdir", {"path": "new"}),
         ("workspace_mkdir", {"path": "new"}),
@@ -482,7 +482,7 @@ def test_progress_throttles_per_invocation_without_losing_results(
         if name == "workspace_read_file":
             assert result.structured_content["text"] == "needle\n" * 30000
             assert result.content[0].text.endswith("30000 | needle")
-        if name == "workspace_search":
+        if name == "workspace_text_search":
             assert len(result.structured_content["matches"]) == 100
             assert result.structured_content["matches_count"] == 30000
             assert result.structured_content["matches_truncated"]

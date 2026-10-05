@@ -68,7 +68,7 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.1-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.2-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
@@ -80,7 +80,7 @@ The distribution name is `forge-cpp-mcp`; the Python module and server command a
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.1
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.2
 ```
 
 ## Setup from source
@@ -186,7 +186,7 @@ a working-directory check, not an operating-system sandbox.
 | `workspace_find_files(pattern="*", path="project/")` | Recursive filename/path glob search |
 | `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
 | `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
-| `workspace_search(query, path="project/", regex=false, extensions=null, case_sensitive=true, max_matches=100)` | Bounded matching lines, exact counts, and a linked skipped-file list |
+| `workspace_text_search(query, path="project/", regex=false, extensions=null, case_sensitive=true, max_matches=100)` | Bounded matching lines, exact counts, and a linked skipped-file list |
 | `workspace_write_file(path, text)` | Create or overwrite; return removed/added line counts |
 | `workspace_edit_file(path, old_text, new_text, replace_all=false)` | Exact replacement; zero or ambiguous matches fail without modifying the file |
 | `workspace_move(source, destination)` | Move a file or directory; destination must not exist |
