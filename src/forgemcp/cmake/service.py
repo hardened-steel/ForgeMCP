@@ -8,21 +8,22 @@ import shutil
 import tempfile
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, cast
 from urllib.parse import quote
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from mcp.types import CallToolResult, ToolAnnotations
+from pydantic import Field
 
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.process.errors import ProcessError
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.progress import progress
+from forgemcp.text import tool_result
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import Toolset
@@ -31,72 +32,14 @@ from forgemcp.workspace.path import WorkspacePath
 
 from .errors import CMakeError
 from .profiles import ProfileDefinition
-
-
-class CMakeProfile(BaseModel):
-    """A resolved operator profile with toolset, build directory, and preset selections."""
-
-    name: str
-    toolset_id: str
-    mode: Literal["plain", "presets"] = "plain"
-    build_directory: WorkspacePath | None = None
-    configure_presets: list[str] = Field(default_factory=list)
-    build_presets: list[str] = Field(default_factory=list)
-    test_presets: list[str] = Field(default_factory=list)
-    configuration: str | None = None
-    generator: str | None = None
-
-
-class CompilationContext(BaseModel):
-    """A successful build configuration with its toolset and compilation database."""
-
-    id: str
-    toolset_id: str
-    build_directory: WorkspacePath
-    compilation_database: WorkspacePath
-
-
-class CMakeConfigureResult(BaseModel):
-    """One configure outcome with discovered paths, failure explanation, and process reference."""
-
-    profile: str
-    preset: str | None = None
-    build_directory: WorkspacePath | None = None
-    compilation_database: WorkspacePath | None = None
-    error: str | None = Field(
-        default=None,
-        description="Null on success; failure explanation otherwise.",
-    )
-    process_id: int | None = None
-
-
-class CMakeBuildResult(BaseModel):
-    """One build outcome with progress counts, failure explanation, and process reference."""
-
-    profile: str
-    preset: str | None = None
-    configuration: str | None = None
-    completed_steps: int | None = None
-    total_steps: int | None = None
-    error: str | None = Field(
-        default=None,
-        description="Null on success; failure explanation otherwise.",
-    )
-    process_id: int | None = None
-
-
-class CMakeTestResult(BaseModel):
-    """One test outcome with parsed cases, failure explanation, and process reference."""
-
-    profile: str
-    preset: str | None = None
-    configuration: str | None = None
-    tests: list[ctest.TestCase] = Field(default_factory=list)
-    error: str | None = Field(
-        default=None,
-        description="Null on success; failure explanation otherwise.",
-    )
-    process_id: int | None = None
+from .models import (
+    CMakeProfile,
+    CompilationContext,
+    CMakeConfigureResult,
+    CMakeBuildResult,
+    CMakeTestResult,
+)
+from .text import render_executions, render_profiles
 
 
 class CMakeService:
@@ -549,7 +492,7 @@ class CMakeService:
             icons=[icon],
             annotations=ToolAnnotations(read_only_hint=True),
         )
-        async def cmake_profiles(ctx: Context) -> list[CMakeProfile]:
+        async def cmake_profiles(ctx: Context) -> Annotated[CallToolResult, list[CMakeProfile]]:
             """List effective profiles with their toolsets, build settings, and preset selections."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Reading CMake profiles")
@@ -560,7 +503,7 @@ class CMakeService:
                     profile = self.resolve_profile(definition, catalogs)
                     profiles.append(profile)
                     await report(len(profiles), message=f"Read {profile.name}")
-                return profiles
+                return tool_result(profiles, render_profiles(profiles))
             except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
 
@@ -573,7 +516,7 @@ class CMakeService:
             ctx: Context,
             profiles: list[str] | None = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> list[CMakeConfigureResult]:
+        ) -> Annotated[CallToolResult, list[CMakeConfigureResult]]:
             """Configure selected profiles; return build/database paths and per-execution errors.
 
             Changing a manual profile's generator removes and recreates its build directory.
@@ -733,7 +676,7 @@ class CMakeService:
                         self.configurations.pop(identifier, None)
                     await self.publish_configurations(refresh=result.error is None)
                     await report_status(result.error or "Completed successfully")
-            return results
+            return tool_result(results, render_executions(results, "Configure"))
 
         @apps.tool(
             resource_uri=self.BUILD_WIDGET.uri,
@@ -746,7 +689,7 @@ class CMakeService:
             targets: list[str] | None = None,
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> list[CMakeBuildResult]:
+        ) -> Annotated[CallToolResult, list[CMakeBuildResult]]:
             """Build selected profiles and their build presets after configuration.
 
             Omitted targets use CMake or preset defaults; a nonempty targets list
@@ -817,7 +760,7 @@ class CMakeService:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
-            return results
+            return tool_result(results, render_executions(results, "Build"))
 
         @apps.tool(
             resource_uri=self.TEST_WIDGET.uri,
@@ -830,7 +773,7 @@ class CMakeService:
             names: list[str] | None = None,
             parallel: Annotated[int | None, Field(ge=1)] = None,
             timeout: ProcessTimeout = ProcessTimeout(total=600),
-        ) -> list[CMakeTestResult]:
+        ) -> Annotated[CallToolResult, list[CMakeTestResult]]:
             """Run CTest for selected profiles and test presets after building; return test cases.
 
             names selects exact test names, not regex patterns; omit it to use
@@ -917,7 +860,7 @@ class CMakeService:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
                     await report_status(result.error or "Completed successfully")
-            return results
+            return tool_result(results, render_executions(results, "CTest"))
 
         for widget in (
             self.PROFILES_WIDGET,

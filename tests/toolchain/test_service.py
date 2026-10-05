@@ -327,6 +327,8 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
         assert result.structured_content == {
             "result": [{"id": "system", "name": "System", "tools": ["python"]}]
         }
+        assert "System (system)" in result.content[0].text
+        assert "Tools: python" in result.content[0].text
         assert result.content and progress == ([0.0, 1.0] if interval == 0 else [0.0])
         progress.clear()
         result = await client.call_tool(
@@ -336,6 +338,8 @@ async def test_mcp_tools_resources_progress_completions_and_transcripts(
         )
         assert progress == ([0.0, 1.0] if interval == 0 else [0.0])
         tool_info = result.structured_content["tools"][0]
+        assert "Version: 12.3" in result.content[0].text
+        assert tool_info["path"] in result.content[0].text
         assert Path(tool_info["path"]).resolve() == Path(sys.executable).resolve()
         assert tool_info == dict(
             name="python",

@@ -5,6 +5,7 @@ import os
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -40,13 +41,15 @@ def call(workspace):
             kwargs["path"] = WorkspacePath("project/" + kwargs["path"])
         if name == "workspace_read_file":
             kwargs["confirm"] = ReadConfirmation(allow=True)
-        return asyncio.run(
+        response = asyncio.run(
             handlers[name](
                 *args,
                 ctx=SimpleNamespace(report_progress=AsyncMock()),
                 **kwargs,
             )
         )
+        result_type = get_args(get_type_hints(handlers[name], include_extras=True)["return"])[1]
+        return result_type.model_validate(response.structured_content)
 
     return invoke
 
@@ -449,9 +452,11 @@ def test_progress_throttles_per_invocation_without_losing_results(
             assert len(events) > 1
             assert all(event[2].startswith("process ") for event in events[1:])
         if name == "workspace_read_file":
-            assert result.text == "needle\n" * 30000
+            assert result.structured_content["text"] == "needle\n" * 30000
+            assert result.content[0].text.endswith("30000 | needle")
         if name == "workspace_search":
-            assert len(result.matches) == 30000
+            assert len(result.structured_content["matches"]) == 30000
+            assert "30000 | needle" in result.content[0].text
             assert all(event[2].startswith("Searching project/large.txt") for event in events[1:])
         if name == "workspace_mkdir":
             assert len(events) == (2 if interval == 0 else 1)

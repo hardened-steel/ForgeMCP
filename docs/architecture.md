@@ -27,6 +27,7 @@ src/forgemcp/
   <feature>/
     service.py                  # business logic, service class, MCP handlers
     errors.py                   # expected feature errors
+    text.py                     # plain-text presentation where substantial
   process/
     service.py                  # subprocess lifecycle, streams, state, MCP inspection
     models.py                   # session results and MCP-facing process state
@@ -102,7 +103,10 @@ class ExampleService:
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[self.ICON.icon])
-        async def example_tool(value: str, ctx: Context) -> Result:
+        async def example_tool(
+            value: str,
+            ctx: Context,
+        ) -> Annotated[CallToolResult, Result]:
             """Describe the tool; the SDK infers its public metadata and schema."""
             ...
 ```
@@ -113,6 +117,18 @@ the class remains focused on reusable business operations. The SDK derives names
 descriptions, schemas, and structured output from the entrypoint signatures and
 docstrings. A local completion function returns `None` for references the feature does
 not own and is added to the shared `Complete` collector.
+
+Tool handlers explicitly return `Annotated[CallToolResult, ResultType]`. A small
+shared `text.tool_result` helper serializes result models in JSON mode with aliases
+and constructs the SDK response, while each feature owns its readable text.
+Workspace and CMake result models live in `models.py` because both operations and
+presentation use them; clangd and process extend their existing shared models.
+Text has no Markdown wrapper, headings, or tables. Workspace reads contain only
+numbered source lines, searches omit match spans from text, and provider resource
+links remain exclusively in structured data. Process command lines quote argument
+boundaries for display and do not execute through a shell. Clangd hover Markdown
+is parsed with `markdown-it-py` into plain text while code and plaintext fragments
+remain unchanged. Widgets continue to consume the original structured shapes.
 
 ## Current MCP surface
 
@@ -139,7 +155,13 @@ The tool response signals completion. File reading reports bytes as chunks are r
 reusable filesystem operations remain service methods; their tool handlers report
 completion of one operation. No generic runner or thread offloading is used.
 Individual filesystem calls are synchronous; traversal yields cooperatively between
-work units. Results remain small Pydantic models. The SDK derives structured output and useful JSON text fallback.
+work units. Typed result models are shared with feature-local plain-text renderers.
+Tools return `Annotated[CallToolResult, ResultType]`, preserving SDK output schemas
+and validation while explicitly supplying English plain text and JSON-compatible
+structured data. List results keep the existing `{"result": [...]}` envelope.
+Workspace Markdown resources validate the structured data from their internal tool
+calls back into result models before rendering. Provider hooks still receive models,
+and text is formed only after their result links have been attached.
 Expected `WorkspaceError` failures become `ToolError` or `ResourceError` at the
 corresponding boundary. OS errors retain the system-provided `strerror`, which may be localized. Resource roots are explicitly checked before filesystem access,
 including mirrors without a path, to avoid opaque SDK validation errors. Platform-specific file ownership is isolated in

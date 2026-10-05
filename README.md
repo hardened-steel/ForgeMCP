@@ -32,8 +32,12 @@ debugger modules are planned.
   toolsets as markdown, querying available versions for details, with completion
   for retained toolset IDs.
 
-The tools remain useful in clients without MCP Apps support because the Python SDK
-serializes their typed results into both text `content` and `structuredContent`.
+Every tool returns readable English plain text in `content` alongside its typed
+`structuredContent`. Trees use branch characters, source excerpts use line numbers,
+and diagnostics use compiler-style messages. Text does not include Markdown
+formatting or Workspace provider resource links; the structured data retains those
+links for widgets. Clients decide how to display the text and may prefer structured
+data when supplying results to a model.
 
 All widgets share a compact console style with a fixed 420px height and adapt to the
 host width. The move confirmation uses only two rows, source and destination.

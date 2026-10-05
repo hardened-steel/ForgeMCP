@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import (
+    CallToolResult,
     Completion,
     CompletionArgument,
     CompletionContext,
@@ -24,6 +26,7 @@ from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.progress import progress
 from forgemcp.process.service import ProcessService
+from forgemcp.text import tool_result
 
 from . import discovery
 from .errors import ToolCommandError, ToolParserError, ToolsetNotFoundError
@@ -53,6 +56,33 @@ class ToolsetDetails(BaseModel):
     id: str
     name: str
     tools: list[ToolDetails]
+
+
+def render_text(result: list[ToolsetSummary] | ToolsetDetails) -> str:
+    """Describe available tools and executable details without Markdown tables."""
+    if isinstance(result, list):
+        lines = [f"Found {len(result)} toolsets."]
+        for item in result:
+            lines.extend(
+                [
+                    "",
+                    f"{item.name} ({item.id})",
+                    f"  Tools: {', '.join(item.tools) if item.tools else 'No tools available'}",
+                ]
+            )
+        return "\n".join(lines)
+    lines = [f'Toolset "{result.name}" ({result.id}): {len(result.tools)} tools.']
+    for tool in result.tools:
+        lines.extend(
+            [
+                "",
+                tool.name,
+                f"  Kind: {tool.kind.value}",
+                f"  Executable: {tool.path}",
+                f"  Version: {tool.version if tool.version is not None else 'Unavailable'}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 class ToolchainService:
@@ -144,7 +174,9 @@ class ToolchainService:
             )
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
-        async def toolsets_list(ctx: Context) -> list[ToolsetSummary]:
+        async def toolsets_list(
+            ctx: Context,
+        ) -> Annotated[CallToolResult, list[ToolsetSummary]]:
             """List all discovered toolsets and the tools available in each."""
             report_progress = progress(ctx, interval=self.progress_interval)
             await report_progress(0, total=1, message="Reading toolsets")
@@ -157,10 +189,13 @@ class ToolchainService:
                 for item in self.list_toolsets()
             ]
             await report_progress(1, total=1, message="Toolsets ready")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
-        async def toolset_get(toolset_id: str, ctx: Context) -> ToolsetDetails:
+        async def toolset_get(
+            toolset_id: str,
+            ctx: Context,
+        ) -> Annotated[CallToolResult, ToolsetDetails]:
             """Read tool paths and kinds, querying available versions for this request."""
             report_progress = progress(ctx, interval=self.progress_interval)
             try:
@@ -177,7 +212,8 @@ class ToolchainService:
                     total=total,
                     message=f"Read {tool.name}",
                 )
-            return ToolsetDetails(id=toolset.id, name=toolset.name, tools=details)
+            result = ToolsetDetails(id=toolset.id, name=toolset.name, tools=details)
+            return tool_result(result, render_text(result))
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
 

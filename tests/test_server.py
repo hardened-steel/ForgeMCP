@@ -23,6 +23,79 @@ from forgemcp.workspace.service import WorkspaceService
 from forgemcp.workspace.diff import FileDiff
 
 
+@pytest.mark.anyio
+async def test_workspace_plain_text_workflow_preserves_structured_data(cpp_acceptance_project):
+    """Exercise every workspace fallback through the SDK, including unchanged Markdown resources."""
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        responses = {}
+        operations = [
+            ("workspace_mkdir", {"path": "project/text-output"}),
+            ("workspace_mkdir", {"path": "project/text-output"}),
+            (
+                "workspace_write_file",
+                {"path": "project/text-output/sample.cpp", "text": "// α\nint needle = 1;\n"},
+            ),
+            ("workspace_list", {"path": "project/text-output", "depth": None}),
+            (
+                "workspace_find_files",
+                {"pattern": "*.cpp", "path": "project/text-output"},
+            ),
+            ("workspace_file_info", {"path": "project/text-output/sample.cpp"}),
+            (
+                "workspace_read_file",
+                {"path": "project/text-output/sample.cpp", "start_line": 2},
+            ),
+            ("workspace_search", {"query": "needle", "path": "project/text-output"}),
+            (
+                "workspace_edit_file",
+                {"path": "project/text-output/sample.cpp", "old_text": "1", "new_text": "2"},
+            ),
+            (
+                "workspace_move",
+                {
+                    "source": "project/text-output/sample.cpp",
+                    "destination": "project/text-output/moved.cpp",
+                },
+            ),
+            ("workspace_delete", {"path": "project/text-output/moved.cpp"}),
+        ]
+        for name, arguments in operations:
+            response = await client.call_tool(name, arguments)
+            assert not response.is_error, response.content
+            assert response.structured_content is not None
+            text = response.content[0].text
+            assert text and not text.lstrip().startswith("{")
+            assert "```" not in text and "forgemcp://workspace/results/" not in text
+            responses[name] = response
+        assert responses["workspace_mkdir"].content[0].text.endswith("already exists.")
+        assert responses["workspace_read_file"].content[0].text == "2 | int needle = 1;"
+        search = responses["workspace_search"]
+        assert "2 | int needle = 1;" in search.content[0].text
+        assert "spans" not in search.content[0].text
+        assert 'Query: "needle" (literal text; case-sensitive)' in search.content[0].text
+        assert search.structured_content["matches"][0]["spans"] == [[4, 10]]
+        assert "Size:" in responses["workspace_find_files"].content[0].text
+        assert "Modified:" in responses["workspace_file_info"].content[0].text
+        assert "├──" in responses["workspace_list"].content[0].text or (
+            "└──" in responses["workspace_list"].content[0].text
+        )
+        assert responses["workspace_move"].content[0].text == (
+            "Moved project/text-output/sample.cpp to project/text-output/moved.cpp."
+        )
+        assert responses["workspace_delete"].content[0].text == (
+            "Deleted project/text-output/moved.cpp."
+        )
+        for uri in (
+            "forgemcp://workspace/list?path=project/text-output",
+            "forgemcp://workspace/find-files?pattern=*.cpp&path=project/text-output",
+            "forgemcp://workspace/file-info?path=project/README.md",
+            "forgemcp://workspace/search?query=fixture&path=project/README.md",
+        ):
+            resource = await client.read_resource(uri)
+            assert resource.contents[0].mime_type == "text/markdown"
+            assert resource.contents[0].text.startswith("# ")
+
+
 @pytest.fixture
 def anyio_backend():
     """Run async tests on the asyncio backend used by the process and LSP services."""
@@ -78,6 +151,8 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
         result = await client.call_tool("workspace_list", {}, progress_callback=collect)
         assert not result.is_error and result.structured_content["path"] == "project/"
         assert result.content
+        assert result.content[0].text.startswith("project/\n")
+        assert "```" not in result.content[0].text
         assert len(progress) > 2
         assert [value for value, _ in progress] == list(range(len(progress)))
         assert all(total is None for _, total in progress)
@@ -118,6 +193,7 @@ async def test_clangd_tools_are_registered_and_unavailable_configurations_fail_c
         assert tools["clangd_diagnostics"].input_schema["properties"]["path"]["type"] == "string"
         contexts = await client.call_tool("clangd_configurations", {})
         assert not contexts.is_error and contexts.structured_content["result"] == []
+        assert contexts.content[0].text == "Available clangd configurations: 0."
         diagnostics = await client.call_tool("clangd_diagnostics", {"path": "project/src/math.cpp"})
         assert diagnostics.is_error and "compilation database" in diagnostics.content[0].text
 
@@ -213,6 +289,8 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
             {"path": "project/diff.txt", "text": "old\nunchanged\n"},
         )
         result = written.structured_content
+        assert written.content[0].text.startswith("Created ")
+        assert "forgemcp://workspace/results/" not in written.content[0].text
         assert "diff" not in result and "changed_lines" not in result
         assert "extensions_uri" not in result
         resource = result["resources"]["diff"]
@@ -227,6 +305,7 @@ async def test_diff_resources_are_linked_typed_and_immutable(cpp_acceptance_proj
             {"path": "project/diff.txt", "old_text": "old", "new_text": "new"},
         )
         assert edited.structured_content["replacements"] == 1
+        assert edited.content[0].text.endswith("Replaced 1 occurrence.")
         assert "diff" not in edited.structured_content
         changed = FileDiff.model_validate_json(
             (await client.read_resource(edited.structured_content["resources"]["diff"]["uri"])).contents[0].text
