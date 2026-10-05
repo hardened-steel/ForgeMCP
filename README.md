@@ -186,7 +186,7 @@ a working-directory check, not an operating-system sandbox.
 | `workspace_find_files(pattern="*", path="project/")` | Recursive filename/path glob search |
 | `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
 | `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
-| `workspace_search(query, path="project/", regex=false, extensions=null, case_sensitive=true, max_matches=100)` | Bounded matching lines, exact counts, and a linked skipped-file list |
+| `workspace_text_search(query, path="project/", regex=false, extensions=null, case_sensitive=true, max_matches=100)` | Bounded matching lines, exact counts, and a linked skipped-file list |
 | `workspace_write_file(path, text)` | Create or overwrite; return removed/added line counts |
 | `workspace_edit_file(path, old_text, new_text, replace_all=false)` | Exact replacement; zero or ambiguous matches fail without modifying the file |
 | `workspace_move(source, destination)` | Move a file or directory; destination must not exist |

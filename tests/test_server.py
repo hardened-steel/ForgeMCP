@@ -46,7 +46,7 @@ async def test_workspace_plain_text_workflow_preserves_structured_data(cpp_accep
                 "workspace_read_file",
                 {"path": "project/text-output/sample.cpp", "start_line": 2},
             ),
-            ("workspace_search", {"query": "needle", "path": "project/text-output"}),
+            ("workspace_text_search", {"query": "needle", "path": "project/text-output"}),
             (
                 "workspace_edit_file",
                 {"path": "project/text-output/sample.cpp", "old_text": "1", "new_text": "2"},
@@ -70,7 +70,7 @@ async def test_workspace_plain_text_workflow_preserves_structured_data(cpp_accep
             responses[name] = response
         assert responses["workspace_mkdir"].content[0].text.endswith("already exists.")
         assert responses["workspace_read_file"].content[0].text == "2 | int needle = 1;"
-        search = responses["workspace_search"]
+        search = responses["workspace_text_search"]
         assert "2 | int needle = 1;" in search.content[0].text
         assert "spans" not in search.content[0].text
         assert 'Query: "needle" (literal text; case-sensitive)' in search.content[0].text
@@ -140,6 +140,8 @@ async def test_workspace_tools_have_apps_schemas_icons_and_progress(
             if tool.name.startswith("workspace_")
         ]
         assert len(tools) == 10
+        assert "workspace_text_search" in {tool.name for tool in tools}
+        assert "workspace_search" not in {tool.name for tool in tools}
         assert "workspace_overview" not in {tool.name for tool in tools}
         assert (await client.list_prompts()).prompts == []
         for tool in tools:
@@ -269,7 +271,7 @@ async def test_full_file_workflow_through_client(cpp_acceptance_project):
             b"one\nthree three\n"
         )
         assert (await call("find_files", pattern="new/*.txt"))["paths"] == ["project/new/a.txt"]
-        assert (await call("search", query="three", path="project/new"))["matches"][0][
+        assert (await call("text_search", query="three", path="project/new"))["matches"][0][
             "line"
         ] == 2
         assert (await call("move", source="project/new/a.txt", destination="project/new/b.txt"))[
@@ -497,7 +499,7 @@ async def test_search_limits_and_immutable_skipped_resource(cpp_acceptance_proje
     binary.write_bytes(b"\0")
     async with Client(create_server(cpp_acceptance_project)) as client:
         response = await client.call_tool(
-            "workspace_search",
+            "workspace_text_search",
             {"query": "needle", "extensions": ["txt", "bin"], "max_matches": 1},
         )
         assert not response.is_error
@@ -520,7 +522,10 @@ async def test_search_limits_and_immutable_skipped_resource(cpp_acceptance_proje
         )).contents[0].text
         assert "Returned 2 of 3" in markdown
         assert "matches\\_truncated=True" in markdown
-        invalid = await client.call_tool("workspace_search", {"query": "needle", "max_matches": 0})
+        invalid = await client.call_tool(
+            "workspace_text_search",
+            {"query": "needle", "max_matches": 0},
+        )
         assert invalid.is_error
 
 
@@ -542,7 +547,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
         for tool, arguments in (
             ("workspace_list", {"depth": None}),
             ("workspace_find_files", {}),
-            ("workspace_search", {"query": "STRASSE", "case_sensitive": False}),
+            ("workspace_text_search", {"query": "STRASSE", "case_sensitive": False}),
             ("workspace_read_file", {"path": "project/large.txt"}),
         ):
             progress.clear()
@@ -555,7 +560,7 @@ async def test_scan_and_read_progress_and_exact_regex_spans(cpp_acceptance_proje
             assert all(total is None for _, total, _ in progress)
             if tool == "workspace_read_file":
                 assert values[-1] == 150000
-            if tool == "workspace_search":
+            if tool == "workspace_text_search":
                 match = next(
                     item
                     for item in result.structured_content["matches"]

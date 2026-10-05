@@ -137,7 +137,7 @@ remain unchanged. Widgets continue to consume the original structured shapes.
 `WorkspaceService` owns path checks, directory trees, metadata, UTF-8 reading,
 literal/regex searching, mutations, and storage directories. The ten tools are
 `workspace_list`, `workspace_find_files`, `workspace_file_info`, `workspace_read_file`,
-`workspace_search`, `workspace_write_file`, `workspace_edit_file`, `workspace_move`,
+`workspace_text_search`, `workspace_write_file`, `workspace_edit_file`, `workspace_move`,
 `workspace_delete`, and `workspace_mkdir`. The former overview, file-extension
 resource, and inspection prompt are removed. There are no workspace prompts.
 

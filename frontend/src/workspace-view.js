@@ -217,7 +217,7 @@ export function workspacePresentation(data, loaded = {}) {
   }
   if (Array.isArray(data.matches)) {
     return {
-      toolName: "workspace_search", summary: data, records: null,
+      toolName: "workspace_text_search", summary: data, records: null,
       resourceFields: resources(data), filterPlaceholder: "Search results",
       count: `${data.matches.length}/${data.matches_count} matching lines · ${data.skipped_files_count} skipped files`,
       render: (doc, query, width) => searchView(doc, data, query, width, loaded),

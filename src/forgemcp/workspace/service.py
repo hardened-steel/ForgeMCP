@@ -164,7 +164,7 @@ class ResultProvider(Generic[ContextT]):
         """
         return None
 
-    async def before_workspace_search(
+    async def before_workspace_text_search(
         self,
         call_id: str,
         query: str,
@@ -173,16 +173,16 @@ class ResultProvider(Generic[ContextT]):
         extensions: list[str] | None,
         case_sensitive: bool,
     ) -> ContextT | None:
-        """Opt out of workspace_search enrichment unless a provider overrides this hook."""
+        """Opt out of workspace_text_search enrichment unless a provider overrides this hook."""
         return None
 
-    async def after_workspace_search(
+    async def after_workspace_text_search(
         self,
         call_id: str,
         context: ContextT,
         result: SearchResult,
     ) -> str | None:
-        """Return no linked resource unless a provider handles the completed workspace_search
+        """Return no linked resource unless a provider handles the completed workspace_text_search
         call.
         """
         return None
@@ -373,7 +373,7 @@ class WorkspaceService:
             "workspace_find_files",
             "workspace_file_info",
             "workspace_read_file",
-            "workspace_search",
+            "workspace_text_search",
             "workspace_write_file",
             "workspace_edit_file",
             "workspace_move",
@@ -1195,7 +1195,7 @@ class WorkspaceService:
             annotations=read_only,
         )
         @serialized
-        async def workspace_search(
+        async def workspace_text_search(
             query: str,
             ctx: Context,
             path: WorkspacePath = WorkspacePath("project/"),
@@ -1213,7 +1213,7 @@ class WorkspaceService:
             """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
-                "workspace_search",
+                "workspace_text_search",
                 {
                     "query": query,
                     "path": path,
@@ -1714,7 +1714,7 @@ class WorkspaceService:
         ) -> str:
             """Read text/regex matches and skipped files as Markdown; query is required."""
             try:
-                result = await workspace_search(
+                result = await workspace_text_search(
                     ctx=ctx,
                     query=query,
                     path=resource_path(path),
