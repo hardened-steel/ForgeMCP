@@ -199,8 +199,15 @@ one result per matching line, with `spans` containing zero-based Unicode-code-po
 include ordinary build directories and dot files. Only text search has an extension
 filter; filename search uses its glob alone. Extension filters accept a
 leading dot and compare case-insensitively. Binary/non-UTF-8 files are reported in
-`skipped_files`. By explicit design, workspace scans currently have no application
-timeout, output cap, index, or pagination.
+`skipped_files_count`, with the full list linked as `resources.skipped_files` to an
+immutable JSON snapshot. Workspace reuses `save_result_resource` and
+`read_result_resource` for this owned resource; its name is reserved against provider
+registration, and it is saved after provider finalization so their cleanup retains
+its independent lifecycle. Text search accepts positive `max_matches` (default 100)
+and retains at most that many matching lines from traversal, sorted for output.
+Scanning continues to compute exact `matches_count` and `skipped_files_count`;
+`matches_truncated` reports omitted matching lines. There is no per-line byte cap,
+application timeout, index, or pagination. Filename searches remain unbounded.
 
 ### Service storage and future consumers
 
@@ -227,7 +234,7 @@ forgemcp://workspace/raw{/path*}
 forgemcp://workspace/list{?path,depth,include_hidden}
 forgemcp://workspace/find-files{?pattern,path}
 forgemcp://workspace/file-info{?path}
-forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}
+forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive,max_matches}
 ```
 
 Text mirrors return complete UTF-8 text with `text/plain`; raw mirrors return exact
@@ -673,7 +680,8 @@ specialized tree/source values, passed through the shared renderer's optional
 the original text used by copying and JSON. Search/find results reuse the shared
 collection filters. Metadata and mutation results use the shared fields view.
 
-The App bridge loads only the linked `diff.json` and `clangd.json` resources, in
+The App bridge loads only the linked `diff.json`, `clangd.json`, and
+`skipped_files.json` resources, in
 parallel, and ignores late responses after cancellation or teardown. Each resource
 has its own loading/error state; failures leave the original operation result
 visible. The Resources view includes the descriptors and full decoded JSON with

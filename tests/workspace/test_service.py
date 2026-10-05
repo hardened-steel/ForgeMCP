@@ -1,6 +1,7 @@
 """Managed filesystem operations, safety boundaries, search, and progress tests."""
 
 import asyncio
+import json
 import os
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
@@ -244,6 +245,28 @@ def test_failed_replace_keeps_file_and_cleans_temporary_file(workspace, call, mo
     assert not list(workspace.root.glob(".forgemcp-*"))
 
 
+@pytest.mark.parametrize("limit", [1, 3, 5])
+def test_search_match_limit_and_exact_counts(request, limit):
+    """Bound matching lines while counting all lines and later binary files."""
+    search_workspace = request.getfixturevalue("workspace")
+    invoke = request.getfixturevalue("call")
+    (search_workspace.root / "a.txt").write_text("needle needle\n" * 3, encoding="utf-8")
+    (search_workspace.root / "z.bin").write_bytes(b"needle\0")
+    result = invoke("workspace_search", "needle", max_matches=limit)
+    assert len(result.matches) == min(limit, 3)
+    assert result.matches_count == 3
+    assert result.matches_truncated is (limit < 3)
+    assert result.skipped_files_count == 1
+    assert result.matches[0].spans == [(0, 6), (7, 13)]
+    assert "skipped_files" not in result.model_dump()
+    empty = invoke("workspace_search", "absent", path="a.txt", max_matches=limit)
+    assert empty.matches_count == 0
+    assert not empty.matches_truncated
+    assert not empty.resources
+    with pytest.raises(ToolError, match="max_matches"):
+        invoke("workspace_search", "needle", max_matches=0)
+
+
 def test_search_literals_regex_extensions_and_skips(workspace, call):
     """Verify literal and regex search, extension filters, and binary or invalid UTF-8 skips."""
     call("workspace_mkdir", WorkspacePath("project/search"))
@@ -256,7 +279,12 @@ def test_search_literals_regex_extensions_and_skips(workspace, call):
         ("search/a.cpp", 1),
         ("search/b.txt", 1),
     ]
-    assert [path.relative for path in result.skipped_files] == ["search/binary", "search/invalid"]
+    assert result.skipped_files_count == 2
+    link = result.resources["skipped_files"]
+    result_id, name = link.uri.rsplit("/", 2)[-2:]
+    assert json.loads(workspace.read_result_resource(result_id, name)) == {
+        "skipped_files": ["project/search/binary", "project/search/invalid"],
+    }
     result = call(
         "workspace_search",
         "a.b",
@@ -455,8 +483,11 @@ def test_progress_throttles_per_invocation_without_losing_results(
             assert result.structured_content["text"] == "needle\n" * 30000
             assert result.content[0].text.endswith("30000 | needle")
         if name == "workspace_search":
-            assert len(result.structured_content["matches"]) == 30000
-            assert "30000 | needle" in result.content[0].text
+            assert len(result.structured_content["matches"]) == 100
+            assert result.structured_content["matches_count"] == 30000
+            assert result.structured_content["matches_truncated"]
+            assert "Returned 100 of 30000 matching lines" in result.content[0].text
+            assert "Matches truncated: True" in result.content[0].text
             assert all(event[2].startswith("Searching project/large.txt") for event in events[1:])
         if name == "workspace_mkdir":
             assert len(events) == (2 if interval == 0 else 1)

@@ -71,10 +71,12 @@ class SearchMatch(BaseModel):
 
 
 class SearchResult(ResultResources):
-    """Matching source lines and skipped files with linked provider resources."""
+    """Bounded matching lines, exact scan counts, and linked skipped-file details."""
 
     matches: list[SearchMatch]
-    skipped_files: list[WorkspacePath]
+    matches_count: int
+    matches_truncated: bool
+    skipped_files_count: int
 
 
 class FileWriteResult(ResultResources):

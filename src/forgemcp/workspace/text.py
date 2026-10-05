@@ -78,8 +78,10 @@ def render_listing(
             ]
         )
     lines = [
-        f"Found {len(result.matches)} matching lines in "
-        f"{len({match.path for match in result.matches})} files."
+        f"Returned {len(result.matches)} of {result.matches_count} matching lines in "
+        f"{len({match.path for match in result.matches})} displayed files.",
+        f"Matches truncated: {result.matches_truncated}.",
+        f"Skipped files: {result.skipped_files_count}.",
     ]
     previous = None
     for match in result.matches:
@@ -87,9 +89,6 @@ def render_listing(
             lines.extend(["", str(match.path)])
             previous = match.path
         lines.append(f"  {match.line} | {match.text}")
-    if result.skipped_files:
-        lines.extend(["", "Skipped files:"])
-        lines.extend(f"  {path}" for path in result.skipped_files)
     return "\n".join(lines)
 
 

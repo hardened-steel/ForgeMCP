@@ -47,6 +47,20 @@ function resultResourceUri(link, provider) {
   return link.uri;
 }
 
+export async function loadResultSkippedFiles(result, read, current = () => true) {
+  const link = result?.structuredContent?.resources?.skipped_files;
+  if (!link || result.isError) return null;
+  const uri = resultResourceUri(link, "skipped_files");
+  if (!current()) return null;
+  const data = decode(await read({ uri }), uri);
+  if (!Array.isArray(data?.skipped_files) || !data.skipped_files.every((path) =>
+    typeof path === "string" && /^(project|storage)\//.test(path))
+    || data.skipped_files.length !== result.structuredContent.skipped_files_count) {
+    throw new Error("Invalid skipped-file resource");
+  }
+  return current() ? data : null;
+}
+
 export async function loadResultClangd(result, read, current = () => true) {
   const link = result?.structuredContent?.resources?.clangd;
   if (!link || result.isError) return null;

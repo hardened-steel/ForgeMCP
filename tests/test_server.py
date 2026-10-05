@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import inspect
+import json
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -485,6 +486,42 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
         failed = await client.call_tool("workspace_delete", {"path": "project/src"})
         assert failed.is_error
         assert "src:" in failed.content[0].text
+
+
+@pytest.mark.anyio
+async def test_search_limits_and_immutable_skipped_resource(cpp_acceptance_project):
+    """Verify compact tool and Markdown results link an immutable skipped-file snapshot."""
+    source = cpp_acceptance_project / "search-limit.txt"
+    source.write_text("needle\n" * 3, encoding="utf-8")
+    binary = cpp_acceptance_project / "search-limit.bin"
+    binary.write_bytes(b"\0")
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        response = await client.call_tool(
+            "workspace_search",
+            {"query": "needle", "extensions": ["txt", "bin"], "max_matches": 1},
+        )
+        assert not response.is_error
+        data = response.structured_content
+        assert len(data["matches"]) == 1
+        assert data["matches_count"] == 3
+        assert data["matches_truncated"]
+        assert data["skipped_files_count"] == 1
+        assert "skipped_files" not in data
+        assert "Returned 1 of 3 matching lines" in response.content[0].text
+        assert "Matches truncated: True" in response.content[0].text
+        assert "Skipped files: 1." in response.content[0].text
+        link = data["resources"]["skipped_files"]
+        saved = (await client.read_resource(link["uri"])).contents[0].text
+        assert json.loads(saved) == {"skipped_files": ["project/search-limit.bin"]}
+        binary.write_text("needle", encoding="utf-8")
+        assert (await client.read_resource(link["uri"])).contents[0].text == saved
+        markdown = (await client.read_resource(
+            "forgemcp://workspace/search?query=needle&path=project/search-limit.txt&max_matches=2"
+        )).contents[0].text
+        assert "Returned 2 of 3" in markdown
+        assert "matches\\_truncated=True" in markdown
+        invalid = await client.call_tool("workspace_search", {"query": "needle", "max_matches": 0})
+        assert invalid.is_error
 
 
 @pytest.mark.anyio
