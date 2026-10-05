@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "forge-cpp-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "A safe MCP server for structured C++ project development workflows."
 readme = "README.md"
 requires-python = ">=3.13"

@@ -68,7 +68,7 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.1-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.2-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
@@ -80,7 +80,7 @@ The distribution name is `forge-cpp-mcp`; the Python module and server command a
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.1
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.2
 ```
 
 ## Setup from source
