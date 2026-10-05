@@ -168,7 +168,7 @@ a working-directory check, not an operating-system sandbox.
 | `workspace_find_files(pattern="*", path="project/")` | Recursive filename/path glob search |
 | `workspace_file_info(path)` | Creation/modification times, byte size, owner; unavailable metadata is null |
 | `workspace_read_file(path, start_line=1, end_line=null)` | UTF-8 text, with an optional inclusive line range |
-| `workspace_search(query, path="project/", regex=false, extensions=null, case_sensitive=true)` | Matching lines and skipped binary/non-UTF-8 files |
+| `workspace_search(query, path="project/", regex=false, extensions=null, case_sensitive=true, max_matches=100)` | Bounded matching lines, exact counts, and a linked skipped-file list |
 | `workspace_write_file(path, text)` | Create or overwrite; return removed/added line counts |
 | `workspace_edit_file(path, old_text, new_text, replace_all=false)` | Exact replacement; zero or ambiguous matches fail without modifying the file |
 | `workspace_move(source, destination)` | Move a file or directory; destination must not exist |
@@ -185,8 +185,15 @@ dot-prefixed files remain visible. Searches skip directories beginning with a do
 access hidden directories and in-root links. Mutations cannot traverse links;
 moving/removing a whole tree containing links is rejected. Dependent modules may
 register protected paths, which remain readable but cannot be changed through the
-workspace API. Searches intentionally have no application-level timeout, result
-limit, or pagination in this iteration.
+workspace API. Searches have no application-level timeout or pagination. Text search
+returns at most `max_matches` matching lines (positive integer, default 100), with
+all spans on each returned line. It continues scanning to return exact
+`matches_count` and `skipped_files_count`; `matches_truncated` indicates omitted
+matching lines. The complete binary/non-UTF-8 file list is an immutable JSON resource
+linked as `resources.skipped_files` when nonempty, rather than inline output.
+The widget loads that snapshot for its skipped-files tab. Narrow the path/extensions
+or increase `max_matches` to retrieve more matching lines. Individual lines and their
+span arrays have no byte limit.
 
 File resource templates use a single path including its project/ or storage/ prefix:
 
@@ -196,7 +203,7 @@ forgemcp://workspace/raw{/path*}
 forgemcp://workspace/list{?path,depth,include_hidden}
 forgemcp://workspace/find-files{?pattern,path}
 forgemcp://workspace/file-info{?path}
-forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}
+forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive,max_matches}
 forgemcp://workspace/results/{result_id}/{name}.json
 forgemcp://workspace/results/{result_id}/{name}.md
 ```

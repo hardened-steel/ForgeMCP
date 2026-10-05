@@ -3,7 +3,7 @@ import { isObject } from "./shared/presentation.js";
 import { clangdValue } from "./clangd-view.js";
 import { appendSourceText, cppSyntax, sourceConfiguration } from "./source-view.js";
 
-function searchView(doc, data, query, width) {
+function searchView(doc, data, query, width, loaded) {
   const node = (tag, className, text) => {
     const result = doc.createElement(tag);
     result.className = className;
@@ -17,7 +17,7 @@ function searchView(doc, data, query, width) {
   const matches = node("div", "fm-search-matches");
   const skipped = node("div", "fm-search-skipped");
   const panels = [matches, skipped];
-  const buttons = ["Matches", `Skipped files (${data.skipped_files?.length ?? 0})`].map((title, index) => {
+  const buttons = ["Matches", `Skipped files (${data.skipped_files_count})`].map((title, index) => {
     const button = node("button", "", title);
     button.type = "button";
     button.id = `workspace-search-tab-${index}`;
@@ -127,9 +127,14 @@ function searchView(doc, data, query, width) {
     matches.append(file);
   }
   if (!groups.size) matches.append(node("p", "fm-empty", "No matching lines."));
-  const paths = (data.skipped_files ?? []).filter((path) => path.toLocaleLowerCase().includes(query));
+  const paths = (loaded.skipped_files?.skipped_files ?? []).filter((path) => path.toLocaleLowerCase().includes(query));
   for (const path of paths) skipped.append(node("div", "fm-skipped-path", path));
-  if (!paths.length) skipped.append(node("p", "fm-empty", "No skipped files."));
+  if (!paths.length) skipped.append(node("p", "fm-empty", data.skipped_files_count === 0
+    ? "No skipped files." : loaded.skipped_filesState === "error"
+      ? "Skipped-file resource could not be loaded." : loaded.skipped_filesState === "ready"
+        ? "No skipped files match the filter." : "Loading skipped files…"));
+  if (data.matches_truncated) matches.prepend(node("p", "fm-empty",
+    `Showing ${data.matches.length} of ${data.matches_count} matching lines (matches_truncated=true). Narrow the search or increase max_matches.`));
   view.append(tabs, matches, skipped);
   return view;
 }
@@ -214,8 +219,8 @@ export function workspacePresentation(data, loaded = {}) {
     return {
       toolName: "workspace_search", summary: data, records: null,
       resourceFields: resources(data), filterPlaceholder: "Search results",
-      count: `${data.matches.length} matches · ${new Set(data.matches.map((match) => match.path)).size} files`,
-      render: (doc, query, width) => searchView(doc, data, query, width),
+      count: `${data.matches.length}/${data.matches_count} matching lines · ${data.skipped_files_count} skipped files`,
+      render: (doc, query, width) => searchView(doc, data, query, width, loaded),
     };
   }
   const toolName = Array.isArray(data.entries) ? "workspace_list"

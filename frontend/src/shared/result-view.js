@@ -272,7 +272,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
           copyResource.addEventListener("click", () => { void copy(JSON.stringify(resource, null, 2)); });
           heading.append(copyResource);
           content.append(heading, json);
-        } else if (["diff", "clangd"].includes(name)) {
+        } else if (["diff", "clangd", "skipped_files"].includes(name)) {
           content.append(element("p", "fm-empty", `${name}: ${resourceData[`${name}State`] === "error" ? "Resource could not be loaded." : "Loading resource…"}`));
         }
       }
