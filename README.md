@@ -139,6 +139,12 @@ add the `forgemcp` entry to it rather than replacing the file. Restart the clien
 after editing its configuration. Check the connection with `codex mcp list` or
 `claude mcp get forgemcp`, respectively.
 
+To require agents to use ForgeMCP for supported operations, append the
+[example agent instructions](examples/mcp-clients/agent-instructions.md) to your
+project's `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code). The same block works
+for both clients and requires evidence of an unsupported operation, tool failure,
+or unavailability before using alternatives. Preserve existing project instructions.
+
 ## Workspace files and storage
 
 All file tools use string paths such as `project/src/main.cpp` and
