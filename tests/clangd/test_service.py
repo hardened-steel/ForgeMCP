@@ -222,6 +222,8 @@ async def test_read_only_tools_group_configurations_and_decode_language_values(s
     async with Client(setup.server) as client:
         configurations = await client.call_tool("clangd_configurations", {})
         assert [item["id"] for item in configurations.structured_content["result"]] == ["debug", "release"]
+        assert "Available clangd configurations: 2." in configurations.content[0].text
+        assert "Compilation database:" in configurations.content[0].text
         for tool in (
             "diagnostics",
             "hover",
@@ -247,22 +249,34 @@ async def test_read_only_tools_group_configurations_and_decode_language_values(s
             answers = response.structured_content["result"]
             assert len(answers) == 1 and answers[0]["configurations"] == ["debug", "release"]
             answer = answers[0]
+            text = response.content[0].text
+            assert "Configurations: debug, release" in text
+            assert "```" not in text and not text.startswith("{")
             assert [value for value, _ in progress] == list(range(len(progress)))
             if tool == "diagnostics":
-                assert answer["diagnostics"][0]["severity"] == "warning"
+                assert (
+                    answer["diagnostics"][0]["severity"] == "warning"
+                    and "warning:" in text and "project/src/math.cpp, line 1" in text
+                )
             elif tool == "hover":
                 assert answer["hover"]["contents"][0]["text"] == "**add**"
+                assert text.endswith("\n\nadd") and "**add**" not in text
                 assert any("debug: Starting textDocument/hover" in message for _, message in progress)
             elif tool in ("definition", "references"):
                 location = answer["locations"][0]
                 assert location["path"] == "project/src/math.cpp"
                 assert location["range"]["start"] == {"line": 1, "character": 0}
                 assert location["preview"]["text"].startswith('#include "fixture/math.hpp"')
+                assert '1 | #include "fixture/math.hpp"' in text
             elif tool == "document_symbols":
-                assert answer["symbols"][0]["children"][0]["name"] == "add"
+                assert (
+                    answer["symbols"][0]["children"][0]["name"] == "add"
+                    and "fixture (namespace)" in text and "add (function)" in text
+                )
             else:
                 assert answer["symbols"][0]["container_name"] == "fixture"
                 assert answer["symbols"][0]["location"]["preview"]
+                assert "add (function)" in text and "Scope: fixture" in text
         selected = await client.call_tool(
             "clangd_diagnostics",
             {"path": "project/src/math.cpp", "configurations": ["debug"]},

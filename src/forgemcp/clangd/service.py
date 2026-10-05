@@ -11,13 +11,13 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from forgemcp.assets import IconFile, Widget
@@ -25,6 +25,7 @@ from forgemcp.cmake.service import CMakeService, CompilationContext
 from forgemcp.completion import Complete
 from forgemcp.process.errors import ProcessError
 from forgemcp.progress import Progress, progress
+from forgemcp.text import tool_result
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.tools import clangd
@@ -47,7 +48,16 @@ from .errors import (
     ClangdTimeoutError,
 )
 from .models import (
-    Diagnostic,
+    DiagnosticsResult,
+    HoverResult,
+    DefinitionResult,
+    ReferencesResult,
+    DocumentSymbolsResult,
+    WorkspaceSymbolsResult,
+    HighlightingResult,
+    FileAnalysis,
+    ClangdResource,
+
     DocumentSymbol,
     HighlightSpan,
     Hover,
@@ -69,75 +79,7 @@ from .session import (
     string,
     validate_timeout,
 )
-
-
-class DiagnosticsResult(BaseModel):
-    """Diagnostics for one file with the configurations that produced them."""
-
-    configurations: list[str]
-    path: WorkspacePath
-    diagnostics: list[Diagnostic]
-
-
-class HoverResult(BaseModel):
-    """A hover answer at a source position with configuration provenance."""
-
-    configurations: list[str]
-    path: WorkspacePath
-    position: Position
-    hover: Hover | None
-
-
-class DefinitionResult(BaseModel):
-    """Definition targets shared by the listed configurations."""
-
-    configurations: list[str]
-    locations: list[NavigationLocation]
-
-
-class ReferencesResult(BaseModel):
-    """Reference targets shared by the listed configurations."""
-
-    configurations: list[str]
-    locations: list[NavigationLocation]
-
-
-class DocumentSymbolsResult(BaseModel):
-    """A file's symbol tree with configuration provenance."""
-
-    configurations: list[str]
-    path: WorkspacePath
-    symbols: list[DocumentSymbol]
-
-
-class WorkspaceSymbolsResult(BaseModel):
-    """Matching workspace symbols with configuration provenance."""
-
-    configurations: list[str]
-    symbols: list[WorkspaceSymbol]
-
-
-class HighlightingResult(BaseModel):
-    """Semantic spans for a file with configuration provenance."""
-
-    configurations: list[str]
-    path: WorkspacePath
-    spans: list[HighlightSpan]
-
-
-class FileAnalysis(BaseModel):
-    """Saved diagnostic and highlighting answers for one file."""
-
-    path: WorkspacePath
-    diagnostics: list[DiagnosticsResult]
-    highlighting: list[HighlightingResult]
-
-
-class ClangdResource(BaseModel):
-    """The versioned payload of an immutable workspace analysis resource."""
-
-    version: Literal[1] = 1
-    files: list[FileAnalysis]
+from .text import render_answers, render_configurations
 
 
 @dataclass
@@ -1018,7 +960,9 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             icons=[self.ICON.icon],
             annotations=read_only,
         )
-        async def clangd_configurations(ctx: Context) -> list[CompilationContext]:
+        async def clangd_configurations(
+            ctx: Context,
+        ) -> Annotated[CallToolResult, list[CompilationContext]]:
             """List CMake contexts with an existing compilation database and clangd."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Finding clangd configurations")
@@ -1027,7 +971,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except ClangdError as error:
                 raise ToolError(str(error)) from error
             await report(1, total=1, message="Completed configuration discovery")
-            return result
+            return tool_result(result, render_configurations(result))
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1039,7 +983,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             ctx: Context,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[DiagnosticsResult]:
+        ) -> Annotated[CallToolResult, list[DiagnosticsResult]]:
             """Get diagnostics for a managed file in selected configurations. Empty configurations selects all."""
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1069,7 +1013,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(result, render_answers(result, f"Diagnostics for {path}."))
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1082,7 +1026,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             position: Position,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[HoverResult]:
+        ) -> Annotated[CallToolResult, list[HoverResult]]:
             """Describe the symbol at a one-based line and zero-based code-point position. Empty configurations selects all."""
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1135,7 +1079,13 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(
+                result,
+                render_answers(
+                    result,
+                    f"Hover at {path}, line {position.line}, character {position.character}.",
+                ),
+            )
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1148,7 +1098,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             position: Position,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[DefinitionResult]:
+        ) -> Annotated[CallToolResult, list[DefinitionResult]]:
             """Find definitions of the symbol at the supplied position.
 
             External locations use root/. Empty configurations selects all.
@@ -1180,7 +1130,14 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(
+                result,
+                render_answers(
+                    result,
+                    f"Definitions at {path}, line {position.line}, "
+                    f"character {position.character}.",
+                ),
+            )
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1194,7 +1151,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             include_declaration: bool = True,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[ReferencesResult]:
+        ) -> Annotated[CallToolResult, list[ReferencesResult]]:
             """Find references to the symbol at the supplied position. Empty configurations selects all."""
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1225,7 +1182,14 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(
+                result,
+                render_answers(
+                    result,
+                    f"References at {path}, line {position.line}, character {position.character} "
+                    f"(include declaration: {'yes' if include_declaration else 'no'}).",
+                ),
+            )
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1237,7 +1201,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             ctx: Context,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[DocumentSymbolsResult]:
+        ) -> Annotated[CallToolResult, list[DocumentSymbolsResult]]:
             """List the symbols declared in a managed file. Empty configurations selects all."""
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1285,7 +1249,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(result, render_answers(result, f"Document symbols in {path}."))
 
         @apps.tool(
             resource_uri=self.WIDGET.uri,
@@ -1297,7 +1261,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             ctx: Context,
             configurations: list[str] = [],
             timeout: float = 30.0,
-        ) -> list[WorkspaceSymbolsResult]:
+        ) -> Annotated[CallToolResult, list[WorkspaceSymbolsResult]]:
             """Find workspace symbols by name query. Empty configurations selects all."""
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1347,6 +1311,9 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except (ClangdError, WorkspaceError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             await status("Completed clangd analysis")
-            return result
+            return tool_result(
+                result,
+                render_answers(result, f'Workspace symbols matching "{query}".'),
+            )
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)

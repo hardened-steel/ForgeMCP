@@ -446,7 +446,7 @@ async def test_process_overview_uses_shared_progress(processes, monkeypatch, int
     for _ in range(2):
         ctx = SimpleNamespace(report_progress=AsyncMock())
         result = await handler(ctx=ctx)
-        assert result.completed == 1
+        assert result.structured_content["completed"] == 1
         values = [call.args[0] for call in ctx.report_progress.await_args_list]
         assert values == ([0, 1] if interval == 0 else [0])
 
@@ -481,6 +481,7 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
             for name in ("processes_overview", "process_get")
         )
         overview = await client.call_tool("processes_overview", {})
+        assert "Completed successfully" in overview.content[0].text
         item = overview.structured_content["processes"][0]
         assert item["summary"]["process_id"] == session.process_id
         assert item["status"]["current_status"] == 0
@@ -488,6 +489,8 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
         assert "transcript" not in item["status"]
         details = await client.call_tool("process_get", {"process_id": session.process_id})
         assert not details.is_error and details.content
+        assert "stdout — " in details.content[0].text and "stderr — " in details.content[0].text
+        assert "Returned transcript lines" in details.content[0].text
         result = details.structured_content
         assert result["process"] == item
         assert result["transcript"]

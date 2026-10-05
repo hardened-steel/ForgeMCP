@@ -91,6 +91,44 @@ def server(service):
     return mcp
 
 
+@pytest.mark.anyio
+async def test_plain_text_reports_profiles_executions_and_all_test_cases(request):
+    """Keep preset identity, errors, log references, and every CTest outcome in text results."""
+    scenario = request.getfixturevalue("setup")
+    scenario.test.return_value = ctest.TestResult(
+        return_code=1,
+        process_id=42,
+        tests=[
+            ctest.TestCase(name="good", status="passed", duration_seconds=0.1),
+            ctest.TestCase(name="broken", status="failed", message="expected 2\nreceived 3"),
+            ctest.TestCase(name="optional", status="skipped", message="not supported"),
+            ctest.TestCase(name="disabled", status="not_run"),
+        ],
+    )
+    scenario.build.return_value = cmake.BuildResult(process_id=41)
+    async with Client(server(scenario.service)) as client:
+        profiles = await client.call_tool("cmake_profiles", {})
+        assert "Configure presets: native" in profiles.content[0].text
+        assert profiles.structured_content["result"][0]["name"] == "presets"
+        configured = await client.call_tool("cmake_configure", {})
+        assert "presets (preset: native): Succeeded" in configured.content[0].text
+        assert "process_get(process_id=40)" in configured.content[0].text
+        built = await client.call_tool("cmake_build", {})
+        assert "Unknown completed; unknown total" in built.content[0].text
+        assert built.structured_content["result"][0]["completed_steps"] is None
+        tested = await client.call_tool("cmake_test", {})
+        text = tested.content[0].text
+        assert not tested.is_error
+        assert tested.structured_content["result"][0]["error"] is not None
+        assert "0 executions succeeded; 1 failed" in text
+        assert "1 passed; 1 failed; 1 skipped; 1 not run" in text
+        for name in ("good", "broken", "optional", "disabled"):
+            assert name in text
+        assert "expected 2\n      received 3" in text
+        assert "process_get(process_id=42)" in text
+        assert "```" not in text
+
+
 def test_profile_options_keep_operator_choices():
     """Verify CLI profile parsing preserves exact operator settings and cache values."""
     profile, = parse_profiles(

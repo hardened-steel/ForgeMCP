@@ -27,6 +27,7 @@ from mcp.server.mcpserver import Context, Elicit, Resolve
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.mcpserver.resources.templates import ResourceSecurity
 from mcp.types import (
+    CallToolResult,
     Completion,
     CompletionArgument,
     CompletionContext,
@@ -39,11 +40,26 @@ from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.progress import progress
+from forgemcp.text import tool_result
 
 from .errors import WorkspaceError
 from .providers import ProviderCall, ResultResource, ResultResources
 from .metadata import file_owner
 from .path import WorkspacePath
+from .models import (
+    TreeEntry,
+    DirectoryTree,
+    FoundFile,
+    FilePaths,
+    FileContent,
+    FileInfo,
+    SearchMatch,
+    SearchResult,
+    FileWriteResult,
+    FileEditResult,
+    PathOperationResult,
+)
+from .text import render_text
 
 
 class ReadConfirmation(BaseModel):
@@ -60,98 +76,6 @@ async def confirm_read(path: WorkspacePath) -> ReadConfirmation | Elicit[ReadCon
 
 
 WorkspaceRoot = Literal["project", "storage"]
-
-
-class TreeEntry(BaseModel):
-    """A qualified filesystem entry with its kind and optional expanded children."""
-
-    path: WorkspacePath
-    kind: Literal["file", "directory", "symlink", "other"]
-    children: list[TreeEntry] | None = None
-
-
-class DirectoryTree(ResultResources):
-    """A requested directory and its tree entries with linked provider resources."""
-
-    path: WorkspacePath
-    entries: list[TreeEntry]
-
-
-class FoundFile(BaseModel):
-    """One matching file with its path, modification time, and size."""
-
-    path: WorkspacePath
-    modified_at: datetime
-    size_bytes: int
-
-
-class FilePaths(ResultResources):
-    """Matched qualified paths and file metadata with linked provider resources."""
-
-    paths: list[WorkspacePath]
-    files: list[FoundFile] = Field(default_factory=list)
-
-
-class FileContent(ResultResources):
-    """A UTF-8 file excerpt with its qualified path and first source line."""
-
-    path: WorkspacePath
-    text: str
-    start_line: int
-
-
-class FileInfo(ResultResources):
-    """File timestamps, size, and optional owner with linked provider resources."""
-
-    path: WorkspacePath
-    created_at: datetime | None
-    modified_at: datetime
-    size_bytes: int
-    owner: str | None
-
-
-class SearchMatch(BaseModel):
-    """One matching source line with zero-based Unicode match spans."""
-
-    path: WorkspacePath
-    line: int
-    text: str
-    spans: list[tuple[int, int]] = Field(
-        description="Match ranges as zero-based Unicode code point [start, end) pairs.",
-    )
-
-
-class SearchResult(ResultResources):
-    """Bounded matching lines, exact scan counts, and linked skipped-file details."""
-
-    matches: list[SearchMatch]
-    matches_count: int
-    matches_truncated: bool
-    skipped_files_count: int
-
-
-class FileWriteResult(ResultResources):
-    """A created or overwritten file with removed and added line counts."""
-
-    path: WorkspacePath
-    action: Literal["created", "overwritten"]
-    lines_removed: int
-    lines_added: int
-
-
-class FileEditResult(ResultResources):
-    """An edited file and the number of exact replacements performed."""
-
-    path: WorkspacePath
-    replacements: int
-
-
-class PathOperationResult(ResultResources):
-    """A path mutation outcome with an optional original move source."""
-
-    path: WorkspacePath
-    action: Literal["moved", "deleted", "created", "already_exists"]
-    source: WorkspacePath | None = None
 
 
 ContextT = TypeVar("ContextT")
@@ -1004,7 +928,7 @@ class WorkspaceService:
             path: WorkspacePath = WorkspacePath("project/"),
             depth: int | None = 1,
             include_hidden: bool = False,
-        ) -> DirectoryTree:
+        ) -> Annotated[CallToolResult, DirectoryTree]:
             """Show a directory tree; null depth expands every directory.
 
             File paths are errors. include_hidden controls dot directories;
@@ -1086,7 +1010,7 @@ class WorkspaceService:
                     raise ToolError(str(error)) from error
                 raise
             result.resources = (await self.after_providers(call, result)).resources
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.TREE_WIDGET.uri,
@@ -1098,7 +1022,7 @@ class WorkspaceService:
             ctx: Context,
             pattern: str = "*",
             path: WorkspacePath = WorkspacePath("project/"),
-        ) -> FilePaths:
+        ) -> Annotated[CallToolResult, FilePaths]:
             """Find file paths recursively by case-sensitive glob, skipping dot directories and links.
 
             Patterns without / match basenames; patterns with / match paths
@@ -1158,7 +1082,10 @@ class WorkspaceService:
                     raise ToolError(str(error)) from error
                 raise
             result.resources = (await self.after_providers(call, result)).resources
-            return result
+            return tool_result(
+                result,
+                f'Files matching "{pattern}" under {path}:\n{render_text(result)}',
+            )
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1169,7 +1096,7 @@ class WorkspaceService:
         async def workspace_file_info(
             path: WorkspacePath,
             ctx: Context,
-        ) -> FileInfo:
+        ) -> Annotated[CallToolResult, FileInfo]:
             """Read creation/modification times, byte size, and owner of one file."""
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers("workspace_file_info", {"path": path})
@@ -1195,7 +1122,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed file info")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.FILE_WIDGET.uri,
@@ -1209,7 +1136,7 @@ class WorkspaceService:
             confirm: Annotated[ReadConfirmation, Resolve(confirm_read)],
             start_line: int = 1,
             end_line: int | None = None,
-        ) -> FileContent:
+        ) -> Annotated[CallToolResult, FileContent]:
             """Read UTF-8 text, optionally selecting an inclusive range of one-based lines."""
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
@@ -1260,7 +1187,7 @@ class WorkspaceService:
                     raise ToolError(str(error)) from error
                 raise
             result.resources = (await self.after_providers(call, result)).resources
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.SEARCH_WIDGET.uri,
@@ -1276,7 +1203,7 @@ class WorkspaceService:
             extensions: list[str] | None = None,
             case_sensitive: bool = True,
             max_matches: Annotated[int, Field(ge=1)] = 100,
-        ) -> SearchResult:
+        ) -> Annotated[CallToolResult, SearchResult]:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files.
 
             extensions accepts suffixes with or without a leading dot;
@@ -1367,17 +1294,24 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             if skipped:
-                uri = self.save_result_resource(
-                    call.id,
-                    self.SKIPPED_FILES_RESOURCE,
-                    "application/json",
-                    json.dumps({"skipped_files": sorted(map(str, skipped))}),
-                )
                 result.resources[self.SKIPPED_FILES_RESOURCE] = ResultResource(
-                    uri=uri,
+                    uri=self.save_result_resource(
+                        call.id,
+                        self.SKIPPED_FILES_RESOURCE,
+                        "application/json",
+                        json.dumps({"skipped_files": sorted(map(str, skipped))}),
+                    ),
                     mime_type="application/json",
                 )
-            return result
+            selected_extensions = "All" if extensions is None else ", ".join(extensions)
+            return tool_result(
+                result,
+                f'Query: "{query}" ('
+                f"{'regular expression' if regex else 'literal text'}; "
+                f"{'case-sensitive' if case_sensitive else 'case-insensitive'})\n"
+                f"Path: {path}\nExtensions: {selected_extensions or 'No extensions'}\n\n"
+                + render_text(result),
+            )
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1389,7 +1323,7 @@ class WorkspaceService:
             path: WorkspacePath,
             text: str,
             ctx: Context,
-        ) -> FileWriteResult:
+        ) -> Annotated[CallToolResult, FileWriteResult]:
             """Create or fully overwrite a UTF-8 file; its parent directory must exist.
 
             Return removed/added line counts and linked change resources.
@@ -1422,7 +1356,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed write file")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1436,7 +1370,7 @@ class WorkspaceService:
             new_text: str,
             ctx: Context,
             replace_all: bool = False,
-        ) -> FileEditResult:
+        ) -> Annotated[CallToolResult, FileEditResult]:
             """Replace one exact text occurrence, or all with replace_all=true.
 
             old_text must be nonempty. Missing or ambiguous matches leave the
@@ -1480,7 +1414,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed edit file")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1492,7 +1426,7 @@ class WorkspaceService:
             source: WorkspacePath,
             destination: WorkspacePath,
             ctx: Context,
-        ) -> PathOperationResult:
+        ) -> Annotated[CallToolResult, PathOperationResult]:
             """Move a file or directory within project/ or within storage/.
 
             The destination must not exist, and its parent directory must exist.
@@ -1541,7 +1475,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed move")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1552,7 +1486,7 @@ class WorkspaceService:
         async def workspace_delete(
             path: WorkspacePath,
             ctx: Context,
-        ) -> PathOperationResult:
+        ) -> Annotated[CallToolResult, PathOperationResult]:
             """Delete a file or empty directory; protected paths and roots cannot be deleted."""
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers("workspace_delete", {"path": path})
@@ -1579,7 +1513,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed delete")
-            return result
+            return tool_result(result, render_text(result))
 
         @apps.tool(
             resource_uri=self.RESULT_WIDGET.uri,
@@ -1595,7 +1529,7 @@ class WorkspaceService:
         async def workspace_mkdir(
             path: WorkspacePath,
             ctx: Context,
-        ) -> PathOperationResult:
+        ) -> Annotated[CallToolResult, PathOperationResult]:
             """Create a directory and missing parents, or report that it already exists."""
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers("workspace_mkdir", {"path": path})
@@ -1616,7 +1550,7 @@ class WorkspaceService:
                 raise
             result.resources = (await self.after_providers(call, result)).resources
             await report_progress(1, total=1, message="Completed mkdir")
-            return result
+            return tool_result(result, render_text(result))
 
         for widget in (
             self.TREE_WIDGET,
@@ -1714,7 +1648,7 @@ class WorkspaceService:
                     depth=None if depth == "all" else depth,
                     include_hidden=include_hidden,
                 )
-                return self.render_markdown(result)
+                return self.render_markdown(DirectoryTree.model_validate(result.structured_content))
             except (WorkspaceError, ToolError) as error:
                 raise ResourceError(str(error)) from error
 
@@ -1737,7 +1671,7 @@ class WorkspaceService:
                     pattern=pattern,
                     path=resource_path(path),
                 )
-                return self.render_markdown(result)
+                return self.render_markdown(FilePaths.model_validate(result.structured_content))
             except (WorkspaceError, ToolError) as error:
                 raise ResourceError(str(error)) from error
 
@@ -1758,7 +1692,7 @@ class WorkspaceService:
                     path=selected,
                     ctx=ctx,
                 )
-                return self.render_markdown(result)
+                return self.render_markdown(FileInfo.model_validate(result.structured_content))
             except (WorkspaceError, ToolError) as error:
                 raise ResourceError(str(error)) from error
 
@@ -1789,7 +1723,7 @@ class WorkspaceService:
                     case_sensitive=case_sensitive,
                     max_matches=max_matches,
                 )
-                return self.render_markdown(result)
+                return self.render_markdown(SearchResult.model_validate(result.structured_content))
             except (WorkspaceError, ToolError) as error:
                 raise ResourceError(str(error)) from error
 

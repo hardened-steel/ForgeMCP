@@ -115,3 +115,72 @@ class HighlightSpan(BaseModel):
     range: SourceRange
     kind: str
     modifiers: list[str] = Field(default_factory=list)
+
+
+class DiagnosticsResult(BaseModel):
+    """Diagnostics for one file with the configurations that produced them."""
+
+    configurations: list[str]
+    path: WorkspacePath
+    diagnostics: list[Diagnostic]
+
+
+class HoverResult(BaseModel):
+    """A hover answer at a source position with configuration provenance."""
+
+    configurations: list[str]
+    path: WorkspacePath
+    position: Position
+    hover: Hover | None
+
+
+class DefinitionResult(BaseModel):
+    """Definition targets shared by the listed configurations."""
+
+    configurations: list[str]
+    locations: list[NavigationLocation]
+
+
+class ReferencesResult(BaseModel):
+    """Reference targets shared by the listed configurations."""
+
+    configurations: list[str]
+    locations: list[NavigationLocation]
+
+
+class DocumentSymbolsResult(BaseModel):
+    """A file's symbol tree with configuration provenance."""
+
+    configurations: list[str]
+    path: WorkspacePath
+    symbols: list[DocumentSymbol]
+
+
+class WorkspaceSymbolsResult(BaseModel):
+    """Matching workspace symbols with configuration provenance."""
+
+    configurations: list[str]
+    symbols: list[WorkspaceSymbol]
+
+
+class HighlightingResult(BaseModel):
+    """Semantic spans for a file with configuration provenance."""
+
+    configurations: list[str]
+    path: WorkspacePath
+    spans: list[HighlightSpan]
+
+
+class FileAnalysis(BaseModel):
+    """Saved diagnostic and highlighting answers for one file."""
+
+    path: WorkspacePath
+    diagnostics: list[DiagnosticsResult]
+    highlighting: list[HighlightingResult]
+
+
+class ClangdResource(BaseModel):
+    """The versioned payload of an immutable workspace analysis resource."""
+
+    version: Literal[1] = 1
+    files: list[FileAnalysis]

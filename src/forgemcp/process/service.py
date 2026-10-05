@@ -17,13 +17,12 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field
 
-from forgemcp import markdown
-
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import (
+    CallToolResult,
     Completion,
     CompletionArgument,
     CompletionContext,
@@ -32,9 +31,11 @@ from mcp.types import (
     ToolAnnotations,
 )
 
+from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
 from forgemcp.progress import progress
+from forgemcp.text import tool_result
 
 from .errors import (
     ProcessError,
@@ -62,6 +63,7 @@ from .models import (
 )
 
 from .transcript import select_transcript
+from .text import describe_status, render_details, render_overview
 
 logger = logging.getLogger(__name__)
 
@@ -339,16 +341,7 @@ class ProcessService:
     @staticmethod
     def describe_status(status: str | int) -> str:
         """Render terminal state in Markdown resources."""
-        if isinstance(status, int):
-            return (
-                "Completed successfully" if status == 0 else f"Exited with code {status}"
-            )
-        return {
-            "running": "Running",
-            "interrupted": "Interrupted by timeout",
-            "stopped": "Stopped",
-            "stream_failure": "Stream failure",
-        }[status]
+        return describe_status(status)
 
     def __init__(
         self,
@@ -462,7 +455,7 @@ class ProcessService:
         async def processes_overview(
             ctx: Context,
             status: Literal["all", "running", "completed"] = "all",
-        ) -> ProcessOverview:
+        ) -> Annotated[CallToolResult, ProcessOverview]:
             """Show current and completed external processes managed by ForgeMCP."""
             report_progress = progress(ctx, interval=self.progress_interval)
             records = tuple(self.records.values())
@@ -491,11 +484,12 @@ class ProcessService:
                 total=len(records),
                 message="Process state ready",
             )
-            return ProcessOverview(
+            result = ProcessOverview(
                 running=running,
                 completed=completed,
                 processes=processes,
             )
+            return tool_result(result, render_overview(result, status))
 
         @apps.tool(
             resource_uri=self.DETAILS_WIDGET.uri,
@@ -513,7 +507,7 @@ class ProcessService:
             lines: FirstLines | LastLines | LineRange | None = None,
             time: FirstSeconds | LastSeconds | TimeRange | None = None,
             max_bytes: Annotated[int, Field(ge=0)] = 65536,
-        ) -> ProcessDetails:
+        ) -> Annotated[CallToolResult, ProcessDetails]:
             """Read a log slice: time, then lines, then UTF-8 text bytes.
 
             With neither selector, return the last 100 lines. Line ranges are
@@ -553,7 +547,7 @@ class ProcessService:
                     ),
                 )
             await report_progress(1, total=1, message="Process transcript ready")
-            return details
+            return tool_result(details, render_details(details))
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
         apps.add_html_resource(self.DETAILS_WIDGET.uri, self.DETAILS_WIDGET.content)
