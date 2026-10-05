@@ -1,6 +1,6 @@
 import { App, PostMessageTransport, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { createResultView } from "./result-view.js";
-import { loadResultClangd, loadResultDiff } from "./result-resources.js";
+import { loadResultClangd, loadResultDiff, loadResultSkippedFiles } from "./result-resources.js";
 import "./widget.css";
 
 /** Lifecycle bridge and immutable result-resource loading; never calls tools. */
@@ -34,6 +34,7 @@ export async function connectWidget({ toolName, describe, renderValue }) {
     if (result?.isError || data?.action === "moved") return;
     await Promise.all([
       ["diff", loadResultDiff], ["clangd", loadResultClangd],
+      ["skipped_files", loadResultSkippedFiles],
     ].filter(([name]) => data?.resources?.[name]).map(async ([name, load]) => {
       try {
         const resource = await load(result, (params) => app.readServerResource(params), () => current === generation);

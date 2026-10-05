@@ -122,10 +122,12 @@ class SearchMatch(BaseModel):
 
 
 class SearchResult(ResultResources):
-    """Matching source lines and skipped files with linked provider resources."""
+    """Bounded matching lines, exact scan counts, and linked skipped-file details."""
 
     matches: list[SearchMatch]
-    skipped_files: list[WorkspacePath]
+    matches_count: int
+    matches_truncated: bool
+    skipped_files_count: int
 
 
 class FileWriteResult(ResultResources):
@@ -434,7 +436,11 @@ class WorkspaceService:
     LIST_URI = "forgemcp://workspace/list{?path,depth,include_hidden}"
     FIND_URI = "forgemcp://workspace/find-files{?pattern,path}"
     INFO_URI = "forgemcp://workspace/file-info{?path}"
-    SEARCH_URI = "forgemcp://workspace/search{?query,path,regex,extensions,case_sensitive}"
+    SEARCH_URI = (
+        "forgemcp://workspace/search"
+        "{?query,path,regex,extensions,case_sensitive,max_matches}"
+    )
+    SKIPPED_FILES_RESOURCE = "skipped_files"
     RESULT_JSON_URI = "forgemcp://workspace/results/{result_id}/{name}.json"
     RESULT_MARKDOWN_URI = "forgemcp://workspace/results/{result_id}/{name}.md"
     PROVIDER_TOOLS = frozenset(
@@ -517,6 +523,7 @@ class WorkspaceService:
             or not name.isascii()
             or any(not (char.isalnum() or char in "_-") for char in name)
             or name in self.result_providers
+            or name == self.SKIPPED_FILES_RESOURCE
         ):
             raise WorkspaceError("Provider needs a unique ASCII name.")
         if tools is not None and any(tool not in self.PROVIDER_TOOLS for tool in tools):
@@ -533,10 +540,10 @@ class WorkspaceService:
         mime_type: Literal["application/json", "text/markdown"],
         text: str,
     ) -> str:
-        """Store one immutable resource for a provider under the tool call ID."""
+        """Store an immutable provider resource or Workspace's own skipped-file list."""
         if len(call_id) != 32 or any(char not in "0123456789abcdef" for char in call_id):
             raise WorkspaceError("Invalid Workspace call ID.")
-        if provider not in self.result_providers:
+        if provider not in self.result_providers and provider != self.SKIPPED_FILES_RESOURCE:
             raise WorkspaceError("Unknown Workspace result provider.")
         if not isinstance(text, str):
             raise WorkspaceError("Result resource must contain text.")
@@ -939,8 +946,24 @@ class WorkspaceService:
             nodes.extend(
                 [
                     markdown.Heading("Skipped files", level=2),
-                    markdown.UnorderedList(str(path) for path in result.skipped_files),
+                    markdown.Paragraph(f"{result.skipped_files_count} skipped files."),
                 ]
+            )
+            nodes.append(
+                markdown.Paragraph(
+                    f"Returned {len(result.matches)} of {result.matches_count} matching lines; "
+                    f"matches_truncated={result.matches_truncated}."
+                )
+            )
+            nodes.extend(
+                markdown.Paragraph(
+                    markdown.Link(
+                        "Full skipped-file list",
+                        link.uri,
+                    )
+                )
+                for name, link in result.resources.items()
+                if name == self.SKIPPED_FILES_RESOURCE
             )
         return markdown.Document(nodes).render()
 
@@ -1252,11 +1275,14 @@ class WorkspaceService:
             regex: bool = False,
             extensions: list[str] | None = None,
             case_sensitive: bool = True,
+            max_matches: Annotated[int, Field(ge=1)] = 100,
         ) -> SearchResult:
             """Search lines by literal text or regex; report skipped binary/non-UTF-8 files.
 
             extensions accepts suffixes with or without a leading dot;
             null selects all files, while an empty list selects none.
+            max_matches limits returned matching lines, not scanning. Counts are exact;
+            skipped-file paths are available through the linked immutable resource.
             """
             report_progress = progress(ctx, interval=self.progress_interval)
             call = await self.before_providers(
@@ -1274,6 +1300,8 @@ class WorkspaceService:
                 await report_progress(0, message="Files visited")
                 if not query:
                     raise WorkspaceError("Search query must not be empty.")
+                if max_matches < 1:
+                    raise WorkspaceError("max_matches must be at least 1.")
                 try:
                     expression = regex_engine.compile(
                         query if regex else regex_engine.escape(query),
@@ -1285,6 +1313,7 @@ class WorkspaceService:
                         f"Invalid regular expression: {error}"
                     ) from error
                 matches, skipped = [], []
+                matches_count = 0
                 with filesystem_errors(path):
                     async for candidate in self.iter_files(path.relative, path.area):
                         visited += 1
@@ -1311,10 +1340,12 @@ class WorkspaceService:
                         for line, value in enumerate(text.splitlines(), 1):
                             if line % 256 == 0:
                                 await asyncio.sleep(0)
-                            spans = [
-                                match.span() for match in expression.finditer(value)
-                            ]
-                            if spans:
+                            found = expression.search(value) is not None
+                            matches_count += int(found)
+                            if found and len(matches) < max_matches:
+                                spans = [
+                                    match.span() for match in expression.finditer(value)
+                                ]
                                 matches.append(
                                     SearchMatch(
                                         path=relative,
@@ -1325,7 +1356,9 @@ class WorkspaceService:
                                 )
                 result = SearchResult(
                     matches=sorted(matches, key=lambda item: (str(item.path), item.line)),
-                    skipped_files=sorted(skipped, key=str),
+                    matches_count=matches_count,
+                    matches_truncated=matches_count > len(matches),
+                    skipped_files_count=len(skipped),
                 )
             except BaseException as error:
                 await self.error_providers(call)
@@ -1333,6 +1366,17 @@ class WorkspaceService:
                     raise ToolError(str(error)) from error
                 raise
             result.resources = (await self.after_providers(call, result)).resources
+            if skipped:
+                uri = self.save_result_resource(
+                    call.id,
+                    self.SKIPPED_FILES_RESOURCE,
+                    "application/json",
+                    json.dumps({"skipped_files": sorted(map(str, skipped))}),
+                )
+                result.resources[self.SKIPPED_FILES_RESOURCE] = ResultResource(
+                    uri=uri,
+                    mime_type="application/json",
+                )
             return result
 
         @apps.tool(
@@ -1732,6 +1776,7 @@ class WorkspaceService:
             regex: bool = False,
             extensions: str | None = None,
             case_sensitive: bool = True,
+            max_matches: Annotated[int, Field(ge=1)] = 100,
         ) -> str:
             """Read text/regex matches and skipped files as Markdown; query is required."""
             try:
@@ -1742,6 +1787,7 @@ class WorkspaceService:
                     regex=regex,
                     extensions=None if extensions is None else extensions.split(","),
                     case_sensitive=case_sensitive,
+                    max_matches=max_matches,
                 )
                 return self.render_markdown(result)
             except (WorkspaceError, ToolError) as error:
