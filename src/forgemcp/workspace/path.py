@@ -10,10 +10,21 @@ from pydantic_core import CoreSchema, core_schema
 
 
 class WorkspacePath(str):
-    """A project/storage path, or root/ followed by an absolute native path."""
+    """A canonical managed path accepting project-relative input, or an explicit root/ location."""
 
     def __new__(cls, value: str) -> WorkspacePath:
-        """Create a string path only after validating its area and path syntax."""
+        """Normalize project-relative input and one managed trailing slash, then validate syntax."""
+        if value.startswith("./"):
+            value = "project/" + value[2:]
+        elif value and not value.startswith(("project/", "storage/", "root/")):
+            value = "project/" + value
+        if (
+            value.startswith(("project/", "storage/"))
+            and value not in ("project/", "storage/")
+            and value.endswith("/")
+            and not value.endswith("//")
+        ):
+            value = value[:-1]
         instance = super().__new__(cls, value)
         instance.validate_path()
         return instance

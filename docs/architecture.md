@@ -148,6 +148,13 @@ including mirrors without a path, to avoid opaque SDK validation errors. Platfor
 Project/storage paths shared between modules and in tool arguments/results use
 `WorkspacePath`, serialized as a string such as `project/src/main.cpp` or
 `storage/build/debug`. The roots themselves are `project/` and `storage/`.
+`WorkspacePath.__new__` normalizes tool input before validation: an ordinary relative
+path or one beginning with `./` selects `project/`, and one trailing `/` on a
+managed non-root path is removed. `./` selects the project root; empty input remains
+invalid. Explicit `project/`, `storage/`, and `root/` prefixes retain their meaning;
+`./storage/...` denotes a project directory named `storage`. Stored and serialized
+paths are always qualified and canonical. External `root/` paths are not normalized;
+double separators, remaining `.` components, and `..` are rejected.
 Executable locations and low-level filesystem APIs still use native `Path` values.
 There is no separate `root` tool argument. Path traversal,
 absolute paths, and resolutions outside the selected root are rejected. Trees

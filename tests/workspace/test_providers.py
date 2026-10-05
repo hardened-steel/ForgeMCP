@@ -39,13 +39,30 @@ def setup(cpp_acceptance_project):
 @pytest.mark.parametrize(
     "value",
     [
-        "project",
-        "src/a",
+        "",
+        ".",
+        "../a",
+        "./../a",
+        "/absolute",
+        "C:/absolute",
+        "C:relative",
+        "//server/share",
+        "a\\b",
+        "a\0b",
+        "a//b",
+        "a//",
+        ".//",
+        "././a",
+        "project//",
+        "storage//",
+        "project/a//",
+        "project/a/./b",
         "project/../a",
         "storage/C:/a",
         "project/a\\b",
         "root/relative",
         "root/C:/SDK/../header.h",
+        "root/C:/SDK/header.h/",
     ],
 )
 def test_qualified_path_rejects_ambiguous_or_escaping_values(value):
@@ -69,6 +86,60 @@ def test_qualified_path_is_a_json_string(value):
     assert json.loads(adapter.dump_json(WorkspacePath(value))) == value
     assert adapter.json_schema()["type"] == "string"
     assert WorkspacePath("project/").relative == "."
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("./", "project/"),
+        ("./src/math.cpp", "project/src/math.cpp"),
+        ("./src/", "project/src"),
+        ("some-dir/file.cpp", "project/some-dir/file.cpp"),
+        ("src/", "project/src"),
+        ("README.md", "project/README.md"),
+        ("project", "project/project"),
+        ("./storage/build/", "project/storage/build"),
+        ("./root/file", "project/root/file"),
+        ("project/src/", "project/src"),
+        ("storage/build/debug/", "storage/build/debug"),
+        ("project/", "project/"),
+        ("storage/", "storage/"),
+        ("root/C:/SDK/header.h", "root/C:/SDK/header.h"),
+        ("root//usr/include/header.h", "root//usr/include/header.h"),
+    ],
+)
+def test_workspace_path_normalizes_input_and_json(value, expected):
+    """Verify shorthand paths store and serialize the same canonical value through Pydantic."""
+    path = WorkspacePath(value)
+    adapter = TypeAdapter(WorkspacePath)
+    assert path == expected
+    assert adapter.validate_python(value) == path
+    assert adapter.validate_json(json.dumps(value)) == path
+    assert json.loads(adapter.dump_json(path)) == expected
+    assert WorkspacePath(path) == path
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["project/src/", "./src/", "src/"])
+async def test_find_files_accepts_project_relative_directory_paths(request, path):
+    """Verify MCP input validation accepts directory aliases and returns qualified file paths."""
+    _, mcp = request.getfixturevalue("setup")
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "workspace_find_files",
+            {"path": path, "pattern": "*.cpp"},
+        )
+        assert not result.is_error
+        assert result.structured_content["paths"] == [
+            "project/src/hierarchy.cpp",
+            "project/src/math.cpp",
+        ]
+        read = await client.call_tool(
+            "workspace_read_file",
+            {"path": "./src/math.cpp"},
+        )
+        assert not read.is_error
+        assert read.structured_content["path"] == "project/src/math.cpp"
 
 
 @pytest.mark.anyio
