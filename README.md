@@ -154,8 +154,16 @@ or unavailability before using alternatives. Preserve existing project instructi
 All file tools use string paths such as `project/src/main.cpp` and
 `storage/build/debug`. Directory tools default to `project/`; the separate tool
 argument `root` has been removed. Python consumers use the shared `WorkspacePath`
-type, which serializes as the same string. Storage defaults to `.<project-name>.forgemcp` beside the
-project. Set its location explicitly when needed:
+type, which serializes as the same string. Tool path arguments also accept ordinary
+relative paths: `src/main.cpp` and `./src/main.cpp` both mean `project/src/main.cpp`,
+and `./` means `project/`. One trailing `/` is accepted for managed paths:
+`project/src/` becomes `project/src`. Results always use canonical qualified paths.
+The prefixes `project/`, `storage/`, and `root/` are reserved; use `./storage/...`
+to access a project directory named `storage`. Absolute paths, `..`, and repeated
+separators remain invalid; external locations require an explicit `root/` prefix.
+
+Storage defaults to `.<project-name>.forgemcp` beside the project. Set its location
+explicitly when needed:
 
 ```powershell
 forgemcp --workspace C:\Projects\Example --workspace-storage D:\ForgeMCP\Example
