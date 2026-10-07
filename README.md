@@ -68,7 +68,7 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.2-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.3-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
@@ -80,7 +80,7 @@ The distribution name is `forge-cpp-mcp`; the Python module and server command a
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.2
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.3
 ```
 
 ## Setup from source
@@ -255,10 +255,26 @@ A resource-loading failure does not change the successful file-operation outcome
 When a CMake configuration has a compilation database and clangd in its toolset,
 Workspace reads, writes, and edits of C/C++ files also return
 `resources.clangd`. This immutable JSON contains diagnostics and semantic
-highlighting grouped by configuration. Workspace mutations synchronize retained
-clangd sessions; changing a header refreshes already opened dependent files.
+highlighting grouped by configuration, always across all available configurations.
+Clangd analyzes the complete file even for a partial Workspace read, but the saved
+diagnostics and semantic spans include only those intersecting the lines actually
+returned. Their coordinates remain absolute file positions; an empty partial-read
+excerpt (for example, beyond EOF) has no annotations.
+
 Clangd starts sessions from CMake's configuration subscription and keeps them until
 the configuration disappears, its database changes, or the server stops.
+Each process receives `-j=2`; this worker setting does not impose a memory limit.
+File analysis opens the complete current file, collects the requested result, and
+closes the document before returning. Documents are not retained between calls, so
+the next analysis incorporates saved header changes without reopening other files
+after each Workspace mutation. Repeated calls pay the cost of a fresh file parse;
+closing a document does not release clangd's whole index. Workspace mutations still
+notify sessions of filesystem changes and reconcile changed compilation databases.
+Explicit clangd tools use their existing `configurations` argument to select a
+subset, for example
+`clangd_diagnostics(path="project/src/main.cpp", configurations=["debug"])`.
+Omitting that argument or passing `[]` selects all available configurations.
+
 Workspace widgets load both resources independently. The source view lets you
 select a configuration for semantic highlighting and inline diagnostic markers;
 lexical C/C++ colors also cover keywords, comments, literals, directives, and nested

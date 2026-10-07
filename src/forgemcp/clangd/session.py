@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import suppress
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -39,7 +40,7 @@ from .models import Diagnostic, Location, Position, RelatedDiagnostic, SourceRan
 
 @dataclass
 class Document:
-    """Retained text, version, and latest versioned diagnostics for one document."""
+    """Text and matching-version diagnostics held only during one file operation."""
 
     path: WorkspacePath
     text: str
@@ -124,8 +125,8 @@ class ClangdSession:
         self.capabilities: dict[str, JsonValue] = {}
         self.pending: dict[int, asyncio.Future[JsonValue]] = {}
         self.methods: dict[int, str] = {}
-        self.documents: dict[str, Document] = {}
-        self.versions: dict[str, int] = {}
+        self.document: Document | None = None
+        self.document_version = 0
         self.next_id = 0
         self.reader: asyncio.Task[None] | None = None
         self.condition = asyncio.Condition()
@@ -146,10 +147,7 @@ class ClangdSession:
             raise ClangdSessionError("clangd session is closing.")
 
     def uri(self, path: WorkspacePath) -> str:
-        """Return the retained document URI or resolve a file path to a native URI."""
-        for uri, document in self.documents.items():
-            if document.path == path:
-                return uri
+        """Resolve a qualified file path to its canonical native URI."""
         native = path.absolute if path.area == "root" else self.workspace.resolve_workspace_path(path)
         return native.resolve().as_uri()
 
@@ -236,12 +234,17 @@ class ClangdSession:
                 elif message.method == "textDocument/publishDiagnostics":
                     data = object_value(message.params)
                     uri = self.uri(self.path(string(data.get("uri"))))
-                    document = self.documents.get(uri)
-                    if document is None or document.path.area == "root":
-                        continue
                     version = data.get("version")
+                    document = self.document
                     # Never label an unversioned or older notification as current.
-                    if type(version) is not int or version != document.version:
+                    if (
+                        document is None
+                        or document.path.area == "root"
+                        or self.uri(document.path) != uri
+                        or type(version) is not int
+                        or version != document.version
+                    ):
+                        del document
                         continue
                     diagnostics = [
                         self.diagnostic(item)
@@ -251,6 +254,7 @@ class ClangdSession:
                         document.diagnostics = diagnostics
                         document.diagnostics_version = version
                         self.condition.notify_all()
+                    del document
         except asyncio.CancelledError:
             raise
         except ClangdError as error:
@@ -437,20 +441,23 @@ class ClangdSession:
         except ToolchainError as error:
             raise ClangdSessionError("Cannot synchronize clangd.") from error
 
-    async def synchronize(
+    @asynccontextmanager
+    async def open_document(
         self,
         path: WorkspacePath,
         text: str,
         *,
         on_progress: Progress | None = None,
-    ) -> int:
-        """Open or update a document and return its retained text version."""
+    ) -> AsyncGenerator[int]:
+        """Open a fresh document version and close it when its operation finishes."""
         self.check_alive()
+        if self.document is not None:
+            raise ClangdSessionError("A file operation is already active in this session.")
         uri = self.uri(path)
-        document = self.documents.get(uri)
-        if document is None:
-            document = Document(path, text, version=self.versions.get(uri, 0) + 1)
-            self.documents[uri] = document
+        self.document_version += 1
+        document = Document(path, text, version=self.document_version)
+        self.document = document
+        try:
             language = "c" if path.relative.endswith(".c") else "cpp"
             await self.notify(
                 "textDocument/didOpen",
@@ -463,33 +470,22 @@ class ClangdSession:
                     },
                 },
             )
-        elif document.text != text:
-            document.version += 1
-            document.text = text
-            document.diagnostics_version = None
-            document.diagnostics = []
-            await self.notify(
-                "textDocument/didChange",
-                {
-                    "textDocument": {"uri": uri, "version": document.version},
-                    "contentChanges": [{"text": text}],
-                    "wantDiagnostics": True,
-                },
+            await self.report(
+                on_progress,
+                f"Opened {path} version {document.version}",
             )
-        self.versions[uri] = document.version
-        async with self.condition:
-            self.condition.notify_all()
-        await self.report(on_progress, f"Synchronized {path} version {document.version}")
-        return document.version
-
-    async def forget(self, path: WorkspacePath) -> None:
-        """Close an opened document and wake diagnostic waiters."""
-        uri = self.uri(path)
-        if uri in self.documents:
-            await self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
-            self.documents.pop(uri, None)
-            async with self.condition:
-                self.condition.notify_all()
+            yield document.version
+        finally:
+            try:
+                if self.failure is None and not self.closing:
+                    await self.notify(
+                        "textDocument/didClose",
+                        {"textDocument": {"uri": uri}},
+                    )
+            finally:
+                self.document = None
+                async with self.condition:
+                    self.condition.notify_all()
 
     async def diagnostics(
         self,
@@ -511,9 +507,15 @@ class ClangdSession:
                 async with self.condition:
                     while True:
                         self.check_alive()
-                        document = self.documents.get(uri)
-                        if document is None or document.version != version:
-                            raise ClangdStaleResultError("The requested document version is no longer current.")
+                        document = self.document
+                        if (
+                            document is None
+                            or self.uri(document.path) != uri
+                            or document.version != version
+                        ):
+                            raise ClangdStaleResultError(
+                                "The requested document version is no longer current.",
+                            )
                         if document.diagnostics_version == version:
                             result = [item.model_copy(deep=True) for item in document.diagnostics]
                             break

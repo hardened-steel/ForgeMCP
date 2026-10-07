@@ -580,14 +580,19 @@ and drops entries whose databases disappear. Build directories come from profile
 a single native preset can use an explicitly configured build directory (`-B`).
 Unknown directories are omitted rather than parsing command output or guessing
 CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
-Empty configuration selections mean all available contexts; executables never fall
-back to another toolset or a system installation.
+Explicit analysis tools use their existing `configurations` list to select contexts;
+omitting it or passing an empty list selects all available contexts. Workspace
+analysis always uses all available contexts. Executables never fall back to another
+toolset or a system installation.
 
 `configuration_updates()` is CMake's in-process subscription stream. It yields the
 current list immediately and then yields changed snapshots when configure adds or
 removes a configuration. A slow subscriber keeps only the newest pending snapshot;
-it does not delay CMake. Successful configure also publishes unchanged lists so
-subscribers can detect changed database contents at the same paths. Subscribers
+it does not delay CMake. A new configure result is eligible only after CMake exits
+successfully and its `compile_commands.json` exists. Publication happens after each
+profile execution, not on configure progress messages. Successful configure also
+publishes unchanged lists so subscribers can detect changed database contents at the
+same paths. Subscribers
 close their generators to unregister. Missing CMake tooling produces an empty
 initial list rather than blocking server startup.
 
@@ -596,7 +601,9 @@ framing. Callers exchange typed request, notification, response, and error envel
 UTF-8 message bodies are framed by byte length without an added frame-size limit.
 The process text transport uses reversible Latin-1 encoding for those bytes; its
 transcript is therefore not a decoded UTF-8 LSP log. Clangd uses its normal index
-locations, including the cache beside the compilation database.
+locations, including the cache beside the compilation database. Each process starts
+with background indexing and the fixed argument `-j=2`. This worker setting is not
+a RAM limit; several configurations still own independent processes and indexes.
 
 `ClangdSession` handles initialization, request correlation, cancellation, document
 versions, diagnostics, and shutdown. Progress callbacks reach the session layer.
@@ -604,7 +611,18 @@ Positions use one-based lines and zero-based Unicode code-point offsets. The ses
 requires UTF-32 position negotiation so external locations can be returned without
 reading their contents to convert offsets.
 
-`ClangdService` starts and retains one session per available context. Its subscription
+Each file operation reads and opens the complete current file with `didOpen`, then
+closes it with `didClose` after collecting its result. Diagnostics wait for
+`publishDiagnostics` matching that opening's version; unversioned or older
+notifications are ignored. LSP requests and semantic-token decoding complete while
+the document is open. Cleanup clears its text and diagnostics even after a failed
+operation. The session keeps one increasing version counter, with no retained
+documents or per-file version map between operations. Repeated requests require a
+fresh parse, and `didClose` does not release the process's whole index. Fresh file
+diagnostics do not imply that the global background index is fully up to date.
+
+`ClangdService` eagerly starts and retains one session per available context at
+initialization and when CMake publishes an available configuration. Its subscription
 applies CMake snapshots under the same lock used by analysis. Removed contexts close
 their sessions; a changed configuration or database fingerprint replaces only the
 affected session. Failed sessions can be recreated by the next operation.
@@ -621,18 +639,21 @@ Clangd's before hooks retain its analysis lock until after or error, preventing
 explicit analysis and configuration updates from overlapping a Workspace mutation.
 Move captures the source subtree's file paths before it disappears. After writes,
 edits, moves, deletes, and directory creation, the provider notifies retained sessions
-and reopens their existing documents from disk. This rebuilds dependent headers and
-obtains fresh versioned diagnostics without restarting clangd processes. Deleted or
-moved source documents are closed. Moves synchronize sessions without producing
-diagnostic/highlighting result resources. Pure reads
-reuse unchanged document versions instead of requesting diagnostics for a no-op
-change that clangd may not publish.
+with `workspace/didChangeWatchedFiles`. There are no documents to reopen between
+operations; the next file analysis opens a fresh document against the current saved
+headers. Moves notify sessions without producing diagnostic/highlighting result
+resources.
 
 After read/write/edit, managed C/C++ files are analyzed across available
 configurations. Diagnostics and semantic highlighting are separately grouped and
 saved as `ClangdResource` in Workspace under the shared invocation ID. Later edits
-never change these resources. Provider failures close potentially stale sessions and
-are isolated by Workspace without changing a successful file operation. Compilation
+never change these resources. Partial reads still analyze the complete file, then
+retain only diagnostic ranges and semantic spans intersecting the lines actually
+returned by Workspace. Coordinates stay absolute and ranges are not clipped; LSP
+range ends remain exclusive. Empty partial-read excerpts, including reads beyond
+EOF, have no diagnostic or semantic annotations.
+Provider failures close potentially stale sessions and are isolated by Workspace
+without changing a successful file operation. Compilation
 database changes observed through Workspace also refresh CMake's snapshot and reconcile
 sessions. Clangd owns its file reads; it does not watch external edits or manage
 editor buffers.

@@ -2,19 +2,74 @@
 
 import json
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+from forgemcp.process.models import ProcessEncoding, ProcessTimeout
 from forgemcp.toolchain.errors import ToolParserError
-from forgemcp.toolchain.tools.clangd import Connection, LspNotification, LspResponse
+from forgemcp.toolchain.tools.clangd import (
+    Connection,
+    LspNotification,
+    LspResponse,
+    Methods,
+    create_spec,
+)
 
 
 @pytest.fixture
 def anyio_backend():
     """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_connect_limits_background_index_workers(
+    cpp_acceptance_project: Path,
+) -> None:
+    """Keep background indexing enabled while limiting each launched clangd to two workers."""
+    database = cpp_acceptance_project / "compile_commands.json"
+    database.write_text("[]", encoding="utf-8")
+    process = SimpleNamespace(process_id=17)
+
+    @asynccontextmanager
+    async def running_process() -> AsyncGenerator[SimpleNamespace]:
+        """Supply a process session without launching an external program."""
+        yield process
+
+    processes = SimpleNamespace(launch=AsyncMock(return_value=running_process()))
+    executable = cpp_acceptance_project / "clangd.exe"
+    environment = {"CLANGD_TEST_ENVIRONMENT": "configured"}
+    spec = create_spec(
+        executable,
+        processes,
+        environment=environment,
+        inherit_environment=False,
+    )
+    methods = cast(Methods, spec.methods)
+    async with methods["connect"](
+        cpp_acceptance_project,
+        cpp_acceptance_project,
+    ) as connection:
+        assert connection.process_id == process.process_id
+
+    processes.launch.assert_awaited_once_with(
+        executable.resolve(),
+        (
+            f"--compile-commands-dir={cpp_acceptance_project}",
+            "--background-index",
+            "-j=2",
+        ),
+        cwd=cpp_acceptance_project,
+        env=environment,
+        inherit_environment=False,
+        encoding=ProcessEncoding(driver="latin_1", errors="strict"),
+        timeout=ProcessTimeout(),
+    )
 
 
 @pytest.mark.anyio

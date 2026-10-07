@@ -9,7 +9,7 @@ import logging
 import os
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -93,9 +93,11 @@ class RunningSession:
 
 @dataclass(frozen=True)
 class WorkspaceContext:
-    """The managed paths captured before a workspace operation."""
+    """Paths and requested lines captured before one workspace operation."""
 
     paths: tuple[WorkspacePath, ...]
+    start_line: int = 1
+    end_line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -131,7 +133,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
     zero-based Unicode code-point characters.
 
     Results and linked analysis resources are immutable snapshots. Workspace
-    mutations synchronize retained sessions; external edits are not watched.
+    mutations notify retained sessions; documents are never retained between calls.
     Diagnostics outside project/storage are excluded; symbol locations may use
     root/... without granting file access.
     """
@@ -453,21 +455,19 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         on_progress: Progress | None,
         timeout: float,
     ) -> list[T]:
-        """Synchronize a source file and collect selected-context answers within one deadline."""
+        """Open, analyze, and close a source file in each selected context within one deadline."""
         async with self.operation(timeout):
             contexts = await self.selection(configurations)
             text = self.text(path)
 
             async def run(session: ClangdSession) -> T:
-                """Synchronize the selected session before executing the version-specific
-                operation.
-                """
-                version = await session.synchronize(
+                """Keep the fresh document open only while building the operation's result."""
+                async with session.open_document(
                     path,
                     text,
                     on_progress=on_progress,
-                )
-                return await operation(session, version)
+                ) as version:
+                    return await operation(session, version)
 
             result = await self.collect(
                 contexts,
@@ -483,9 +483,12 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         path: WorkspacePath,
         position: Position,
     ) -> dict[str, JsonValue]:
-        """Validate a source position against retained text and build LSP request parameters."""
+        """Validate a position against the operation's text and build LSP request parameters."""
         uri = session.uri(path)
-        lines = session.documents[uri].text.split("\n")
+        document = session.document
+        if document is None or document.path != path:
+            raise ClangdSessionError("The requested document is not open for this operation.")
+        lines = document.text.split("\n")
         if position.line > len(lines) or position.character > len(lines[position.line - 1].removesuffix("\r")):
             raise ClangdError("Position is outside the document.")
         return {"textDocument": {"uri": uri}, "position": lsp_position(position)}
@@ -588,7 +591,9 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         line = 1
         character = 0
         spans = []
-        lines = session.documents[session.uri(path)].text.split("\n")
+        if session.document is None:
+            raise ClangdSessionError("The requested document is not open for this operation.")
+        lines = session.document.text.split("\n")
         for index in range(0, len(data), 5):
             delta, offset, length, kind, flags = [integer(item) for item in data[index:index + 5]]
             line += delta
@@ -671,7 +676,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         end_line: int | None,
     ) -> WorkspaceContext | None:
         """Capture and lock the file whose read result will receive analysis."""
-        return await self.begin_workspace(path)
+        context = await self.begin_workspace(path)
+        return (
+            replace(context, start_line=start_line, end_line=end_line)
+            if context is not None else None
+        )
 
     async def after_workspace_read_file(
         self,
@@ -680,6 +689,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         result: FileContent,
     ) -> str | None:
         """Save analysis for the completed read and release the analysis lock."""
+        if context.start_line != 1 or context.end_line is not None:
+            context = replace(
+                context,
+                end_line=result.start_line + len(result.text.splitlines()) - 1,
+            )
         return await self.finish_workspace(call_id, context)
 
     async def before_workspace_write_file(
@@ -826,7 +840,11 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             async with asyncio.timeout(self.ANALYSIS_TIMEOUT):
                 if changes:
                     await self.synchronize_changes(changes)
-                files = await self.analyze_files(context.paths if paths is None else paths)
+                files = await self.analyze_files(
+                    context.paths if paths is None else paths,
+                    start_line=context.start_line,
+                    end_line=context.end_line,
+                )
                 if not files:
                     return None
                 return self.workspace.save_result_resource(
@@ -845,7 +863,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             self.lock.release()
 
     async def synchronize_changes(self, changes: Sequence[FileChange]) -> None:
-        """Refresh affected configurations and reopen retained documents after disk changes."""
+        """Refresh changed compilation databases and notify sessions of filesystem changes."""
         databases = {context.compilation_database for context in self.contexts.values()}
         if any(change.path in databases for change in changes):
             await self.cmake.publish_configurations(refresh=True)
@@ -863,22 +881,31 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                     "workspace/didChangeWatchedFiles",
                     {"changes": notifications},
                 )
-                for document in tuple(running.session.documents.values()):
-                    # Reopen after disk changes to rebuild dependent preambles
-                    # and get versioned diagnostics even for unchanged text.
-                    await running.session.forget(document.path)
-                    try:
-                        text = self.text(document.path)
-                    except (WorkspaceError, ClangdError):
-                        continue
-                    else:
-                        await running.session.synchronize(document.path, text)
             except BaseException:
                 await self.close_session(identifier)
                 raise
 
-    async def analyze_files(self, paths: Sequence[WorkspacePath]) -> list[FileAnalysis]:
-        """Collect diagnostic and highlighting snapshots for eligible managed source files."""
+    @staticmethod
+    def overlaps_lines(span: SourceRange, start_line: int, end_line: int | None) -> bool:
+        """Test intersection with inclusive lines while respecting exclusive LSP range ends."""
+        last_line = span.end.line
+        if span.end.character == 0 and last_line > span.start.line:
+            last_line -= 1
+        return (
+            last_line >= start_line
+            and (end_line is None or span.start.line <= end_line)
+            and (end_line is None or end_line >= start_line)
+        )
+
+    async def analyze_files(
+        self,
+        paths: Sequence[WorkspacePath],
+        *,
+        start_line: int = 1,
+        end_line: int | None = None,
+    ) -> list[FileAnalysis]:
+        """Analyze full files transiently, retaining annotations intersecting requested lines."""
+        contexts = await self.configurations()
         files = []
         for path in dict.fromkeys(paths):
             if path.area == "root" or not self.contexts:
@@ -888,26 +915,38 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 continue
             text = self.text(path)
 
-            async def run(session: ClangdSession) -> FileAnalysis:
-                """Synchronize one file and capture versioned diagnostics and semantic spans."""
-                version = await session.synchronize(path, text)
-                diagnostics = await session.diagnostics(
-                    path,
-                    version,
-                    timeout=self.ANALYSIS_TIMEOUT,
-                )
-                highlighting = await self.highlighting(
-                    session,
-                    path,
-                    on_progress=None,
-                    timeout=self.ANALYSIS_TIMEOUT,
-                )
+            async def run(
+                session: ClangdSession,
+                source_path: WorkspacePath = path,
+                source_text: str = text,
+            ) -> FileAnalysis:
+                """Capture independent diagnostics and semantic spans before closing the file."""
+                async with session.open_document(source_path, source_text) as version:
+                    diagnostics = await session.diagnostics(
+                        source_path,
+                        version,
+                        timeout=self.ANALYSIS_TIMEOUT,
+                    )
+                    highlighting = await self.highlighting(
+                        session,
+                        source_path,
+                        on_progress=None,
+                        timeout=self.ANALYSIS_TIMEOUT,
+                    )
+                    diagnostics = [
+                        item for item in diagnostics
+                        if self.overlaps_lines(item.range, start_line, end_line)
+                    ]
+                    highlighting.spans = [
+                        item for item in highlighting.spans
+                        if self.overlaps_lines(item.range, start_line, end_line)
+                    ]
                 return FileAnalysis(
-                    path=path,
+                    path=source_path,
                     diagnostics=[
                         DiagnosticsResult(
                             configurations=[session.configuration.id],
-                            path=path,
+                            path=source_path,
                             diagnostics=diagnostics,
                         ),
                     ],
@@ -917,7 +956,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             outcomes = await asyncio.gather(
                 *(
                     self.run_context(context, run, None, self.ANALYSIS_TIMEOUT)
-                    for context in self.contexts.values()
+                    for context in contexts
                 ),
                 return_exceptions=True,
             )
@@ -984,7 +1023,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> Annotated[CallToolResult, list[DiagnosticsResult]]:
-            """Get diagnostics for a managed file in selected configurations. Empty configurations selects all."""
+            """Get fresh file diagnostics in selected configurations.
+
+            Omitted or empty configurations select all available contexts.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:
@@ -1027,7 +1069,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> Annotated[CallToolResult, list[HoverResult]]:
-            """Describe the symbol at a one-based line and zero-based code-point position. Empty configurations selects all."""
+            """Describe the symbol at a one-based line and zero-based code-point position.
+
+            Omitted or empty configurations select all available contexts.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:
@@ -1101,7 +1146,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         ) -> Annotated[CallToolResult, list[DefinitionResult]]:
             """Find definitions of the symbol at the supplied position.
 
-            External locations use root/. Empty configurations selects all.
+            External locations use root/. Empty configurations select all.
             """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
@@ -1152,7 +1197,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> Annotated[CallToolResult, list[ReferencesResult]]:
-            """Find references to the symbol at the supplied position. Empty configurations selects all."""
+            """Find references to the symbol in selected configurations.
+
+            Omitted or empty configurations select all available contexts.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:
@@ -1202,7 +1250,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> Annotated[CallToolResult, list[DocumentSymbolsResult]]:
-            """List the symbols declared in a managed file. Empty configurations selects all."""
+            """List file symbols in selected configurations.
+
+            Omitted or empty configurations select all available contexts.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:
@@ -1262,7 +1313,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             configurations: list[str] = [],
             timeout: float = 30.0,
         ) -> Annotated[CallToolResult, list[WorkspaceSymbolsResult]]:
-            """Find workspace symbols by name query. Empty configurations selects all."""
+            """Find workspace symbols in selected configurations.
+
+            Omitted or empty configurations select all available contexts.
+            """
             status = analysis_progress(ctx)
             await status("Starting clangd analysis")
             try:
