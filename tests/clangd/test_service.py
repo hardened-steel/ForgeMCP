@@ -10,7 +10,12 @@ from mcp import Client
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 
-from forgemcp.clangd.errors import ClangdTimeoutError
+from forgemcp.clangd.errors import (
+    ClangdError,
+    ClangdSessionError,
+    ClangdStaleResultError,
+    ClangdTimeoutError,
+)
 from forgemcp.clangd.service import ClangdResource, ClangdService, HoverResult, group_results
 from forgemcp.clangd.models import Hover, HoverText, Position
 from forgemcp.cmake.service import CMakeService, CompilationContext
@@ -31,6 +36,11 @@ def anyio_backend():
 class LspPeer:
     """Respond to the exercised LSP methods without launching an installed clangd."""
 
+    span = {
+        "start": {"line": 0, "character": 0},
+        "end": {"line": 0, "character": 3},
+    }
+
     def __init__(self, root):
         """Initialize a scripted peer with queues, recorded messages, and a shared sample range."""
         self.root = root
@@ -38,10 +48,10 @@ class LspPeer:
         self.sent = []
         self.closed = False
         self.ignore = set()
-        self.span = {
-            "start": {"line": 0, "character": 0},
-            "end": {"line": 0, "character": 3},
-        }
+        self.diagnostics = [
+            {"range": self.span, "message": "sample warning", "severity": 2},
+        ]
+        self.tokens = [0, 0, 3, 0, 0]
 
     async def send(self, message):
         """Record a client message and enqueue the scripted response or versioned diagnostic."""
@@ -91,22 +101,15 @@ class LspPeer:
                         "containerName": "fixture",
                     },
                 ],
-                "textDocument/semanticTokens/full": {"data": [0, 0, 3, 0, 0]},
+                "textDocument/semanticTokens/full": {"data": self.tokens},
                 "shutdown": None,
             }
             await self.incoming.put(LspResponse(message.id, results[message.method]))
-        elif message.method in ("textDocument/didOpen", "textDocument/didChange"):
+        elif message.method == "textDocument/didOpen":
             document = message.params["textDocument"]
-            await self.incoming.put(
-                LspNotification(
-                    "textDocument/publishDiagnostics",
-                    {
-                        "uri": document["uri"],
-                        "version": document["version"],
-                        "diagnostics": [{"range": self.span, "message": "sample warning", "severity": 2}],
-                    },
-                ),
-            )
+            await self.publish(document["uri"], document["version"])
+        elif message.method == "textDocument/didClose":
+            await self.publish(message.params["textDocument"]["uri"], None, [])
         elif message.method == "exit":
             await self.incoming.put(None)
 
@@ -119,9 +122,59 @@ class LspPeer:
         """Mark the scripted connection as closed."""
         self.closed = True
 
+    async def publish(self, uri, version, diagnostics=None):
+        """Queue diagnostics with optional versions, including clangd's close notification."""
+        value = {
+            "uri": uri,
+            "diagnostics": self.diagnostics if diagnostics is None else diagnostics,
+        }
+        if version is not None:
+            value["version"] = version
+        await self.incoming.put(LspNotification("textDocument/publishDiagnostics", value))
 
-@pytest.fixture
-async def setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace]:
+
+def opened_documents(peer):
+    """Return the complete buffers and versions supplied by didOpen notifications."""
+    return [
+        message.params["textDocument"]
+        for message in peer.sent
+        if message.method == "textDocument/didOpen"
+    ]
+
+
+def closed_documents(peer):
+    """Return the URIs released by didClose notifications."""
+    return [
+        message.params["textDocument"]["uri"]
+        for message in peer.sent
+        if message.method == "textDocument/didClose"
+    ]
+
+
+async def wait_for_method(peer, method):
+    """Wait until a scripted peer receives the requested method without a timing assumption."""
+    async with asyncio.timeout(5):
+        while not any(message.method == method for message in peer.sent):
+            await asyncio.sleep(0)
+
+
+async def read_analysis(client, result):
+    """Decode the immutable clangd snapshot linked by a workspace tool result."""
+    uri = result.structured_content["resources"]["clangd"]["uri"]
+    resource = await client.read_resource(uri)
+    return ClangdResource.model_validate_json(resource.contents[0].text)
+
+
+def lsp_span(start, end, *, start_character=0, end_character=3):
+    """Build a zero-based LSP range for filtering and diagnostic-version scenarios."""
+    return {
+        "start": {"line": start, "character": start_character},
+        "end": {"line": end, "character": end_character},
+    }
+
+
+@pytest.fixture(name="setup")
+async def clangd_setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace]:
     """Provide two compilation contexts and retained sessions backed by deterministic LSP peers."""
     workspace = WorkspaceService(cpp_acceptance_project)
     peers = []
@@ -297,10 +350,8 @@ async def test_read_only_tools_group_configurations_and_decode_language_values(s
 
 
 @pytest.mark.anyio
-async def test_workspace_edits_sync_sessions_and_keep_old_analysis_immutable(setup):
-    """Verify workspace mutations synchronize sessions while earlier analysis resources remain
-    unchanged.
-    """
+async def test_workspace_edits_use_fresh_documents_and_keep_old_analysis_immutable(setup):
+    """Verify each file operation closes its document without changing earlier snapshots."""
     async with Client(setup.server) as client:
         read = await client.call_tool("workspace_read_file", {"path": "project/src/math.cpp"})
         uri = read.structured_content["resources"]["clangd"]["uri"]
@@ -311,16 +362,19 @@ async def test_workspace_edits_sync_sessions_and_keep_old_analysis_immutable(set
         repeated = await client.call_tool("workspace_read_file", {"path": "project/src/math.cpp"})
         assert not repeated.is_error
         for peer in setup.peers:
-            assert sum(message.method == "textDocument/didOpen" for message in peer.sent) == 1
+            assert [document["version"] for document in opened_documents(peer)] == [1, 2]
+            assert len(closed_documents(peer)) == 2
         edited = await client.call_tool(
             "workspace_edit_file",
             {"path": "project/src/math.cpp", "old_text": "left + right", "new_text": "left - right"},
         )
         assert not edited.is_error and edited.structured_content["resources"]["clangd"]["uri"] != uri
         assert (await client.read_resource(uri)).contents[0].text == frozen
-        for running in setup.service.sessions.values():
-            document = next(iter(running.session.documents.values()))
-            assert document.version == 2 and "left - right" in document.text
+        for peer in setup.peers:
+            document = opened_documents(peer)[-1]
+            assert document["version"] == 3 and "left - right" in document["text"]
+            assert len(closed_documents(peer)) == 3
+        assert all(running.session.document is None for running in setup.service.sessions.values())
         moved = await client.call_tool(
             "workspace_move",
             {"source": "project/src/math.cpp", "destination": "project/src/moved.cpp"},
@@ -331,7 +385,8 @@ async def test_workspace_edits_sync_sessions_and_keep_old_analysis_immutable(set
         changes = [message for message in peer.sent if message.method == "workspace/didChangeWatchedFiles"]
         assert len(changes) == 2
         assert [item["type"] for item in changes[-1].params["changes"]] == [3, 1]
-    assert all(not running.session.documents for running in setup.service.sessions.values())
+    assert all(running.session.document is None for running in setup.service.sessions.values())
+    assert all(len(opened_documents(peer)) == 3 for peer in setup.peers)
     assert not setup.service.lock.locked()
 
 
@@ -371,3 +426,293 @@ async def test_request_timeout_sends_cancellation_and_cleans_pending_state(setup
     assert not session.pending and not session.methods
     assert peer.sent[-1].method == "$/cancelRequest"
     assert peer.sent[-1].params["id"] == peer.sent[-2].id
+
+
+@pytest.mark.anyio
+async def test_header_edit_does_not_reopen_previous_sources_and_next_read_is_fresh(setup):
+    """Verify header mutations leave old sources closed and their next analysis uses a new parse."""
+    path = "project/src/math.cpp"
+    async with Client(setup.server) as client:
+        first = await client.call_tool("workspace_read_file", {"path": path})
+        uri = first.structured_content["resources"]["clangd"]["uri"]
+        frozen = (await client.read_resource(uri)).contents[0].text
+        for peer in setup.peers:
+            peer.diagnostics = [{"range": peer.span, "message": "after header edit", "severity": 2}]
+        edited = await client.call_tool(
+            "workspace_edit_file",
+            {
+                "path": "project/include/fixture/math.hpp",
+                "old_text": "int add(int left, int right);",
+                "new_text": "int add(int left, int right);\nint subtract(int left, int right);",
+            },
+        )
+        assert not edited.is_error
+        for peer in setup.peers:
+            cpp_opens = [
+                document
+                for document in opened_documents(peer)
+                if document["uri"].endswith("math.cpp")
+            ]
+            assert len(cpp_opens) == 1
+        second = await client.call_tool("workspace_read_file", {"path": path})
+        fresh = await read_analysis(client, second)
+        assert fresh.files[0].diagnostics[0].diagnostics[0].message == "after header edit"
+        assert (await client.read_resource(uri)).contents[0].text == frozen
+    for peer in setup.peers:
+        cpp_opens = [
+            document
+            for document in opened_documents(peer)
+            if document["uri"].endswith("math.cpp")
+        ]
+        assert len(cpp_opens) == 2 and cpp_opens[0]["text"] == cpp_opens[1]["text"]
+        assert cpp_opens[1]["version"] > cpp_opens[0]["version"]
+        assert len(closed_documents(peer)) == len(opened_documents(peer))
+
+
+@pytest.mark.anyio
+async def test_document_context_rejects_overlap_and_diagnostics_for_inactive_paths(setup):
+    """Verify one session cannot hold overlapping documents or reuse a closed diagnostic version."""
+    session = setup.service.sessions["debug"].session
+    path = WorkspacePath("project/src/math.cpp")
+    other = WorkspacePath("project/include/fixture/math.hpp")
+    text = setup.service.text(path)
+    async with session.open_document(path, text) as version:
+        with pytest.raises(ClangdSessionError):
+            async with session.open_document(other, setup.service.text(other)):
+                pytest.fail("A second active document must be rejected.")
+        with pytest.raises(ClangdStaleResultError):
+            await session.diagnostics(other, version, timeout=0.1)
+        result = await session.diagnostics(path, version, timeout=0.1)
+        assert result[0].message == "sample warning"
+    assert session.document is None
+    with pytest.raises(ClangdStaleResultError):
+        await session.diagnostics(path, version, timeout=0.1)
+    async with session.open_document(other, setup.service.text(other)) as reopened:
+        assert reopened == version + 1
+        assert session.document.path == other
+    assert session.document is None
+
+
+@pytest.mark.anyio
+async def test_diagnostics_ignore_closed_old_unversioned_and_other_document_notifications(setup):
+    """Verify delayed pushes cannot satisfy diagnostics for the next open document version."""
+    peer = setup.peers[0]
+    peer.ignore.add("textDocument/didOpen")
+    session = setup.service.sessions["debug"].session
+    path = WorkspacePath("project/src/math.cpp")
+    uri = session.uri(path)
+    async with session.open_document(path, setup.service.text(path)) as previous:
+        pass
+    await peer.publish(uri, previous)
+    await session.request("textDocument/hover", {})
+    assert session.document is None
+    async with session.open_document(path, setup.service.text(path)) as version:
+        cases = [
+            (uri, previous),
+            (uri, None),
+            (uri, version + 1),
+            (session.uri(WorkspacePath("project/include/fixture/math.hpp")), version),
+        ]
+        for wrong_uri, wrong_version in cases:
+            await peer.publish(wrong_uri, wrong_version)
+            await session.request("textDocument/hover", {})
+            assert session.document.diagnostics_version is None
+        accepted = [{"range": peer.span, "message": "current", "severity": 2}]
+        await peer.publish(uri, version, accepted)
+        result = await session.diagnostics(path, version, timeout=0.1)
+        assert [diagnostic.message for diagnostic in result] == ["current"]
+    assert session.document is None and len(closed_documents(peer)) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
+async def test_interrupted_analysis_closes_document_session_and_lock(setup, failure):
+    """Verify interrupted analysis closes its active buffer and cleans up the failed context."""
+    peer = setup.peers[0]
+    peer.ignore.add("textDocument/hover")
+    session = setup.service.sessions["debug"].session
+    path = WorkspacePath("project/src/math.cpp")
+
+    async def run(active, version):
+        """Block a document request until its deadline or the test cancellation arrives."""
+        assert active.document.version == version
+        await active.request(
+            "textDocument/hover",
+            {"textDocument": {"uri": active.uri(path)}},
+            timeout=0.01 if failure == "timeout" else 5,
+        )
+        return HoverResult(
+            configurations=["debug"],
+            path=path,
+            position=Position(line=1, character=0),
+            hover=None,
+        )
+
+    task = asyncio.create_task(
+        setup.service.file_operation(
+            path,
+            ["debug"],
+            run,
+            on_progress=None,
+            timeout=5,
+        ),
+    )
+    if failure == "cancel":
+        await wait_for_method(peer, "textDocument/hover")
+        task.cancel()
+    expected = asyncio.CancelledError if failure == "cancel" else ClangdError
+    with pytest.raises(expected):
+        await task
+    assert session.document is None and peer.closed
+    assert set(setup.service.sessions) == {"release"}
+    assert not setup.service.lock.locked() and not session.pending and not session.methods
+    assert len(opened_documents(peer)) == len(closed_documents(peer)) == 1
+    methods = [message.method for message in peer.sent]
+    assert methods.index("$/cancelRequest") < methods.index("textDocument/didClose")
+    assert methods.index("textDocument/didClose") < methods.index("shutdown")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "tool, method",
+    [
+        ("diagnostics", None),
+        ("hover", "textDocument/hover"),
+        ("definition", "textDocument/definition"),
+        ("references", "textDocument/references"),
+        ("document_symbols", "textDocument/documentSymbol"),
+        ("workspace_symbols", "workspace/symbol"),
+    ],
+)
+async def test_clangd_tools_open_only_explicitly_selected_configurations(setup, tool, method):
+    """Verify explicit configuration filters limit analysis to the selected retained session."""
+    arguments = {"configurations": ["debug"]}
+    if tool != "workspace_symbols":
+        arguments["path"] = "project/src/math.cpp"
+    if tool in ("hover", "definition", "references"):
+        arguments["position"] = {"line": 1, "character": 0}
+    if tool == "workspace_symbols":
+        arguments["query"] = "add"
+    async with Client(setup.server) as client:
+        response = await client.call_tool(f"clangd_{tool}", arguments)
+        assert not response.is_error, response.content
+        result = response.structured_content["result"]
+        assert result[0]["configurations"] == ["debug"]
+        for invalid in ("missing", "unavailable"):
+            response = await client.call_tool(
+                f"clangd_{tool}",
+                {**arguments, "configurations": [invalid]},
+            )
+            assert response.is_error
+    assert len(setup.peers) == 2
+    assert not opened_documents(setup.peers[1])
+    if method is not None:
+        assert any(message.method == method for message in setup.peers[0].sent)
+        assert not any(message.method == method for message in setup.peers[1].sent)
+    if tool != "workspace_symbols":
+        assert len(opened_documents(setup.peers[0])) == len(closed_documents(setup.peers[0])) == 1
+    assert all(running.session.document is None for running in setup.service.sessions.values())
+
+
+@pytest.mark.anyio
+async def test_new_configuration_starts_session_before_its_first_file_request(setup):
+    """Verify CMake publication still starts clangd eagerly while keeping its documents closed."""
+    assert len(setup.peers) == 2 and set(setup.service.sessions) == {"debug", "release"}
+    setup.cmake.configurations["extra"] = setup.cmake.configurations["debug"].model_copy(
+        update={"id": "extra"},
+        deep=True,
+    )
+    await setup.cmake.publish_configurations()
+    async with asyncio.timeout(5):
+        while "extra" not in setup.service.sessions:
+            await asyncio.sleep(0)
+    assert len(setup.peers) == 3 and not any(peer.closed for peer in setup.peers)
+    assert all(not opened_documents(peer) for peer in setup.peers)
+    assert all(running.session.document is None for running in setup.service.sessions.values())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool", ["read_file", "write_file", "edit_file"])
+async def test_workspace_analysis_timeout_keeps_successful_file_operation(setup, monkeypatch, tool):
+    """Verify timed-out enrichment keeps completed file changes and closes language sessions."""
+    monkeypatch.setattr(setup.service, "ANALYSIS_TIMEOUT", 0.03)
+    for peer in setup.peers:
+        peer.ignore.add("textDocument/semanticTokens/full")
+    path = WorkspacePath("project/src/math.cpp")
+    arguments = {"path": str(path)}
+    if tool == "write_file":
+        arguments["text"] = "int replacement;\n"
+    if tool == "edit_file":
+        arguments.update({"old_text": "left + right", "new_text": "left - right"})
+    async with Client(setup.server) as client:
+        response = await client.call_tool(f"workspace_{tool}", arguments)
+        assert not response.is_error, response.content
+        assert "clangd" not in response.structured_content["resources"]
+        if tool == "write_file":
+            assert setup.service.text(path) == arguments["text"]
+        if tool == "edit_file":
+            assert "left - right" in setup.service.text(path)
+    assert not setup.service.lock.locked() and not setup.service.sessions
+    assert all(peer.closed for peer in setup.peers)
+    for peer in setup.peers:
+        assert len(opened_documents(peer)) == len(closed_documents(peer)) == 1
+
+
+@pytest.mark.anyio
+async def test_partial_reads_parse_full_buffer_and_filter_intersecting_annotations(setup):
+    """Verify partial views preserve source coordinates and exclude unselected source lines."""
+    path = WorkspacePath("project/src/math.cpp")
+    text = "int first;\nint second;\nint third;\nint fourth;\nint fifth;\n"
+    setup.workspace.resolve_workspace_path(path).write_text(
+        text,
+        encoding="utf-8",
+        newline="",
+    )
+    spans = [
+        ("ends before selected lines", lsp_span(0, 1, end_character=0)),
+        ("crosses selected start", lsp_span(0, 1, end_character=1)),
+        ("inside", lsp_span(1, 1)),
+        ("crosses selected end", lsp_span(2, 3, end_character=0)),
+        ("after selected lines", lsp_span(3, 3)),
+    ]
+    for peer in setup.peers:
+        peer.diagnostics = [
+            {"range": span, "message": message, "severity": 2}
+            for message, span in spans
+        ]
+        peer.tokens = [0, 0, 3, 0, 0] + [1, 0, 3, 0, 0] * 4
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "workspace_read_file",
+            {"path": str(path), "start_line": 2, "end_line": 3},
+        )
+        assert response.structured_content["text"] == "int second;\nint third;\n"
+        analysis = (await read_analysis(client, response)).files[0]
+    diagnostics = analysis.diagnostics[0].diagnostics
+    assert [item.message for item in diagnostics] == [
+        "crosses selected start",
+        "inside",
+        "crosses selected end",
+    ]
+    assert diagnostics[0].range.start.line == 1 and diagnostics[0].range.end.line == 2
+    assert diagnostics[-1].range.end.line == 4 and diagnostics[-1].range.end.character == 0
+    assert [span.range.start.line for span in analysis.highlighting[0].spans] == [2, 3]
+    assert analysis.diagnostics[0].configurations == ["debug", "release"]
+    for peer in setup.peers:
+        assert opened_documents(peer)[0]["text"] == text and len(closed_documents(peer)) == 1
+
+
+@pytest.mark.anyio
+async def test_empty_read_returns_no_diagnostics_or_highlighting(setup):
+    """Verify an excerpt beyond EOF does not include annotations from the complete source buffer."""
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "workspace_read_file",
+            {"path": "project/src/math.cpp", "start_line": 100},
+        )
+        assert not response.is_error and response.structured_content["text"] == ""
+        analysis = await read_analysis(client, response)
+        for file in analysis.files:
+            assert all(not item.diagnostics for item in file.diagnostics)
+            assert all(not item.spans for item in file.highlighting)
+    assert all(running.session.document is None for running in setup.service.sessions.values())

@@ -283,6 +283,7 @@ def create_spec(
                 (
                     f"--compile-commands-dir={compilation_database_directory}",
                     "--background-index",
+                    "-j=2",
                 ),
                 cwd=project,
                 env=environment,
