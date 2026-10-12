@@ -20,6 +20,7 @@ from forgemcp.clangd.service import ClangdResource, ClangdService, HoverResult, 
 from forgemcp.clangd.models import Hover, HoverText, Position
 from forgemcp.cmake.service import CMakeService, CompilationContext
 from forgemcp.completion import Complete
+from forgemcp.process.service import ProcessService
 from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.tools.clangd import LspMessage, LspNotification, LspRequest, LspResponse
@@ -204,6 +205,7 @@ async def clangd_setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace
     )
     cmake = CMakeService(
         toolchains,
+        ProcessService(workspace.root, allowed_roots=(workspace.storage_root,)),
         project_root=workspace.root,
         storage_root=workspace.storage_root,
         protected_paths=workspace.protected_paths,

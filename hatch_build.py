@@ -31,7 +31,7 @@ class CustomBuildHook(BuildHookInterface):
             Path(self.root) / "src" / "forgemcp" / "assets" / "clangd-result.html",
             *(
                 Path(self.root) / "src" / "forgemcp" / "assets" / f"cmake-{kind}.html"
-                for kind in ("profiles", "configure", "build", "test")
+                for kind in ("profiles", "configure", "build", "test", "run-test")
             ),
         ]
         artifacts = build_data.setdefault("artifacts", [])

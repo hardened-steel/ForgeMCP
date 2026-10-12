@@ -20,8 +20,9 @@ from pydantic import Field
 
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
-from forgemcp.process.errors import ProcessError
+from forgemcp.process.errors import ProcessError, ProcessStartError
 from forgemcp.process.models import ProcessTimeout
+from forgemcp.process.service import ProcessService
 from forgemcp.progress import progress
 from forgemcp.text import tool_result
 from forgemcp.toolchain.errors import ToolchainError
@@ -38,8 +39,9 @@ from .models import (
     CMakeConfigureResult,
     CMakeBuildResult,
     CMakeTestResult,
+    CMakeRunTestResult,
 )
-from .text import render_executions, render_profiles
+from .text import render_executions, render_profiles, render_run_test
 
 
 class CMakeService:
@@ -57,6 +59,11 @@ class CMakeService:
     Configure before building; build before testing. Diagnose with a subset,
     then verify all profiles. Each execution reports error (null means success)
     and, when launched, process_id for its command log.
+
+    cmake_run_test runs an explicit project/storage test executable with literal
+    arguments and a working directory, inheriting the server environment.
+    It requires no profile or CTest registration. Zero exit means success;
+    CTest properties, preset environments, and framework case reports do not apply.
     """
 
     ICON = IconFile("icons/cmake.svg")
@@ -64,10 +71,12 @@ class CMakeService:
     CONFIGURE_WIDGET = Widget("assets/cmake-configure.html")
     BUILD_WIDGET = Widget("assets/cmake-build.html")
     TEST_WIDGET = Widget("assets/cmake-test.html")
+    RUN_TEST_WIDGET = Widget("assets/cmake-run-test.html")
 
     def __init__(
         self,
         toolchains: ToolchainService,
+        processes: ProcessService,
         profiles: tuple[ProfileDefinition, ...] = (),
         *,
         project_root: Path,
@@ -81,6 +90,7 @@ class CMakeService:
         self.storage_root = storage_root.resolve()
         self.protected_paths = protected_paths
         self.toolchains = toolchains
+        self.processes = processes
         self.definitions = profiles
         self.default_toolset = default_toolset
         self.progress_interval = progress_interval
@@ -477,6 +487,23 @@ class CMakeService:
                 queue.put_nowait(snapshot)
                 self.configuration_subscribers[queue] = signature
 
+    def execution_path(self, reference: WorkspacePath) -> Path:
+        """Resolve a test executable or working directory without escaping its managed root."""
+        if reference.area == "root":
+            raise CMakeError("Test execution paths must be inside project/ or storage/.")
+        base = self.project_root if reference.area == "project" else self.storage_root
+        try:
+            if os.name == "nt" and any(
+                os.path.isreserved(part) for part in Path(reference.relative).parts
+            ):
+                raise CMakeError(f"Test execution path contains a reserved name: {reference}.")
+            path = (base / reference.relative).resolve()
+            if not path.is_relative_to(base):
+                raise CMakeError(f"Test execution path resolves outside its root: {reference}.")
+            return path
+        except OSError as error:
+            raise CMakeError(f"Cannot resolve test execution path: {reference}.") from error
+
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register profile inspection, configure, build, and test tools with their widgets."""
         icon = self.ICON.icon
@@ -862,10 +889,76 @@ class CMakeService:
                     await report_status(result.error or "Completed successfully")
             return tool_result(results, render_executions(results, "CTest"))
 
+        @apps.tool(
+            resource_uri=self.RUN_TEST_WIDGET.uri,
+            icons=[icon],
+            annotations=changes_files,
+        )
+        async def cmake_run_test(
+            executable: WorkspacePath,
+            ctx: Context,
+            arguments: list[str] | None = None,
+            cwd: WorkspacePath = WorkspacePath("project/"),
+            timeout: ProcessTimeout = ProcessTimeout(total=600),
+        ) -> Annotated[CallToolResult, CMakeRunTestResult]:
+            """Run one project/storage test executable directly with literal command-line arguments.
+
+            Inherits the server environment; cwd defaults to project/. Zero exit
+            means success. No profiles, CTest properties, or case reports are used.
+            Read output through process_get with the returned process_id.
+            """
+            report = progress(ctx, interval=self.progress_interval)
+            await report(0, message="Preparing test executable")
+            values = arguments if arguments is not None else []
+            if any("\0" in value for value in values):
+                raise ToolError("Test arguments cannot contain NUL.")
+            try:
+                program = self.execution_path(executable)
+                directory = self.execution_path(cwd)
+                if not program.is_file():
+                    raise CMakeError(f"Test executable is not a file: {executable}.")
+                if not directory.is_dir():
+                    raise CMakeError(f"Test working directory does not exist: {cwd}.")
+                if os.name == "nt" and program.suffix.lower() in (".bat", ".cmd"):
+                    raise CMakeError("Test executable must be a native program, not a batch file.")
+            except CMakeError as error:
+                raise ToolError(str(error)) from error
+            except OSError as error:
+                raise ToolError("Cannot inspect test executable or working directory.") from error
+            result = CMakeRunTestResult(
+                executable=executable,
+                arguments=values,
+                cwd=cwd,
+            )
+            updates = 1
+            await report(updates, message="Starting test executable")
+            try:
+                async with await self.processes.launch(
+                    program,
+                    values,
+                    cwd=directory,
+                    timeout=timeout,
+                ) as session:
+                    result.process_id = session.process_id
+                    await session.close_stdin()
+                    async for _ in session.output():
+                        updates += 1
+                        await report(updates, message="Receiving test output")
+                    code = await session.wait()
+                    if code != 0:
+                        result.error = f"Test executable exited with {code}."
+            except ProcessStartError:
+                result.error = f"Cannot start test executable: {executable}."
+            except ProcessError as error:
+                result.error = str(error)
+            await report(updates + 1, message=result.error or "Completed successfully")
+            return tool_result(result, render_run_test(result))
+
         for widget in (
             self.PROFILES_WIDGET,
             self.CONFIGURE_WIDGET,
             self.BUILD_WIDGET,
             self.TEST_WIDGET,
+            self.RUN_TEST_WIDGET,
         ):
             apps.add_html_resource(widget.uri, widget.content)

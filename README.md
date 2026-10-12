@@ -19,7 +19,8 @@ debugger modules are planned.
   configuration selections use all available contexts.
 - No prompts are currently registered.
 - CMake tools list operator profiles, configure projects, build targets, and run
-  CTest. Each tool has its own widget with profile filters, Fields/JSON views,
+  CTest. `cmake_run_test` directly runs a project/storage test executable with
+  literal command-line arguments. Each tool has its own widget with Fields/JSON views,
   copying and per-test results. Command logs are available through `process_get`. CMake syntax highlighting remains deferred.
 - Tool `processes_overview` shows running and completed external development tools,
   including exit codes and timeout interruptions. `process_get(process_id)` returns
@@ -50,7 +51,9 @@ without making additional tool calls. Process times are readable to seconds; JSO
 copying preserve the original precision. A toolsets list shows summaries, while a
 `toolset_get` result shows the details returned by that call.
 
-ForgeMCP does not expose arbitrary command execution over MCP. Feature services use
+ForgeMCP can directly run an explicitly selected test executable inside the
+project or storage root; it does not expose shell commands or external executable
+paths over MCP. Feature services use
 the shared process service internally; its public MCP surface is read-only.
 
 ## Requirements
@@ -306,6 +309,30 @@ when known; build returns parsed step counts when available; test returns JUnit 
 Full process transcripts remain in the process module; CMake results contain no
 transcript links. The default command timeout is 600 seconds per execution and
 can be overridden with the existing `ProcessTimeout` shape (`total`, `idle`).
+
+`cmake_run_test(executable, arguments=null, cwd="project/", timeout={"total":600})`
+runs one already-built test executable directly, without a profile or CTest
+registration. Executable and working-directory paths use `project/...` or
+`storage/...` and must resolve inside their respective roots. The working directory
+must exist; storage is not created automatically. On Windows, batch files are not
+supported. Arguments are a list of literal strings, preserving spaces and empty
+strings; NUL is rejected. For example:
+
+```json
+{
+  "executable": "project/build/ninja-debug/fixture_tests.exe",
+  "arguments": ["--fail"],
+  "cwd": "project/build/ninja-debug",
+  "timeout": {"total": 30}
+}
+```
+
+The process inherits the server environment, closes stdin, and waits for completion.
+It does not replay toolset/preset environments or CTest properties such as
+`WILL_FAIL`, fixtures, or per-test timeouts. Exit zero means success; a nonzero
+exit or process failure is reported in `error`. The single structured result
+contains `executable`, `arguments`, `cwd`, `error`, and `process_id`; logs are read
+through `process_get`. No JUnit or framework case report is inferred from output.
 
 With no explicit profiles:
 

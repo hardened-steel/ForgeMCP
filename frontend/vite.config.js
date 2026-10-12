@@ -15,6 +15,7 @@ const widgets = {
   "cmake-configure": "cmake-configure",
   "cmake-build": "cmake-build",
   "cmake-test": "cmake-test",
+  "cmake-run-test": "cmake-run-test",
   clangd: "clangd-result",
 };
 

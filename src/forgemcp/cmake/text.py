@@ -1,5 +1,6 @@
 """Plain-text CMake settings, execution outcomes, and complete CTest cases."""
 
+import json
 from typing import Literal
 
 from forgemcp.toolchain.tools import ctest
@@ -9,6 +10,7 @@ from .models import (
     CMakeConfigureResult,
     CMakeBuildResult,
     CMakeTestResult,
+    CMakeRunTestResult,
 )
 
 
@@ -96,3 +98,20 @@ def render_test_cases(tests: list[ctest.TestCase]) -> list[str]:
         if test.message is not None:
             lines.append("      " + test.message.replace("\n", "\n      "))
     return lines
+
+
+def render_run_test(result: CMakeRunTestResult) -> str:
+    """Describe a direct run and preserve argument boundaries without copying its transcript."""
+    lines = [
+        f"Test executable: {result.executable}",
+        f"  Arguments: {json.dumps(result.arguments, ensure_ascii=False)}",
+        f"  Working directory: {result.cwd}",
+        f"  Outcome: {'Succeeded' if result.error is None else 'Failed'}",
+    ]
+    if result.error is not None:
+        lines.append("  Error: " + result.error.replace("\n", "\n    "))
+    if result.process_id is not None:
+        lines.append(f"  Command output: process_get(process_id={result.process_id})")
+    else:
+        lines.append("  Process: not available")
+    return "\n".join(lines)

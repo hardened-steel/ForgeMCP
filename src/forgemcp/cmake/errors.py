@@ -2,4 +2,4 @@
 
 
 class CMakeError(Exception):
-    """Invalid profiles, unavailable tools, or unusable CMake build metadata."""
+    """Invalid profiles, execution paths, unavailable tools, or unusable build metadata."""
