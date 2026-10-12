@@ -6,7 +6,8 @@ ForgeMCP is intentionally at foundation stage. The `workspace` feature manages
 project files and a separate service-storage root. The shared `process` service adds asynchronous
 external-program lifecycle, text transcripts, timeouts, and a read-only inspection
 surface for development commands. CMake now configures, builds, and tests operator
-profiles. Read-only clangd analysis is mounted through MCP tools and workspace
+profiles, and directly runs explicit test executables with command-line arguments.
+Read-only clangd analysis is mounted through MCP tools and workspace
 result providers, with a shared analysis widget. Quality and debugger remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
@@ -334,7 +335,8 @@ its JSON payload rather than the link.
 ## CMake profiles and operations
 
 `CMakeService` receives project/storage roots and protected paths directly, plus
-`ToolchainService` for tool selection. It owns its build-tree filesystem operations.
+`ToolchainService` for tool selection and `ProcessService` for direct test runs.
+It owns its build-tree filesystem operations.
 Operator profiles are parsed from repeated
 `--cmake-profile NAME KEY=VALUE ...` arguments; the default
 toolset is selected by `--cmake-toolset`. There is no environment-based profile
@@ -389,8 +391,25 @@ Execution/parser failures after launch also retain the process identifier. CTest
 JUnit into a CMake-owned temporary directory under storage; parsed cases are returned
 before cleanup.
 
-CMake registers all four tools through Apps with separate packaged widgets:
-profiles, configure, build, and test. They share `cmake-view.js` and the common
+`cmake_run_test` runs one explicit `WorkspacePath` executable with literal
+`arguments`, a `cwd` (default `project/`), and `ProcessTimeout` (default total 600
+seconds). It uses the injected ProcessService directly and inherits the server
+environment without selecting profiles, discovering tools, or replaying preset
+environments. Executable and cwd must resolve inside their own project/storage
+root; cwd must exist, executable must be a file, and Windows batch files are
+rejected. NUL arguments are rejected while empty strings remain valid.
+`execution_path` owns the shared path validation for executable and cwd.
+The handler closes stdin, drains both output streams without accumulating another
+transcript, waits for completion, and cleans up the session on cancellation.
+Progress counts start/output/completion events with no invented total.
+`CMakeRunTestResult` returns qualified command inputs, `error`, and `process_id`;
+zero exit means success, while nonzero exits and process failures populate error.
+Invalid paths or arguments raise ToolError before launch. A launched process's ID
+survives timeout or stream failure for inspection with `process_get`.
+CTest properties and framework case/JUnit reports are not interpreted by this tool.
+
+CMake registers five tools through Apps with separate packaged widgets:
+profiles, configure, build, test, and run-test. They share `cmake-view.js` and the common
 result renderer: profile/mode filters, Fields/JSON, full-value copying,
 process identifiers for log retrieval, and expandable test cases. Fields used as
 record headings are not repeated in the body; JSON and copying retain all fields.
@@ -407,7 +426,9 @@ widget work as the last refactoring stage.
 
 `ProcessService` is the only module that calls `asyncio.create_subprocess_exec`.
 Feature services receive it through constructor injection, select executables, and
-construct explicit argument lists. `launch` uses exec mode; interpreters such as
+construct explicit argument lists. `cmake_run_test` accepts an explicit managed
+test executable path; it does not accept external executables or shell commands.
+`launch` uses exec mode; interpreters such as
 `cmd.exe` must be selected explicitly by the owning feature. ForgeMCP does not expose
 a generic command-execution MCP tool.
 

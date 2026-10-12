@@ -1,7 +1,13 @@
 """Operator choices and CMake orchestration, without host tool discovery."""
 import asyncio
+from collections.abc import AsyncGenerator
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp import Client
@@ -12,6 +18,8 @@ from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import ProfileDefinition, parse_profiles
 from forgemcp.cmake.service import CMakeService
 from forgemcp.completion import Complete
+from forgemcp.process.service import ProcessService
+from forgemcp.process.models import ProcessOutput
 from forgemcp.toolchain.errors import ToolCommandError
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
@@ -62,8 +70,10 @@ def setup(cpp_acceptance_project):
     )
     toolchains = ToolchainService(SimpleNamespace())
     toolchains.toolsets = (Toolset("system", "System", tools, None, True),)
+    processes = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
     service = CMakeService(
         toolchains,
+        processes,
         project_root=workspace.root,
         storage_root=workspace.storage_root,
         protected_paths=workspace.protected_paths,
@@ -72,6 +82,7 @@ def setup(cpp_acceptance_project):
     return SimpleNamespace(
         workspace=workspace,
         service=service,
+        processes=processes,
         configure=configure,
         build=build,
         test=test,
@@ -89,6 +100,297 @@ def server(service):
     for binding in apps.resources():
         mcp.add_resource(binding.resource)
     return mcp
+
+
+@pytest.fixture
+def test_program(request):
+    """Copy a real Python executable into the isolated project as a deterministic test program."""
+    scenario = request.getfixturevalue("setup")
+    folder = scenario.workspace.root / "Test tools & spaces"
+    folder.mkdir()
+    executable = folder / ("python.exe" if os.name == "nt" else "python")
+    shutil.copy2(sys.executable, executable)
+    configuration = Path(sys.executable).parent.parent / "pyvenv.cfg"
+    if configuration.is_file():
+        shutil.copy2(configuration, folder / "pyvenv.cfg")
+    return WorkspacePath("project/" + executable.relative_to(scenario.workspace.root).as_posix())
+
+
+@pytest.mark.anyio
+async def test_direct_run_metadata(request):
+    """Expose a typed direct-run contract and Apps metadata without profile parameters."""
+    scenario = request.getfixturevalue("setup")
+    async with Client(server(scenario.service)) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    tool = tools["cmake_run_test"]
+    assert set(tool.input_schema["properties"]) == {
+        "executable",
+        "arguments",
+        "cwd",
+        "timeout",
+    }
+    assert tool.input_schema["required"] == ["executable"]
+    assert tool.input_schema["properties"]["cwd"]["default"] == "project/"
+    assert tool.output_schema["properties"]["executable"]["type"] == "string"
+    assert tool.icons
+    assert tool.meta["ui"]["resourceUri"] == "ui://forgemcp/cmake-run-test.html"
+    assert tool.annotations.read_only_hint is False
+    assert tool.annotations.idempotent_hint is False
+
+
+@pytest.mark.anyio
+async def test_direct_run_preserves_inputs_and_retains_both_streams(request, monkeypatch):
+    """Run a real child with literal arguments, inherited environment, and storage cwd.
+
+    Verify stdin EOF and retain both output streams without copying them into the tool result.
+    """
+    scenario = request.getfixturevalue("setup")
+    executable = request.getfixturevalue("test_program")
+    directory = scenario.workspace.storage_root / "test data"
+    directory.mkdir(parents=True)
+    monkeypatch.setenv("FORGEMCP_DIRECT_TEST", "inherited")
+    values = ["a b", "", "a&b|c>d", 'a"b', "%FORGEMCP_DIRECT_TEST%", "Žąsis"]
+    arguments = [
+        "-c",
+        "import json,os,sys; "
+        "print(json.dumps([sys.argv[1:], os.getcwd(), "
+        "os.environ['FORGEMCP_DIRECT_TEST'], sys.stdin.read()])); "
+        "sys.stderr.write('error stream' * 10000)",
+        *values,
+    ]
+    notifications = []
+
+    async def collect(value, total, message):
+        """Record progress and require meaningful messages without an invented work total."""
+        assert total is None and message
+        notifications.append(value)
+
+    try:
+        async with Client(server(scenario.service)) as client:
+            response = await client.call_tool(
+                "cmake_run_test",
+                {
+                    "executable": executable,
+                    "arguments": arguments,
+                    "cwd": "storage/test data",
+                },
+                progress_callback=collect,
+            )
+        assert not response.is_error
+        result = response.structured_content
+        assert result["error"] is None
+        assert result["executable"] == executable
+        assert result["arguments"] == arguments and result["cwd"] == "storage/test data"
+        record = scenario.processes.records[result["process_id"]]
+        stdout = "".join(entry.text for entry in record.transcript if entry.stream == "stdout")
+        assert json.loads(stdout) == [values, str(directory.resolve()), "inherited", ""]
+        stderr = "".join(entry.text for entry in record.transcript if entry.stream == "stderr")
+        assert stderr.endswith("error stream" * 10000)
+        assert record.summary.timeout.total == 600
+        assert record.status.current_status == 0
+        assert "Succeeded" in response.content[0].text
+        assert f"process_get(process_id={result['process_id']})" in response.content[0].text
+        assert "error stream" * 2 not in response.content[0].text
+        assert notifications[0] == 0 and len(notifications) >= 3
+        assert all(right > left for left, right in zip(notifications, notifications[1:]))
+        scenario.presets.assert_not_awaited()
+        scenario.test.assert_not_awaited()
+    finally:
+        await scenario.processes.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("code", [0, 7])
+@pytest.mark.parametrize("arguments", [None, []])
+@pytest.mark.parametrize("area", ["project", "storage"])
+async def test_direct_run_defaults_and_exit_outcomes(
+    request,
+    monkeypatch,
+    code,
+    arguments,
+    area,
+):
+    """Use project cwd and empty arguments by default while reporting raw executable exit codes."""
+    scenario = request.getfixturevalue("setup")
+    executable = (
+        scenario.workspace.root if area == "project" else scenario.workspace.storage_root
+    ) / "test-program.exe"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"program")
+    session = MagicMock(
+        process_id=42,
+        close_stdin=AsyncMock(),
+        wait=AsyncMock(return_value=code),
+    )
+
+    async def output() -> AsyncGenerator[ProcessOutput, None]:
+        """Emit no output for a silent executable."""
+        for chunk in ():
+            yield chunk
+
+    session.output = output
+    session.__aenter__.return_value = session
+    launch = AsyncMock(return_value=session)
+    monkeypatch.setattr(scenario.processes, "launch", launch)
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(
+            "cmake_run_test",
+            {"executable": f"{area}/test-program.exe", "arguments": arguments},
+        )
+    result = response.structured_content
+    assert not response.is_error
+    assert result["arguments"] == [] and result["cwd"] == "project/"
+    assert result["executable"] == f"{area}/test-program.exe"
+    assert result["process_id"] == 42
+    assert result["error"] == (None if code == 0 else "Test executable exited with 7.")
+    assert launch.call_args.args == (executable.resolve(), [])
+    assert launch.call_args.kwargs["cwd"] == scenario.workspace.root
+    session.close_stdin.assert_awaited_once()
+    session.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["total", "idle"])
+async def test_direct_run_timeout_retains_process_and_cleans_up(request, mode):
+    """Preserve a timed-out child's process reference and terminate it before returning."""
+    scenario = request.getfixturevalue("setup")
+    executable = request.getfixturevalue("test_program")
+    try:
+        async with Client(server(scenario.service)) as client:
+            response = await client.call_tool(
+                "cmake_run_test",
+                {
+                    "executable": executable,
+                    "arguments": ["-c", "import time; time.sleep(20)"],
+                    "timeout": {mode: 0.2},
+                },
+            )
+        assert not response.is_error
+        result = response.structured_content
+        assert result["error"]
+        record = scenario.processes.records[result["process_id"]]
+        assert record.status.current_status == "interrupted"
+        assert not scenario.processes.sessions
+    finally:
+        await scenario.processes.close()
+
+
+@pytest.mark.anyio
+async def test_direct_run_launch_failure_has_no_process_reference(request):
+    """Report a non-executable file as a launch failure without a fictitious process ID."""
+    scenario = request.getfixturevalue("setup")
+    (scenario.workspace.root / "broken.exe").write_bytes(b"not an executable")
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_run_test", {"executable": "broken.exe"})
+    assert not response.is_error
+    assert response.structured_content["error"]
+    assert str(scenario.workspace.root) not in response.structured_content["error"]
+    assert response.structured_content["process_id"] is None
+    assert "Process: not available" in response.content[0].text
+    assert not scenario.processes.records
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"executable": "missing.exe"},
+        {"executable": "project/tests"},
+        {"executable": "../outside.exe"},
+        {"executable": "root/C:/outside.exe"},
+        {"cwd": "missing-directory"},
+        {"cwd": "project/test-program.exe"},
+        {"cwd": "root/C:/outside"},
+        {"arguments": ["before\0after"]},
+        {"timeout": {"total": -1}},
+    ],
+)
+async def test_direct_run_rejects_invalid_inputs_before_launch(request, monkeypatch, inputs):
+    """Reject unmanaged paths, wrong filesystem kinds, NUL arguments, and invalid timeout values."""
+    scenario = request.getfixturevalue("setup")
+    (scenario.workspace.root / "test-program.exe").write_bytes(b"program")
+    launch = AsyncMock()
+    monkeypatch.setattr(scenario.processes, "launch", launch)
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(
+            "cmake_run_test",
+            {"executable": "project/test-program.exe", **inputs},
+        )
+    assert response.is_error
+    launch.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_direct_run_cancellation_closes_the_child(request, monkeypatch):
+    """Stop a real test child when its MCP request is cancelled."""
+    scenario = request.getfixturevalue("setup")
+    executable = request.getfixturevalue("test_program")
+    started = asyncio.Event()
+    children = []
+    launch = scenario.processes.launch
+
+    async def capture(*args, **kwargs):
+        """Observe the real child so cancellation cleanup can be checked deterministically."""
+        session = await launch(*args, **kwargs)
+        children.append(session)
+        started.set()
+        return session
+
+    monkeypatch.setattr(scenario.processes, "launch", capture)
+    try:
+        async with Client(server(scenario.service)) as client:
+            task = asyncio.create_task(
+                client.call_tool(
+                    "cmake_run_test",
+                    {
+                        "executable": executable,
+                        "arguments": ["-c", "import time; time.sleep(20)"],
+                    },
+                )
+            )
+            async with asyncio.timeout(5):
+                await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert children[0].returncode is not None
+        assert children[0].task.done()
+    finally:
+        await scenario.processes.close()
+
+
+@pytest.mark.parametrize("area", ["project", "storage"])
+def test_execution_path_rejects_links_outside_the_selected_root(request, monkeypatch, area):
+    """Check the resolved target against its selected root even when a lexical path stays inside."""
+    scenario = request.getfixturevalue("setup")
+    base = scenario.workspace.root if area == "project" else scenario.workspace.storage_root
+    path = base / "linked-program"
+    resolve = Path.resolve
+
+    def linked_path(value, *args, **kwargs):
+        """Simulate an escaping link resolution without requiring Windows symlink privileges."""
+        if value == path:
+            return base.parent / "external-program"
+        return resolve(value, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", linked_path)
+    with pytest.raises(CMakeError, match="outside its root"):
+        scenario.service.execution_path(WorkspacePath(f"{area}/linked-program"))
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(os.name != "nt", reason="Windows batch execution restriction")
+@pytest.mark.parametrize("suffix", [".cmd", ".BAT"])
+async def test_direct_run_rejects_windows_batch_files(request, monkeypatch, suffix):
+    """Keep Windows batch files out of the native executable launch surface."""
+    scenario = request.getfixturevalue("setup")
+    (scenario.workspace.root / ("test" + suffix)).write_text("echo test")
+    launch = AsyncMock()
+    monkeypatch.setattr(scenario.processes, "launch", launch)
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_run_test", {"executable": "test" + suffix})
+    assert response.is_error
+    launch.assert_not_awaited()
 
 
 @pytest.mark.anyio

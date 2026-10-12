@@ -324,7 +324,8 @@ class ProcessService:
 
     Feature results identify commands by process_id. Process state and ordered
     stdin/stdout/stderr logs are retained in memory until the server stops.
-    Arbitrary command execution is unavailable through the public surface.
+    This service exposes no command execution tools. cmake_run_test can launch an
+    explicit test executable inside project/storage through the CMake surface.
     """
 
     WIDGET = Widget("assets/process-overview.html")

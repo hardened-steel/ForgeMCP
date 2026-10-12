@@ -72,3 +72,16 @@ class CMakeTestResult(BaseModel):
         description="Null on success; failure explanation otherwise.",
     )
     process_id: int | None = None
+
+
+class CMakeRunTestResult(BaseModel):
+    """One direct executable run with its command inputs, error, and process reference."""
+
+    executable: WorkspacePath
+    arguments: list[str] = Field(default_factory=list)
+    cwd: WorkspacePath
+    error: str | None = Field(
+        default=None,
+        description="Null on success; failure explanation otherwise.",
+    )
+    process_id: int | None = None

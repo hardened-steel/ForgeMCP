@@ -63,6 +63,7 @@ def create_server(
     )
     builds = CMakeService(
         toolchains,
+        processes,
         profiles,
         project_root=workspace.root,
         storage_root=workspace.storage_root,
