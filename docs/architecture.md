@@ -340,7 +340,7 @@ It owns its build-tree filesystem operations.
 Operator profiles are parsed from repeated
 `--cmake-profile NAME KEY=VALUE ...` arguments; the default
 toolset is selected by `--cmake-toolset`. There is no environment-based profile
-configuration, persistent profile registry, or directory lock.
+configuration or persistent profile registry.
 
 Without explicit profiles, projects with a presets file receive one `presets`
 profile containing all available configure/build/test presets. Names come from
@@ -421,6 +421,63 @@ paths, and completions. They use fake ToolSpecs/process streams and isolated fix
 copies; installed compilers are not required. Workspace/server tests still
 target the former service methods and extension API; their migration follows the
 widget work as the last refactoring stage.
+
+### CMake configuration inputs and controlled mutations
+
+`CMakeService` owns per-build-directory baselines and context eligibility.
+`cmake/file_api.py` reads the latest successful index and its `cmakeFiles-v1`
+reference, validates source/build ownership, bounds JSON replies and input counts,
+and computes incremental SHA-256 hashes without retaining file contents. Configure
+requests `cmakeFiles-v1` alongside codemodel/cache/toolchains, including native
+presets with an explicitly known managed build directory. Unknown preset directories
+remain outside context discovery; ForgeMCP does not expand native presets.
+Each confirmed generation replaces that tree's complete dependency list, including
+managed generated inputs. External inputs and links escaping managed roots are
+excluded without reads or elicitation. This is an explicit boundary of freshness
+tracking, not a guarantee about SDK/toolchain inputs in external `root/` locations.
+The hashes and current/invalid state are in memory only. Startup never creates a
+baseline by hashing files against an old reply.
+
+`server.py` registers `CMakeProvider` beside diff and clangd for Workspace write,
+edit, move, delete, and mkdir. Its typed hooks only delegate to CMakeService.
+Before captures hashes for known dependencies beneath the affected paths and
+path kinds for structural changes. It never scans a directory to find dependencies.
+After verifies actual changes; error follows the same path to catch partial
+mutations. Identical replacements preserve freshness. Shared inputs invalidate
+all consuming trees, while ordinary C/C++ edits do not invalidate unless File API
+listed them as configuration inputs. Root CMakePresets/CMakeUserPresets files,
+including their initial absence, are conservatively tracked for every tree.
+No inheritance/include resolver is implemented; preset inputs not identified by
+File API or those known names are outside tracking.
+
+cmakeFiles 1.1 exposes `globsDependent`. When nonempty, any managed structural
+creation/removal/move conservatively invalidates that tree. With version 1.0,
+structural mutations invalidate every such tree because glob presence is unknown.
+No glob expression is interpreted or rescanned. Content-only edits of globbed
+source files remain ordinary source edits unless also listed in `inputs`.
+Missing files and changed contents invalidate through hashes, independently of
+mtime. No operation auto-configures, removes stale artifacts, or watches external
+changes. Configure and build also verify inputs at their controlled boundaries;
+external editor/IDE/process changes are not guaranteed to be noticed.
+
+A CMake operation lock serializes configure/build with each Workspace before-to-
+after/error interval. Publication enqueues independent snapshots without awaiting
+subscriber processing or taking the clangd lock. Clangd may hold its analysis lock
+while waiting for CMake's mutation verification, then reconciles the current
+snapshot before notifying sessions or collecting Workspace analysis. CMake never
+waits in the opposite direction. Cancellation/error paths release the operation
+lock and withdraw any tree whose freshness cannot be confirmed. An unchanged
+context/database fingerprint retains its session; removed contexts close only
+their own sessions. Old databases never restore an invalid/unknown tree.
+
+Build compares File API generation identities before/after the command. Only a
+new successful index confirms automatic regeneration and replaces dependencies;
+this confirmation is independent of the build exit code, so compilation errors
+after successful generation still publish the new context. A success exit with
+an unchanged index cannot adopt current input hashes as a new baseline. A newer
+CMake error index, failed configure, or interrupted command cannot confirm old
+artifacts. Profile failures do not withdraw independent build trees. Analysis
+errors explain unconfirmed/outdated inputs and direct the user to `cmake_configure`.
 
 ## External process execution
 
@@ -596,8 +653,9 @@ only when opened. External locations remain visible without bypassing read appro
 
 CMake retains successful configurations as
 `CompilationContext(id, toolset_id, build_directory, compilation_database)`.
-It starts from existing compilation databases, updates entries after configure,
-and drops entries whose databases disappear. Build directories come from profile parameters;
+It exposes candidates only while their build directory has a confirmed input
+baseline and its database exists. Existing artifacts at startup have unknown
+freshness and provide no context until a new configure confirms them. Build directories come from profile parameters;
 a single native preset can use an explicitly configured build directory (`-B`).
 Unknown directories are omitted rather than parsing command output or guessing
 CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
@@ -608,9 +666,10 @@ toolset or a system installation.
 
 `configuration_updates()` is CMake's in-process subscription stream. It yields the
 current list immediately and then yields changed snapshots when configure adds or
-removes a configuration. A slow subscriber keeps only the newest pending snapshot;
-it does not delay CMake. A new configure result is eligible only after CMake exits
-successfully and its `compile_commands.json` exists. Publication happens after each
+removes or invalidates a configuration, or build produces a new generation. A slow subscriber keeps only the newest pending snapshot;
+it does not delay CMake. A configure result is eligible only after CMake exits successfully, produces a
+new successful File API index, supplies readable managed configuration inputs,
+and its `compile_commands.json` exists. Publication happens after each
 profile execution, not on configure progress messages. Successful configure also
 publishes unchanged lists so subscribers can detect changed database contents at the
 same paths. Subscribers

@@ -273,21 +273,32 @@ class ClangdService(ResultProvider[WorkspaceContext]):
     async def configurations(self) -> list[CompilationContext]:
         """Return independent copies of currently usable compilation contexts."""
         self.check_ready()
-        return [context.model_copy(deep=True) for context in self.contexts.values()]
+        current = {context.id: context for context in await self.cmake.compilation_contexts()}
+        return [
+            context.model_copy(deep=True)
+            for context in self.contexts.values()
+            if current.get(context.id) == context
+        ]
 
     async def selection(self, configurations: Sequence[str]) -> list[CompilationContext]:
         """Validate requested configuration IDs, using all contexts for an empty selection."""
         contexts = await self.configurations()
-        unknown = set(configurations) - self.contexts.keys()
+        unknown = set(configurations) - {context.id for context in contexts}
         if unknown:
-            raise ClangdError(f"Unavailable clangd configurations: {', '.join(sorted(unknown))}.")
+            raise ClangdError(
+                f"Unavailable clangd configurations: {', '.join(sorted(unknown))}. "
+                "CMake inputs may be outdated or unconfirmed; run cmake_configure."
+            )
         selected = [
             context
             for context in contexts
             if not configurations or context.id in configurations
         ]
         if not selected:
-            raise ClangdError("No CMake configuration has both a compilation database and clangd.")
+            raise ClangdError(
+                "No confirmed CMake configuration has both a compilation database and clangd. "
+                "CMake inputs may be outdated or unconfirmed; run cmake_configure."
+            )
         return selected
 
     @asynccontextmanager
@@ -867,7 +878,9 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         databases = {context.compilation_database for context in self.contexts.values()}
         if any(change.path in databases for change in changes):
             await self.cmake.publish_configurations(refresh=True)
-            await self.update_configurations(await self.cmake.compilation_contexts())
+        # CMake's provider may still be checking this mutation. It never waits
+        # for analysis while holding its operation lock, so this order is safe.
+        await self.update_configurations(await self.cmake.compilation_contexts())
         notifications: list[JsonValue] = [
             {
                 "uri": self.workspace.resolve_workspace_path(change.path).as_uri(),

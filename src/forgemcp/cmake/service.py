@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import tempfile
+from collections import defaultdict
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import Annotated, cast
@@ -31,8 +31,20 @@ from forgemcp.toolchain.spec import Toolset
 from forgemcp.toolchain.tools import cmake, ctest
 from forgemcp.workspace.path import WorkspacePath
 
+from .build_tree import clear_build_directory, execution_path
 from .errors import CMakeError
-from .profiles import ProfileDefinition
+from .file_api import (
+    ConfigurationInputs,
+    WorkspaceChange,
+    compilation_database,
+    generation,
+    input_checksums,
+    input_path,
+    path_kind,
+    prepare_queries,
+    read_generation,
+)
+from .profiles import ProfileDefinition, require_configuration
 from .models import (
     CMakeProfile,
     CompilationContext,
@@ -59,6 +71,10 @@ class CMakeService:
     Configure before building; build before testing. Diagnose with a subset,
     then verify all profiles. Each execution reports error (null means success)
     and, when launched, process_id for its command log.
+
+    Workspace changes to configuration inputs withdraw affected clangd contexts.
+    Run cmake_configure to confirm unknown or outdated configurations. A build
+    may restore them through CMake's automatic generation. External edits are not watched.
 
     cmake_run_test runs an explicit project/storage test executable with literal
     arguments and a working directory, inheriting the server environment.
@@ -95,11 +111,13 @@ class CMakeService:
         self.default_toolset = default_toolset
         self.progress_interval = progress_interval
         self.configurations: dict[str, CompilationContext] = {}
-        self.configurations_loaded = False
+        self.inputs: defaultdict[WorkspacePath, ConfigurationInputs] = defaultdict(
+            ConfigurationInputs
+        )
+        self.operation_lock = asyncio.Lock()
         self.configuration_subscribers: dict[
             asyncio.Queue[list[CompilationContext]], tuple[str, ...]
         ] = {}
-        self.configuration_lock = asyncio.Lock()
 
     def toolset(self, selector: str) -> Toolset:
         """Resolve a toolset name or ID and require exactly one match."""
@@ -309,27 +327,6 @@ class CMakeService:
             raise CMakeError("Build directory belongs to another source project.")
         return cache
 
-    def require_configuration(
-        self,
-        cache: dict[str, str],
-        configuration: str | None,
-    ) -> None:
-        """Validate the requested configuration against single- or multi-config cache settings."""
-        choices = cache.get("CMAKE_CONFIGURATION_TYPES", "").split(";")
-        if choices != [""] and configuration not in choices:
-            raise CMakeError(
-                "Select an available multi-config configuration in the operator "
-                f"profile or preset: {', '.join(choices)}."
-            )
-        if (
-            choices == [""]
-            and configuration is not None
-            and cache.get("CMAKE_BUILD_TYPE") != configuration
-        ):
-            raise CMakeError(
-                "The build directory has a different configuration; configure this profile first."
-            )
-
     def configure_definitions(self, definition: ProfileDefinition) -> dict[str, str]:
         """Resolve compiler and toolchain settings and reject conflicting cache overrides."""
         result = dict(definition.definitions)
@@ -381,85 +378,42 @@ class CMakeService:
                 result["CMAKE_MAKE_PROGRAM"] = str(ninja.path)
         return result
 
-    def prepare_file_api(self, directory: WorkspacePath) -> None:
-        """Create managed File API query files for codemodel, cache, and toolchains."""
-        build_directory = self.build_path(directory)
-        reference = WorkspacePath(f"{directory}/.cmake/api/v1/query/client-forgemcp")
-        query = self.build_path(reference)
-        try:
-            build_directory.mkdir(parents=True, exist_ok=True)
-            query.mkdir(parents=True, exist_ok=True)
-            for name in ("codemodel-v2", "cache-v2", "toolchains-v1"):
-                target = WorkspacePath(f"{reference}/{name}")
-                file = self.build_path(target)
-                file.write_text("", encoding="utf-8")
-        except OSError as error:
-            raise CMakeError(f"Cannot prepare CMake File API in {directory}.") from error
-
-    def compilation_database(self, directory: WorkspacePath) -> WorkspacePath | None:
-        """Return the qualified compilation database path when the file exists."""
-        path = self.build_path(directory) / "compile_commands.json"
-        return WorkspacePath(f"{directory}/compile_commands.json") if path.is_file() else None
+    def current_contexts(self) -> list[CompilationContext]:
+        """Copy confirmed contexts whose databases still exist."""
+        available = []
+        for context in self.configurations.values():
+            snapshot = self.inputs.get(context.build_directory)
+            if snapshot is None or not snapshot.current:
+                continue
+            try:
+                database = compilation_database(
+                    context.build_directory,
+                    self.build_path(context.build_directory),
+                )
+            except (CMakeError, OSError):
+                continue
+            if database == context.compilation_database:
+                available.append(context.model_copy(deep=True))
+        return available
 
     async def compilation_contexts(
         self,
         profiles: Sequence[str] = (),
     ) -> list[CompilationContext]:
-        """Return successful configurations with databases that still exist."""
-        if not self.configurations_loaded:
-            try:
-                definitions, catalogs = await self.selection(None)
-            except (CMakeError, ToolchainError, ProcessError):
-                return []
-            for definition in definitions:
-                try:
-                    profile = self.resolve_profile(definition, catalogs)
-                    presets = self.operation_presets(profile, "configure")
-                except (CMakeError, ToolchainError):
-                    continue
-                for preset in presets:
-                    directory = profile.build_directory
-                    if directory is None or (preset is not None and len(presets) != 1):
-                        continue
-                    try:
-                        database = self.compilation_database(directory)
-                    except (CMakeError, OSError):
-                        continue
-                    if database is None:
-                        continue
-                    identifier = quote(profile.name, safe="")
-                    if preset is not None:
-                        identifier += "/" + quote(preset, safe="")
-                    self.configurations[identifier] = CompilationContext(
-                        id=identifier,
-                        toolset_id=profile.toolset_id,
-                        build_directory=directory,
-                        compilation_database=database,
-                    )
-            self.configurations_loaded = True
+        """Return confirmed contexts after any in-flight controlled mutation finishes."""
+        async with self.operation_lock:
+            current = self.current_contexts()
         if profiles:
             definitions, _ = await self.selection(list(profiles))
             selected = {quote(definition.name, safe="") for definition in definitions}
-        else:
-            selected = None
-        for identifier, context in tuple(self.configurations.items()):
-            try:
-                available = self.compilation_database(context.build_directory)
-            except (CMakeError, OSError):
-                available = None
-            if available != context.compilation_database:
-                del self.configurations[identifier]
-        return [
-            context.model_copy(deep=True)
-            for context in self.configurations.values()
-            if selected is None or context.id.split("/", 1)[0] in selected
-        ]
+            current = [item for item in current if item.id.split("/", 1)[0] in selected]
+        return current
 
     async def configuration_updates(self) -> AsyncGenerator[list[CompilationContext], None]:
-        """Yield the current configurations, then their latest changed snapshot."""
+        """Yield independent current snapshots; slow subscribers retain only the latest update."""
         queue: asyncio.Queue[list[CompilationContext]] = asyncio.Queue(maxsize=1)
-        async with self.configuration_lock:
-            current = await self.compilation_contexts()
+        async with self.operation_lock:
+            current = self.current_contexts()
             self.configuration_subscribers[queue] = tuple(
                 item.model_dump_json() for item in current
             )
@@ -468,41 +422,76 @@ class CMakeService:
             while True:
                 yield await queue.get()
         finally:
-            async with self.configuration_lock:
-                self.configuration_subscribers.pop(queue, None)
+            self.configuration_subscribers.pop(queue, None)
 
     async def publish_configurations(self, *, refresh: bool = False) -> None:
-        """Publish changed snapshots, or refresh databases after successful configure."""
-        if not self.configuration_subscribers:
-            return
-        async with self.configuration_lock:
-            current = await self.compilation_contexts()
-            signature = tuple(item.model_dump_json() for item in current)
-            for queue, previous in tuple(self.configuration_subscribers.items()):
-                if signature == previous and not refresh:
-                    continue
-                if queue.full():
-                    queue.get_nowait()
-                snapshot = [item.model_copy(deep=True) for item in current]
-                queue.put_nowait(snapshot)
-                self.configuration_subscribers[queue] = signature
+        """Enqueue snapshots without waiting for a subscriber or acquiring its locks."""
+        current = self.current_contexts()
+        signature = tuple(item.model_dump_json() for item in current)
+        for queue, previous in tuple(self.configuration_subscribers.items()):
+            if signature == previous and not refresh:
+                continue
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait([item.model_copy(deep=True) for item in current])
+            self.configuration_subscribers[queue] = signature
 
-    def execution_path(self, reference: WorkspacePath) -> Path:
-        """Resolve a test executable or working directory without escaping its managed root."""
-        if reference.area == "root":
-            raise CMakeError("Test execution paths must be inside project/ or storage/.")
-        base = self.project_root if reference.area == "project" else self.storage_root
+    async def begin_workspace(self, paths: Sequence[WorkspacePath]) -> WorkspaceChange | None:
+        """Serialize a mutation with CMake commands and capture affected known dependencies."""
+        if any(path.area == "root" for path in paths):
+            return None
+        await self.operation_lock.acquire()
+        affected: set[WorkspacePath] = set()
         try:
-            if os.name == "nt" and any(
-                os.path.isreserved(part) for part in Path(reference.relative).parts
-            ):
-                raise CMakeError(f"Test execution path contains a reserved name: {reference}.")
-            path = (base / reference.relative).resolve()
-            if not path.is_relative_to(base):
-                raise CMakeError(f"Test execution path resolves outside its root: {reference}.")
-            return path
-        except OSError as error:
-            raise CMakeError(f"Cannot resolve test execution path: {reference}.") from error
+            affected = {
+                dependency
+                for snapshot in self.inputs.values()
+                for dependency in snapshot.checksums
+                if any(
+                    dependency.area == path.area
+                    and Path(dependency.relative).is_relative_to(Path(path.relative))
+                    for path in paths
+                )
+            }
+            return WorkspaceChange(
+                inputs=input_checksums(affected, self.project_root, self.storage_root),
+                kinds={
+                    path: path_kind(input_path(path, self.project_root, self.storage_root))
+                    for path in paths
+                },
+            )
+        except BaseException:
+            for snapshot in self.inputs.values():
+                if snapshot.structural or affected & snapshot.checksums.keys():
+                    snapshot.current = False
+            self.operation_lock.release()
+            await self.publish_configurations()
+            raise
+
+    async def finish_workspace(self, context: WorkspaceChange) -> None:
+        """Verify actual input and structural changes, including partial failed mutations."""
+        try:
+            changed = {
+                path for path, digest in context.inputs.items()
+                if input_checksums((path,), self.project_root, self.storage_root)[path] != digest
+            }
+            structural = any(
+                path_kind(input_path(path, self.project_root, self.storage_root)) != kind
+                for path, kind in context.kinds.items()
+            )
+            for snapshot in self.inputs.values():
+                if changed.intersection(snapshot.checksums) or (structural and snapshot.structural):
+                    snapshot.current = False
+                elif any(path in snapshot.checksums for path in context.inputs):
+                    snapshot.verify(self.project_root, self.storage_root)
+        except BaseException:
+            for snapshot in self.inputs.values():
+                if snapshot.structural or context.inputs.keys() & snapshot.checksums.keys():
+                    snapshot.current = False
+            raise
+        finally:
+            self.operation_lock.release()
+            await self.publish_configurations()
 
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register profile inspection, configure, build, and test tools with their widgets."""
@@ -552,7 +541,6 @@ class CMakeService:
             await report(0, message="Preparing CMake configure")
             try:
                 definitions, catalogs = await self.selection(profiles)
-                await self.compilation_contexts()
             except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
             results: list[CMakeConfigureResult] = []
@@ -585,37 +573,27 @@ class CMakeService:
                     )
                     continue
                 for preset in presets:
-                    identifier = quote(profile.name, safe="")
-                    if preset is not None:
-                        identifier += "/" + quote(preset, safe="")
                     result = CMakeConfigureResult(
                         profile=profile.name,
                         preset=preset,
                         build_directory=profile.build_directory,
                     )
                     results.append(result)
+                    await self.operation_lock.acquire()
+                    previous = None
                     try:
+                        context = profile.compilation_context
+                        if context is not None:
+                            self.configurations[context.id] = context
                         key = (profile.toolset_id, preset, profile.build_directory)
+                        if profile.build_directory is not None and key not in configured:
+                            self.inputs[profile.build_directory].current = False
+                            previous = generation(self.build_path(profile.build_directory))
                         if preset is not None and key in configured:
                             prior = configured[key]
                             result.error = prior.error
                             result.process_id = prior.process_id
                             result.compilation_database = prior.compilation_database
-                            if (
-                                result.error is None
-                                and result.build_directory is not None
-                                and result.compilation_database is not None
-                                and len(presets) == 1
-                            ):
-                                self.configurations[identifier] = CompilationContext(
-                                    id=identifier,
-                                    toolset_id=profile.toolset_id,
-                                    build_directory=result.build_directory,
-                                    compilation_database=result.compilation_database,
-                                )
-                            else:
-                                self.configurations.pop(identifier, None)
-                            await self.publish_configurations()
                             continue
                         build_directory = (
                             self.build_path(profile.build_directory)
@@ -630,43 +608,27 @@ class CMakeService:
                             if (build_directory / "CMakeCache.txt").exists():
                                 cache = self.require_configured(profile)
                                 if cache.get("CMAKE_GENERATOR") != profile.generator:
-                                    await report_status("Clearing build directory for generator change")
-                                    if any(
-                                        protected.is_relative_to(build_directory)
-                                        for protected in self.protected_paths
-                                    ) or self.storage_root.is_relative_to(build_directory):
-                                        raise CMakeError("Build directory contains a protected path.")
-                                    if build_directory.exists():
-                                        def raise_walk_error(error: OSError) -> None:
-                                            """Propagate errors while checking a build tree before
-                                            generator replacement.
-                                            """
-                                            raise error
-
-                                        try:
-                                            for parent, directories, files in os.walk(
-                                                build_directory,
-                                                followlinks=False,
-                                                onerror=raise_walk_error,
-                                            ):
-                                                for name in (*directories, *files):
-                                                    item = Path(parent) / name
-                                                    if item.is_symlink() or item.is_junction():
-                                                        raise CMakeError(
-                                                            "Build directory contains a link or junction."
-                                                        )
-                                            base = (
-                                                self.project_root
-                                                if profile.build_directory.area == "project"
-                                                else self.storage_root
-                                            )
-                                            if not build_directory.resolve().is_relative_to(base):
-                                                raise CMakeError("Build directory escaped its root.")
-                                            shutil.rmtree(build_directory)
-                                            await self.publish_configurations()
-                                        except OSError as error:
-                                            raise CMakeError("Cannot clear build directory.") from error
-                            self.prepare_file_api(profile.build_directory)
+                                    await report_status(
+                                        "Clearing build directory for generator change"
+                                    )
+                                    clear_build_directory(
+                                        build_directory,
+                                        self.project_root
+                                        if profile.build_directory.area == "project"
+                                        else self.storage_root,
+                                        self.storage_root,
+                                        self.protected_paths,
+                                    )
+                                    await self.publish_configurations()
+                        if profile.build_directory is not None:
+                            prepare_queries(
+                                self.build_path(
+                                    WorkspacePath(
+                                        f"{profile.build_directory}/.cmake/api/v1/query/"
+                                        "client-forgemcp"
+                                    )
+                                )
+                            )
                         await report_status("Starting configure")
                         command = await methods["configure"](
                             self.project_root,
@@ -681,29 +643,78 @@ class CMakeService:
                         if command.return_code != 0:
                             result.error = f"CMake configure exited with {command.return_code}."
                         if command.return_code == 0 and result.build_directory is not None:
-                            result.compilation_database = self.compilation_database(result.build_directory)
+                            snapshot = read_generation(
+                                self.build_path(result.build_directory),
+                                previous,
+                                self.project_root,
+                                self.storage_root,
+                            )
+                            if snapshot is None:
+                                raise CMakeError(
+                                    "No new successful CMake File API generation; "
+                                    "run cmake_configure."
+                                )
+                            self.inputs[result.build_directory] = snapshot
+                            result.compilation_database = compilation_database(
+                                result.build_directory,
+                                self.build_path(result.build_directory),
+                            )
                         if preset is not None:
                             configured[key] = result
                     except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
-                    if (
-                        result.error is None
-                        and result.build_directory is not None
-                        and result.compilation_database is not None
-                        and (preset is None or len(presets) == 1)
-                    ):
-                        self.configurations[identifier] = CompilationContext(
-                            id=identifier,
-                            toolset_id=profile.toolset_id,
-                            build_directory=result.build_directory,
-                            compilation_database=result.compilation_database,
-                        )
-                    else:
-                        self.configurations.pop(identifier, None)
-                    await self.publish_configurations(refresh=result.error is None)
+                    finally:
+                        self.operation_lock.release()
+                        await self.publish_configurations(refresh=result.error is None)
                     await report_status(result.error or "Completed successfully")
             return tool_result(results, render_executions(results, "Configure"))
+
+        async def begin_build(profile: CMakeProfile) -> str | None:
+            """Check known inputs and capture the index preceding this build command."""
+            if profile.build_directory is None:
+                return None
+            self.inputs[profile.build_directory].verify(self.project_root, self.storage_root)
+            await self.publish_configurations()
+            return generation(self.build_path(profile.build_directory))
+
+        async def finish_build(
+            profile: CMakeProfile,
+            previous: str | None,
+            completed: bool,
+            result: CMakeBuildResult,
+        ) -> None:
+            """Publish build generation and always release the command lock."""
+            try:
+                context = profile.compilation_context
+                if context is not None:
+                    self.configurations[context.id] = context
+                if profile.build_directory is not None:
+                    self.inputs[profile.build_directory].verify(
+                        self.project_root,
+                        self.storage_root,
+                    )
+                    if (
+                        not completed
+                        or generation(self.build_path(profile.build_directory)) is None
+                    ):
+                        self.inputs[profile.build_directory].current = False
+                    if completed:
+                        snapshot = read_generation(
+                            self.build_path(profile.build_directory),
+                            previous,
+                            self.project_root,
+                            self.storage_root,
+                        )
+                        if snapshot is not None:
+                            self.inputs[profile.build_directory] = snapshot
+            except (CMakeError, OSError) as error:
+                if profile.build_directory is not None:
+                    self.inputs[profile.build_directory].current = False
+                result.error = result.error or str(error)
+            finally:
+                self.operation_lock.release()
+                await self.publish_configurations(refresh=completed)
 
         @apps.tool(
             resource_uri=self.BUILD_WIDGET.uri,
@@ -759,13 +770,17 @@ class CMakeService:
                         preset=preset,
                     )
                     results.append(result)
+                    await self.operation_lock.acquire()
+                    previous = None
+                    completed = False
                     try:
+                        previous = await begin_build(profile)
                         configuration = profile.configuration
                         result.configuration = configuration
                         build_directory = None
                         if preset is None:
                             cache = self.require_configured(profile)
-                            self.require_configuration(cache, configuration)
+                            require_configuration(cache, configuration)
                             build_directory = self.build_path(profile.build_directory)
                         await report_status("Starting build")
                         command = await methods["build"](
@@ -778,6 +793,7 @@ class CMakeService:
                             timeout=timeout,
                             on_progress=report_status,
                         )
+                        completed = True
                         result.completed_steps = command.completed_steps
                         result.total_steps = command.total_steps
                         result.process_id = command.process_id
@@ -786,6 +802,8 @@ class CMakeService:
                     except (CMakeError, ToolchainError, ProcessError) as error:
                         result.error = str(error)
                         result.process_id = getattr(error, "process_id", result.process_id)
+                    finally:
+                        await finish_build(profile, previous, completed, result)
                     await report_status(result.error or "Completed successfully")
             return tool_result(results, render_executions(results, "Build"))
 
@@ -849,7 +867,7 @@ class CMakeService:
                         build_directory = None
                         if preset is None:
                             cache = self.require_configured(profile)
-                            self.require_configuration(cache, configuration)
+                            require_configuration(cache, configuration)
                             build_directory = self.build_path(profile.build_directory)
                         temporary_root = self.build_path(WorkspacePath("storage/tmp"))
                         try:
@@ -913,8 +931,8 @@ class CMakeService:
             if any("\0" in value for value in values):
                 raise ToolError("Test arguments cannot contain NUL.")
             try:
-                program = self.execution_path(executable)
-                directory = self.execution_path(cwd)
+                program = execution_path(executable, self.project_root, self.storage_root)
+                directory = execution_path(cwd, self.project_root, self.storage_root)
                 if not program.is_file():
                     raise CMakeError(f"Test executable is not a file: {executable}.")
                 if not directory.is_dir():

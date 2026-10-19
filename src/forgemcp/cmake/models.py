@@ -1,6 +1,7 @@
 """CMake profiles and typed execution results shared with analysis and presentation."""
 
 from typing import Literal
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,22 @@ class CMakeProfile(BaseModel):
     test_presets: list[str] = Field(default_factory=list)
     configuration: str | None = None
     generator: str | None = None
+
+
+    @property
+    def compilation_context(self) -> "CompilationContext | None":
+        """Derive a candidate identity only for an unambiguous managed build directory."""
+        if self.build_directory is None or len(self.configure_presets) > 1:
+            return None
+        identifier = quote(self.name, safe="")
+        if self.configure_presets:
+            identifier += "/" + quote(self.configure_presets[0], safe="")
+        return CompilationContext(
+            id=identifier,
+            toolset_id=self.toolset_id,
+            build_directory=self.build_directory,
+            compilation_database=WorkspacePath(f"{self.build_directory}/compile_commands.json"),
+        )
 
 
 class CompilationContext(BaseModel):

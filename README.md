@@ -71,7 +71,7 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.4-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.5-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
@@ -83,7 +83,7 @@ The distribution name is `forge-cpp-mcp`; the Python module and server command a
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.4
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.5
 ```
 
 ## Setup from source
@@ -296,6 +296,36 @@ Managed excerpts are captured with the tool result; external `root/` locations h
 no source preview because explicit external reads require confirmation.
 
 ## CMake profiles
+
+CMake owns which configurations can supply clangd compilation contexts. After a
+successful configure/generate, ForgeMCP reads `cmakeFiles-v1` from a new CMake
+File API reply and records SHA-256 hashes of that build directory's configuration
+inputs in `project/` and `storage/`. Hashes and dependency lists live in memory;
+restart the server and run `cmake_configure` to confirm contexts again. Existing
+File API replies and `compile_commands.json` alone do not confirm current inputs.
+
+Workspace writes, edits, moves, deletions, and directory creation check known
+inputs at the operation boundary. Actual input changes withdraw affected contexts
+and notify clangd through the CMake subscription; identical content and ordinary
+source/header edits keep contexts available unless those files are CMake inputs.
+Known preset files are treated conservatively without resolving preset inheritance
+or includes. CONFIGURE_DEPENDS globs conservatively invalidate on structural
+changes; older File API replies without glob information use this policy for all
+configurations. No project-wide dependency scan or CMake/glob parser is used.
+
+Run `cmake_configure` to restore outdated or unknown contexts. `cmake_build` is
+also allowed for outdated configurations: a new successful File API generation
+can restore them even when later compilation fails. A successful build without
+regeneration does not refresh the input baseline. Failed configure/generate cannot
+reactivate old artifacts, and invalidation leaves build trees and databases intact.
+Unchanged contexts and database contents retain their clangd sessions.
+
+Checks occur only during Workspace mutations, configure, and build. There are no
+filesystem watchers, polling, or background scans, and no guarantee of detecting
+external editor/process changes. External `root/` dependencies are omitted from
+hash tracking without elicitation or reads; changes to those inputs require an
+explicit configure. Native preset contexts still require a known managed build
+directory and a compilation database.
 
 `cmake_profiles` lists profiles. `cmake_configure`, `cmake_build`, and `cmake_test`
 operate on all profiles unless a nonempty `profiles` list selects a subset.
