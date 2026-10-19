@@ -15,6 +15,7 @@ from forgemcp import __version__
 from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import parse_profiles
 from forgemcp.cmake.service import CMakeService
+from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
@@ -71,6 +72,7 @@ def create_server(
         default_toolset=cmake_toolset,
         progress_interval=progress_interval,
     )
+    workspace.register_provider("cmake", CMakeProvider(builds), tools=CMakeProvider.TOOLS)
     analysis = ClangdService(
         workspace,
         toolchains,

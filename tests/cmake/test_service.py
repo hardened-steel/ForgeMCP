@@ -6,100 +6,26 @@ import os
 from pathlib import Path
 import shutil
 import sys
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp import Client
-from mcp.server import MCPServer
-from mcp.server.apps import Apps
 
+from forgemcp.cmake.build_tree import execution_path
 from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import ProfileDefinition, parse_profiles
-from forgemcp.cmake.service import CMakeService
-from forgemcp.completion import Complete
-from forgemcp.process.service import ProcessService
 from forgemcp.process.models import ProcessOutput
 from forgemcp.toolchain.errors import ToolCommandError
-from forgemcp.toolchain.service import ToolchainService
-from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
 from forgemcp.toolchain.tools import cmake, ctest
 from forgemcp.workspace.path import WorkspacePath
-from forgemcp.workspace.service import WorkspaceService
+
+from tests.cmake.conftest import server, write_generation
 
 
 @pytest.fixture
 def anyio_backend():
     """Run async tests on the asyncio backend used by the process and LSP services."""
     return "asyncio"
-
-
-@pytest.fixture
-def setup(cpp_acceptance_project):
-    """Create an isolated CMake service with scripted tool operations and captured invocations."""
-    workspace = WorkspaceService(cpp_acceptance_project)
-    configure = AsyncMock(return_value=cmake.ConfigureResult(process_id=40))
-    build = AsyncMock(return_value=cmake.BuildResult(completed_steps=2, total_steps=2))
-    test = AsyncMock(return_value=ctest.TestResult(return_code=0, process_id=42))
-    presets = AsyncMock(
-        return_value=cmake.PresetsResult(
-            configure=["native"],
-            build=["native-build"],
-            test=["native-test"],
-        ),
-    )
-    tools = (
-        ToolSpec(
-            "cmake",
-            ToolKind.BUILD_SYSTEM,
-            workspace.root / "cmake",
-            {"configure": configure, "build": build, "presets": presets},
-        ),
-        ToolSpec(
-            "ctest",
-            ToolKind.TEST_RUNNER,
-            workspace.root / "ctest",
-            {"test": test},
-        ),
-        ToolSpec(
-            "ninja",
-            ToolKind.BUILD_RUNNER,
-            workspace.root / "ninja",
-            {},
-        ),
-    )
-    toolchains = ToolchainService(SimpleNamespace())
-    toolchains.toolsets = (Toolset("system", "System", tools, None, True),)
-    processes = ProcessService(workspace.root, allowed_roots=(workspace.storage_root,))
-    service = CMakeService(
-        toolchains,
-        processes,
-        project_root=workspace.root,
-        storage_root=workspace.storage_root,
-        protected_paths=workspace.protected_paths,
-        progress_interval=0,
-    )
-    return SimpleNamespace(
-        workspace=workspace,
-        service=service,
-        processes=processes,
-        configure=configure,
-        build=build,
-        test=test,
-        presets=presets,
-    )
-
-
-def server(service):
-    """Mount the service's Apps bindings on an in-process MCP server."""
-    apps = Apps()
-    mcp = MCPServer("cmake-unit", extensions=[apps])
-    service.register(mcp, apps, Complete())
-    for binding in apps.tools():
-        mcp.add_tool(binding.fn, meta=binding.meta, **binding.kwargs)
-    for binding in apps.resources():
-        mcp.add_resource(binding.resource)
-    return mcp
 
 
 @pytest.fixture
@@ -375,7 +301,11 @@ def test_execution_path_rejects_links_outside_the_selected_root(request, monkeyp
 
     monkeypatch.setattr(Path, "resolve", linked_path)
     with pytest.raises(CMakeError, match="outside its root"):
-        scenario.service.execution_path(WorkspacePath(f"{area}/linked-program"))
+        execution_path(
+            WorkspacePath(f"{area}/linked-program"),
+            scenario.workspace.root,
+            scenario.workspace.storage_root,
+        )
 
 
 @pytest.mark.anyio
@@ -507,7 +437,7 @@ async def test_generator_change_cleans_only_eligible_build_directory(setup, bloc
         assert not stale.exists()
         assert (directory / ".cmake/api/v1/query/client-forgemcp/codemodel-v2").is_file()
         assert kwargs["generator"] == "Ninja"
-        (directory / "compile_commands.json").write_text("[]")
+        write_generation(setup)
         return cmake.ConfigureResult(process_id=40)
 
     setup.configure.side_effect = configure
@@ -596,7 +526,7 @@ async def test_subscription_reports_successful_configs_and_removes_failed_or_mis
 
     async def configure(*args, **kwargs):
         """Create a scripted compilation database or return a failed configure outcome."""
-        (directory / "compile_commands.json").write_text("[]")
+        write_generation(setup)
         return cmake.ConfigureResult(process_id=40)
 
     setup.configure.side_effect = configure

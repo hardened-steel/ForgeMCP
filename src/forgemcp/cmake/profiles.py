@@ -96,3 +96,24 @@ def parse_profiles(
                 )
         profiles.append(profile)
     return tuple(profiles)
+
+
+def require_configuration(
+    cache: dict[str, str],
+    configuration: str | None,
+) -> None:
+    """Validate the requested configuration against single- or multi-config cache settings."""
+    choices = cache.get("CMAKE_CONFIGURATION_TYPES", "").split(";")
+    if choices != [""] and configuration not in choices:
+        raise CMakeError(
+            "Select an available multi-config configuration in the operator "
+            f"profile or preset: {', '.join(choices)}."
+        )
+    if (
+        choices == [""]
+        and configuration is not None
+        and cache.get("CMAKE_BUILD_TYPE") != configuration
+    ):
+        raise CMakeError(
+            "The build directory has a different configuration; configure this profile first."
+        )

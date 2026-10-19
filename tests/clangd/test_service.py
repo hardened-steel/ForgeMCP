@@ -18,6 +18,8 @@ from forgemcp.clangd.errors import (
 )
 from forgemcp.clangd.service import ClangdResource, ClangdService, HoverResult, group_results
 from forgemcp.clangd.models import Hover, HoverText, Position
+from forgemcp.cmake.file_api import ConfigurationInputs, checksum
+from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.cmake.service import CMakeService, CompilationContext
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
@@ -210,11 +212,15 @@ async def clangd_setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace
         storage_root=workspace.storage_root,
         protected_paths=workspace.protected_paths,
     )
-    cmake.configurations_loaded = True
     for name, toolset in (("debug", "llvm"), ("release", "llvm"), ("unavailable", "empty")):
         directory = workspace.root / f"build/{name}"
         directory.mkdir(parents=True)
         (directory / "compile_commands.json").write_text("[]")
+        cmake.inputs[WorkspacePath(f"project/build/{name}")] = ConfigurationInputs(
+            {WorkspacePath("project/CMakeLists.txt"): checksum(workspace.root / "CMakeLists.txt")},
+            structural=False,
+            current=True,
+        )
         cmake.configurations[name] = CompilationContext(
             id=name,
             toolset_id=toolset,
@@ -222,6 +228,7 @@ async def clangd_setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace
             compilation_database=WorkspacePath(f"project/build/{name}/compile_commands.json"),
         )
     service = ClangdService(workspace, toolchains, cmake, progress_interval=0)
+    workspace.register_provider("cmake", CMakeProvider(cmake), tools=CMakeProvider.TOOLS)
     workspace.register_provider("clangd", service, tools=service.PROVIDER_TOOLS)
     apps = Apps()
     mcp = MCPServer("clangd-unit", extensions=[apps])
@@ -718,3 +725,61 @@ async def test_empty_read_returns_no_diagnostics_or_highlighting(setup):
             assert all(not item.diagnostics for item in file.diagnostics)
             assert all(not item.spans for item in file.highlighting)
     assert all(running.session.document is None for running in setup.service.sessions.values())
+
+@pytest.mark.anyio
+async def test_cmake_input_invalidation_closes_only_affected_clangd_session(setup):
+    """Withdraw stale contexts through the subscription while retaining independent sessions."""
+    release = setup.cmake.inputs[WorkspacePath('project/build/release')]
+    release.checksums = {
+        WorkspacePath('project/README.md'): checksum(setup.workspace.root / 'README.md'),
+    }
+    original = dict(setup.service.sessions)
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            'workspace_write_file',
+            {'path': 'CMakeLists.txt', 'text': '# configuration changed'},
+        )
+        assert not response.is_error
+        assert 'debug' not in setup.service.contexts
+        assert setup.peers[0].closed
+        assert setup.service.sessions['release'] is original['release']
+        failed = await client.call_tool(
+            'clangd_diagnostics',
+            {'path': 'src/math.cpp', 'configurations': ['debug']},
+        )
+        assert failed.is_error
+        assert 'cmake_configure' in failed.content[0].text
+        assert 'outdated or unconfirmed' in failed.content[0].text
+    await setup.cmake.publish_configurations(refresh=True)
+    async with setup.service.lock:
+        pass
+    assert setup.service.sessions['release'] is original['release']
+    assert 'debug' not in setup.service.sessions
+    assert not setup.cmake.operation_lock.locked()
+
+
+@pytest.mark.anyio
+async def test_cmake_publication_does_not_wait_for_subscriber_analysis_lock(setup):
+    """Queue invalidation while clangd holds its lock without reversing the lock order."""
+    async with setup.service.lock:
+        async with asyncio.timeout(2):
+            context = await setup.cmake.begin_workspace((WorkspacePath('project/CMakeLists.txt'),))
+            (setup.workspace.root / 'CMakeLists.txt').write_text('# changed')
+            await setup.cmake.finish_workspace(context)
+            assert await setup.cmake.compilation_contexts() == []
+    async with asyncio.timeout(2):
+        while setup.service.contexts:
+            await asyncio.sleep(0)
+    async with setup.service.lock:
+        assert not setup.service.sessions
+
+@pytest.mark.anyio
+async def test_analysis_excludes_stale_context_before_subscriber_acquires_lock(setup):
+    """Do not expose cached contexts while a queued subscription update waits for analysis."""
+    async with setup.service.lock:
+        setup.cmake.inputs[WorkspacePath("project/build/debug")].current = False
+        await setup.cmake.publish_configurations()
+        assert "debug" in setup.service.contexts
+        assert [context.id for context in await setup.service.configurations()] == ["release"]
+        with pytest.raises(ClangdError, match="cmake_configure"):
+            await setup.service.selection(["debug"])
