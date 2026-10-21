@@ -1,0 +1,62 @@
+{
+  "type": "response",
+  "id": "widget-snapshot",
+  "result": {
+    "tools": [
+      {
+        "name": "workspace_read_file",
+        "description": "Read project UTF-8 text.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {"path": {"type": "string", "default": null}}
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "error": {
+              "anyOf": [{"type": "string"}, {"type": "null"}],
+              "default": null
+            }
+          }
+        },
+        "icons": [
+          {
+            "src": "data:image/svg+xml;base64,PHN2Zy8+",
+            "mimeType": "image/svg+xml",
+            "sizes": ["any"]
+          }
+        ],
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {"ui": {"resourceUri": "ui://forgemcp/workspace-file.html"}}
+      }
+    ],
+    "history": [
+      {
+        "id": "0123456789abcdef0123456789abcdef",
+        "tool_name": "workspace_read_file",
+        "arguments": {"path": "project/main.cpp", "end_line": null},
+        "started_at": "2026-10-21T12:00:00Z",
+        "finished_at": "2026-10-21T12:00:00Z",
+        "status": "completed",
+        "result": {
+          "content": [{"type": "text", "text": "1 | int main() {}"}],
+          "structuredContent": {
+            "path": "project/main.cpp",
+            "error": null,
+            "process_id": null,
+            "details": {"selected": null, "values": [null, "α"]}
+          },
+          "isError": false,
+          "resultType": "complete"
+        },
+        "progress": [],
+        "source": "stdio"
+      }
+    ]
+  }
+}

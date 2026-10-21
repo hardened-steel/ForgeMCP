@@ -71,19 +71,20 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.2.5-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.3.0-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
 The wheel includes the compiled HTML widgets and icons. No npm commands or separate
-frontend deployment are needed. CMake, Ninja, compilers, and clangd are external
+frontend deployment are needed. It also packages the local admin panel and its
+isolated widget host. CMake, Ninja, compilers, and clangd are external
 tools: install the ones needed by your workflows separately.
 The distribution name is `forge-cpp-mcp`; the Python module and server command are `forgemcp`.
 
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.2.5
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.3.0
 ```
 
 ## Setup from source
@@ -126,6 +127,75 @@ In VS Code, the `ForgeMCP: server` launch configuration is the one-button path: 
 builds the wheel first and then starts the server for this repository.
 
 All MCP traffic uses stdout. Operational logs must go to stderr.
+
+## Local admin panel
+
+Normal CLI launches automatically join one admin Hub for the current OS user.
+Each server remains an independent stdio process with its own workspace,
+environment, toolsets, processes, and clangd sessions. The Hub presents them as
+separate browser tabs; it does not move their services into a shared process.
+
+Open the panel while at least one server is running:
+
+```powershell
+forgemcp --open-admin
+```
+
+This command retrieves the private browser URL through same-user local IPC and
+opens the system browser, then exits. The startup message contains the public
+address and this command; the authentication token is never printed. Opening the
+public address in a new browser session alone does not authenticate that session.
+
+Each instance tab offers:
+
+- tool-call history from both MCP clients and the browser, with original arguments,
+  results, progress, timestamps, and errors;
+- the original MCP App widget, text fallback, and complete JSON result;
+- tool schemas, static resources, resource templates, and resource reading;
+- startup settings, process status, discovered toolsets, CMake configurations,
+  and retained clangd sessions;
+- browser responses to SDK elicitation requests, including external-file read
+  confirmation for commands initiated from the panel.
+
+Settings are read-only. Command controls start hidden; select **Enable command
+controls** to call an existing tool with literal JSON arguments; the catalog shows
+its input schema. These
+calls pass through the same SDK handlers, validation, and feature locks as stdio
+calls. There is no panel-wide execution queue. Existing modules decide which
+operations may run concurrently.
+The panel can cancel its own running commands; calls initiated by an MCP client
+remain owned by that client.
+
+The panel listens on `127.0.0.1`, preferring port 8765 and choosing a free port when
+that port is unavailable. Widgets use a second loopback port for their isolated
+host. The Hub stops shortly after the last server session ends; browser tabs do
+not keep it running. A temporary IPC disconnect is shown as reconnecting while
+the underlying server process remains alive. Lost tool calls are never replayed
+automatically; read the instance history after reconnecting before repeating one.
+
+History and linked widget result resources live only in the server's memory.
+Stopping that server loses its history; there is no database or disk archive.
+Process transcripts retain their existing in-memory lifecycle and are not copied
+into a separate admin log.
+
+Use these operator options when needed:
+
+```powershell
+forgemcp --no-admin
+forgemcp --admin-port 9000
+forgemcp --admin-ipc forgemcp-other
+forgemcp --open-admin --admin-ipc forgemcp-other
+```
+
+`--no-admin` opts that instance out of the panel. `--admin-port` is a preference
+when starting a new Hub; it does not change an already running Hub's port.
+Instances using the same `--admin-ipc` name share a Hub; a different name creates
+a separate group for the same OS user.
+
+The normal wheel build includes `admin.html` and `sandbox.html` alongside the MCP
+widgets. After changing frontend source, use the documented wheel build or
+`npm run build --prefix frontend`. An unbuilt source checkout returns an explicit
+missing-assets page until those files are generated.
 
 ## Connect Codex or Claude Code
 
