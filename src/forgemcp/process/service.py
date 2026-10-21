@@ -64,6 +64,7 @@ from .models import (
 
 from .transcript import select_transcript
 from .text import describe_status, render_details, render_overview
+from . import host
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,21 @@ class ProcessService:
     ICON = IconFile("icons/process.svg")
     RESOURCE_URI = "forgemcp://processes/{process_id}"
     OVERVIEW_URI = "forgemcp://processes"
+
+    @staticmethod
+    async def start_detached(
+        executable: str | Path,
+        arguments: Sequence[str],
+        *,
+        cwd: Path,
+    ) -> int:
+        """Launch the independently owned admin Hub without MCP streams or transcripts."""
+        return await host.start_detached(executable, arguments, cwd=cwd)
+
+    @staticmethod
+    async def open_browser(url: str) -> None:
+        """Open the local panel in response to an explicit operator CLI request."""
+        await host.open_browser(url)
 
     @staticmethod
     def format_timestamp(value: datetime) -> str:

@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
+import logging
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
 
 from forgemcp import __version__
+from forgemcp import local_ipc
+from forgemcp.admin.history import MemoryHistory
+from forgemcp.admin.instance import InstanceAgent
 from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.profiles import parse_profiles
 from forgemcp.cmake.service import CMakeService
@@ -19,6 +30,8 @@ from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
+from forgemcp.process.host import ProcessIdentity
+from forgemcp.process.errors import ProcessError
 from forgemcp.progress import validate_progress_interval
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.loader import load_tools
@@ -28,8 +41,179 @@ from forgemcp.workspace.service import WorkspaceService
 from forgemcp.workspace.diff import DiffProvider
 from forgemcp.workspace.errors import WorkspaceError
 
+logger = logging.getLogger(__name__)
 
-def create_server(
+
+@dataclass
+class ServerRuntime:
+    """Own one workspace's services once while stdio and the in-process client use them."""
+
+    workspace: WorkspaceService
+    processes: ProcessService
+    toolchains: ToolchainService
+    builds: CMakeService
+    analysis: ClangdService
+    history: MemoryHistory
+    settings: dict[str, Any]
+    mcp: MCPServer = field(init=False)
+    lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    closed: bool = False
+
+    @asynccontextmanager
+    async def lifespan(self) -> AsyncGenerator[dict[str, object]]:
+        """Share initialization and teardown across the transports of this runtime."""
+        async with self.lifecycle_lock:
+            if self.closed:
+                raise RuntimeError("This ForgeMCP runtime has already stopped.")
+            if self.users == 0:
+                try:
+                    await self.toolchains.initialize()
+                    await self.analysis.initialize()
+                except BaseException:
+                    self.closed = True
+                    try:
+                        await self.analysis.close()
+                    finally:
+                        await self.processes.close()
+                    raise
+            self.users += 1
+        try:
+            yield {}
+        finally:
+            async with self.lifecycle_lock:
+                self.users -= 1
+                if self.users == 0:
+                    self.closed = True
+                    try:
+                        await self.analysis.close()
+                    finally:
+                        await self.processes.close()
+
+    async def state_snapshot(self) -> dict[str, Any]:
+        """Read retained service state without scans, tool calls, or transcript copies."""
+        processes = []
+        for record in tuple(self.processes.records.values()):
+            async with record.lock:
+                processes.append(record.snapshot().model_dump(mode="json"))
+        running = sum(
+            item["status"]["current_status"] == "running" for item in processes
+        )
+        return {
+            "settings": self.settings,
+            "workspace": {
+                "busy": self.workspace.operation_lock.locked(),
+                "result_resources": len(self.workspace.result_resources),
+            },
+            "processes": {
+                "running": running,
+                "completed": len(processes) - running,
+                "processes": processes,
+            },
+            "toolsets": {
+                "initialized": self.toolchains.initialized,
+                "items": [
+                    {
+                        "id": toolset.id,
+                        "name": toolset.name,
+                        "tools": [tool.name for tool in toolset.tools],
+                    }
+                    for toolset in self.toolchains.toolsets
+                ],
+            },
+            "cmake": {
+                "configurations": [
+                    context.model_dump(mode="json")
+                    for context in self.builds.configurations.values()
+                ],
+            },
+            "clangd": {
+                "closed": self.analysis.closed,
+                "subscription_failed": self.analysis.subscription_failure is not None,
+                "sessions": [
+                    {"configuration_id": identifier}
+                    for identifier in self.analysis.sessions
+                ],
+                "contexts": [
+                    context.model_dump(mode="json")
+                    for context in self.analysis.contexts.values()
+                ],
+            },
+        }
+
+    async def run_stdio(
+        self,
+        *,
+        admin: bool,
+        ipc_name: str,
+        admin_port: int,
+    ) -> None:
+        """Hold application ownership until stdio and its admin bridge have both stopped."""
+        async with self.lifespan():
+            bridge_task: asyncio.Task[None] | None = None
+            agent: InstanceAgent | None = None
+            if admin:
+                identity = ProcessIdentity.current()
+                metadata = {
+                    "id": str(uuid4()),
+                    "pid": identity.pid,
+                    "process_started_at": identity.started_at,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "project_root": str(self.workspace.root),
+                    "storage_root": str(self.workspace.storage_root),
+                    "version": __version__,
+                }
+                last_spawn = float("-inf")
+
+                async def ensure_hub() -> None:
+                    """Bootstrap candidates sparingly; the OS endpoint elects the winner."""
+                    nonlocal last_spawn
+                    now = asyncio.get_running_loop().time()
+                    if now - last_spawn < 5:
+                        return
+                    last_spawn = now
+                    await self.processes.start_detached(
+                        sys.executable,
+                        [
+                            "-m",
+                            "forgemcp.server",
+                            "--admin-hub",
+                            "--admin-ipc",
+                            ipc_name,
+                            "--admin-port",
+                            str(admin_port),
+                        ],
+                        cwd=self.workspace.root,
+                    )
+
+                agent = InstanceAgent(
+                    self.mcp,
+                    self.history,
+                    metadata,
+                    state_snapshot=self.state_snapshot,
+                    ensure_hub=ensure_hub,
+                    ipc_name=ipc_name,
+                )
+                bridge_task = asyncio.create_task(agent.run())
+
+                def bridge_finished(task: asyncio.Task[None]) -> None:
+                    """Report a bridge lifecycle failure without logging request data."""
+                    if not task.cancelled() and task.exception() is not None:
+                        logger.warning("ForgeMCP admin bridge stopped; the stdio session remains active.")
+
+                bridge_task.add_done_callback(bridge_finished)
+            try:
+                await self.mcp.run_stdio_async()
+            finally:
+                if agent is not None:
+                    await agent.close()
+                if bridge_task is not None:
+                    bridge_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await bridge_task
+
+
+def create_runtime(
     workspace_root: Path | None = None,
     *,
     toolsets: list[list[str]] | None = None,
@@ -37,8 +221,8 @@ def create_server(
     progress_interval: float = 1.0,
     cmake_profiles: list[list[str]] | None = None,
     cmake_toolset: str = "system",
-) -> MCPServer:
-    """Compose dependencies explicitly and return a ready MCP server."""
+) -> ServerRuntime:
+    """Compose independent services and their shared transport lifetime explicitly."""
     validate_progress_interval(progress_interval)
     profiles = parse_profiles(cmake_profiles or (), cmake_toolset)
     root = workspace_root or Path.cwd()
@@ -87,19 +271,29 @@ def create_server(
     services = (workspace, processes, toolchains, builds, analysis)
     apps = Apps()
     complete = Complete()
+    history = MemoryHistory()
+    runtime = ServerRuntime(
+        workspace,
+        processes,
+        toolchains,
+        builds,
+        analysis,
+        history,
+        {
+            "project_root": str(workspace.root),
+            "storage_root": str(workspace.storage_root),
+            "progress_interval": progress_interval,
+            "cmake_toolset": cmake_toolset,
+            "cmake_profiles": cmake_profiles or [],
+            "toolset_definitions": toolsets or [],
+        },
+    )
 
     @asynccontextmanager
     async def lifespan(_: MCPServer) -> AsyncGenerator[dict[str, object]]:
-        """Initialize toolchains and analysis, then close analysis and processes on server exit."""
-        try:
-            await toolchains.initialize()
-            await analysis.initialize()
-            yield {}
-        finally:
-            try:
-                await analysis.close()
-            finally:
-                await processes.close()
+        """Join application-owned services without restarting them for the admin client."""
+        async with runtime.lifespan() as state:
+            yield state
 
     service_instructions = [inspect.getdoc(type(service)) for service in services]
     instructions = "\n\n".join(
@@ -117,6 +311,7 @@ def create_server(
         icons=[WorkspaceService.ICON.icon],
         extensions=[apps],
         lifespan=lifespan,
+        middleware=[history],
     )
 
     for service in services:
@@ -129,7 +324,28 @@ def create_server(
     for resource in apps.resources():
         mcp.add_resource(resource.resource)
     complete.register(mcp)
-    return mcp
+    runtime.mcp = mcp
+    return runtime
+
+
+def create_server(
+    workspace_root: Path | None = None,
+    *,
+    toolsets: list[list[str]] | None = None,
+    storage_root: Path | None = None,
+    progress_interval: float = 1.0,
+    cmake_profiles: list[list[str]] | None = None,
+    cmake_toolset: str = "system",
+) -> MCPServer:
+    """Return the public SDK server for embedding, without starting an admin Hub."""
+    return create_runtime(
+        workspace_root,
+        toolsets=toolsets,
+        storage_root=storage_root,
+        progress_interval=progress_interval,
+        cmake_profiles=cmake_profiles,
+        cmake_toolset=cmake_toolset,
+    ).mcp
 
 
 def argument_parser() -> argparse.ArgumentParser:
@@ -174,16 +390,53 @@ def argument_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Minimum seconds between progress notifications (default: 1; 0 disables throttling).",
     )
+    parser.add_argument(
+        "--no-admin",
+        action="store_true",
+        help="Run stdio without connecting this instance to the local admin panel.",
+    )
+    parser.add_argument(
+        "--open-admin",
+        action="store_true",
+        help="Open the running local admin panel in a browser, then exit.",
+    )
+    parser.add_argument(
+        "--admin-ipc",
+        default="forgemcp-hub",
+        help="Local per-user Hub endpoint name (default: forgemcp-hub).",
+    )
+    parser.add_argument(
+        "--admin-port",
+        type=int,
+        default=8765,
+        help="Preferred loopback HTTP port when starting a Hub (default: 8765).",
+    )
+    parser.add_argument("--admin-hub", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
 def main() -> None:
-    """Run ForgeMCP over stdio."""
+    """Run stdio, an automatically owned Hub, or an explicit browser-open command."""
     parser = argument_parser()
     arguments = parser.parse_args()
     try:
+        local_ipc.validate_name(arguments.admin_ipc)
+    except local_ipc.IpcError as error:
+        parser.error(str(error))
+    if not 0 <= arguments.admin_port <= 65535:
+        parser.error("--admin-port must be between 0 and 65535.")
+    if arguments.admin_hub:
+        asyncio.run(run_hub(arguments.admin_ipc, arguments.admin_port))
+        return
+    if arguments.open_admin:
+        try:
+            asyncio.run(open_admin(arguments.admin_ipc))
+        except (local_ipc.IpcError, ProcessError, RuntimeError, ValueError) as error:
+            parser.error(str(error))
+        return
+    try:
         parse_toolsets(arguments.toolset, load_tools())
-        server = create_server(
+        runtime = create_runtime(
             arguments.workspace,
             toolsets=arguments.toolset,
             storage_root=arguments.workspace_storage,
@@ -193,7 +446,40 @@ def main() -> None:
         )
     except (CMakeError, ToolchainError, WorkspaceError, ValueError) as error:
         parser.error(str(error))
-    server.run(transport="stdio")
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(message)s")
+    asyncio.run(
+        runtime.run_stdio(
+            admin=not arguments.no_admin,
+            ipc_name=arguments.admin_ipc,
+            admin_port=arguments.admin_port,
+        )
+    )
+
+
+async def run_hub(ipc_name: str, port: int) -> None:
+    """Let endpoint ownership select one detached Hub before opening HTTP ports."""
+    from forgemcp.admin.service import HubService
+
+    try:
+        listener = await local_ipc.listen(ipc_name)
+    except local_ipc.IpcAddressInUseError:
+        return
+    try:
+        await HubService(listener, port=port).run()
+    finally:
+        await listener.close()
+
+
+async def open_admin(ipc_name: str) -> None:
+    """Discover the private browser capability without revealing it in command logs."""
+    from forgemcp.admin.errors import HubRequestError
+    from forgemcp.admin.service import discover_url
+
+    try:
+        url = await discover_url(ipc_name)
+    except HubRequestError as error:
+        raise RuntimeError(str(error)) from error
+    await ProcessService.open_browser(url)
 
 
 if __name__ == "__main__":

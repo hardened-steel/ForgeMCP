@@ -11,6 +11,9 @@ Read-only clangd analysis is mounted through MCP tools and workspace
 result providers, with a shared analysis widget. Quality and debugger remain future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
+CLI instances also join a same-user local administration Hub by default. Each
+instance retains its own services and volatile call history; the Hub hosts one
+browser panel and routes commands back to the selected instance through local IPC.
 
 The design goal is a small composition root plus independent feature services. There
 is no plugin system, service locator, event bus, repository layer, or transport-neutral
@@ -23,6 +26,12 @@ src/forgemcp/
   server.py                     # composition root, CLI, MCPServer
   assets.py                     # package-relative Widget and IconFile helpers
   completion.py                 # one server-wide completion dispatcher
+  admin/
+    history.py                  # SDK middleware and in-memory tool-call records
+    instance.py                 # one SDK client and reconnecting instance IPC bridge
+    service.py                  # shared loopback HTTP panel and instance routing
+    errors.py                   # expected administration request failures
+  local_ipc/                    # same-user Windows pipes / Unix sockets and framing
   assets/*.html                 # generated single-file widgets
   icons/*                       # source icon files packaged with the server
   <feature>/
@@ -31,6 +40,7 @@ src/forgemcp/
     text.py                     # plain-text presentation where substantial
   process/
     service.py                  # subprocess lifecycle, streams, state, MCP inspection
+    host.py                     # detached operator programs and OS process identities
     models.py                   # session results and MCP-facing process state
     errors.py                   # expected process failures
   toolchain/
@@ -61,20 +71,27 @@ interfaces and factories for hypothetical parsers or kit providers.
 
 `src/forgemcp/server.py` is the only composition root:
 
-1. Resolve operator configuration such as the workspace root.
+1. `create_runtime` resolves operator configuration such as the workspace root.
 2. Construct `WorkspaceService`, then `ProcessService` with the project and storage
    directories as allowed working roots, then feature services with explicit dependencies.
 3. Create one `Apps` instance.
 4. Create one `Complete` completion collector.
-5. Construct `MCPServer(extensions=[apps])`, composing its instructions from the base
-   text and every service class docstring.
+5. Construct `MCPServer(extensions=[apps], middleware=[history])`, composing its
+   instructions from the base text and every service class docstring.
 6. Call each service's single `register(mcp, apps, complete)` method.
 7. Mount the validated Apps tools and resources through their public bindings and
    register the one server-wide completion handler.
-8. Run the selected transport; stdio is the default and the workspace defaults to the
-   server process working directory. Before accepting requests, the server lifespan
-   awaits toolchain discovery; it closes remaining managed processes during shutdown,
-   including when discovery fails.
+8. `ServerRuntime.run_stdio` holds the application lifespan while stdio and the
+   optional persistent administration client use the same services. The workspace
+   defaults to the server process working directory. The first lifespan user awaits
+   toolchain and clangd initialization; reference-counted users share that completed
+   initialization. Only the final user closes analysis and managed processes,
+   including cleanup after discovery failure.
+
+`create_server` remains the embedding entrypoint returning the SDK `MCPServer`;
+it does not start an administration Hub. The CLI creates a runtime and enables its
+admin bridge unless `--no-admin` is supplied. The internal Hub CLI branch runs
+before feature construction, so the Hub owns no workspace or toolchain services.
 
 Steps 3-7 are deliberately visible. MCP Python SDK 2.1 fixes extensions at server
 construction and consumes their bindings at that point. The empty `Apps` extension is
@@ -86,6 +103,14 @@ SDK access.
 A service may depend on another service, but receives it in `__init__`. It never
 creates that dependency itself. This keeps tests local and makes application state
 ownership visible in `server.py`.
+
+The lifetime lock coordinates service initialization and final shutdown only.
+It does not serialize tool execution. Workspace keeps its existing reentrant
+operation lock, and clangd coordinates its analysis and Workspace provider hooks
+through its own lock. CMake's operation lock serializes configure/build operations
+and the Workspace provider's before-to-after/error interval; its publication lock
+protects subscription snapshots. There is no global command queue or cross-instance
+coordination of a shared source/build directory.
 
 ## Feature service contract
 
@@ -516,6 +541,12 @@ module. `close()` and context exit stop a remaining process and await all worker
 session exposes `process_id` and `returncode` without exposing its queue protocol as
 the consumer API.
 
+Two local operator actions also belong to the process module: `start_detached`
+starts a Hub with explicit arguments and disconnected standard streams, and
+`open_browser` opens the operator-requested admin URL. They are not MCP execution
+tools and do not create development-command transcripts. `ProcessIdentity` uses
+psutil's PID and process birth time to distinguish a live runtime from a reused PID.
+
 Each pipe owns an incremental decoder so a multibyte character split across OS reads
 is reconstructed correctly. The default encoding is `locale.getencoding()` and each
 consumer may select an explicit encoding. Replacement decoding is the resilient
@@ -915,6 +946,151 @@ When adding a widget, wire its source into the Vite build and Python `Widget` bi
 and verify its generated HTML and icon are packaged. Build with
 `npm run build --prefix frontend` or the wheel build. Do not add or run automated
 widget tests; the user reviews appearance and behavior visually.
+
+## Local administration
+
+The CLI starts independent stdio runtimes. Each has its own inherited environment,
+toolsets, CMake state, clangd sessions, managed processes, and `MemoryHistory`.
+`InstanceAgent` keeps one in-process SDK `Client(mcp, cache=None)` and one outgoing
+local IPC connection to a shared `HubService`. The Hub serves the browser and routes
+requests; it never constructs feature services or replays their startup environment.
+
+The local IPC endpoint elects one Hub per OS user and logical endpoint name
+(`--admin-ipc`, default `forgemcp-hub`). Competing detached Hub candidates exit if
+another listener owns that endpoint. Windows uses same-user named pipes with
+explicit user permissions and kernel peer checks. Unix uses a private per-user
+socket directory, peer identity checks, and exclusive listener ownership. The
+shared interface exchanges bytes framed by a four-byte unsigned big-endian length;
+`receive()` returns `None` only for clean EOF between frames. Requests and responses
+may use the duplex connection concurrently without interleaving frames.
+
+An instance registers its UUID, PID, OS process birth time, roots, startup time,
+and version. The Hub checks kernel peer PID when available and checks process
+identity using psutil. A temporary connection loss marks that instance disconnected
+but retains it while the same process remains alive; PID reuse does not preserve a
+dead session. The agent reconnects with bounded backoff and can ask the composition
+root to start a replacement Hub. Closing stdio unregisters the runtime. The Hub
+allows 15 seconds for initial registration, then stops three seconds after the last
+runtime ends. Browser connections and history views do not extend that lifetime.
+
+The panel prefers `127.0.0.1:8765`, falling back to a reserved free port. Its Apps
+sandbox uses a second loopback port and browser origin. `--admin-port` affects only
+Hub startup; `--no-admin` excludes an individual CLI instance from administration.
+`--open-admin` discovers the bootstrap URL through same-user IPC and opens the
+browser through the process module. Bootstrap credentials remain in memory and
+are never written to operational logs or a token file. The frontend exchanges the
+capability for an HttpOnly, same-site session cookie and a CSRF token. HTTP endpoints
+check the expected Host, browser Origin/fetch context, and session; POST requests
+also require `X-ForgeMCP-Token`. This is a local operator interface, not a remote
+network administration service.
+
+### SDK reuse and call history
+
+Hub commands use the existing SDK client methods for catalog listing, tool calls,
+resource reads, and template listing. This preserves handler schemas, validation,
+real request Context, progress, and SDK elicitation behavior. Direct
+`MCPServer.call_tool()` is not used by HTTP handlers: it bypasses middleware and
+does not construct a transport request Context. Apps support is advertised by the
+in-process client. Concurrent commands reach the same feature service instances;
+their existing locks determine execution order.
+
+`MemoryHistory` is SDK middleware for `tools/call`. Each request receives its own
+UUID, independently of the JSON-RPC or Hub transport request ID. Records retain
+tool name, arguments, source (`stdio` or `admin`), start/finish timestamps, status,
+error, reported progress, and the SDK result. Input-required rounds are observable
+SDK requests; the middleware does not hold a global execution slot while a client
+asks for confirmation. The common progress helper attaches the notifications it
+reports to the currently active history record through a ContextVar. The admin
+client's direct SDK dispatch carries the source context in the requesting task.
+
+Results stay as SDK data in memory; the bridge serializes standard Pydantic models
+with `model_dump(mode="json", by_alias=True, exclude_none=True)` only at the IPC
+boundary. Absent optional SDK fields are omitted, as required by MCP and the Apps
+handshake schemas; explicit null values inside arguments, JSON schemas, and
+structured result dictionaries are preserved. Default invocation IDs, timestamps,
+and progress arrays remain present. Original
+`content`, `structuredContent`, `isError`, metadata, empty values, and nested fields
+remain available to the browser. A successful SDK exchange can still contain a
+feature failure, such as a CMake profile's `error`; the structured result remains
+the authority for that feature's outcome.
+
+No database, history archive, or result-resource mirror is created. The Hub stores
+only live instance registration and pending response routing. History belongs to
+the running instance and disappears when it stops. Workspace's existing immutable
+result resources and ProcessService's transcripts keep their existing owners;
+the admin layer does not archive or copy them into another log.
+
+History, elicitation, and periodic service-state changes send small invalidation
+events rather than complete result copies. The browser uses an SSE stream and
+fetches snapshots on demand. Monitor state is sampled from retained service data,
+without filesystem scans, version probes, or synthetic MCP tool calls. Service
+state invalidations occur every two seconds while the instance is connected.
+An IPC failure fails outstanding Hub responses; already-started instance calls
+are not automatically repeated. Their eventual result remains in instance history.
+
+### HTTP and IPC surface
+
+The main browser entrypoint is `/` (also `/admin.html`). `/api/session` establishes
+the authenticated browser session, `/api/events` streams invalidations, and
+`/api/instances` lists registered sessions. The instance-scoped endpoints are:
+
+| HTTP route below `/api/instances/{instance_id}` | Behavior |
+| --- | --- |
+| `GET /snapshot` | Instance identity, tools, static resources, resource templates, history, and service state |
+| `GET /history` | Retained tool-call records |
+| `GET /calls/{call_id}` | One original invocation and result |
+| `POST /calls/{call_id}/cancel` | Request cancellation of the admin client's own running call; returns `{"cancelled":true}` when accepted |
+| `GET /state` | Read-only startup settings and retained service monitor data |
+| `GET /tools` | SDK tool metadata and input/output schemas |
+| `POST /tools/{tool_name}` | Call the tool with `{"arguments": {...}}` |
+| `GET /resources` | SDK static resource listing |
+| `GET /resource-templates` | SDK resource-template listing |
+| `GET /resources?uri=...` | Read the selected resource through the SDK |
+| `GET /elicitations` | Pending questions for this instance's admin client |
+| `POST /elicitations/{id}` | Supply an SDK elicitation `{"result": {...}}` |
+
+The bridge uses explicit JSON envelopes on local IPC: registration is
+`{"type":"register","instance":{...}}`, acknowledged by
+`{"type":"registered","hub_id":"...","url":"..."}`. Commands use
+`{"type":"request","id":"...","method":"...","params":{...}}`; responses
+echo that transport ID and carry either `result` or `error`. Change notifications
+use `{"type":"event","kind":"...","version":N}`. Reconnection does not replay
+requests. The `discover` exchange retrieves the private browser URL without
+registering a runtime; `unregister` ends an instance's registration.
+
+### Browser behavior and widgets
+
+Each registered runtime has a tab with its own selected history record, catalog,
+read-only settings, and monitors. Existing tool schemas drive command controls,
+with JSON arguments available for complete input. Command controls are initially
+hidden and must be explicitly enabled in the panel; this UI choice does not create
+a second authorization or validation policy for the tools.
+
+The selected invocation offers its MCP widget, readable text, and complete raw JSON.
+The admin host loads the tool's registered `ui://` HTML and connects it using the
+Apps bridge through the separate-origin sandbox proxy. Resource reads made for a
+widget include the original `call_id`: the instance allows only an exact URI in
+that result's `structuredContent.resources`, under
+`forgemcp://workspace/results/`. The original HTML is read separately. Widgets
+remain bound to one invocation and cannot use the admin host to execute tools or
+browse arbitrary resources. Historical resources are read from their original
+in-memory owner, so they are unavailable after the runtime stops.
+
+Cancellation correlates a retained call's admin request ID with the agent's active
+SDK task. The cancel endpoint accepts an empty object and returns
+`{"cancelled":false}` when that call is no longer active. Requests to cancel a
+call owned by stdio are rejected.
+Cancelling an admin task uses normal SDK and feature cleanup; it does not create
+a second process-termination path or cancel another MCP client's requests.
+
+Elicitation from a web-initiated command is forwarded to the browser as the SDK's
+form or URL request. A response completes that admin client's pending question;
+unanswered questions cancel after five minutes. Elicitation originating from stdio
+continues to belong to the original MCP client and is not answered by the panel.
+
+Vite builds the standalone panel and sandbox proxy into `assets/admin.html` and
+`assets/sandbox.html`; the wheel hook packages both alongside the tool widgets.
+The Hub returns a clear missing-assets page when those generated files are absent.
 
 ## Errors and trust boundaries
 

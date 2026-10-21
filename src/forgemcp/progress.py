@@ -1,6 +1,7 @@
 """Per-invocation throttling of MCP progress notifications."""
 
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from math import isfinite
 from time import monotonic
 
@@ -8,6 +9,10 @@ from mcp.server.mcpserver import Context
 
 
 type Progress = Callable[[str], Awaitable[None]]
+
+progress_collector: ContextVar[
+    Callable[[float, float | None, str | None], None] | None
+] = ContextVar("forgemcp_progress_collector", default=None)
 
 
 def validate_progress_interval(interval: float) -> float:
@@ -38,6 +43,8 @@ def progress(
         if last_sent is not None and now - last_sent < interval:
             return
         last_sent = now
+        if collector := progress_collector.get():
+            collector(value, total, message)
         await ctx.report_progress(value, total=total, message=message)
 
     return report

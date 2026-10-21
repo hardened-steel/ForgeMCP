@@ -17,6 +17,8 @@ const widgets = {
   "cmake-test": "cmake-test",
   "cmake-run-test": "cmake-run-test",
   clangd: "clangd-result",
+  admin: "admin",
+  sandbox: "sandbox",
 };
 
 export default defineConfig(({ mode }) => {
