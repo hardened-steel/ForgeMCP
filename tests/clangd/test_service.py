@@ -763,9 +763,11 @@ async def test_cmake_publication_does_not_wait_for_subscriber_analysis_lock(setu
     """Queue invalidation while clangd holds its lock without reversing the lock order."""
     async with setup.service.lock:
         async with asyncio.timeout(2):
-            context = await setup.cmake.begin_workspace((WorkspacePath('project/CMakeLists.txt'),))
+            context = await setup.cmake.begin_source_change(
+                (WorkspacePath('project/CMakeLists.txt'),),
+            )
             (setup.workspace.root / 'CMakeLists.txt').write_text('# changed')
-            await setup.cmake.finish_workspace(context)
+            await setup.cmake.finish_source_change(context)
             assert await setup.cmake.compilation_contexts() == []
     async with asyncio.timeout(2):
         while setup.service.contexts:

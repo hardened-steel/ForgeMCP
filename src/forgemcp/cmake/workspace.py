@@ -34,7 +34,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         text: str,
     ) -> WorkspaceChange | None:
         """Capture dependencies affected by replacing one file."""
-        return await self.service.begin_workspace((path,))
+        return await self.service.begin_source_change((path,))
 
     async def after_workspace_write_file(
         self,
@@ -43,7 +43,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         result: FileWriteResult,
     ) -> None:
         """Verify the completed write without adding a result resource."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)
 
     async def before_workspace_edit_file(
         self,
@@ -54,7 +54,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         replace_all: bool,
     ) -> WorkspaceChange | None:
         """Capture dependencies affected by an exact file edit."""
-        return await self.service.begin_workspace((path,))
+        return await self.service.begin_source_change((path,))
 
     async def after_workspace_edit_file(
         self,
@@ -63,7 +63,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         result: FileEditResult,
     ) -> None:
         """Verify the completed edit without adding a result resource."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)
 
     async def before_workspace_move(
         self,
@@ -72,7 +72,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         destination: WorkspacePath,
     ) -> WorkspaceChange | None:
         """Capture known dependencies under both source and destination."""
-        return await self.service.begin_workspace((source, destination))
+        return await self.service.begin_source_change((source, destination))
 
     async def after_workspace_move(
         self,
@@ -81,7 +81,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         result: PathOperationResult,
     ) -> None:
         """Verify a file or directory move without scanning the project."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)
 
     async def before_workspace_delete(
         self,
@@ -89,7 +89,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         path: WorkspacePath,
     ) -> WorkspaceChange | None:
         """Capture known dependencies beneath the deletion target."""
-        return await self.service.begin_workspace((path,))
+        return await self.service.begin_source_change((path,))
 
     async def after_workspace_delete(
         self,
@@ -98,7 +98,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         result: PathOperationResult,
     ) -> None:
         """Verify deletion without adding a result resource."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)
 
     async def before_workspace_mkdir(
         self,
@@ -106,7 +106,7 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         path: WorkspacePath,
     ) -> WorkspaceChange | None:
         """Capture the path kind for conservative glob invalidation."""
-        return await self.service.begin_workspace((path,))
+        return await self.service.begin_source_change((path,))
 
     async def after_workspace_mkdir(
         self,
@@ -115,8 +115,8 @@ class CMakeProvider(ResultProvider[WorkspaceChange]):
         result: PathOperationResult,
     ) -> None:
         """Verify actual directory creation, ignoring an already existing directory."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)
 
     async def error(self, call_id: str, context: WorkspaceChange) -> None:
         """Check partial changes and release the mutation lock after failure or cancellation."""
-        await self.service.finish_workspace(context)
+        await self.service.finish_source_change(context)

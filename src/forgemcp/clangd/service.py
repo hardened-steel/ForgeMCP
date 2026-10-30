@@ -898,6 +898,37 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                 await self.close_session(identifier)
                 raise
 
+    @asynccontextmanager
+    async def source_change(self) -> AsyncGenerator[None]:
+        """Exclude analysis during a batch mutation; callers finish CMake before refreshing."""
+        async with self.lock:
+            try:
+                yield
+            except BaseException:
+                await self.close_sessions()
+                raise
+
+    async def refresh_source_changes(
+        self,
+        changes: Sequence[FileChange] | None,
+    ) -> None:
+        """Reconcile CMake and saved-source changes while the caller holds the analysis lock.
+
+        None represents an unknown change set and discards potentially stale indexes.
+        This method collects no diagnostics and never performs CMake configuration.
+        """
+        if self.closed:
+            return
+        try:
+            if changes is None:
+                await self.close_sessions()
+                await self.update_configurations(await self.cmake.compilation_contexts())
+            else:
+                await self.synchronize_changes(changes)
+        except BaseException:
+            await self.close_sessions()
+            raise
+
     @staticmethod
     def overlaps_lines(span: SourceRange, start_line: int, end_line: int | None) -> bool:
         """Test intersection with inclusive lines while respecting exclusive LSP range ends."""

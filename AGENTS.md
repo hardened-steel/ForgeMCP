@@ -101,6 +101,9 @@ Before designing or changing a module, read:
   paths unless an absolute path is explicitly part of a local operator command.
   External `root/` locations may be returned by analysis; explicit reads require
   SDK elicitation approval, writes are forbidden, and no mirror resources exist.
+  Git CLI commands run in the configured worktree and may access that repository's
+  own administrative data outside these roots, as required by linked worktrees.
+  This does not extend Workspace file-tool access or permit selecting another worktree.
 - Bound scans, filesystem output, and process time, except workspace scans/output,
   which are deliberately unbounded in the current design (see `docs/architecture.md`). Process transcripts are
   temporarily retained in full memory by design; do not create additional copies,

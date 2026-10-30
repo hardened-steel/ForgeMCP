@@ -436,8 +436,13 @@ class CMakeService:
             queue.put_nowait([item.model_copy(deep=True) for item in current])
             self.configuration_subscribers[queue] = signature
 
-    async def begin_workspace(self, paths: Sequence[WorkspacePath]) -> WorkspaceChange | None:
-        """Serialize a mutation with CMake commands and capture affected known dependencies."""
+    async def begin_source_change(
+        self,
+        paths: Sequence[WorkspacePath] | None = None,
+    ) -> WorkspaceChange | None:
+        """Capture known dependencies under supplied paths, or both roots for a batch mutation."""
+        if paths is None:
+            paths = (WorkspacePath("project/"), WorkspacePath("storage/"))
         if any(path.area == "root" for path in paths):
             return None
         await self.operation_lock.acquire()
@@ -468,19 +473,29 @@ class CMakeService:
             await self.publish_configurations()
             raise
 
-    async def finish_workspace(self, context: WorkspaceChange) -> None:
-        """Verify actual input and structural changes, including partial failed mutations."""
+    async def finish_source_change(
+        self,
+        context: WorkspaceChange,
+        *,
+        structural: bool = False,
+        uncertain: bool = False,
+    ) -> None:
+        """Verify batch input and structural changes, or withdraw uncertain contexts."""
         try:
             changed = {
                 path for path, digest in context.inputs.items()
                 if input_checksums((path,), self.project_root, self.storage_root)[path] != digest
             }
-            structural = any(
+            structural = structural or any(
                 path_kind(input_path(path, self.project_root, self.storage_root)) != kind
                 for path, kind in context.kinds.items()
             )
             for snapshot in self.inputs.values():
-                if changed.intersection(snapshot.checksums) or (structural and snapshot.structural):
+                if (
+                    uncertain
+                    or changed.intersection(snapshot.checksums)
+                    or (structural and snapshot.structural)
+                ):
                     snapshot.current = False
                 elif any(path in snapshot.checksums for path in context.inputs):
                     snapshot.verify(self.project_root, self.storage_root)

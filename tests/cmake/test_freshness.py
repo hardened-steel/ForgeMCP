@@ -383,7 +383,7 @@ async def test_workspace_error_checks_partial_changes_and_releases_lock(
         scenario.workspace.root,
         scenario.workspace.storage_root,
     )
-    call = await scenario.service.begin_workspace(
+    call = await scenario.service.begin_source_change(
         (WorkspacePath("project/CMakeLists.txt"),)
     )
     if partial:
@@ -393,7 +393,7 @@ async def test_workspace_error_checks_partial_changes_and_releases_lock(
     assert scenario.service.inputs[directory].current is not partial
     assert not scenario.service.operation_lock.locked()
     async with asyncio.timeout(2):
-        call = await scenario.service.begin_workspace(
+        call = await scenario.service.begin_source_change(
             (WorkspacePath("project/CMakeLists.txt"),)
         )
         await provider.error("next-call", call)
@@ -510,7 +510,7 @@ async def test_unreadable_input_releases_lock_and_preserves_independent_tree(
             scenario.workspace.storage_root,
         )
     paths = (WorkspacePath("project/CMakeLists.txt"),)
-    context = await scenario.service.begin_workspace(paths) if stage == "after" else None
+    context = await scenario.service.begin_source_change(paths) if stage == "after" else None
 
     def unreadable(*_args, **_kwargs):
         """Simulate an input becoming unreadable without depending on platform ACL semantics."""
@@ -519,9 +519,9 @@ async def test_unreadable_input_releases_lock_and_preserves_independent_tree(
     monkeypatch.setattr("forgemcp.cmake.service.input_checksums", unreadable)
     with pytest.raises(OSError):
         if stage == "before":
-            await scenario.service.begin_workspace(paths)
+            await scenario.service.begin_source_change(paths)
         else:
-            await scenario.service.finish_workspace(context)
+            await scenario.service.finish_source_change(context)
     assert not scenario.service.operation_lock.locked()
     assert not scenario.service.inputs[WorkspacePath("storage/build/cmake-debug")].current
     assert scenario.service.inputs[WorkspacePath("storage/build/cmake-release")].current

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field
+import psutil
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
@@ -79,6 +80,7 @@ class ProcessRecord:
     transcript: list[ProcessLogEntry] = field(default_factory=list)
     next_line: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    job: Any = field(default=None, repr=False)
 
     def append_log(self, stream: ProcessStream, text: str, time: float) -> None:
         """Append under the record lock; all streams share one line sequence."""
@@ -104,17 +106,36 @@ class ProcessRecord:
         )
 
     async def terminate(self, process: Process) -> None:
-        """Request termination, escalate to kill after two seconds, and reap the process."""
+        """Stop the process and its current descendants, escalating after two seconds."""
         try:
-            process.terminate()
+            children = psutil.Process(process.pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            children = []
+        host.close_process_job(self.job)
+        self.job = None
+        # Capture descendants before their parent exits and they are reparented.
+        for child in reversed(children):
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.terminate()
+        try:
+            with suppress(ProcessLookupError):
+                process.terminate()
             try:
                 async with asyncio.timeout(2):
                     await process.wait()
             except TimeoutError:
-                process.kill()
+                # A child retaining a pipe can delay asyncio's wait even after
+                # the direct process has exited, so close descendants first.
+                for child in reversed(children):
+                    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                        child.kill()
+                with suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
-        except ProcessLookupError:
-            await process.wait()
+        finally:
+            for child in reversed(children):
+                with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    child.kill()
 
     async def monitor(self, process: Process, stopping: asyncio.Event) -> None:
         """Track exit, stop requests, and total or idle timeout while updating process status."""
@@ -432,6 +453,7 @@ class ProcessService:
         stdin = asyncio.Queue[str | None]()
         output = asyncio.Queue[ProcessOutput | None]()
         record = ProcessRecord(summary, status)
+        record.job = host.process_job(process.pid)
         self.records[summary.process_id] = record
         session = ProcessSession(
             process,
@@ -788,6 +810,8 @@ class ProcessSession:
                 if self.failure is None:
                     self.failure = error
             finally:
+                host.close_process_job(self.record.job)
+                self.record.job = None
                 async with self.record.lock:
                     if self.record.status.current_status == "running":
                         self.record.status.current_status = (

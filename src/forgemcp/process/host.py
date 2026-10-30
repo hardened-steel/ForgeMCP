@@ -9,12 +9,64 @@ import webbrowser
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import psutil
 
 from .errors import ProcessStartError
 
 reapers: set[asyncio.Task[None]] = set()
+
+
+def process_job(pid: int) -> Any:
+    """Track Windows descendants across MSYS exec/reparenting using an OS job handle."""
+    # pywin32 exposes these Windows-only APIs through native extension modules.
+    # pylint: disable=c-extension-no-member
+    if os.name != "nt":
+        return None
+    # Windows-only modules are optional on other supported hosts.
+    import win32api  # pylint: disable=import-outside-toplevel
+    import win32con  # pylint: disable=import-outside-toplevel
+    import win32job  # pylint: disable=import-outside-toplevel
+    import pywintypes  # pylint: disable=import-outside-toplevel
+
+    job = None
+    try:
+        job = win32job.CreateJobObject(None, "")
+        information = win32job.QueryInformationJobObject(
+            job,
+            win32job.JobObjectExtendedLimitInformation,
+        )
+        information["BasicLimitInformation"]["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        win32job.SetInformationJobObject(
+            job,
+            win32job.JobObjectExtendedLimitInformation,
+            information,
+        )
+        process = win32api.OpenProcess(
+            win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE,
+            False,
+            pid,
+        )
+        try:
+            win32job.AssignProcessToJobObject(job, process)
+        finally:
+            process.Close()
+    except pywintypes.error:
+        # Short commands may already have exited; restrictive parent jobs may
+        # disallow assignment. Retain ordinary descendant cleanup in those cases.
+        if job is not None:
+            job.Close()
+        return None
+    return job
+
+
+def close_process_job(job: Any) -> None:
+    """Close an owned job, terminating any descendants still assigned to it."""
+    if job is not None:
+        job.Close()
 
 
 @dataclass(frozen=True)

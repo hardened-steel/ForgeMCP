@@ -1,0 +1,99 @@
+/* Git content uses the common widget shell, density, palette and host fonts. */
+.fm-git { padding-top: 5px; }
+.fm-git h2, .fm-git p { margin: 0; }
+.fm-git code, .fm-git pre, .fm-git button { font: inherit; }
+.fm-git button { cursor: pointer; }
+.fm-git summary { cursor: pointer; overflow-wrap: anywhere; }
+.fm-git .fm-git-section-title { font: inherit; font-weight: 600; margin: 8px 0 4px; }
+.fm-git .fm-git-muted, .fm-git .fm-git-context, .fm-git .fm-git-count, .fm-git .fm-git-old-path { color: var(--fm-muted); }
+.fm-git .fm-git-context { overflow-wrap: anywhere; white-space: pre-wrap; padding: 3px 0 7px; }
+.fm-git .fm-git-count { font-size: 11px; margin: 3px 0 5px; }
+.fm-git .fm-git-empty { color: var(--fm-muted); padding: 7px 0; }
+.fm-git .fm-git-path, .fm-git .fm-git-address, .fm-git .fm-git-subject { overflow-wrap: anywhere; white-space: pre-wrap; }
+.fm-git .fm-git-path { color: var(--fm-accent); }
+.fm-git .fm-git-path-group { display: inline-flex; align-items: baseline; max-width: 100%; overflow-wrap: anywhere; }
+.fm-git .fm-git-path-text { min-width: 0; }
+.fm-git .fm-git-copy { display: inline-flex; vertical-align: middle; margin-left: 4px; }
+.fm-git .fm-git-path-group > .fm-git-copy { flex: none; }
+.fm-git .fm-git-oid { color: var(--fm-accent); white-space: nowrap; }
+.fm-git .fm-git-repository { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; padding: 2px 0 5px; }
+.fm-git .fm-git-repository > strong { overflow-wrap: anywhere; white-space: pre-wrap; }
+.fm-git .fm-git-stash-reference { white-space: pre-wrap; overflow-wrap: anywhere; }
+.fm-git .fm-git-badge { display: inline-block; border: 1px solid var(--fm-border); border-radius: 3px; padding: 0 5px; font-size: 11px; white-space: normal; overflow-wrap: anywhere; align-self: start; }
+.fm-git .fm-git-success { color: var(--fm-success); }
+.fm-git .fm-git-warning { color: var(--fm-warning); }
+.fm-git .fm-git-error { color: var(--fm-error); }
+.fm-git .fm-git-active { color: var(--fm-accent); }
+.fm-git .fm-git-notice { border: 1px solid var(--fm-border); border-left: 3px solid currentColor; background: var(--fm-bar); padding: 7px 9px; margin: 4px 0 8px; }
+.fm-git .fm-git-notice h2 { font: inherit; font-weight: 600; }
+.fm-git .fm-git-notice p { color: var(--fm-text); white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 3px; }
+.fm-git .fm-git-change-header, .fm-git .fm-git-change-row { display: grid; grid-template-columns: minmax(0, 1fr) 102px 102px; gap: 4px 8px; padding: 5px 0; border-bottom: 1px solid var(--fm-border); }
+.fm-git .fm-git-change-header { color: var(--fm-muted); font-size: 11px; padding-bottom: 3px; }
+.fm-git .fm-git-change-row > .fm-git-badge { justify-self: start; }
+.fm-git .fm-git-submodule { grid-column: 1 / -1; color: var(--fm-muted); font-size: 11px; }
+.fm-git .fm-git-details { margin: 8px 0; border-top: 1px solid var(--fm-border); }
+.fm-git .fm-git-details > summary { color: var(--fm-muted); padding: 6px 0; font-size: 11px; }
+.fm-git .fm-git-details > .fm-fields { padding: 5px 0; }
+.fm-git .fm-git-commit { border-bottom: 1px solid var(--fm-border); padding: 6px 0; }
+.fm-git .fm-git-commit > summary { display: list-item; padding: 2px 0; }
+.fm-git .fm-git-commit > summary .fm-git-subject { font-weight: 600; }
+.fm-git .fm-git-commit-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--fm-muted); font-size: 11px; padding-top: 3px; padding-left: 15px; }
+.fm-git .fm-git-commit-meta > span { overflow-wrap: anywhere; white-space: pre-wrap; }
+.fm-git .fm-git-message, .fm-git .fm-git-literal { white-space: pre-wrap; overflow-wrap: anywhere; padding: 7px 0; margin: 0; }
+.fm-git .fm-git-ref { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 9px; padding: 7px 0; border-bottom: 1px solid var(--fm-border); }
+.fm-git .fm-git-ref > strong { font-weight: 500; flex: 1 1 200px; }
+.fm-git .fm-git-upstream { color: var(--fm-muted); width: 100%; font-size: 11px; }
+.fm-git .fm-git-remote { padding: 4px 0 8px; border-bottom: 1px solid var(--fm-border); }
+.fm-git .fm-git-remote-line { display: grid; grid-template-columns: 6ch minmax(0, 1fr); gap: 10px; padding: 3px 0; }
+.fm-git .fm-git-address + .fm-git-address { margin-top: 4px; }
+.fm-git .fm-git-conflict-paths > .fm-git-path-group { display: flex; padding: 3px 0; }
+.fm-git .fm-git-update { white-space: pre-wrap; overflow-wrap: anywhere; padding: 4px 0; }
+.fm-git .fm-git-diff-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; margin-bottom: 4px; }
+.fm-git .fm-git-diff-heading .fm-git-section-title { margin: 0; margin-right: auto; }
+.fm-git .fm-git-wrap { border: 1px solid var(--fm-border); border-radius: 3px; padding: 2px 7px; }
+.fm-git .fm-git-patch-file { margin: 6px 0 10px; border: 1px solid var(--fm-border); }
+.fm-git .fm-git-patch-file > summary { padding: 6px 8px; background: var(--fm-bar); }
+.fm-git .fm-git-patch-file > summary .fm-git-badge { margin-right: 7px; }
+.fm-git .fm-git-patch-file > .fm-git-empty, .fm-git .fm-git-patch-headers { padding: 5px 8px; }
+.fm-git .fm-git-patch-headers > summary { color: var(--fm-muted); font-size: 11px; }
+.fm-git .fm-git-code-viewport { overflow-x: auto; }
+.fm-git .fm-git-code { border-collapse: collapse; width: max-content; min-width: 100%; }
+.fm-git .fm-git-code th { font-weight: 400; font-size: 10px; color: var(--fm-muted); text-align: left; background: var(--fm-bar); }
+.fm-git .fm-git-code th:first-child, .fm-git .fm-git-code th:nth-child(2) { text-align: right; }
+.fm-git .fm-git-code th, .fm-git .fm-git-code td { padding: 1px 6px; vertical-align: top; }
+.fm-git .fm-git-code .fm-git-line-number { min-width: 5ch; border-right: 1px solid var(--fm-border); }
+.fm-git .fm-git-line-number { text-align: right; color: var(--fm-muted); user-select: none; font-size: 11px; }
+.fm-git .fm-git-code-text code { white-space: pre; tab-size: 4; }
+.fm-git .fm-git-patch-meta { color: var(--fm-muted); }
+.fm-git .fm-git-patch-hunk { color: var(--fm-accent); background: var(--fm-bar); }
+.fm-git .fm-git-patch-add .fm-git-code-text { color: var(--fm-success); background: color-mix(in srgb, var(--fm-success) 8%, transparent); }
+.fm-git .fm-git-patch-remove .fm-git-code-text { color: var(--fm-error); background: color-mix(in srgb, var(--fm-error) 8%, transparent); }
+.fm-git .fm-git-wrapped .fm-git-code { width: 100%; table-layout: fixed; }
+.fm-git .fm-git-wrapped .fm-git-code th:first-child, .fm-git .fm-git-wrapped .fm-git-code th:nth-child(2) { width: 5ch; }
+.fm-git .fm-git-wrapped .fm-git-code-text code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.fm-git .fm-git-blame-line { border-bottom: 1px solid var(--fm-border); }
+.fm-git .fm-git-blame-line > summary { display: grid; grid-template-columns: 150px 5ch minmax(0, 1fr); gap: 8px; padding: 3px 0; }
+.fm-git .fm-git-attribution { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; color: var(--fm-muted); font-size: 11px; }
+.fm-git .fm-git-attribution::before { content: "▸"; }
+.fm-git .fm-git-blame-line[open] > summary .fm-git-attribution::before { content: "▾"; }
+.fm-git .fm-git-attribution > span { overflow-wrap: anywhere; white-space: normal; }
+.fm-git .fm-git-blame-text { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.fm-git .fm-git-conflict { border: 1px solid var(--fm-border); margin: 7px 0; }
+.fm-git .fm-git-conflict > summary { background: var(--fm-bar); padding: 6px 8px; }
+.fm-git .fm-git-stages { padding: 0 8px; }
+.fm-git .fm-git-stage { border-bottom: 1px solid var(--fm-border); padding: 5px 0; }
+.fm-git .fm-git-stage:last-child { border-bottom: 0; }
+.fm-git .fm-git-stage > summary { color: var(--fm-accent); }
+.fm-git .fm-git-stage-kind { color: var(--fm-muted); font-size: 11px; margin-left: 10px; }
+.fm-git .fm-git-stage-text { overflow-x: auto; white-space: pre; tab-size: 4; background: var(--fm-bar); padding: 7px; margin: 7px 0; }
+@container (max-width: 500px) {
+  .fm-git .fm-git-change-header { display: none; }
+  .fm-git .fm-git-change-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 5px 8px; padding: 7px 0; }
+  .fm-git .fm-git-change-row > .fm-git-path-group { grid-column: 1 / -1; }
+  .fm-git .fm-git-change-row > .fm-git-badge:nth-child(2)::before { content: "Staged: "; }
+  .fm-git .fm-git-change-row > .fm-git-badge:nth-child(3)::before { content: "Working: "; }
+  .fm-git .fm-git-blame-line > summary { grid-template-columns: 4ch minmax(0, 1fr); gap: 2px 7px; }
+  .fm-git .fm-git-attribution { grid-column: 2; }
+  .fm-git .fm-git-blame-line > summary > .fm-git-line-number { grid-row: 1 / 3; grid-column: 1; }
+  .fm-git .fm-git-blame-text { grid-column: 2; }
+}
