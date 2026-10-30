@@ -29,6 +29,7 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
+from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
 from forgemcp.process.host import ProcessIdentity
 from forgemcp.process.errors import ProcessError
@@ -55,6 +56,7 @@ class ServerRuntime:
     analysis: ClangdService
     history: MemoryHistory
     settings: dict[str, Any]
+    git: GitService | None = None
     mcp: MCPServer = field(init=False)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -126,6 +128,10 @@ class ServerRuntime:
                     context.model_dump(mode="json")
                     for context in self.builds.configurations.values()
                 ],
+            },
+            "git": {
+                "last_status": self.git.last_status.model_dump(mode="json")
+                if self.git is not None and self.git.last_status is not None else None,
             },
             "clangd": {
                 "closed": self.analysis.closed,
@@ -221,6 +227,7 @@ def create_runtime(
     progress_interval: float = 1.0,
     cmake_profiles: list[list[str]] | None = None,
     cmake_toolset: str = "system",
+    git_toolset: str = "system",
 ) -> ServerRuntime:
     """Compose independent services and their shared transport lifetime explicitly."""
     validate_progress_interval(progress_interval)
@@ -268,7 +275,14 @@ def create_runtime(
         analysis,
         tools=analysis.PROVIDER_TOOLS,
     )
-    services = (workspace, processes, toolchains, builds, analysis)
+    repository = GitService(
+        workspace,
+        toolchains,
+        builds,
+        analysis,
+        toolset=git_toolset,
+    )
+    services = (workspace, processes, toolchains, builds, analysis, repository)
     apps = Apps()
     complete = Complete()
     history = MemoryHistory()
@@ -284,9 +298,11 @@ def create_runtime(
             "storage_root": str(workspace.storage_root),
             "progress_interval": progress_interval,
             "cmake_toolset": cmake_toolset,
+            "git_toolset": git_toolset,
             "cmake_profiles": cmake_profiles or [],
             "toolset_definitions": toolsets or [],
         },
+        git=repository,
     )
 
     @asynccontextmanager
@@ -336,6 +352,7 @@ def create_server(
     progress_interval: float = 1.0,
     cmake_profiles: list[list[str]] | None = None,
     cmake_toolset: str = "system",
+    git_toolset: str = "system",
 ) -> MCPServer:
     """Return the public SDK server for embedding, without starting an admin Hub."""
     return create_runtime(
@@ -345,6 +362,7 @@ def create_server(
         progress_interval=progress_interval,
         cmake_profiles=cmake_profiles,
         cmake_toolset=cmake_toolset,
+        git_toolset=git_toolset,
     ).mcp
 
 
@@ -374,6 +392,11 @@ def argument_parser() -> argparse.ArgumentParser:
         "--cmake-toolset",
         default="system",
         help="Toolset ID or exact name for automatic CMake profiles (default: system).",
+    )
+    parser.add_argument(
+        "--git-toolset",
+        default="system",
+        help="Toolset ID or exact name for Git operations (default: system).",
     )
     parser.add_argument(
         "--cmake-profile",
@@ -442,6 +465,7 @@ def main() -> None:
             storage_root=arguments.workspace_storage,
             progress_interval=arguments.progress_interval,
             cmake_profiles=arguments.cmake_profile,
+            git_toolset=arguments.git_toolset,
             cmake_toolset=arguments.cmake_toolset,
         )
     except (CMakeError, ToolchainError, WorkspaceError, ValueError) as error:

@@ -18,6 +18,10 @@ debugger modules are planned.
   definitions, references, document symbols, and workspace symbols. Empty
   configuration selections use all available contexts.
 - No prompts are currently registered.
+- Git tools inspect and modify the repository rooted at the workspace: status,
+  diffs, history, blame, branches/tags/remotes, staging, commits, restore, stash,
+  fetch/pull/push, merge/rebase/cherry-pick/revert, and conflict stages and continuation.
+  Every tool has typed data, plain text, a shared Git App, and process provenance.
 - CMake tools list operator profiles, configure projects, build targets, and run
   CTest. `cmake_run_test` directly runs a project/storage test executable with
   literal command-line arguments. Each tool has its own widget with Fields/JSON views,
@@ -71,7 +75,7 @@ and install it in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.3.0-py3-none-any.whl
+.\.venv\Scripts\python.exe -m pip install .\forge_cpp_mcp-0.4.0-py3-none-any.whl
 .\.venv\Scripts\forgemcp.exe --help
 ```
 
@@ -84,7 +88,7 @@ The distribution name is `forge-cpp-mcp`; the Python module and server command a
 After the package is published to PyPI, the install command can instead be:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.3.0
+.\.venv\Scripts\python.exe -m pip install forge-cpp-mcp==0.4.0
 ```
 
 ## Setup from source
@@ -490,6 +494,70 @@ overridden; their compilation-database settings remain controlled by the preset.
 The initial CMake slice does not yet include clean/project-inspection tools
 or syntax highlighting. Unit and in-process MCP tests cover profiles,
 command parsing, generator changes, result resources, and qualified paths.
+
+## Git operations
+
+Git uses the executable and environment of `--git-toolset ID_OR_NAME` (default:
+`system`). It must be installed in that toolset. ForgeMCP does not initialize,
+clone, create, move, or remove worktrees. Run one instance in each desired worktree;
+the admin panel exposes their independent tools and histories in separate tabs.
+The configured workspace must be the repository's worktree root. Linked worktrees
+work normally: Git itself accesses their shared repository metadata, without
+extending Workspace access to external source files.
+
+Read tools are `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`,
+`git_branches`, `git_tags`, `git_remotes`, and `git_conflicts`. `git_diff` selects
+`unstaged`, `staged`, or `revision` comparisons; revision comparisons require `base`
+and optionally `target`. Log pages return a resolved revision and `next_skip`;
+reuse both to keep pagination anchored. Show uses the first parent for merges.
+Conflict results include available base/ours/theirs object IDs, modes, and UTF-8
+text; binary or gitlink stages retain metadata without invented text.
+
+`git_stage(paths)`, `git_unstage(paths)`, and `git_restore(paths, source=null)` use
+explicit literal project paths. Restore discards working-file changes using the
+index or the selected committed source. `git_commit(message, amend=false)` commits
+the current index. `git_branch` creates/deletes local branches; force deletion is
+explicit. `git_switch` optionally creates a branch. `git_stash` supports list,
+save, apply, pop, and drop, returning one consistent action-result schema.
+
+`git_fetch` selects a configured remote and optionally prunes remote-tracking
+refs. `git_pull` defaults to fast-forward only; `strategy=merge` or `rebase` is
+explicit. These operations never automatically stash local changes. `git_push`
+pushes HEAD to one destination branch; replacing published history requires
+`expected_remote_oid`, used as an explicit force-with-lease expectation. No raw
+force-push or arbitrary Git command tool is exposed. Credentials come from the
+operator's Git/SSH configuration; tools do not accept passwords or tokens.
+
+`git_merge`, `git_rebase`, `git_cherry_pick`, and `git_revert` preserve unfinished
+operations. Cherry-pick/revert accept a mainline parent for merge commits.
+Resolve conflicts using Workspace tools, stage the resolutions, then call
+`git_continue(action=continue|abort|skip)`. Skip applies only to operations that
+support it. Normal installed Git hooks remain enabled. A nonzero command may
+leave conflicts or other partial changes: mutation results report `error`, actual
+resulting HEAD, unfinished operation, conflicts, and `process_ids`. Inspect status
+after interruption before deciding whether to retry. A secondary synchronization
+failure is reported separately from a successfully completed Git operation.
+
+Mutations share Workspace serialization and coordinate with CMake and clangd.
+CMake alone determines compilation-context eligibility and notifies clangd through
+its existing subscription. Source notifications combine Git dirty paths and
+committed tree changes; unknown changes use conservative invalidation. No external
+file watcher or cross-instance execution queue is added.
+
+Git output is bounded to 4 MiB per command; narrow the request when the limit is
+exceeded. Each command has a 300-second deadline and each request a 620-second
+deadline. Machine names/metadata must be UTF-8; patches explicitly report decoding
+replacement. Full process transcripts retain their existing ProcessService owner.
+`forgemcp://git/status` is the last captured status, not a live scan.
+`forgemcp://git/commits/{revision}` serves previously captured log/show metadata
+with completion over retained revisions. These snapshots, the Git monitor, and
+history disappear when the instance stops. The Git App displays one invocation:
+status separates staged and working changes, history puts commit messages first,
+and patches show file groups and line numbers with a wrap toggle. Blame keeps source
+and attribution together; conflict views distinguish base, ours, theirs, missing
+stages, and binary content. Errors and analysis-refresh warnings appear before
+the current repository state. Local search, expandable details, individual copying,
+and complete original JSON remain available; the widget never executes Git actions.
 
 ## Toolchain discovery
 
