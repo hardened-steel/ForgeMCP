@@ -29,6 +29,7 @@ from forgemcp import local_ipc
 from forgemcp.admin.history import MemoryHistory
 from forgemcp.admin.instance import InstanceAgent
 from forgemcp.cmake.errors import CMakeError
+from forgemcp.cmake.models import CMakeConfigureResult
 from forgemcp.cmake.profiles import parse_profiles
 from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
@@ -111,6 +112,42 @@ class ServerRuntime:
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
     closed: bool = False
+    startup_configure_task: asyncio.Task[list[CMakeConfigureResult]] | None = None
+    startup_configure_results: list[CMakeConfigureResult] = field(default_factory=list)
+    startup_configure_error: str | None = None
+
+    def startup_configured(self, task: asyncio.Task[list[CMakeConfigureResult]]) -> None:
+        """Retain startup outcomes and log lifecycle summaries without command output."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.startup_configure_error = (
+                str(error)
+                if isinstance(error, (CMakeError, ToolchainError, ProcessError))
+                else "Startup CMake configuration failed unexpectedly."
+            )
+            logger.warning("Startup CMake configuration failed; the server remains available.")
+        else:
+            self.startup_configure_results = task.result()
+            failures = sum(result.error is not None for result in self.startup_configure_results)
+            logger.info(
+                "Startup CMake configuration finished: %d executions, %d failures.",
+                len(self.startup_configure_results),
+                failures,
+            )
+
+    async def close_services(self) -> None:
+        """Finish startup cancellation before closing its subscribers and process owner."""
+        try:
+            if self.startup_configure_task is not None:
+                self.startup_configure_task.cancel()
+                await asyncio.gather(self.startup_configure_task, return_exceptions=True)
+        finally:
+            try:
+                await self.analysis.close()
+            finally:
+                await self.processes.close()
 
     @asynccontextmanager
     async def lifespan(self) -> AsyncGenerator[dict[str, object]]:
@@ -122,12 +159,11 @@ class ServerRuntime:
                 try:
                     await self.toolchains.initialize()
                     await self.analysis.initialize()
+                    self.startup_configure_task = asyncio.create_task(self.builds.configure())
+                    self.startup_configure_task.add_done_callback(self.startup_configured)
                 except BaseException:
                     self.closed = True
-                    try:
-                        await self.analysis.close()
-                    finally:
-                        await self.processes.close()
+                    await self.close_services()
                     raise
             self.users += 1
         try:
@@ -137,10 +173,7 @@ class ServerRuntime:
                 self.users -= 1
                 if self.users == 0:
                     self.closed = True
-                    try:
-                        await self.analysis.close()
-                    finally:
-                        await self.processes.close()
+                    await self.close_services()
 
     async def state_snapshot(self) -> dict[str, Any]:
         """Read retained service state without scans, tool calls, or transcript copies."""
@@ -174,6 +207,17 @@ class ServerRuntime:
                 ],
             },
             "cmake": {
+                "startup_configure": {
+                    "running": (
+                        self.startup_configure_task is not None
+                        and not self.startup_configure_task.done()
+                    ),
+                    "error": self.startup_configure_error,
+                    "results": [
+                        result.model_dump(mode="json")
+                        for result in self.startup_configure_results
+                    ],
+                },
                 "configurations": [
                     context.model_dump(mode="json")
                     for context in self.builds.configurations.values()

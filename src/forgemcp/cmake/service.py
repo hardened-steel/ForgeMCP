@@ -23,7 +23,7 @@ from forgemcp.diagnostics import available_values, display_value, os_error_reaso
 from forgemcp.process.errors import ProcessError, ProcessStartError
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.process.service import ProcessService
-from forgemcp.progress import progress
+from forgemcp.progress import Progress, progress
 from forgemcp.text import tool_result
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.service import ToolchainService
@@ -86,6 +86,7 @@ class CMakeService:
     then verify all profiles. Each execution reports error (null means success)
     and, when launched, process_id for its command log.
 
+    All effective profiles are configured once in the background at server startup.
     Workspace changes to configuration inputs withdraw affected clangd contexts.
     Run cmake_configure to confirm unknown or outdated configurations. A build
     may restore them through CMake's automatic generation. External edits are not watched.
@@ -457,6 +458,141 @@ class CMakeService:
             self.operation_lock.release()
             await self.publish_configurations()
 
+    async def configure(
+        self,
+        profiles: list[str] | None = None,
+        *,
+        timeout: ProcessTimeout = ProcessTimeout(total=600),
+        on_progress: Progress | None = None,
+    ) -> list[CMakeConfigureResult]:
+        """Configure profiles for startup or a tool call, publishing each outcome."""
+        definitions, catalogs = await self.selection(profiles)
+        results: list[CMakeConfigureResult] = []
+        configured = {}
+
+        async def report_status(message: str) -> None:
+            """Report configure work with the current profile and preset prefix."""
+            label = profile.name if preset is None else f"{profile.name}/{preset}"
+            if on_progress is not None:
+                await on_progress(f"{label}: {message}")
+
+        for definition in definitions:
+            try:
+                profile = self.resolve_profile(definition, catalogs)
+                presets = self.operation_presets(profile, "configure")
+                methods = self.cmake_methods(profile.toolset_id)
+            except (CMakeError, ToolchainError) as error:
+                identifier = quote(definition.name, safe="")
+                for key in tuple(self.configurations):
+                    if key == identifier or key.startswith(identifier + "/"):
+                        del self.configurations[key]
+                await self.publish_configurations()
+                results.append(
+                    CMakeConfigureResult(
+                        profile=definition.name,
+                        error=str(error),
+                    )
+                )
+                continue
+            for preset in presets:
+                result = CMakeConfigureResult(
+                    profile=profile.name,
+                    preset=preset,
+                    build_directory=profile.build_directory,
+                )
+                results.append(result)
+                await self.operation_lock.acquire()
+                previous = None
+                try:
+                    context = profile.compilation_context
+                    if context is not None:
+                        self.configurations[context.id] = context
+                    key = (profile.toolset_id, preset, profile.build_directory)
+                    if profile.build_directory is not None and key not in configured:
+                        self.inputs[profile.build_directory].current = False
+                        previous = generation(self.build_path(profile.build_directory))
+                    if preset is not None and key in configured:
+                        prior = configured[key]
+                        result.error = prior.error
+                        result.process_id = prior.process_id
+                        result.compilation_database = prior.compilation_database
+                        continue
+                    build_directory = (
+                        self.build_path(profile.build_directory)
+                        if profile.build_directory is not None else None
+                    )
+                    settings = {}
+                    if preset is None:
+                        if profile.build_directory is None:
+                            raise CMakeError("Plain configure requires a build directory.")
+                        settings = self.configure_definitions(definition)
+                        if (build_directory / "CMakeCache.txt").exists():
+                            cache = self.require_configured(profile)
+                            if cache.get("CMAKE_GENERATOR") != profile.generator:
+                                await report_status(
+                                    "Clearing build directory for generator change"
+                                )
+                                clear_build_directory(
+                                    build_directory,
+                                    self.project_root
+                                    if profile.build_directory.area == "project"
+                                    else self.storage_root,
+                                    self.storage_root,
+                                    self.protected_paths,
+                                )
+                                await self.publish_configurations()
+                    if profile.build_directory is not None:
+                        query = WorkspacePath(
+                            f"{profile.build_directory}/.cmake/api/v1/query/"
+                            "client-forgemcp"
+                        )
+                        prepare_queries(self.build_path(query))
+                    await report_status("Starting configure")
+                    command = await methods["configure"](
+                        self.project_root,
+                        build_directory,
+                        preset=preset,
+                        generator=profile.generator,
+                        definitions=settings,
+                        timeout=timeout,
+                        on_progress=report_status,
+                    )
+                    result.process_id = command.process_id
+                    if command.return_code != 0:
+                        result.error = f"CMake configure exited with {command.return_code}."
+                    if command.return_code == 0 and result.build_directory is not None:
+                        snapshot = read_generation(
+                            self.build_path(result.build_directory),
+                            previous,
+                            self.project_root,
+                            self.storage_root,
+                        )
+                        if snapshot is None:
+                            raise CMakeError(
+                                "Configure exited successfully but produced no new successful "
+                                "CMake File API generation in "
+                                f"{display_value(str(result.build_directory))}. "
+                                "The compilation context remains unconfirmed. Inspect "
+                                f"process_get(process_id={result.process_id}) and the "
+                                "build directory's .cmake/api/v1/reply metadata before "
+                                "retrying cmake_configure."
+                            )
+                        self.inputs[result.build_directory] = snapshot
+                        result.compilation_database = compilation_database(
+                            result.build_directory,
+                            self.build_path(result.build_directory),
+                        )
+                    if preset is not None:
+                        configured[key] = result
+                except (CMakeError, ToolchainError, ProcessError) as error:
+                    result.error = str(error)
+                    result.process_id = getattr(error, "process_id", result.process_id)
+                finally:
+                    self.operation_lock.release()
+                    await self.publish_configurations(refresh=result.error is None)
+                await report_status(result.error or "Completed successfully")
+        return results
+
     def register(self, mcp: MCPServer, apps: Apps, complete: Complete) -> None:
         """Register profile inspection, configure, build, and test tools with their widgets."""
         icon = self.ICON.icon
@@ -503,140 +639,22 @@ class CMakeService:
             """
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing CMake configure")
-            try:
-                definitions, catalogs = await self.selection(profiles)
-            except (CMakeError, ToolchainError, ProcessError) as error:
-                raise ToolError(str(error)) from error
-            results: list[CMakeConfigureResult] = []
-            configured = {}
             updates = 0
 
             async def report_status(message: str) -> None:
-                """Advance configure progress with the current profile and preset prefix."""
+                """Advance this invocation's progress for shared configure work."""
                 nonlocal updates
                 updates += 1
-                label = profile.name if preset is None else f"{profile.name}/{preset}"
-                await report(updates, message=f"{label}: {message}")
+                await report(updates, message=message)
 
-            for definition in definitions:
-                try:
-                    profile = self.resolve_profile(definition, catalogs)
-                    presets = self.operation_presets(profile, "configure")
-                    methods = self.cmake_methods(profile.toolset_id)
-                except (CMakeError, ToolchainError) as error:
-                    identifier = quote(definition.name, safe="")
-                    for key in tuple(self.configurations):
-                        if key == identifier or key.startswith(identifier + "/"):
-                            del self.configurations[key]
-                    await self.publish_configurations()
-                    results.append(
-                        CMakeConfigureResult(
-                            profile=definition.name,
-                            error=str(error),
-                        )
-                    )
-                    continue
-                for preset in presets:
-                    result = CMakeConfigureResult(
-                        profile=profile.name,
-                        preset=preset,
-                        build_directory=profile.build_directory,
-                    )
-                    results.append(result)
-                    await self.operation_lock.acquire()
-                    previous = None
-                    try:
-                        context = profile.compilation_context
-                        if context is not None:
-                            self.configurations[context.id] = context
-                        key = (profile.toolset_id, preset, profile.build_directory)
-                        if profile.build_directory is not None and key not in configured:
-                            self.inputs[profile.build_directory].current = False
-                            previous = generation(self.build_path(profile.build_directory))
-                        if preset is not None and key in configured:
-                            prior = configured[key]
-                            result.error = prior.error
-                            result.process_id = prior.process_id
-                            result.compilation_database = prior.compilation_database
-                            continue
-                        build_directory = (
-                            self.build_path(profile.build_directory)
-                            if profile.build_directory is not None else None
-                        )
-                        settings = {}
-                        if preset is None:
-                            if profile.build_directory is None:
-                                raise CMakeError("Plain configure requires a build directory.")
-                            settings = self.configure_definitions(definition)
-                            build_directory = self.build_path(profile.build_directory)
-                            if (build_directory / "CMakeCache.txt").exists():
-                                cache = self.require_configured(profile)
-                                if cache.get("CMAKE_GENERATOR") != profile.generator:
-                                    await report_status(
-                                        "Clearing build directory for generator change"
-                                    )
-                                    clear_build_directory(
-                                        build_directory,
-                                        self.project_root
-                                        if profile.build_directory.area == "project"
-                                        else self.storage_root,
-                                        self.storage_root,
-                                        self.protected_paths,
-                                    )
-                                    await self.publish_configurations()
-                        if profile.build_directory is not None:
-                            prepare_queries(
-                                self.build_path(
-                                    WorkspacePath(
-                                        f"{profile.build_directory}/.cmake/api/v1/query/"
-                                        "client-forgemcp"
-                                    )
-                                )
-                            )
-                        await report_status("Starting configure")
-                        command = await methods["configure"](
-                            self.project_root,
-                            build_directory,
-                            preset=preset,
-                            generator=profile.generator,
-                            definitions=settings,
-                            timeout=timeout,
-                            on_progress=report_status,
-                        )
-                        result.process_id = command.process_id
-                        if command.return_code != 0:
-                            result.error = f"CMake configure exited with {command.return_code}."
-                        if command.return_code == 0 and result.build_directory is not None:
-                            snapshot = read_generation(
-                                self.build_path(result.build_directory),
-                                previous,
-                                self.project_root,
-                                self.storage_root,
-                            )
-                            if snapshot is None:
-                                raise CMakeError(
-                                    "Configure exited successfully but produced no new successful "
-                                    "CMake File API generation in "
-                                    f"{display_value(str(result.build_directory))}. "
-                                    "The compilation context remains unconfirmed. Inspect "
-                                    f"process_get(process_id={result.process_id}) and the "
-                                    "build directory's .cmake/api/v1/reply metadata before "
-                                    "retrying cmake_configure."
-                                )
-                            self.inputs[result.build_directory] = snapshot
-                            result.compilation_database = compilation_database(
-                                result.build_directory,
-                                self.build_path(result.build_directory),
-                            )
-                        if preset is not None:
-                            configured[key] = result
-                    except (CMakeError, ToolchainError, ProcessError) as error:
-                        result.error = str(error)
-                        result.process_id = getattr(error, "process_id", result.process_id)
-                    finally:
-                        self.operation_lock.release()
-                        await self.publish_configurations(refresh=result.error is None)
-                    await report_status(result.error or "Completed successfully")
+            try:
+                results = await self.configure(
+                    profiles,
+                    timeout=timeout,
+                    on_progress=report_status,
+                )
+            except (CMakeError, ToolchainError, ProcessError) as error:
+                raise ToolError(str(error)) from error
             return tool_result(results, render_executions(results, "Configure"))
 
         async def begin_build(profile: CMakeProfile) -> str | None:

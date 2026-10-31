@@ -376,9 +376,19 @@ no source preview because explicit external reads require confirmation.
 CMake owns which configurations can supply clangd compilation contexts. After a
 successful configure/generate, ForgeMCP reads `cmakeFiles-v1` from a new CMake
 File API reply and records SHA-256 hashes of that build directory's configuration
-inputs in `project/` and `storage/`. Hashes and dependency lists live in memory;
-restart the server and run `cmake_configure` to confirm contexts again. Existing
-File API replies and `compile_commands.json` alone do not confirm current inputs.
+inputs in `project/` and `storage/`. Hashes and dependency lists live in memory.
+Each server startup configures all effective profiles once in the background after
+toolset discovery and clangd subscription setup. MCP requests remain available;
+clangd receives contexts as individual profiles finish. Existing File API replies
+and `compile_commands.json` alone do not confirm current inputs.
+
+Startup uses the same configure settings, build-directory ownership checks,
+generator-change cleanup, and 600-second per-command timeout as `cmake_configure`.
+One failed profile does not stop the remaining profiles or the server. The admin
+panel's CMake monitor retains startup results, process IDs, and any batch error;
+command transcripts remain available through `process_get`. A second client of
+the same server does not repeat startup configuration. Server shutdown cancels
+and awaits startup configure before closing clangd and managed processes.
 
 Workspace writes, edits, moves, deletions, and directory creation check known
 inputs at the operation boundary. Actual input changes withdraw affected contexts

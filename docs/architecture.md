@@ -86,8 +86,10 @@ interfaces and factories for hypothetical parsers or kit providers.
    optional persistent administration client use the same services. The workspace
    defaults to the server process working directory. The first lifespan user awaits
    toolchain and clangd initialization; reference-counted users share that completed
-   initialization. Only the final user closes analysis and managed processes,
-   including cleanup after discovery failure.
+   initialization. After the clangd subscription exists, one background task
+   configures all effective CMake profiles without delaying MCP readiness. Only
+   the final user cancels and awaits that task, then closes analysis and managed
+   processes, including cleanup after discovery failure.
 
 `create_server` remains the embedding entrypoint returning the SDK `MCPServer`;
 it does not start an administration Hub. The CLI creates a runtime and enables its
@@ -398,6 +400,16 @@ must belong to this project, and build/test configurations must match their cach
 Known plain build directories receive CMake File API queries and request a compilation
 database. Native presets retain control over these settings and directories.
 
+`CMakeService.configure` owns the batch shared by server startup and the
+`cmake_configure` handler. The handler supplies per-invocation MCP progress;
+startup runs without a request Context. Both callers use the same operation lock,
+per-profile error isolation, File API confirmation, and context publication. The
+runtime retains startup outcomes and process IDs in its CMake monitor, consumes
+background task failures, and exposes expected batch errors while sanitizing
+unexpected failures. Operational logs contain only lifecycle counts. Additional
+lifespan users share the same task, and shutdown awaits its cancellation before
+closing clangd or ProcessService. Startup uses the default 600-second command timeout.
+
 Commands are typed methods on bound CMake/CTest ToolSpecs and launch only through
 ProcessService. Callable protocols preserve their positional and keyword signatures.
 Tool files own process consumption and parsing: CMake presets/cache/configure/build
@@ -482,8 +494,8 @@ structural mutations invalidate every such tree because glob presence is unknown
 No glob expression is interpreted or rescanned. Content-only edits of globbed
 source files remain ordinary source edits unless also listed in `inputs`.
 Missing files and changed contents invalidate through hashes, independently of
-mtime. No operation auto-configures, removes stale artifacts, or watches external
-changes. Configure and build also verify inputs at their controlled boundaries;
+mtime. Workspace operations do not auto-configure, remove stale artifacts, or watch
+external changes. Configure and build also verify inputs at their controlled boundaries;
 external editor/IDE/process changes are not guaranteed to be noticed.
 
 A CMake operation lock serializes configure/build with each Workspace before-to-
@@ -687,7 +699,8 @@ CMake retains successful configurations as
 `CompilationContext(id, toolset_id, build_directory, compilation_database)`.
 It exposes candidates only while their build directory has a confirmed input
 baseline and its database exists. Existing artifacts at startup have unknown
-freshness and provide no context until a new configure confirms them. Build directories come from profile parameters;
+freshness and provide no context until the background startup configure (or an
+explicit configure) confirms them. Build directories come from profile parameters;
 a single native preset can use an explicitly configured build directory (`-B`).
 Unknown directories are omitted rather than parsing command output or guessing
 CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
