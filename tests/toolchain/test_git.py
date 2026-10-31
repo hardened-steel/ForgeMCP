@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from forgemcp.process.errors import ProcessStartError
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.toolchain.errors import ToolCommandError
 from forgemcp.toolchain.tools import git
@@ -126,6 +127,7 @@ async def test_run_byte_limit_fails_without_returning_partial_result(cpp_accepta
     with pytest.raises(ToolCommandError, match="byte limit") as caught:
         await methods["run"](cpp_acceptance_project, ["status"], max_bytes=4)
     assert caught.value.process_id == 37
+    assert "4 bytes" in str(caught.value) and "process_get(process_id=37)" in str(caught.value)
     assert session.closed
 
 
@@ -166,6 +168,7 @@ async def test_run_timeout_retains_process_id_and_closes_child(scripted_processe
             timeout=ProcessTimeout(total=0.1),
         )
     assert caught.value.process_id is not None
+    assert "total=0.1 s" in str(caught.value)
     assert "PRIVATE" not in str(caught.value)
     assert all(
         record.status.current_status != "running"
@@ -207,3 +210,20 @@ async def test_run_rejects_invalid_inputs_before_launch(cpp_acceptance_project):
         with pytest.raises(ToolCommandError):
             await methods["run"](cpp_acceptance_project, arguments, max_bytes=limit)
     launch.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_start_failure_explains_operator_recovery_without_native_paths(
+    cpp_acceptance_project,
+):
+    """Name the unavailable Git executable role without copying native exception filenames."""
+    launch = AsyncMock(side_effect=ProcessStartError("private executable path"))
+    methods = git.create_spec(
+        cpp_acceptance_project / "git",
+        SimpleNamespace(launch=launch),
+    ).methods
+    with pytest.raises(ToolCommandError) as caught:
+        await methods["run"](cpp_acceptance_project, ["status"])
+    message = str(caught.value)
+    assert "could not be started" in message and "operator" in message
+    assert "toolset_get" in message and "private executable path" not in message

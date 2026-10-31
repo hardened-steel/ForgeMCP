@@ -1,5 +1,7 @@
 """Expected language analysis failures, without protocol or transcript dumps."""
 
+from forgemcp.diagnostics import display_value
+
 
 class ClangdError(Exception):
     """Base error for an unavailable or unsuccessful analysis."""
@@ -22,7 +24,7 @@ class ClangdRequestError(ClangdError):
 
     def __init__(self, method: str, code: int, message: str) -> None:
         """Retain the server error code and describe the failed LSP method."""
-        super().__init__(f"{method} failed ({code}): {message}")
+        super().__init__(f"{method} failed ({code}): {display_value(message)}")
         self.code = code
 
 

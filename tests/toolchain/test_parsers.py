@@ -50,6 +50,7 @@ class Session:
 
     def __init__(self, chunks):
         """Retain output chunks and reset the observable lifecycle flags."""
+        self.process_id = 42
         self.chunks = chunks
         self.consumed = self.waited = self.closed_stdin = self.exited = False
 
@@ -83,10 +84,12 @@ async def test_unrecognized_version_raises():
     session = Session([ProcessOutput("stdout", "an unfamiliar banner")])
     processes = SimpleNamespace(launch=AsyncMock(return_value=session))
     info = next(info for info in load_tools() if info.name == "cmake")
-    with pytest.raises(ToolParserError):
+    with pytest.raises(ToolParserError) as failure:
         await info.create_spec(Path("cmake"), processes, None, True).methods[
             "version"
         ]()
+    assert "process_get(process_id=42)" in str(failure.value)
+    assert "cmake version <version>" in str(failure.value)
     assert session.exited and session.waited
 
 

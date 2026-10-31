@@ -516,7 +516,32 @@ async def test_process_inspection_tools_and_markdown_resources(processes):
         assert " · +" in details_md
         assert " s" in details_md
         assert "### stdout" in details_md and "### stderr" in details_md
-        assert (await client.call_tool("process_get", {"process_id": 99999})).is_error
+        details = await client.call_tool("process_get", {"process_id": 99999})
+        assert details.is_error
+        assert "process_id=99999" in details.content[0].text
+        assert "processes_overview()" in details.content[0].text
+        assert "operating-system PIDs" in details.content[0].text
+
+
+@pytest.mark.anyio
+async def test_start_failure_keeps_os_reason_without_filename_or_process_record(
+    cpp_acceptance_project,
+    monkeypatch,
+):
+    """Explain failed launch permissions without leaking OS filename fields or inventing an ID."""
+    service = ProcessService(cpp_acceptance_project)
+    async def cannot_start(*args, **kwargs):
+        """Return a deterministic launch error with a private native filename."""
+        raise PermissionError(13, "Execution denied", "C:/private/filename")
+
+    monkeypatch.setattr("forgemcp.process.service.asyncio.create_subprocess_exec", cannot_start)
+    with pytest.raises(ProcessStartError) as caught:
+        await service.launch("missing-program.exe")
+    message = str(caught.value)
+    assert "missing-program.exe" in message and "Execution denied" in message
+    assert "No process was started" in message
+    assert "C:/private/filename" not in message
+    assert not service.records
 
 
 @pytest.mark.anyio

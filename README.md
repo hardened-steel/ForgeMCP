@@ -601,6 +601,29 @@ without caching them. Listing toolsets does not launch version probes. All probe
 overview and retain their transcripts. Toolset resources omit environments; the
 environment capture's stdout is retained in its ordinary process transcript.
 
+## Understanding tool errors
+
+Expected tool errors name the invalid argument or missing prerequisite and explain
+how to correct it. Small catalogs list available values; larger catalogs point to
+an existing listing tool such as `toolsets_list`, `cmake_profiles`,
+`clangd_configurations`, `processes_overview`, or `git_remotes`. Unknown argument
+names are rejected instead of being silently ignored, with spelling suggestions
+when possible. Process transcript selector errors describe their valid JSON forms.
+
+For example, an unknown profile identifies `profiles` and either lists its valid
+names or recommends `cmake_profiles()`. A bad edit identifies `old_text` and suggests
+reading the current file or choosing a unique fragment, without repeating source
+text. Toolset installation and profile configuration errors explicitly require
+operator setup; toolsets are discovered once at startup.
+
+When a command started, use its returned process ID with `process_get` to read its
+transcript. CMake profile failures and Git mutation failures remain in the result's
+`error` fields even when the MCP exchange itself succeeded. A mutation may have
+partially completed; inspect the returned state and `git_status` before repeating
+Git operations. A synchronization warning after a completed operation does not mean
+the commit or push should be repeated. Retained process and result-resource IDs
+belong to the current server process and disappear when it stops.
+
 ## Tests
 
 Tests that need a C/C++ workspace use the shared `cpp_acceptance_project` fixture from

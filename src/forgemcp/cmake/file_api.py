@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from forgemcp.diagnostics import display_value, os_error_reason
 from forgemcp.workspace.path import WorkspacePath
 
 from .errors import CMakeError
@@ -65,15 +66,28 @@ def checksum(path: Path) -> str | None:
 
 def read_reply(path: Path, project: Path, storage: Path) -> dict:
     """Read a size-bounded managed JSON reply without following references outside the roots."""
-    if managed_path(path, project, storage) is None:
+    reference = managed_path(path, project, storage)
+    if reference is None:
         raise CMakeError("CMake File API reply is outside managed roots.")
     with path.open("rb") as stream:
         data = stream.read(MAX_REPLY_BYTES + 1)
     if len(data) > MAX_REPLY_BYTES:
-        raise CMakeError("CMake File API reply exceeds the size limit.")
-    value = json.loads(data)
+        raise CMakeError(
+            f"CMake File API reply {display_value(str(reference))} exceeds "
+            f"the {MAX_REPLY_BYTES}-byte size limit."
+        )
+    try:
+        value = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise CMakeError(
+            f"CMake File API reply {display_value(str(reference))} has invalid JSON "
+            f"at line {error.lineno}, column {error.colno}. Run cmake_configure "
+            "to regenerate metadata."
+        ) from error
     if not isinstance(value, dict):
-        raise CMakeError("Expected a CMake File API object.")
+        raise CMakeError(
+            f"CMake File API reply {display_value(str(reference))} must contain a JSON object."
+        )
     return value
 
 
@@ -84,7 +98,10 @@ def generation(directory: Path) -> str | None:
         current = reply
         while current != directory:
             if current.is_symlink() or current.is_junction():
-                raise CMakeError("CMake File API cannot traverse links or junctions.")
+                raise CMakeError(
+                    "CMake File API metadata path .cmake/api/v1/reply traverses a link "
+                    "or junction. Choose a build tree without metadata links."
+                )
             current = current.parent
         if not reply.exists():
             return None
@@ -92,7 +109,11 @@ def generation(directory: Path) -> str | None:
         errors = []
         for count, path in enumerate(reply.iterdir()):
             if count >= MAX_INPUTS:
-                raise CMakeError("Too many CMake File API reply files.")
+                raise CMakeError(
+                    "CMake File API directory .cmake/api/v1/reply exceeds the "
+                    f"{MAX_INPUTS}-entry scan limit. Inspect old build metadata "
+                    "before configuring again."
+                )
             if path.name.startswith("index-") and path.suffix == ".json":
                 indexes.append(path.name)
             elif path.name.startswith("error-") and path.suffix == ".json":
@@ -102,7 +123,10 @@ def generation(directory: Path) -> str | None:
             return None
         return latest
     except OSError as error:
-        raise CMakeError("Cannot inspect CMake File API generation.") from error
+        raise CMakeError(
+            f"Cannot inspect CMake File API generation in .cmake/api/v1/reply: "
+            f"{os_error_reason(error)}."
+        ) from error
 
 
 def read_inputs(
@@ -119,10 +143,16 @@ def read_inputs(
         ]["cmakeFiles-v1"]
         filename = reference["jsonFile"]
         if not isinstance(filename, str) or Path(filename).name != filename:
-            raise CMakeError("Invalid CMake File API reply reference.")
+            raise CMakeError(
+                "CMake File API cmakeFiles-v1.jsonFile must be one relative filename "
+                "inside .cmake/api/v1/reply. Run cmake_configure to regenerate metadata."
+            )
         files = read_reply(reply / filename, project, storage)
         if files["kind"] != "cmakeFiles" or files["version"]["major"] != 1:
-            raise CMakeError("Unsupported CMake configuration inputs reply.")
+            raise CMakeError(
+                "CMake configuration inputs reply requires kind='cmakeFiles' and "
+                "version.major=1. Regenerate supported File API metadata with cmake_configure."
+            )
         if (
             Path(files["paths"]["source"]).resolve() != project
             or Path(files["paths"]["build"]).resolve() != directory.resolve()
@@ -132,7 +162,10 @@ def read_inputs(
             )
         inputs = files["inputs"]
         if not isinstance(inputs, list) or not inputs or len(inputs) > MAX_INPUTS:
-            raise CMakeError("Invalid or excessive CMake configuration inputs.")
+            raise CMakeError(
+                f"CMake File API inputs must be a nonempty array with at most {MAX_INPUTS} "
+                "entries. The compilation context cannot be confirmed from this reply."
+            )
         checksums = {}
         for item in inputs:
             native = Path(item["path"])
@@ -155,8 +188,17 @@ def read_inputs(
             current=True,
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
+        reason = (
+            os_error_reason(error)
+            if isinstance(error, OSError)
+            else f"missing metadata field {display_value(error.args[0])}"
+            if isinstance(error, KeyError)
+            else "metadata has an invalid value or shape"
+        )
         raise CMakeError(
-            "Cannot confirm CMake configuration inputs; run cmake_configure."
+            f"Cannot confirm CMake configuration inputs from index "
+            f"{display_value(index)}: {reason}. Resolve the metadata problem and run "
+            "cmake_configure; clangd contexts remain unavailable until confirmation."
         ) from error
 
 
@@ -197,7 +239,10 @@ def prepare_queries(query: Path) -> None:
                 raise CMakeError("CMake File API queries cannot be links.")
             target.write_text("", encoding="utf-8")
     except OSError as error:
-        raise CMakeError("Cannot prepare CMake File API queries.") from error
+        raise CMakeError(
+            "Cannot prepare CMake File API queries in .cmake/api/v1/query/client-forgemcp: "
+            f"{os_error_reason(error)}."
+        ) from error
 
 
 def compilation_database(
@@ -225,5 +270,6 @@ def read_generation(
         return read_inputs(directory, latest, project, storage)
     except OSError as error:
         raise CMakeError(
-            "Cannot inspect CMake generation; run cmake_configure."
+            f"Cannot inspect CMake generation: {os_error_reason(error)}. "
+            "Resolve build-metadata access and run cmake_configure."
         ) from error

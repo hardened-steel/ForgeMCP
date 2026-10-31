@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Sequence
@@ -20,6 +19,7 @@ from pydantic import Field
 
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value, os_error_reason
 from forgemcp.process.errors import ProcessError, ProcessStartError
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.process.service import ProcessService
@@ -31,7 +31,13 @@ from forgemcp.toolchain.spec import Toolset
 from forgemcp.toolchain.tools import cmake, ctest
 from forgemcp.workspace.path import WorkspacePath
 
-from .build_tree import clear_build_directory, execution_path
+from .build_tree import (
+    build_path,
+    clear_build_directory,
+    execution_paths,
+    read_cache,
+    require_configured,
+)
 from .errors import CMakeError
 from .file_api import (
     ConfigurationInputs,
@@ -44,7 +50,15 @@ from .file_api import (
     prepare_queries,
     read_generation,
 )
-from .profiles import ProfileDefinition, require_configuration
+from .profiles import (
+    ProfileDefinition,
+    configure_definitions,
+    operation_presets,
+    plain_profile,
+    require_configuration,
+    validate_names,
+    validate_presets,
+)
 from .models import (
     CMakeProfile,
     CompilationContext,
@@ -127,27 +141,42 @@ class CMakeService:
             if selector in (item.id, item.name)
         ]
         if len(matches) != 1:
-            raise CMakeError(f"Expected one toolset matching {selector!r}.")
+            choices = [item.id for item in matches or self.toolchains.list_toolsets()]
+            reason = "matches multiple toolsets" if matches else "matches no toolset"
+            raise CMakeError(
+                f"Operator toolset setting {display_value(selector)} {reason}. "
+                "Select one exact toolset ID in --cmake-toolset or --cmake-profile. "
+                + available_values(choices, "toolsets_list()")
+            )
         return matches[0]
 
     def cmake_methods(self, toolset_id: str) -> cmake.Methods:
         """Return typed CMake operations or reject a toolset without CMake."""
         tool = self.toolchains.get_tool(toolset_id, "cmake")
         if tool is None:
-            raise CMakeError(f"Toolset {toolset_id!r} has no cmake executable.")
+            raise CMakeError(
+                f"Toolset {display_value(toolset_id)} has no cmake executable. "
+                f"Inspect toolset_get(toolset_id={display_value(toolset_id)}); "
+                "the operator must install CMake or select a toolset containing it."
+            )
         return cast(cmake.Methods, tool.methods)
 
     def ctest_methods(self, toolset_id: str) -> ctest.Methods:
         """Return typed CTest operations or reject a toolset without CTest."""
         tool = self.toolchains.get_tool(toolset_id, "ctest")
         if tool is None:
-            raise CMakeError(f"Toolset {toolset_id!r} has no ctest executable.")
+            raise CMakeError(
+                f"Toolset {display_value(toolset_id)} has no ctest executable. "
+                f"Inspect toolset_get(toolset_id={display_value(toolset_id)}); "
+                "the operator must install CTest or select a toolset containing it."
+            )
         return cast(ctest.Methods, tool.methods)
 
     async def available_presets(self, toolset_id: str) -> cmake.PresetsResult:
         """Ask the selected CMake executable for the project's preset catalog."""
         methods = self.cmake_methods(toolset_id)
         return await methods["presets"](self.project_root)
+
 
     async def selection(
         self,
@@ -183,11 +212,30 @@ class CMakeService:
                 for configuration in ("Debug", "Release")
             ]
         if names is not None:
-            if not names or len(names) != len(set(names)):
-                raise CMakeError("Profiles must be a nonempty list without duplicates.")
+            if not names:
+                raise CMakeError(
+                    "profiles=[] is empty. Omit profiles or pass null to select all profiles. "
+                    + available_values(
+                        [definition.name for definition in definitions],
+                        "cmake_profiles()",
+                    )
+                )
+            for index, name in enumerate(names):
+                if name in names[:index]:
+                    raise CMakeError(
+                        f"profiles[{index}]={display_value(name)} duplicates "
+                        f"profiles[{names.index(name)}]. List each profile once."
+                    )
             unknown = set(names) - {definition.name for definition in definitions}
             if unknown:
-                raise CMakeError(f"Unknown CMake profiles: {', '.join(sorted(unknown))}.")
+                invalid = next(index for index, name in enumerate(names) if name in unknown)
+                raise CMakeError(
+                    f"Unknown CMake profiles: profiles[{invalid}]={display_value(names[invalid])}. "
+                    + available_values(
+                        [definition.name for definition in definitions],
+                        "cmake_profiles()",
+                    )
+                )
             definitions = [definition for definition in definitions if definition.name in names]
         for definition in definitions:
             try:
@@ -214,15 +262,7 @@ class CMakeService:
         available = catalogs[toolset.id]
         if isinstance(available, CMakeError):
             raise available
-        for kind in ("configure", "build", "test"):
-            chosen = getattr(definition, kind + "_presets") or []
-            if len(chosen) != len(set(chosen)):
-                raise CMakeError(f"Repeated {kind} preset in profile {definition.name!r}.")
-            unknown = set(chosen) - set(getattr(available, kind))
-            if unknown:
-                raise CMakeError(
-                    f"Unavailable {kind} presets for {toolset.name}: {', '.join(sorted(unknown))}."
-                )
+        validate_presets(definition, available, toolset.id)
         if definition.build_directory is not None:
             self.build_path(definition.build_directory)
         return CMakeProfile(
@@ -237,146 +277,55 @@ class CMakeService:
         )
 
     def operation_presets(self, profile: CMakeProfile, operation: str) -> list[str | None]:
-        """Choose operation presets or a permitted ordinary build-directory invocation."""
-        if profile.mode == "plain":
-            return [None]
-        selected = getattr(profile, operation + "_presets")
-        if selected:
-            return selected
-        if operation != "configure" and profile.build_directory is not None:
-            return [None]
-        raise CMakeError(
-            f"Profile {profile.name!r} has no {operation} presets. "
-            "Select the required presets in --cmake-profile; for build/test without "
-            "presets, set build-directory to the existing preset build directory."
-        )
+        """Choose native presets or a permitted configured build-directory operation."""
+        return operation_presets(profile, operation)
 
     def plain_profile(self, definition: ProfileDefinition) -> CMakeProfile:
         """Resolve a manual profile with a safe build directory and default Ninja generator."""
-        toolset = self.toolset(definition.toolset)
-        directory = definition.build_directory
-        if directory is None:
-            if (
-                not definition.name
-                or definition.name in (".", "..")
-                or any(char in definition.name for char in "/\\\0")
-            ):
-                raise CMakeError("Directory key must be one nonempty directory name.")
-            directory = WorkspacePath(f"storage/build/cmake-{definition.name}")
-        self.build_path(directory)
-        return CMakeProfile(
-            name=definition.name,
-            toolset_id=toolset.id,
-            build_directory=directory,
-            configuration=definition.configuration,
-            generator=definition.generator or "Ninja",
+        return plain_profile(
+            definition,
+            self.toolset(definition.toolset).id,
+            self.project_root,
+            self.storage_root,
+            self.protected_paths,
         )
 
     def build_path(self, directory: WorkspacePath) -> Path:
-        """Validate a managed build path against root, link, and protected-path restrictions."""
-        if directory.area == "root":
-            raise CMakeError("Build directory must be inside the project or storage root.")
-        base = self.project_root if directory.area == "project" else self.storage_root
-        path = base / directory.relative
-        try:
-            if not path.resolve().is_relative_to(base):
-                raise CMakeError(f"Build path resolves outside its root: {directory}.")
-            if path in (self.project_root, self.storage_root):
-                raise CMakeError("Cannot use a workspace root as a build directory.")
-            if os.name == "nt" and any(
-                os.path.isreserved(part) for part in Path(directory.relative).parts
-            ):
-                raise CMakeError(f"Build path contains a reserved name: {directory}.")
-            current = path
-            while True:
-                if current.is_symlink() or current.is_junction():
-                    raise CMakeError("Build path cannot traverse symbolic links or junctions.")
-                if current == base:
-                    break
-                current = current.parent
-            if any(path.is_relative_to(protected) for protected in self.protected_paths):
-                raise CMakeError(f"Build path is protected: {directory}.")
-        except OSError as error:
-            raise CMakeError(f"Cannot inspect build path {directory}.") from error
-        return path
+        """Resolve a checked build path using this service's managed roots."""
+        return build_path(
+            directory,
+            self.project_root,
+            self.storage_root,
+            self.protected_paths,
+        )
 
     def cache(self, directory: WorkspacePath) -> dict[str, str]:
-        """Read and parse a managed build directory's UTF-8 CMake cache."""
-        path = self.build_path(directory) / "CMakeCache.txt"
-        base = self.project_root if directory.area == "project" else self.storage_root
-        try:
-            if not path.resolve().is_relative_to(base):
-                raise CMakeError("CMake cache resolves outside the build root.")
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise CMakeError(f"Cannot read CMake cache in {directory}.") from error
-        if "\0" in text:
-            raise CMakeError(f"CMake cache in {directory} is not a text file.")
-        return cmake.parse_cache(text)
+        """Read a checked build cache using this service's managed roots."""
+        return read_cache(
+            directory,
+            self.project_root,
+            self.storage_root,
+            self.protected_paths,
+        )
 
     def require_configured(self, profile: CMakeProfile) -> dict[str, str]:
-        """Require a readable cache whose source directory belongs to this project."""
-        if profile.build_directory is None:
-            raise CMakeError("Set build-directory for operations without a preset.")
-        try:
-            cache = self.cache(profile.build_directory)
-        except CMakeError as error:
-            raise CMakeError(f"Configure profile {profile.name!r} first.") from error
-        source = cache.get("CMAKE_HOME_DIRECTORY")
-        if source is None or Path(source).resolve() != self.project_root:
-            raise CMakeError("Build directory belongs to another source project.")
-        return cache
+        """Require a readable cache belonging to this workspace and profile."""
+        return require_configured(
+            profile,
+            self.project_root,
+            self.storage_root,
+            self.protected_paths,
+        )
 
     def configure_definitions(self, definition: ProfileDefinition) -> dict[str, str]:
-        """Resolve compiler and toolchain settings and reject conflicting cache overrides."""
-        result = dict(definition.definitions)
-        reserved = {"CMAKE_HOME_DIRECTORY", "CMAKE_CACHEFILE_DIR"}
-        if reserved.intersection(key.partition(":")[0] for key in result):
-            raise CMakeError("CMake source/build directories cannot be cache overrides.")
-        toolset = self.toolset(definition.toolset)
-        for field, variable in (
-            (definition.c_compiler, "CMAKE_C_COMPILER"),
-            (definition.cxx_compiler, "CMAKE_CXX_COMPILER"),
-        ):
-            if field is not None:
-                tool = self.toolchains.get_tool(toolset.id, field)
-                if tool is None:
-                    raise CMakeError(f"Toolset {toolset.name!r} has no {field!r}.")
-                if any(key.partition(":")[0] == variable for key in result):
-                    raise CMakeError(f"Duplicate setting for {variable}.")
-                result[variable] = str(tool.path)
-        if definition.toolchain_file is not None:
-            if any(key.partition(":")[0] == "CMAKE_TOOLCHAIN_FILE" for key in result):
-                raise CMakeError("Duplicate setting for CMAKE_TOOLCHAIN_FILE.")
-            reference = definition.toolchain_file
-            if reference.area == "root":
-                raise CMakeError("Toolchain file must be inside the project or storage root.")
-            base = self.project_root if reference.area == "project" else self.storage_root
-            toolchain_file = (base / reference.relative).resolve()
-            if not toolchain_file.is_relative_to(base):
-                raise CMakeError(f"Toolchain file is outside its root: {reference}.")
-            if not toolchain_file.is_file():
-                raise CMakeError(f"Toolchain file does not exist: {reference}.")
-            result["CMAKE_TOOLCHAIN_FILE"] = str(toolchain_file)
-        if definition.configuration is not None:
-            configured = [
-                value
-                for key, value in result.items()
-                if key.partition(":")[0] == "CMAKE_BUILD_TYPE"
-            ]
-            if configured and any(value != definition.configuration for value in configured):
-                raise CMakeError("configuration conflicts with CMAKE_BUILD_TYPE.")
-            if not configured:
-                result["CMAKE_BUILD_TYPE"] = definition.configuration
-        if not any(key.partition(":")[0] == "CMAKE_EXPORT_COMPILE_COMMANDS" for key in result):
-            result["CMAKE_EXPORT_COMPILE_COMMANDS"] = "ON"
-        if (definition.generator or "Ninja") in ("Ninja", "Ninja Multi-Config"):
-            ninja = self.toolchains.get_tool(toolset.id, "ninja")
-            if ninja is None:
-                raise CMakeError(f"Toolset {toolset.name!r} has no ninja executable.")
-            if not any(key.partition(":")[0] == "CMAKE_MAKE_PROGRAM" for key in result):
-                result["CMAKE_MAKE_PROGRAM"] = str(ninja.path)
-        return result
+        """Resolve operator cache settings using this service's toolchains and roots."""
+        return configure_definitions(
+            definition,
+            self.toolset(definition.toolset),
+            self.toolchains,
+            self.project_root,
+            self.storage_root,
+        )
 
     def current_contexts(self) -> list[CompilationContext]:
         """Copy confirmed contexts whose databases still exist."""
@@ -524,7 +473,7 @@ class CMakeService:
             annotations=ToolAnnotations(read_only_hint=True),
         )
         async def cmake_profiles(ctx: Context) -> Annotated[CallToolResult, list[CMakeProfile]]:
-            """List effective profiles with their toolsets, build settings, and preset selections."""
+            """List effective profiles and their toolsets, build settings, and preset selections."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Reading CMake profiles")
             try:
@@ -666,8 +615,13 @@ class CMakeService:
                             )
                             if snapshot is None:
                                 raise CMakeError(
-                                    "No new successful CMake File API generation; "
-                                    "run cmake_configure."
+                                    "Configure exited successfully but produced no new successful "
+                                    "CMake File API generation in "
+                                    f"{display_value(str(result.build_directory))}. "
+                                    "The compilation context remains unconfirmed. Inspect "
+                                    f"process_get(process_id={result.process_id}) and the "
+                                    "build directory's .cmake/api/v1/reply metadata before "
+                                    "retrying cmake_configure."
                                 )
                             self.inputs[result.build_directory] = snapshot
                             result.compilation_database = compilation_database(
@@ -748,11 +702,10 @@ class CMakeService:
             Omitted targets use CMake or preset defaults; a nonempty targets list
             selects explicit build targets.
             """
-            if targets is not None and (not targets or any(not name for name in targets)):
-                raise ToolError("Targets must be a nonempty list of nonempty names.")
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing CMake build")
             try:
+                validate_names(targets, "targets")
                 definitions, catalogs = await self.selection(profiles)
             except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
@@ -839,11 +792,10 @@ class CMakeService:
             names selects exact test names, not regex patterns; omit it to use
             CTest or preset defaults.
             """
-            if names is not None and (not names or any(not name for name in names)):
-                raise ToolError("Test names must be a nonempty list of nonempty names.")
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing CTest")
             try:
+                validate_names(names, "names")
                 definitions, catalogs = await self.selection(profiles)
             except (CMakeError, ToolchainError, ProcessError) as error:
                 raise ToolError(str(error)) from error
@@ -888,7 +840,10 @@ class CMakeService:
                         try:
                             temporary_root.mkdir(parents=True, exist_ok=True)
                         except OSError as error:
-                            raise CMakeError("Cannot create CTest temporary storage.") from error
+                            raise CMakeError(
+                                "Cannot create CTest temporary storage storage/tmp: "
+                                f"{os_error_reason(error)}."
+                            ) from error
                         try:
                             with tempfile.TemporaryDirectory(
                                 prefix="ctest-",
@@ -910,7 +865,10 @@ class CMakeService:
                                 result.process_id = command.process_id
                                 result.tests = command.tests
                         except OSError as error:
-                            raise CMakeError("Cannot use CTest temporary storage.") from error
+                            raise CMakeError(
+                                "Cannot use CTest temporary storage storage/tmp: "
+                                f"{os_error_reason(error)}."
+                            ) from error
                         failed = any(
                             test.status in ("failed", "not_run") for test in result.tests
                         )
@@ -942,25 +900,29 @@ class CMakeService:
             """
             report = progress(ctx, interval=self.progress_interval)
             await report(0, message="Preparing test executable")
-            values = arguments if arguments is not None else []
-            if any("\0" in value for value in values):
-                raise ToolError("Test arguments cannot contain NUL.")
+            arguments = arguments if arguments is not None else []
+            for index, value in enumerate(arguments):
+                if "\0" in value:
+                    raise ToolError(
+                        f"arguments[{index}] contains NUL. Pass literal strings without NUL."
+                    )
             try:
-                program = execution_path(executable, self.project_root, self.storage_root)
-                directory = execution_path(cwd, self.project_root, self.storage_root)
-                if not program.is_file():
-                    raise CMakeError(f"Test executable is not a file: {executable}.")
-                if not directory.is_dir():
-                    raise CMakeError(f"Test working directory does not exist: {cwd}.")
-                if os.name == "nt" and program.suffix.lower() in (".bat", ".cmd"):
-                    raise CMakeError("Test executable must be a native program, not a batch file.")
+                program, directory = execution_paths(
+                    executable,
+                    cwd,
+                    self.project_root,
+                    self.storage_root,
+                )
             except CMakeError as error:
                 raise ToolError(str(error)) from error
             except OSError as error:
-                raise ToolError("Cannot inspect test executable or working directory.") from error
+                raise ToolError(
+                    f"Cannot inspect executable={display_value(str(executable))} or "
+                    f"cwd={display_value(str(cwd))}: {os_error_reason(error)}."
+                ) from error
             result = CMakeRunTestResult(
                 executable=executable,
-                arguments=values,
+                arguments=arguments,
                 cwd=cwd,
             )
             updates = 1
@@ -968,7 +930,7 @@ class CMakeService:
             try:
                 async with await self.processes.launch(
                     program,
-                    values,
+                    arguments,
                     cwd=directory,
                     timeout=timeout,
                 ) as session:
@@ -980,8 +942,18 @@ class CMakeService:
                     code = await session.wait()
                     if code != 0:
                         result.error = f"Test executable exited with {code}."
-            except ProcessStartError:
-                result.error = f"Cannot start test executable: {executable}."
+            except ProcessStartError as error:
+                result.error = (
+                    f"Cannot start executable={display_value(str(executable))} "
+                    f"with cwd={display_value(str(cwd))}."
+                    + (
+                        f" {os_error_reason(error.__cause__)}."
+                        if isinstance(error.__cause__, OSError)
+                        else ""
+                    )
+                    + " Check that it is an executable program for this operating system "
+                    "and that execution is permitted."
+                )
             except ProcessError as error:
                 result.error = str(error)
             await report(updates + 1, message=result.error or "Completed successfully")

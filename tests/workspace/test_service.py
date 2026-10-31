@@ -17,7 +17,7 @@ from forgemcp.completion import Complete
 
 from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.errors import WorkspaceError
-from forgemcp.workspace.service import ReadConfirmation, WorkspaceService
+from forgemcp.workspace.service import ReadConfirmation, WorkspaceService, confirm_read
 
 
 @pytest.fixture
@@ -415,11 +415,181 @@ def test_filesystem_errors_preserve_os_message_without_absolute_path():
     with pytest.raises(WorkspaceError) as caught:
         with filesystem_errors("relative/path"):
             raise OSError(errno.ENOTEMPTY, "Каталог не пуст", "C:/private/path")
-    assert str(caught.value) == "relative/path: Каталог не пуст."
+    message = str(caught.value)
+    assert "path='relative/path'" in message
+    assert "Каталог не пуст" in message
+    assert "workspace_list" in message
+    assert "C:/private/path" not in message
 
     with pytest.raises(WorkspaceError, match="PermissionError"):
         with filesystem_errors("relative/path"):
             raise PermissionError()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "keywords", "details"),
+    [
+        (
+            "workspace_list",
+            (),
+            {"depth": 0},
+            ("depth=0", ">= 1", "null"),
+        ),
+        (
+            "workspace_read_file",
+            (WorkspacePath("project/README.md"),),
+            {"start_line": 0},
+            ("start_line=0", "numbered from 1", "start_line=1"),
+        ),
+        (
+            "workspace_read_file",
+            (WorkspacePath("project/README.md"),),
+            {"start_line": 3, "end_line": 2},
+            ("end_line=2", "start_line=3", "null"),
+        ),
+        (
+            "workspace_find_files",
+            (),
+            {"pattern": ""},
+            ("pattern=''", "glob", "'*'"),
+        ),
+        (
+            "workspace_text_search",
+            ("",),
+            {},
+            ("query=''", "nonempty", "workspace_find_files"),
+        ),
+        (
+            "workspace_text_search",
+            ("[",),
+            {"regex": True},
+            ("query", "position", "regex=false"),
+        ),
+        (
+            "workspace_text_search",
+            ("text",),
+            {"max_matches": 0},
+            ("max_matches=0", ">= 1", "100"),
+        ),
+        (
+            "workspace_file_info",
+            (WorkspacePath("project/src"),),
+            {},
+            ("path='project/src'", "found a directory", "workspace_list"),
+        ),
+    ],
+)
+def test_argument_errors_identify_values_and_recovery(request, name, arguments, keywords, details):
+    """Explain the rejected argument and a concrete correction for common Workspace failures."""
+    invoke = request.getfixturevalue("call")
+    with pytest.raises(ToolError) as caught:
+        invoke(name, *arguments, **keywords)
+    message = str(caught.value)
+    assert all(detail in message for detail in details), message
+
+
+def test_edit_errors_preserve_contents_and_do_not_repeat_source_text(request):
+    """Give exact-edit recovery without exposing the supplied source fragment in the error."""
+    test_workspace = request.getfixturevalue("workspace")
+    invoke = request.getfixturevalue("call")
+    candidate = test_workspace.root / "error-edit.txt"
+    candidate.write_bytes(b"repeat repeat\r\noriginal")
+    original = candidate.read_bytes()
+    for old_text, details in (
+        ("", ("old_text=''", "workspace_read_file")),
+        ("private fragment", ("old_text", "no exact match", "line endings")),
+        ("repeat", ("2 occurrences", "replace_all=true", "unique")),
+    ):
+        with pytest.raises(ToolError) as caught:
+            invoke(
+                "workspace_edit_file",
+                WorkspacePath("project/error-edit.txt"),
+                old_text,
+                "changed",
+            )
+        message = str(caught.value)
+        assert "path='project/error-edit.txt'" in message
+        assert all(detail in message for detail in details), message
+        assert "private fragment" not in message
+        assert candidate.read_bytes() == original
+
+
+def test_move_errors_identify_destination_without_changing_source(request):
+    """Attribute a missing parent to destination and preserve the original file."""
+    test_workspace = request.getfixturevalue("workspace")
+    invoke = request.getfixturevalue("call")
+    source = test_workspace.root / "README.md"
+    original = source.read_bytes()
+    with pytest.raises(ToolError) as caught:
+        invoke(
+            "workspace_move",
+            WorkspacePath("project/README.md"),
+            WorkspacePath("project/missing-parent/moved.md"),
+        )
+    message = str(caught.value)
+    assert "destination='project/missing-parent/moved.md'" in message
+    assert "parent directory 'project/missing-parent'" in message
+    assert "workspace_mkdir" in message
+    assert source.read_bytes() == original
+    assert not (test_workspace.root / "missing-parent").exists()
+
+
+@pytest.mark.parametrize("operation", ["workspace_write_file", "workspace_edit_file"])
+def test_invalid_utf8_input_names_text_argument_without_changing_file(request, operation):
+    """Identify invalid replacement text before any bytes are written or replaced."""
+    test_workspace = request.getfixturevalue("workspace")
+    invoke = request.getfixturevalue("call")
+    candidate = test_workspace.root / "encoding.txt"
+    candidate.write_bytes(b"original\r\n")
+    arguments = (
+        [WorkspacePath("project/encoding.txt"), "\ud800"]
+        if operation == "workspace_write_file"
+        else [WorkspacePath("project/encoding.txt"), "original", "\ud800"]
+    )
+    with pytest.raises(ToolError) as caught:
+        invoke(operation, *arguments)
+    message = str(caught.value)
+    text_parameter = "text" if operation == "workspace_write_file" else "new_text"
+    assert f"Invalid {text_parameter}:" in message
+    assert "UTF-8" in message and "unpaired" in message
+    assert candidate.read_bytes() == b"original\r\n"
+
+
+def test_search_filesystem_error_identifies_nested_file(request, monkeypatch):
+    """Keep the failing file context and localized reason while hiding the native filename."""
+    test_workspace = request.getfixturevalue("workspace")
+    invoke = request.getfixturevalue("call")
+    candidate = test_workspace.root / "unreadable.err"
+    candidate.write_text("needle", encoding="utf-8")
+    original_read = Path.read_bytes
+
+    def read_bytes(path):
+        """Fail only the selected file with an OS error containing a private native path."""
+        if path == candidate:
+            raise PermissionError(13, "Доступ запрещён", "C:/private/native-path")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with pytest.raises(ToolError) as caught:
+        invoke("workspace_text_search", "needle", extensions=["err"])
+    message = str(caught.value)
+    assert "path='project/unreadable.err'" in message
+    assert "Доступ запрещён" in message
+    assert "permissions" in message
+    assert "C:/private/native-path" not in message
+
+
+def test_external_path_for_other_os_is_a_correctable_tool_error():
+    """Reject another host's absolute-path syntax before constructing an elicitation request."""
+    external = WorkspacePath(
+        "root//usr/include/header.h" if os.name == "nt" else "root/C:/SDK/header.h"
+    )
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(confirm_read(external))
+    message = str(caught.value)
+    assert f"path='{external}'" in message
+    assert "server's OS" in message
+    assert "for example" in message
 
 
 @pytest.mark.parametrize("interval", [0, 0.5, 1, 2])
