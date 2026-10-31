@@ -555,6 +555,9 @@ module. `close()` and context exit stop a remaining process and await all worker
 session exposes `process_id` and `returncode` without exposing its queue protocol as
 the consumer API.
 
+Closing an empty stdin after the child has closed its pipe is normal EOF. Errors
+flushing buffered input or an encoder's final bytes remain process stream failures.
+
 Two local operator actions also belong to the process module: `start_detached`
 starts a Hub with explicit arguments and disconnected standard streams, and
 `open_browser` opens the operator-requested admin URL. They are not MCP execution

@@ -279,10 +279,19 @@ class ProcessRecord:
             while True:
                 text = await queue.get()
                 if text is None:
-                    writer.write(encoder.final())
-                    await writer.drain()
+                    final = encoder.final()
+                    if final:
+                        writer.write(final)
+                    pending = bool(final) or writer.transport.get_write_buffer_size() > 0
+                    if pending:
+                        await writer.drain()
                     writer.close()
-                    await writer.wait_closed()
+                    if pending:
+                        await writer.wait_closed()
+                    else:
+                        # A fast child can close an empty pipe before queued EOF is handled.
+                        with suppress(BrokenPipeError, ConnectionResetError):
+                            await writer.wait_closed()
                     break
 
                 writer.write(encoder.encode(text))

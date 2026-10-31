@@ -6,11 +6,13 @@ import os
 import sys
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from forgemcp.process.service import ProcessService, ChunkDecoder, ProcessRecord
-from forgemcp.process.models import ProcessEncoding, ProcessTimeout
+from forgemcp.process.service import ProcessService, ChunkDecoder, ChunkEncoder, ProcessRecord
+from forgemcp.process.models import ProcessEncoding, ProcessStatus, ProcessSummary, ProcessTimeout
 from forgemcp.process.errors import (
     ProcessError,
     ProcessExitedError,
@@ -136,6 +138,7 @@ async def test_stdin_fifo_eof_both_outputs_and_repeat_wait(processes):
 @pytest.mark.anyio
 @pytest.mark.parametrize("send_eof", [False, True])
 async def test_stdin_cleanup_after_child_exit(processes, send_eof):
+    """Close an exited child's stdin without inventing an undelivered-input failure."""
     async with await processes.launch(
         sys.executable,
         ("-c", "print('finished')"),
@@ -147,6 +150,57 @@ async def test_stdin_cleanup_after_child_exit(processes, send_eof):
         writer = session.process.stdin
         assert writer.is_closing()
         await writer.wait_closed()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_type", [BrokenPipeError, ConnectionResetError])
+@pytest.mark.parametrize(
+    "driver,buffered,expected_failure",
+    [
+        ("utf-8", 0, False),
+        ("utf-8", 1024, True),
+        ("utf-16", 0, True),
+    ],
+)
+async def test_eof_after_peer_closes_stdin_preserves_only_pending_write_failures(
+    failure_type,
+    driver,
+    buffered,
+    expected_failure,
+):
+    """A closed empty pipe is normal EOF; undelivered input must remain a process failure."""
+    summary = ProcessSummary(
+        executable="program",
+        encoding=driver,
+        process_id=17,
+        cwd="project",
+        arguments=[],
+        timeout=ProcessTimeout(),
+    )
+    record = ProcessRecord(summary, ProcessStatus(pid=17, current_status="running"))
+    writer = SimpleNamespace(
+        write=Mock(),
+        drain=AsyncMock(side_effect=failure_type()),
+        close=Mock(),
+        wait_closed=AsyncMock(side_effect=failure_type()),
+        is_closing=Mock(return_value=True),
+        transport=SimpleNamespace(
+            get_write_buffer_size=Mock(return_value=buffered),
+            abort=Mock(),
+        ),
+    )
+    queue = asyncio.Queue()
+    queue.put_nowait(None)
+    encoder = ChunkEncoder(ProcessEncoding(driver, "strict"))
+    if expected_failure:
+        with pytest.raises(ProcessStreamError) as failure:
+            await record.write_stream(writer, encoder, queue)
+        assert "process 17 stdin" in str(failure.value)
+        assert "process_get(process_id=17)" in str(failure.value)
+    else:
+        await record.write_stream(writer, encoder, queue)
+        writer.drain.assert_not_awaited()
+        writer.close.assert_called_once()
 
 
 @pytest.mark.anyio
@@ -430,8 +484,6 @@ async def test_launch_cancellation_delegates_to_asyncio(processes, monkeypatch):
 @pytest.mark.parametrize("interval", [0, 1])
 async def test_process_overview_uses_shared_progress(processes, monkeypatch, interval):
     """Verify overview progress follows the shared per-invocation throttle."""
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
     from mcp.server import MCPServer
     from mcp.server.apps import Apps
     from forgemcp.completion import Complete

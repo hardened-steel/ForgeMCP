@@ -342,7 +342,9 @@ class LldbDapSession(DebugSession):
         return m.ThreadRef(session_id=self.state.session_id, handle=handle)
 
     def reference(
-        self, kind: str, native: int | str
+        self,
+        kind: str,
+        native: int | str,
     ) -> m.FrameRef | m.VariablesRef | m.MemoryRef:
         """Intern one suspension-scoped adapter identity without exposing its raw value."""
         key = (kind, native)
@@ -365,7 +367,9 @@ class LldbDapSession(DebugSession):
         )
 
     def resolve_reference(
-        self, reference: m.FrameRef | m.VariablesRef | m.MemoryRef, kind: str
+        self,
+        reference: m.FrameRef | m.VariablesRef | m.MemoryRef,
+        kind: str,
     ) -> int | str:
         """Validate a generation and reference kind before reading the adapter object."""
         parameter = "frame" if kind == "frame" else "reference"
