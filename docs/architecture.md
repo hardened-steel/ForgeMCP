@@ -26,6 +26,7 @@ src/forgemcp/
   server.py                     # composition root, CLI, MCPServer
   assets.py                     # package-relative Widget and IconFile helpers
   completion.py                 # one server-wide completion dispatcher
+  diagnostics.py                # bounded error values, catalog hints, SDK validation text
   admin/
     history.py                  # SDK middleware and in-memory tool-call records
     instance.py                 # one SDK client and reconnecting instance IPC bridge
@@ -960,6 +961,77 @@ and verify its generated HTML and icon are packaged. Build with
 `npm run build --prefix frontend` or the wheel build. Do not add or run automated
 widget tests; the user reviews appearance and behavior visually.
 
+## Git repository operations
+
+`server.py` constructs `GitService` inside the same `ServerRuntime` used by stdio
+and the admin SDK client. It injects Workspace, Toolchain, CMake, and clangd;
+`--git-toolset` chooses the executable/environment without an implicit fallback.
+The Git ToolSpec binds a typed `run` method to ProcessService; only the feature's
+explicit handlers construct its argument lists. No arbitrary command MCP surface
+or backend interface hierarchy is introduced. Git result models are shared with
+the machine-format parsers and plain-text presentation in the feature directory.
+
+Git validates that the workspace equals the worktree root, protects `project/.git`
+from Workspace writes, uses literal pathspecs, rejects source paths outside the
+project, and removes inherited Git repository/config-injection redirects from the
+child environment. Git-owned metadata can reside outside the roots for linked
+worktrees; the Git executable accesses it without Python reading those external
+files or widening the file tools. Worktree management, init, and clone are outside
+the module. Installed Git hooks and operator credential helpers remain enabled.
+
+Read tools return status with separate index/worktree states, raw diff metadata
+plus a native patch, stable paginated history, commit details, line porcelain
+blame, refs, redacted remote addresses, and conflict index stages. NUL framing
+preserves spaces and line breaks in valid UTF-8 filenames. Binary blobs and gitlinks
+retain typed identities. Git transport uses reversible Latin-1 internally for
+byte-exact machine output, then the feature decodes explicit UTF-8 fields.
+Each command bounds retained stdout to 4 MiB and stderr to a short error summary;
+the existing process transcript is not copied into an additional operation log.
+
+Mutation tools cover explicit-path staging/unstaging/restore, commits, local branch
+management, switch, stash, fetch/pull/push, merge/rebase/cherry-pick/revert, and
+continue/abort/skip. Pull defaults to fast-forward only. Push targets one branch;
+history replacement requires the expected full remote OID. Stopped operation
+detection uses Git's pseudoref resolution, including rebase administrative refs,
+without parsing localized status prose or reading external metadata with Python.
+Ambiguous pseudoref/branch collisions fail explicitly. Unfinished operations remain
+owned by Git across requests and server restarts. Commands are never replayed.
+
+The lock order for mutations is Workspace serialization, clangd's source-change
+interval, then CMake's source-change interval. CMake finishes and releases its lock
+before clangd reconciles approved contexts. `CMakeProvider` and Git share
+`begin_source_change`/`finish_source_change`; unknown changes withdraw uncertain
+contexts. Source notifications combine pre/post dirty paths with committed tree
+diffs, without a project scan. Failure/cancellation still finalizes dependency
+checks; refresh failures cannot conceal a completed commit or push. There is no
+Hub-wide execution queue or cross-instance source/build coordination.
+
+Every Git tool binds `assets/git-result.html`, built from `frontend/git-result.html`,
+and `icons/git.svg`. It uses the common Apps lifecycle, theme, fixed geometry,
+filters, JSON, and original-value copying. Git projections and literal patch/source
+rendering live in `frontend/src/git-view.js`; `git.css` contains only the specialized
+content layouts and reuses the shared palette, typography, and outer geometry.
+Status separates index/worktree states, history emphasizes commit subjects, diffs
+group file patches with line gutters and wrapping controls, and blame aligns
+attribution with source lines. Conflict stages distinguish missing/binary content;
+mutation errors, unfinished operations, and analysis synchronization warnings lead
+the result. Native disclosures retain complete labeled fields, including unknown
+metadata. The shared custom-render call supplies its existing field renderer,
+copying, and tooltip helpers, so Git uses the same clipboard fallback and lifecycle
+as ordinary fields. Search is local and reversible, with matched/total counts.
+No tool calls, polling, external resources, or additional interactive mutation
+controls are present in the widget.
+The ordinary admin catalog/history already exposes these tools and their Apps.
+The Git monitor reads only the retained last status; it never launches a Git probe.
+Retained status/commit text resources and revision completions likewise use saved
+data rather than executing resource-time commands. No state is persisted to disk.
+
+Process termination snapshots descendants with psutil. On Windows, managed children
+also receive an OS Job Object so MSYS hooks that reparent grandchildren do not
+keep pipes open after cancellation. Closing the owned job terminates its remaining
+members. If the OS rejects job assignment, ordinary descendant cleanup remains
+available. This is process lifecycle management, not a filesystem sandbox.
+
 ## Local administration
 
 The CLI starts independent stdio runtimes. Each has its own inherited environment,
@@ -1000,8 +1072,8 @@ network administration service.
 ### SDK reuse and call history
 
 Hub commands use the existing SDK client methods for catalog listing, tool calls,
-resource reads, and template listing. This preserves handler schemas, validation,
-real request Context, progress, and SDK elicitation behavior. Direct
+resource reads, template listing, and completions. This preserves handler schemas,
+validation, real request Context, progress, and SDK elicitation behavior. Direct
 `MCPServer.call_tool()` is not used by HTTP handlers: it bypasses middleware and
 does not construct a transport request Context. Apps support is advertised by the
 in-process client. Concurrent commands reach the same feature service instances;
@@ -1059,6 +1131,7 @@ the authenticated browser session, `/api/events` streams invalidations, and
 | `GET /resources` | SDK static resource listing |
 | `GET /resource-templates` | SDK resource-template listing |
 | `GET /resources?uri=...` | Read the selected resource through the SDK |
+| `POST /completion` | Request native SDK completion with MCP `ref`, `argument`, and optional `context.arguments` |
 | `GET /elicitations` | Pending questions for this instance's admin client |
 | `POST /elicitations/{id}` | Supply an SDK elicitation `{"result": {...}}` |
 
@@ -1075,7 +1148,12 @@ registering a runtime; `unregister` ends an instance's registration.
 
 Each registered runtime has a tab with its own selected history record, catalog,
 read-only settings, and monitors. Existing tool schemas drive command controls,
-with JSON arguments available for complete input. Command controls are initially
+with labeled fields for ordinary input and JSON arguments available for complete
+input. Resource-template fields request native MCP completions using the original
+template reference and other entered parameters as context. The same bridge accepts
+prompt references without inventing a separate suggestion provider. Completion
+requests use the authenticated, CSRF-protected `POST /completion` route and never
+execute a tool. Command controls are initially
 hidden and must be explicitly enabled in the panel; this UI choice does not create
 a second authorization or validation policy for the tools.
 
@@ -1114,6 +1192,40 @@ methods translate them according to who can recover:
 - `ResourceNotFoundError` or another MCP error: the resource/request cannot be served;
 - any other exception: unexpected bug, logged server-side and sanitized by the SDK.
 
+Expected error messages identify the actual JSON argument, including nested fields
+and list indices, then explain the constraint or prerequisite and a concrete next
+step. Unknown identifiers include all available values for catalogs of up to eight
+items; larger catalogs report their size and an existing discovery call. Empty
+catalogs are explicit. Catalog hints use retained or already-read data without
+additional discovery processes. CMake target/test enumeration is not exposed;
+errors must not suggest a nonexistent listing tool.
+
+The small `ForgeMCPServer` specialization in the composition root uses the SDK's
+public `list_tools` and `call_tool` methods. It advertises closed top-level argument
+objects, rejects unknown argument names with a spelling suggestion when available,
+and formats SDK `ValidationError` details without input payloads, Pydantic links,
+or internal union branch names. Validation, resolver/elicitation execution, output
+conversion, and sanitization still belong to the SDK and run once per invocation.
+Union-object arguments such as process transcript selectors describe their valid
+forms and constraints in their schema; those descriptions also explain failures.
+
+`diagnostics.py` shares bounded escaped identifier rendering, small-catalog hints,
+OS explanations without native filename fields, and SDK validation formatting.
+Feature handlers retain operation-specific recovery decisions. Managed file errors
+keep project/storage qualification and distinguish source and destination roles.
+Source fragments, replacement text, full argument arrays, environments, malformed
+protocol payloads, and credentials are not added to diagnostic explanations.
+
+Process failures retain available process IDs and direct transcript lookup hints.
+Git uses stderr diagnostics with a bounded, credential-redacted stdout fallback
+when stderr is empty. Its typed repository state drives conflict recovery guidance.
+CMake per-profile errors and Git mutation errors retain their existing structured
+result contracts: a successful MCP exchange does not imply that every underlying
+operation succeeded. Messages distinguish pre-launch failure, partial or unknown
+mutation outcomes, and successful operations followed by synchronization warnings;
+they never advise blindly repeating completed mutations. Toolset version failures
+keep `version=null` and add textual explanations without changing result fields.
+
 Project-controlled text is data. It must not change server instructions, choose an
 executable, escape the workspace, or be copied into operational logs. Process
 consumers must explicitly select executables, construct arguments, choose timeout and
@@ -1133,6 +1245,11 @@ assert the public contract: schemas, Apps metadata, icons, progress, structured
 output, resources, prompts, and completions. The source acceptance project remains a
 portable fixture for later checks against real CMake, compilers, clangd, sanitizers,
 and debuggers; tests never operate on it in place.
+
+Expected-failure tests also check the parameter, useful constraint/choices or real
+recovery call, process provenance, and unchanged/partial mutation guarantees where
+relevant. SDK Client checks cover unknown argument rejection and concise validation
+messages; asserting only `is_error` does not establish the error contract.
 
 `.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
 frontend and Python wheel together. Python changes must also pass

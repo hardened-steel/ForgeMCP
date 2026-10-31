@@ -142,7 +142,10 @@ class LineRange(BaseModel):
     def validate_range(self) -> LineRange:
         """Reject inclusive line ranges whose end precedes the start."""
         if self.end < self.start:
-            raise ValueError("Line range requires start <= end.")
+            raise ValueError(
+                f"Invalid lines.end={self.end}: must be >= lines.start={self.start}; "
+                "line numbers start at 1 and ranges include both endpoints."
+            )
         return self
 
 
@@ -171,5 +174,8 @@ class TimeRange(BaseModel):
     def validate_range(self) -> TimeRange:
         """Require a nonempty half-open interval in elapsed process seconds."""
         if self.end <= self.start:
-            raise ValueError("Time range requires start < end.")
+            raise ValueError(
+                f"Invalid time.end={self.end}: must be > time.start={self.start}; "
+                "time is measured in seconds from process start and the end is excluded."
+            )
         return self

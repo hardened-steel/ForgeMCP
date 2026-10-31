@@ -282,7 +282,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
     const query = search.value.toLocaleLowerCase();
     const matches = (item) => !query || JSON.stringify(item).toLocaleLowerCase().includes(query);
     if (presentation.render) {
-      content.append(presentation.render(doc, query, content.clientWidth));
+      content.append(presentation.render(doc, query, content.clientWidth, { fields, copy, help }));
       count.textContent = presentation.count;
       return;
     }

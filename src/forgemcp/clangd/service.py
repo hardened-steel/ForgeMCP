@@ -23,6 +23,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 from forgemcp.assets import IconFile, Widget
 from forgemcp.cmake.service import CMakeService, CompilationContext
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value, os_error_reason
 from forgemcp.process.errors import ProcessError
 from forgemcp.progress import Progress, progress
 from forgemcp.text import tool_result
@@ -285,9 +286,17 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         contexts = await self.configurations()
         unknown = set(configurations) - {context.id for context in contexts}
         if unknown:
+            index = next(
+                index
+                for index, identifier in enumerate(configurations)
+                if identifier in unknown
+            )
             raise ClangdError(
-                f"Unavailable clangd configurations: {', '.join(sorted(unknown))}. "
-                "CMake inputs may be outdated or unconfirmed; run cmake_configure."
+                f"Unavailable clangd configurations: configurations[{index}]="
+                f"{display_value(configurations[index])}. "
+                + available_values([context.id for context in contexts], "clangd_configurations()")
+                + " CMake inputs may be outdated or unconfirmed; run cmake_configure "
+                "if this configuration was previously available."
             )
         selected = [
             context
@@ -297,7 +306,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         if not selected:
             raise ClangdError(
                 "No confirmed CMake configuration has both a compilation database and clangd. "
-                "CMake inputs may be outdated or unconfirmed; run cmake_configure."
+                "Call cmake_profiles() and run cmake_configure for the intended profiles. "
+                "If configuration succeeds, check that compile_commands.json is generated "
+                "and toolset_get(toolset_id=...) includes clangd. "
+                "Use clangd_configurations() to list usable configurations."
             )
         return selected
 
@@ -311,7 +323,10 @@ class ClangdService(ResultProvider[WorkspaceContext]):
                     self.check_ready()
                     yield
         except TimeoutError as error:
-            raise ClangdTimeoutError("Language analysis exceeded its timeout.") from error
+            raise ClangdTimeoutError(
+                f"Language analysis exceeded timeout={timeout:g} seconds, including queueing "
+                "and synchronization. Retry with fewer configurations or a larger timeout."
+            ) from error
         except WorkspaceError as error:
             raise ClangdError(str(error)) from error
 
@@ -354,7 +369,12 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         try:
             digest = hashlib.sha256(database.read_bytes()).hexdigest()
         except OSError as error:
-            raise ClangdError("Cannot read the compilation database.") from error
+            raise ClangdError(
+                f"Cannot read compilation database "
+                f"{display_value(str(context.compilation_database))} for configuration "
+                f"{display_value(context.id)}: {os_error_reason(error)}. "
+                "Restore access or regenerate it with cmake_configure."
+            ) from error
         return f"{digest}|{context.toolset_id}|{tool.path}|{database}"
 
     async def session(
@@ -398,12 +418,22 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         """Read managed UTF-8 source and reject external paths or binary text."""
         if path.area == "root":
             raise ClangdError(
-                "Analysis inputs must be project/storage files; external locations are read-only results.",
+                f"path={display_value(str(path))} cannot be analyzed: analysis inputs must "
+                "use project/ or storage/. External root/ locations can appear in results, "
+                "but cannot be supplied as analysis inputs.",
             )
         try:
             text = self.workspace.resolve_workspace_path(path).read_bytes().decode("utf-8")
-        except (OSError, UnicodeError) as error:
-            raise ClangdError(f"{path}: cannot read UTF-8 text.") from error
+        except OSError as error:
+            raise ClangdError(
+                f"Cannot read path={display_value(str(path))}: {os_error_reason(error)}. "
+                "Select an existing readable UTF-8 source file."
+            ) from error
+        except UnicodeError as error:
+            raise ClangdError(
+                f"path={display_value(str(path))} is not valid UTF-8 text. "
+                "Language analysis requires a UTF-8 source file."
+            ) from error
         if "\0" in text:
             raise ClangdError(f"{path}: expected UTF-8 text, found a binary file.")
         return text
@@ -413,7 +443,12 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         """Reject an analysis operation whose server capability is absent or false."""
         value = session.capabilities.get(name)
         if value is None or value is False:
-            raise ClangdError(f"clangd does not support {name}.")
+            raise ClangdError(
+                f"clangd in configuration {display_value(session.configuration.id)} "
+                f"does not advertise capability {display_value(name)} required by this "
+                "operation. Select another available configuration with "
+                "clangd_configurations(), or ask the operator to update its clangd toolset."
+            )
 
     async def run_context[T](
         self,
@@ -423,6 +458,7 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         timeout: float,
     ) -> T:
         """Run an operation in one context and discard its session on failure or cancellation."""
+        session = None
         try:
             session = await self.session(context, on_progress, timeout)
             return await operation(session)
@@ -430,11 +466,27 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             await self.close_session(context.id)
             raise
         except (ClangdError, ToolchainError, ProcessError, WorkspaceError) as error:
+            process_id = (
+                session.connection.process_id
+                if session is not None
+                else getattr(error, "process_id", None)
+            )
             await self.close_session(context.id)
-            raise ClangdError(f"{context.id}: {error}") from error
+            hint = (
+                f" Inspect process_get(process_id={process_id}) for the clangd process."
+                if process_id is not None
+                else ""
+            )
+            raise ClangdError(
+                f"Configuration {display_value(context.id)}: {error}{hint}"
+            ) from error
         except (ValidationError, KeyError, TypeError, ValueError) as error:
             await self.close_session(context.id)
-            raise ClangdProtocolError(f"{context.id}: invalid language-server result.") from error
+            raise ClangdProtocolError(
+                f"Configuration {display_value(context.id)} returned an invalid "
+                "language-server result for this operation. Ask the operator to check "
+                "clangd compatibility; changing source arguments may not resolve this failure."
+            ) from error
 
     async def collect[T: BaseModel](
         self,
@@ -500,8 +552,19 @@ class ClangdService(ResultProvider[WorkspaceContext]):
         if document is None or document.path != path:
             raise ClangdSessionError("The requested document is not open for this operation.")
         lines = document.text.split("\n")
-        if position.line > len(lines) or position.character > len(lines[position.line - 1].removesuffix("\r")):
-            raise ClangdError("Position is outside the document.")
+        if position.line > len(lines):
+            raise ClangdError(
+                f"position.line={position.line} is outside path={display_value(str(path))}. "
+                f"Valid lines are 1..{len(lines)} (one-based). "
+                "Use workspace_read_file to inspect source line numbers."
+            )
+        length = len(lines[position.line - 1].removesuffix("\r"))
+        if position.character > length:
+            raise ClangdError(
+                f"position.character={position.character} is outside line {position.line} "
+                f"of path={display_value(str(path))}. Valid character offsets are 0..{length} "
+                "(zero-based Unicode code points, not bytes)."
+            )
         return {"textDocument": {"uri": uri}, "position": lsp_position(position)}
 
     async def locations(
@@ -897,6 +960,37 @@ class ClangdService(ResultProvider[WorkspaceContext]):
             except BaseException:
                 await self.close_session(identifier)
                 raise
+
+    @asynccontextmanager
+    async def source_change(self) -> AsyncGenerator[None]:
+        """Exclude analysis during a batch mutation; callers finish CMake before refreshing."""
+        async with self.lock:
+            try:
+                yield
+            except BaseException:
+                await self.close_sessions()
+                raise
+
+    async def refresh_source_changes(
+        self,
+        changes: Sequence[FileChange] | None,
+    ) -> None:
+        """Reconcile CMake and saved-source changes while the caller holds the analysis lock.
+
+        None represents an unknown change set and discards potentially stale indexes.
+        This method collects no diagnostics and never performs CMake configuration.
+        """
+        if self.closed:
+            return
+        try:
+            if changes is None:
+                await self.close_sessions()
+                await self.update_configurations(await self.cmake.compilation_contexts())
+            else:
+                await self.synchronize_changes(changes)
+        except BaseException:
+            await self.close_sessions()
+            raise
 
     @staticmethod
     def overlaps_lines(span: SourceRange, start_line: int, end_line: int | None) -> bool:

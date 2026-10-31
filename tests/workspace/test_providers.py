@@ -143,6 +143,71 @@ async def test_find_files_accepts_project_relative_directory_paths(request, path
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "details"),
+    [
+        (
+            "workspace_list",
+            {"depth": 0},
+            ("depth=0", ">= 1", "null"),
+        ),
+        (
+            "workspace_read_file",
+            {"path": "project/README.md", "start_line": 4, "end_line": 2},
+            ("end_line=2", "start_line=4", "null"),
+        ),
+        (
+            "workspace_read_file",
+            {"path": "project/src/../README.md"},
+            ("path", "'..'", "project/src/main.cpp"),
+        ),
+        (
+            "workspace_write_file",
+            {"path": "root/C:/SDK/header.h", "text": "unused"},
+            ("path='root/C:/SDK/header.h'", "project/ or storage/", "forbidden"),
+        ),
+        (
+            "workspace_move",
+            {"source": "project/README.md", "destination": "storage/moved.md"},
+            ("source='project/README.md'", "destination='storage/moved.md'", "both"),
+        ),
+        (
+            "workspace_edit_file",
+            {"path": "project/README.md", "old_text": "", "new_text": "unused"},
+            ("old_text=''", "project/README.md", "workspace_read_file"),
+        ),
+    ],
+)
+async def test_tool_error_contract_names_argument_and_recovery(request, tool, arguments, details):
+    """Expose actionable expected errors through the SDK without changing project contents."""
+    workspace, mcp = request.getfixturevalue("setup")
+    original = (workspace.root / "README.md").read_bytes()
+    async with Client(mcp) as client:
+        response = await client.call_tool(tool, arguments)
+    assert response.is_error
+    message = response.content[0].text
+    assert all(detail in message for detail in details), message
+    assert (workspace.root / "README.md").read_bytes() == original
+
+
+@pytest.mark.anyio
+async def test_missing_snapshot_error_identifies_link_and_session(request):
+    """Explain missing immutable resources without suggesting a repeated mutation."""
+    _, mcp = request.getfixturevalue("setup")
+    result_id = "a" * 32
+    async with Client(mcp) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource(
+                f"forgemcp://workspace/results/{result_id}/missing.json"
+            )
+    message = str(caught.value)
+    assert result_id in message
+    assert "missing.json" in message
+    assert "current tool result" in message
+    assert "restarts" in message
+
+
+@pytest.mark.anyio
 async def test_context_and_immutable_resource_belong_to_one_call(setup):
     """Verify provider context and immutable resources stay bound to one copied tool result."""
     workspace, mcp = setup

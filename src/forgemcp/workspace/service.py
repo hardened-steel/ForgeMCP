@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import errno
 import fnmatch
 import json
 import logging
@@ -39,6 +40,7 @@ from pydantic import BaseModel, Field
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import display_value, os_error_reason
 from forgemcp.progress import progress
 from forgemcp.text import tool_result
 
@@ -72,6 +74,12 @@ async def confirm_read(path: WorkspacePath) -> ReadConfirmation | Elicit[ReadCon
     """Allow managed reads directly and request SDK elicitation for external reads."""
     if path.area != "root":
         return ReadConfirmation(allow=True)
+    if not Path(path.relative).is_absolute():
+        example = "root/C:/SDK/header.h" if os.name == "nt" else "root//usr/include/header.h"
+        raise ToolError(
+            f"Invalid path={display_value(path)}: the external path is not absolute on this "
+            f"host. Use an absolute path for the server's OS, for example {display_value(example)}."
+        )
     return Elicit(f"Allow reading external file {path.absolute}?", ReadConfirmation)
 
 
@@ -290,15 +298,56 @@ class ResultProvider(Generic[ContextT]):
 
 
 @contextmanager
-def filesystem_errors(path: str | WorkspacePath) -> Generator[None]:
+def filesystem_errors(
+    path: str | WorkspacePath,
+    *,
+    parameter: str = "path",
+    text_parameter: str = "text",
+) -> Generator[None]:
     """Translate expected failures without exposing absolute filesystem paths."""
     try:
         yield
     except UnicodeError as error:
-        raise WorkspaceError(f"{path}: expected valid UTF-8 text.") from error
-    except OSError as error:
+        if isinstance(error, UnicodeEncodeError):
+            raise WorkspaceError(
+                f"Invalid {text_parameter}: text contains characters that cannot be encoded "
+                "as UTF-8. Remove unpaired Unicode surrogates before retrying; "
+                "the file was not changed."
+            ) from error
+        recovery = (
+            "Managed file bytes can be read through the workspace raw resource."
+            if str(path).startswith(("project/", "storage/"))
+            else "Choose a UTF-8 text file."
+        )
         raise WorkspaceError(
-            f"{path}: {error.strerror or type(error).__name__}."
+            f"Invalid {parameter}={display_value(path)}: expected valid UTF-8 text. "
+            f"{recovery}"
+        ) from error
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            recovery = (
+                "Inspect the path and its parent with workspace_list; file writes and moves "
+                "require an existing parent directory, which workspace_mkdir can create."
+            )
+        elif error.errno in (errno.EACCES, errno.EPERM) or isinstance(error, PermissionError):
+            recovery = (
+                "Check filesystem permissions and whether another process has locked the path."
+            )
+        elif error.errno == errno.ENOTEMPTY:
+            recovery = (
+                "workspace_delete removes only files and empty directories; "
+                "inspect the directory with workspace_list before choosing individual entries."
+            )
+        elif error.errno == errno.EISDIR:
+            recovery = "Choose a regular file; inspect this directory with workspace_list."
+        elif error.errno == errno.EEXIST:
+            recovery = (
+                "Choose an unused destination or inspect the existing path with workspace_list."
+            )
+        else:
+            recovery = "Check the path, filesystem permissions, and whether the path is in use."
+        raise WorkspaceError(
+            f"Invalid {parameter}={display_value(path)}: {os_error_reason(error)}. {recovery}"
         ) from error
 
 
@@ -306,10 +355,17 @@ def read_text(candidate: Path, path: WorkspacePath) -> str:
     """Read complete UTF-8 text without newline conversion for Workspace and diff."""
     with filesystem_errors(path):
         if not candidate.is_file():
-            raise WorkspaceError(f"{path}: expected an existing regular file.")
+            raise WorkspaceError(
+                f"Invalid path={display_value(path)}: expected an existing regular file. "
+                "Use workspace_list to inspect directories or workspace_find_files "
+                "to locate a file."
+            )
         text = candidate.read_bytes().decode("utf-8")
         if "\0" in text:
-            raise WorkspaceError(f"{path}: expected UTF-8 text, found a binary file.")
+            raise WorkspaceError(
+                f"Invalid path={display_value(path)}: expected UTF-8 text, found a binary file. "
+                "Use the workspace raw resource to read managed file bytes."
+            )
         return text
 
 
@@ -432,7 +488,12 @@ class WorkspaceService:
         try:
             return self.result_resources[result_id][name][1]
         except KeyError as error:
-            raise WorkspaceError("Workspace result resource does not exist.") from error
+            raise WorkspaceError(
+                f"Workspace result resource result_id={display_value(result_id)}, "
+                f"name={display_value(name)} does not exist in this server session. "
+                "Use an exact resource URI from a current tool result; retained snapshots "
+                "are lost when the server restarts."
+            ) from error
 
     def register_provider(
         self,
@@ -636,12 +697,31 @@ class WorkspaceService:
             return self.root
         if root == "storage":
             return self.storage_root
-        raise WorkspaceError("Root must be 'project' or 'storage'.")
+        raise WorkspaceError(
+            f"Invalid root={display_value(root)}: expected 'project' or 'storage'. "
+            "Use a qualified managed path such as 'project/src/main.cpp' or 'storage/build/debug'."
+        )
 
-    def resolve_path(self, path: str, *, root: WorkspaceRoot = "project") -> Path:
+    def resolve_path(
+        self,
+        path: str,
+        *,
+        root: WorkspaceRoot = "project",
+        parameter: str = "path",
+    ) -> Path:
         """Return a checked absolute path, retaining its lexical link components."""
+        requested = f"{root}/{'' if path == '.' else path}"
+        if root not in ("project", "storage"):
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: this operation accepts only "
+                "project/ or storage/ paths. External root/ files can only be read with "
+                "workspace_read_file and operator approval; external writes are forbidden."
+            )
         if not path or "\0" in path:
-            raise WorkspaceError("Path must be a nonempty relative path.")
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: use a nonempty relative path "
+                "without NUL characters, for example 'project/src/main.cpp'."
+            )
         portable = PurePosixPath(path.replace("\\", "/"))
         windows = PureWindowsPath(path)
         if (
@@ -650,14 +730,24 @@ class WorkspaceService:
             or windows.root
             or ".." in portable.parts
         ):
-            raise WorkspaceError("Path must be relative and cannot contain '..'.")
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: managed paths must be "
+                "relative and cannot contain '..'. Use a path within project/ or storage/."
+            )
         if os.name == "nt" and any(os.path.isreserved(part) for part in portable.parts):
-            raise WorkspaceError("Path contains a reserved Windows name.")
+            reserved = next(part for part in portable.parts if os.path.isreserved(part))
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: component "
+                f"{display_value(reserved)} is reserved on Windows. Choose a different filename."
+            )
         base = self.root_path(root)
         candidate = base.joinpath(*portable.parts)
-        with filesystem_errors(path):
+        with filesystem_errors(requested, parameter=parameter):
             if not candidate.resolve().is_relative_to(base):
-                raise WorkspaceError("Path resolves outside the selected root.")
+                raise WorkspaceError(
+                    f"Invalid {parameter}={display_value(requested)}: the path resolves outside "
+                    "its managed root. Choose a path within that root without an escaping link."
+                )
         return candidate
 
     def relative_path(self, path: Path, *, root: WorkspaceRoot = "project") -> str:
@@ -665,7 +755,10 @@ class WorkspaceService:
         try:
             relative = path.relative_to(self.root_path(root)).as_posix()
         except ValueError as error:
-            raise WorkspaceError("Path is outside the selected root.") from error
+            raise WorkspaceError(
+                f"Invalid path: it is outside root={display_value(root)}. "
+                "Choose a path within the selected project/ or storage/ root."
+            ) from error
         self.resolve_path(relative, root=root)
         return relative
 
@@ -673,14 +766,22 @@ class WorkspaceService:
         """Recognize both symbolic links and Windows directory junctions."""
         return path.is_symlink() or path.is_junction()
 
-    def check_path_links(self, path: Path, root: WorkspaceRoot) -> None:
+    def check_path_links(
+        self,
+        path: Path,
+        root: WorkspaceRoot,
+        *,
+        parameter: str = "path",
+    ) -> None:
         """Reject any link encountered between a candidate path and its managed root."""
         base = self.root_path(root)
         current = path
         while True:
             if self.is_link(current):
                 raise WorkspaceError(
-                    "This operation cannot traverse symbolic links or junctions."
+                    f"Invalid {parameter}={display_value(self.workspace_path(path))}: "
+                    f"symbolic link or junction {display_value(self.workspace_path(current))} "
+                    "cannot be traversed by this operation. Choose a direct managed path."
                 )
             if current == base:
                 break
@@ -695,7 +796,9 @@ class WorkspaceService:
         ):
             if any(self.is_link(Path(directory) / name) for name in [*dirs, *files]):
                 raise WorkspaceError(
-                    "This operation cannot move or remove a tree containing links."
+                    f"Invalid source={display_value(self.workspace_path(path))}: the tree "
+                    "contains symbolic links or junctions and cannot be moved or removed. "
+                    "Inspect it with workspace_list and choose an entry without links."
                 )
 
     def protect_path(self, path: WorkspacePath) -> None:
@@ -709,19 +812,31 @@ class WorkspaceService:
         *,
         root: WorkspaceRoot,
         subtree: bool = False,
+        parameter: str = "path",
     ) -> Path:
         """Validate a mutation target against roots, links, reserved names, and protected paths."""
-        candidate = self.resolve_path(path, root=root)
-        self.check_path_links(candidate, root)
+        candidate = self.resolve_path(path, root=root, parameter=parameter)
+        self.check_path_links(candidate, root, parameter=parameter)
+        requested = self.workspace_path(candidate)
         if candidate in (self.root, self.storage_root):
-            raise WorkspaceError("Cannot change a workspace root.")
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: cannot change a workspace root. "
+                "Choose a child path within project/ or storage/."
+            )
         for protected in self.protected_paths:
             if candidate.is_relative_to(protected) or (
                 subtree and protected.is_relative_to(candidate)
             ):
-                raise WorkspaceError(f"{path}: path is protected.")
+                raise WorkspaceError(
+                    f"Invalid {parameter}={display_value(requested)}: this path is protected "
+                    "or contains a protected descendant. Read access remains available; "
+                    "choose an unprotected path for this mutation."
+                )
         if subtree and self.storage_root.is_relative_to(candidate):
-            raise WorkspaceError("Cannot move or remove a parent of the storage root.")
+            raise WorkspaceError(
+                f"Invalid {parameter}={display_value(requested)}: cannot move or remove a parent "
+                "of the storage root. Choose a child path that does not contain storage/."
+            )
         return candidate
 
     def resolve_workspace_path(self, path: WorkspacePath) -> Path:
@@ -732,11 +847,14 @@ class WorkspaceService:
         """Adapt a resource URI's root/path pair to the shared path type."""
         self.root_path(root)
         if not path:
-            raise WorkspaceError("Path must not be empty.")
+            raise WorkspaceError(
+                "Invalid path='': use a qualified path such as 'project/' "
+                "or 'project/src/main.cpp'."
+            )
         try:
             return WorkspacePath(f"{root}/{'' if path == '.' else path}")
         except ValueError as error:
-            raise WorkspaceError("Expected a canonical relative workspace path.") from error
+            raise WorkspaceError(str(error)) from error
 
     def workspace_path(self, path: Path) -> WorkspacePath:
         """Represent a native path without granting permission to access it."""
@@ -752,7 +870,14 @@ class WorkspaceService:
         """Require an existing regular file within the selected managed root."""
         candidate = self.resolve_path(path, root=root)
         if not candidate.is_file():
-            raise WorkspaceError(f"{path}: expected an existing regular file.")
+            found = (
+                "found a directory" if candidate.is_dir() else "the file is missing or not regular"
+            )
+            raise WorkspaceError(
+                f"Invalid path={display_value(self.workspace_path(candidate))}: expected an "
+                f"existing regular file; {found}. Use workspace_list to inspect directories "
+                "or workspace_find_files to locate a file."
+            )
         return candidate
 
     def raise_walk_error(self, error: OSError) -> None:
@@ -771,7 +896,11 @@ class WorkspaceService:
             yield start
             return
         if not start.is_dir():
-            raise WorkspaceError(f"{path}: expected an existing file or directory.")
+            raise WorkspaceError(
+                f"Invalid path={display_value(self.workspace_path(start))}: expected an existing "
+                "file or directory. Use workspace_list(path='project/') or "
+                "workspace_list(path='storage/') to inspect available paths."
+            )
         for directory, dirs, files in os.walk(
             start,
             followlinks=False,
@@ -948,12 +1077,18 @@ class WorkspaceService:
                 await report_progress(0, message="Starting directory scan")
                 if depth is not None and depth < 1:
                     raise WorkspaceError(
-                        "Depth must be positive or null for the complete tree."
+                        f"Invalid depth={display_value(depth)}: expected an integer >= 1, "
+                        "or null to expand the complete directory tree."
                     )
                 directory = self.resolve_workspace_path(path)
                 self.check_path_links(directory, path.area)
                 if not directory.is_dir():
-                    raise WorkspaceError(f"{path}: expected an existing directory.")
+                    found = "found a file" if directory.is_file() else "the directory is missing"
+                    raise WorkspaceError(
+                        f"Invalid path={display_value(path)}: expected an existing directory; "
+                        f"{found}. Use workspace_read_file for a file, or workspace_list on "
+                        "its parent directory to inspect available paths."
+                    )
 
                 async def entries(
                     parent: Path,
@@ -964,7 +1099,9 @@ class WorkspaceService:
                     """
                     nonlocal visited
                     result: list[TreeEntry] = []
-                    for child in sorted(parent.iterdir(), key=lambda item: item.name):
+                    with filesystem_errors(self.workspace_path(parent)):
+                        children = sorted(parent.iterdir(), key=lambda item: item.name)
+                    for child in children:
                         if (
                             not include_hidden
                             and child.name.startswith(".")
@@ -1042,7 +1179,10 @@ class WorkspaceService:
                 start = self.resolve_workspace_path(path)
                 base = start if start.is_dir() else start.parent
                 if not pattern:
-                    raise WorkspaceError("File pattern must not be empty.")
+                    raise WorkspaceError(
+                        "Invalid pattern='': expected a nonempty filename or path glob. "
+                        "Use '*' for all files or '*.cpp' for C++ sources."
+                    )
                 paths = []
                 files = []
                 with filesystem_errors(path):
@@ -1064,7 +1204,8 @@ class WorkspaceService:
                                 self.relative_path(candidate, root=path.area),
                             )
                             paths.append(found)
-                            metadata = candidate.stat()
+                            with filesystem_errors(found):
+                                metadata = candidate.stat()
                             files.append(
                                 FoundFile(
                                     path=found,
@@ -1149,19 +1290,34 @@ class WorkspaceService:
                 },
             )
             try:
-                if start_line < 1 or (end_line is not None and end_line < start_line):
+                if start_line < 1:
                     raise WorkspaceError(
-                        "Line range must start at 1 or later and end at or after its start."
+                        f"Invalid start_line={display_value(start_line)}: lines are numbered "
+                        "from 1; use start_line=1 to read from the beginning."
+                    )
+                if end_line is not None and end_line < start_line:
+                    raise WorkspaceError(
+                        f"Invalid end_line={display_value(end_line)}: must be >= "
+                        f"start_line={display_value(start_line)}, or null to read through EOF."
                     )
                 with filesystem_errors(path):
                     if not confirm.allow:
-                        raise WorkspaceError("External file reading was not permitted.")
+                        raise WorkspaceError(
+                            f"Cannot read path={display_value(path)}: external file reading "
+                            "was not permitted by the operator. No file content was read; "
+                            "choose a managed file or obtain operator approval "
+                            "for this external read."
+                        )
                     candidate = (
                         path.absolute if path.area == "root"
                         else self.require_file(path.relative, path.area)
                     )
                     if not candidate.is_file():
-                        raise WorkspaceError(f"{path}: expected an existing regular file.")
+                        raise WorkspaceError(
+                            f"Invalid path={display_value(path)}: "
+                            "expected an existing regular file. Choose an existing UTF-8 file; "
+                            "workspace_list can inspect managed directories."
+                        )
                     text = bytearray()
                     await report_progress(0, message="Bytes read")
                     with candidate.open("rb") as stream:
@@ -1171,8 +1327,14 @@ class WorkspaceService:
                             await asyncio.sleep(0)
                     decoded = text.decode("utf-8")
                     if "\0" in decoded:
+                        recovery = (
+                            "Use the workspace raw resource to read managed file bytes."
+                            if path.area != "root"
+                            else "Choose a UTF-8 text file; external files have no mirror resource."
+                        )
                         raise WorkspaceError(
-                            f"{path}: expected UTF-8 text, found a binary file."
+                            f"Invalid path={display_value(path)}: expected UTF-8 text, "
+                            f"found a binary file. {recovery}"
                         )
                     result = FileContent(
                         path=path,
@@ -1226,9 +1388,16 @@ class WorkspaceService:
                 visited = 0
                 await report_progress(0, message="Files visited")
                 if not query:
-                    raise WorkspaceError("Search query must not be empty.")
+                    raise WorkspaceError(
+                        "Invalid query='': expected nonempty search text. Supply literal text, "
+                        "or a regular expression with regex=true; "
+                        "use workspace_find_files to list files."
+                    )
                 if max_matches < 1:
-                    raise WorkspaceError("max_matches must be at least 1.")
+                    raise WorkspaceError(
+                        f"Invalid max_matches={display_value(max_matches)}: expected an integer "
+                        ">= 1; use max_matches=100 for the default result size."
+                    )
                 try:
                     expression = regex_engine.compile(
                         query if regex else regex_engine.escape(query),
@@ -1237,7 +1406,9 @@ class WorkspaceService:
                     )
                 except regex_engine.error as error:
                     raise WorkspaceError(
-                        f"Invalid regular expression: {error}"
+                        f"Invalid query regular expression: {display_value(str(error))}. "
+                        "Correct the expression at the reported position, or set regex=false "
+                        "to search the query literally."
                     ) from error
                 matches, skipped = [], []
                 matches_count = 0
@@ -1251,18 +1422,15 @@ class WorkspaceService:
                         await report_progress(visited, message=f"Searching {current}")
                         if not self.extension_matches(candidate, extensions):
                             continue
-                        relative = self.qualified_path(
-                            path.area,
-                            self.relative_path(candidate, root=path.area),
-                        )
-                        data = candidate.read_bytes()
+                        with filesystem_errors(current):
+                            data = candidate.read_bytes()
                         try:
                             text = data.decode("utf-8")
                         except UnicodeDecodeError:
-                            skipped.append(relative)
+                            skipped.append(current)
                             continue
                         if "\0" in text:
-                            skipped.append(relative)
+                            skipped.append(current)
                             continue
                         for line, value in enumerate(text.splitlines(), 1):
                             if line % 256 == 0:
@@ -1275,7 +1443,7 @@ class WorkspaceService:
                                 ]
                                 matches.append(
                                     SearchMatch(
-                                        path=relative,
+                                        path=current,
                                         line=line,
                                         text=value,
                                         spans=spans,
@@ -1389,18 +1557,28 @@ class WorkspaceService:
             try:
                 await report_progress(0, total=1, message="Starting edit file")
                 if not old_text:
-                    raise WorkspaceError("old_text must not be empty.")
-                with filesystem_errors(path):
+                    raise WorkspaceError(
+                        f"Invalid old_text='': expected a nonempty exact fragment from "
+                        f"path={display_value(path)}. "
+                        "Read the current file with workspace_read_file "
+                        "and choose a unique fragment."
+                    )
+                with filesystem_errors(path, text_parameter="new_text"):
                     candidate = self.writable_path(path.relative, root=path.area)
                     text = read_text(candidate, path)
                     count = text.count(old_text)
                     if count == 0:
                         raise WorkspaceError(
-                            "Exact text was not found; the file was not changed."
+                            f"Invalid old_text: no exact match in path={display_value(path)}; "
+                            "the file was not changed. Read the current contents with "
+                            "workspace_read_file and match the exact whitespace and line endings."
                         )
                     if count > 1 and not replace_all:
                         raise WorkspaceError(
-                            f"Found {count} occurrences; use replace_all or a more specific old_text."
+                            f"Invalid old_text: found {count} occurrences "
+                            f"in path={display_value(path)}; "
+                            "the file was not changed. Use a larger unique old_text fragment, "
+                            "or replace_all=true if every occurrence should change."
                         )
                     replace_text(candidate, text.replace(old_text, new_text))
                     result = FileEditResult(
@@ -1442,27 +1620,64 @@ class WorkspaceService:
             try:
                 await report_progress(0, total=1, message="Starting move")
                 if source.area != destination.area:
-                    raise WorkspaceError("Move source and destination must use the same root.")
-                with filesystem_errors(source):
+                    raise WorkspaceError(
+                        f"Invalid source={display_value(source)}, "
+                        f"destination={display_value(destination)}: workspace_move requires "
+                        "both paths within project/ or both within storage/. "
+                        "Choose a destination in the source's managed root."
+                    )
+                with filesystem_errors(source, parameter="source"):
                     origin = self.writable_path(
                         source.relative,
                         root=source.area,
                         subtree=True,
+                        parameter="source",
                     )
+                    if not origin.exists():
+                        raise WorkspaceError(
+                            f"Invalid source={display_value(source)}: the path does not exist. "
+                            "Use workspace_list or workspace_find_files to locate the source."
+                        )
+                    if origin.is_dir():
+                        self.check_tree_links(origin)
+                with filesystem_errors(destination, parameter="destination"):
                     target = self.writable_path(
                         destination.relative,
                         root=destination.area,
                         subtree=True,
+                        parameter="destination",
                     )
-                    if not origin.exists():
-                        raise WorkspaceError(f"{source}: path does not exist.")
                     if target.exists() or target.is_symlink():
-                        raise WorkspaceError(f"{destination}: destination already exists.")
+                        raise WorkspaceError(
+                            f"Invalid destination={display_value(destination)}: "
+                            "the path already exists. Choose an unused destination; "
+                            "workspace_move does not overwrite existing paths."
+                        )
                     if origin.is_dir():
                         if target.is_relative_to(origin):
-                            raise WorkspaceError("Cannot move a directory into itself.")
-                        self.check_tree_links(origin)
-                    origin.rename(target)
+                            raise WorkspaceError(
+                                f"Invalid destination={display_value(destination)}: it is inside "
+                                f"source={display_value(source)}. "
+                                "Choose a destination outside the source tree."
+                            )
+                    if not target.parent.is_dir():
+                        raise WorkspaceError(
+                            f"Invalid destination={display_value(destination)}: "
+                            "its parent directory "
+                            f"{display_value(self.workspace_path(target.parent))} does not exist "
+                            "or is not a directory. "
+                            "Use workspace_mkdir to create a missing parent, "
+                            "or choose an existing destination directory."
+                        )
+                    try:
+                        origin.rename(target)
+                    except OSError as error:
+                        raise WorkspaceError(
+                            f"Cannot move source={display_value(source)} to "
+                            f"destination={display_value(destination)}: {os_error_reason(error)}. "
+                            "Inspect both paths with workspace_list and check their permissions "
+                            "and whether another process has locked either path."
+                        ) from error
                     result = PathOperationResult(
                         path=destination,
                         action="moved",
@@ -1592,9 +1807,16 @@ class WorkspaceService:
                 # Directory completions end in '/', while WorkspacePath is canonical.
                 area, separator, relative = value.partition("/")
                 if area == "root":
-                    raise ResourceNotFoundError("External files have no workspace mirror resources.")
+                    raise ResourceNotFoundError(
+                        f"Invalid path={display_value(value)}: external files have no workspace "
+                        "mirror resources. Use workspace_read_file for an external UTF-8 file; "
+                        "it requires operator approval."
+                    )
                 if not separator:
-                    raise WorkspaceError("Path must start with project/ or storage/.")
+                    raise WorkspaceError(
+                        f"Invalid path={display_value(value)}: resource paths must start with "
+                        "project/ or storage/, for example 'project/src/main.cpp'."
+                    )
                 return self.qualified_path(area, relative.rstrip("/") or ".")
             except WorkspaceError as error:
                 raise ResourceError(str(error)) from error

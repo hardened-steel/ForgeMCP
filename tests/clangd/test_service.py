@@ -39,6 +39,8 @@ def anyio_backend():
 class LspPeer:
     """Respond to the exercised LSP methods without launching an installed clangd."""
 
+    process_id = 42
+
     span = {
         "start": {"line": 0, "character": 0},
         "end": {"line": 0, "character": 3},
@@ -249,6 +251,86 @@ async def clangd_setup(cpp_acceptance_project) -> AsyncGenerator[SimpleNamespace
         )
     finally:
         await service.close()
+
+
+@pytest.mark.anyio
+async def test_unavailable_configuration_lists_choices_and_discovery(setup):
+    """Explain an invalid configuration selection using current contexts without extra probes."""
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "clangd_diagnostics",
+            {"path": "src/math.cpp", "configurations": ["typo"]},
+        )
+    assert response.is_error
+    text = response.content[0].text
+    assert all(
+        value in text
+        for value in ("configurations[0]", "typo", "debug", "release", "clangd_configurations()")
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        ({"line": 9, "character": 0}, ["position.line=9", "1..3", "one-based"]),
+        (
+            {"line": 1, "character": 9},
+            ["position.character=9", "0..2", "Unicode code points"],
+        ),
+    ],
+)
+async def test_invalid_position_reports_actual_document_bounds(setup, position, expected):
+    """Validate coordinates against the opened UTF-8 document and preserve process provenance."""
+    (setup.workspace.root / "src/math.cpp").write_text("α😀\nsecond\n", encoding="utf-8")
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "clangd_hover",
+            {"path": "src/math.cpp", "position": position, "configurations": ["debug"]},
+        )
+    assert response.is_error
+    text = response.content[0].text
+    assert all(value in text for value in expected)
+    assert "project/src/math.cpp" in text
+    assert "process_get(process_id=42)" in text
+    assert "α😀" not in text
+
+
+@pytest.mark.anyio
+async def test_missing_capability_identifies_configuration_and_process(setup):
+    """Report an unavailable server capability with its configuration and command log."""
+    setup.service.sessions["debug"].session.capabilities["hoverProvider"] = False
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "clangd_hover",
+            {
+                "path": "src/math.cpp",
+                "position": {"line": 1, "character": 0},
+                "configurations": ["debug"],
+            },
+        )
+    assert response.is_error
+    text = response.content[0].text
+    assert all(
+        value in text
+        for value in (
+            "hoverProvider",
+            "debug",
+            "clangd_configurations()",
+            "process_get(process_id=42)",
+        )
+    )
+
+
+@pytest.mark.anyio
+async def test_request_timeout_reports_method_and_seconds(setup):
+    """Retain the exact LSP method and timeout value when a server does not respond."""
+    setup.peers[0].ignore.add("textDocument/hover")
+    session = setup.service.sessions["debug"].session
+    with pytest.raises(ClangdTimeoutError) as failure:
+        await session.request("textDocument/hover", {}, timeout=0.01)
+    assert "textDocument/hover" in str(failure.value)
+    assert "timeout=0.01 seconds" in str(failure.value)
 
 
 def test_equal_answers_merge_configuration_ids_but_different_answers_stay_separate():
@@ -763,9 +845,11 @@ async def test_cmake_publication_does_not_wait_for_subscriber_analysis_lock(setu
     """Queue invalidation while clangd holds its lock without reversing the lock order."""
     async with setup.service.lock:
         async with asyncio.timeout(2):
-            context = await setup.cmake.begin_workspace((WorkspacePath('project/CMakeLists.txt'),))
+            context = await setup.cmake.begin_source_change(
+                (WorkspacePath('project/CMakeLists.txt'),),
+            )
             (setup.workspace.root / 'CMakeLists.txt').write_text('# changed')
-            await setup.cmake.finish_workspace(context)
+            await setup.cmake.finish_source_change(context)
             assert await setup.cmake.compilation_contexts() == []
     async with asyncio.timeout(2):
         while setup.service.contexts:

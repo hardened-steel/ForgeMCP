@@ -17,6 +17,7 @@ const widgets = {
   "cmake-test": "cmake-test",
   "cmake-run-test": "cmake-run-test",
   clangd: "clangd-result",
+  "git-result": "git-result",
   admin: "admin",
   sandbox: "sandbox",
 };
@@ -26,6 +27,8 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [viteSingleFile()],
     build: {
+      // Preserve light-dark() so host and operator theme changes work at runtime.
+      cssTarget: "esnext",
       outDir: fileURLToPath(new URL("../src/forgemcp/assets", import.meta.url)),
       emptyOutDir: mode === "workspace",
       rollupOptions: {

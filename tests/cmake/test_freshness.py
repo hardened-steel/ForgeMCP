@@ -5,6 +5,8 @@ import asyncio
 import pytest
 from mcp import Client
 
+from forgemcp.cmake import file_api
+from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.file_api import generation, read_generation
 from forgemcp.cmake.profiles import ProfileDefinition
 from forgemcp.cmake.workspace import CMakeProvider
@@ -13,6 +15,32 @@ from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.service import ResultProvider
 
 from tests.cmake.conftest import server, write_generation
+
+
+@pytest.mark.parametrize(
+    ("contents", "limit", "expected"),
+    [
+        ('{"oversized": true}', 8, ["8-byte size limit"]),
+        ('{\ninvalid-json}', 100, ["line 2", "column 1", "cmake_configure"]),
+    ],
+)
+def test_file_api_reply_error_identifies_metadata_and_cause(
+    cpp_acceptance_project,
+    monkeypatch,
+    contents,
+    limit,
+    expected,
+):
+    """Report bounded metadata locations and size or JSON causes without native roots."""
+    path = cpp_acceptance_project / "reply.json"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(file_api, "MAX_REPLY_BYTES", limit)
+    with pytest.raises(CMakeError) as failure:
+        file_api.read_reply(path, cpp_acceptance_project, cpp_acceptance_project / "storage")
+    text = str(failure.value)
+    assert "project/reply.json" in text
+    assert all(value in text for value in expected)
+    assert str(cpp_acceptance_project) not in text
 
 
 @pytest.mark.anyio
@@ -383,7 +411,7 @@ async def test_workspace_error_checks_partial_changes_and_releases_lock(
         scenario.workspace.root,
         scenario.workspace.storage_root,
     )
-    call = await scenario.service.begin_workspace(
+    call = await scenario.service.begin_source_change(
         (WorkspacePath("project/CMakeLists.txt"),)
     )
     if partial:
@@ -393,7 +421,7 @@ async def test_workspace_error_checks_partial_changes_and_releases_lock(
     assert scenario.service.inputs[directory].current is not partial
     assert not scenario.service.operation_lock.locked()
     async with asyncio.timeout(2):
-        call = await scenario.service.begin_workspace(
+        call = await scenario.service.begin_source_change(
             (WorkspacePath("project/CMakeLists.txt"),)
         )
         await provider.error("next-call", call)
@@ -510,7 +538,7 @@ async def test_unreadable_input_releases_lock_and_preserves_independent_tree(
             scenario.workspace.storage_root,
         )
     paths = (WorkspacePath("project/CMakeLists.txt"),)
-    context = await scenario.service.begin_workspace(paths) if stage == "after" else None
+    context = await scenario.service.begin_source_change(paths) if stage == "after" else None
 
     def unreadable(*_args, **_kwargs):
         """Simulate an input becoming unreadable without depending on platform ACL semantics."""
@@ -519,9 +547,9 @@ async def test_unreadable_input_releases_lock_and_preserves_independent_tree(
     monkeypatch.setattr("forgemcp.cmake.service.input_checksums", unreadable)
     with pytest.raises(OSError):
         if stage == "before":
-            await scenario.service.begin_workspace(paths)
+            await scenario.service.begin_source_change(paths)
         else:
-            await scenario.service.finish_workspace(context)
+            await scenario.service.finish_source_change(context)
     assert not scenario.service.operation_lock.locked()
     assert not scenario.service.inputs[WorkspacePath("storage/build/cmake-debug")].current
     assert scenario.service.inputs[WorkspacePath("storage/build/cmake-release")].current

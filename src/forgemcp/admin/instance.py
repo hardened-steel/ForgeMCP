@@ -16,7 +16,7 @@ from mcp.client import ClientRequestContext, advertise
 from mcp.server import MCPServer
 from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID
 from mcp.shared.exceptions import MCPError
-from mcp.types import ElicitRequestParams, ElicitResult
+from mcp.types import CompleteRequestParams, ElicitRequestParams, ElicitResult
 from pydantic import BaseModel, Field
 
 from forgemcp.local_ipc import IpcConnection, IpcError, connect
@@ -363,6 +363,13 @@ class InstanceAgent:
             return await client.list_resources()
         if method == "resources/templates/list":
             return await client.list_resource_templates()
+        if method == "completion/complete":
+            request = CompleteRequestParams.model_validate(params)
+            return await client.complete(
+                ref=request.ref,
+                argument=request.argument.model_dump(),
+                context_arguments=request.context.arguments if request.context else None,
+            )
         if method == "resources/read":
             uri = params["uri"]
             if not isinstance(uri, str):

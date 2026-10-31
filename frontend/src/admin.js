@@ -1,5 +1,7 @@
 import { getToolUiResourceUri } from "@modelcontextprotocol/ext-apps/app-bridge";
 import { mountInvocationWidget } from "./admin-widget.js";
+import { createSchemaForm } from "./admin-form.js";
+import { createResourceView } from "./admin-resource.js";
 import "./shared/widget.css";
 import "./admin.css";
 
@@ -8,8 +10,11 @@ const root = document.getElementById("admin");
 const state = {
   instances: [], instanceId: null, snapshot: null, page: "history", callId: null,
   call: null, resultMode: "widget", filter: "", controls: false, toolName: "",
-  arguments: "{}", executing: false, session: null, elicitations: [],
+  session: null, elicitations: [],
+  catalogKind: "tools", catalogFilter: "", catalogSelection: null,
 };
+const commandDrafts = new Map();
+const executingCommands = new Set();
 let selectionGeneration = 0;
 let refreshGeneration = 0;
 let widgetGeneration = 0;
@@ -75,7 +80,10 @@ function applyTheme() {
   widget?.refreshContext();
 }
 
-const heading = element("h1", "", "ForgeMCP / admin");
+const heading = element("div", "admin-brand", null, [
+  element("span", "admin-brand-mark", "F"),
+  element("div", "", null, [element("h1", "", "ForgeMCP"), element("span", "admin-brand-caption", "Local administration")]),
+]);
 const connection = element("span", "admin-connection", "Connecting");
 connection.setAttribute("role", "status");
 const controls = element("input");
@@ -85,7 +93,7 @@ controls.addEventListener("change", () => {
   renderPageTabs();
   renderPage();
 });
-const controlsLabel = element("label", "", null, [controls, document.createTextNode("Enable command controls")]);
+const controlsLabel = element("label", "admin-controls-toggle", null, [controls, document.createTextNode("Enable command controls")]);
 const theme = element("select");
 theme.setAttribute("aria-label", "Color theme");
 for (const value of ["system", "dark", "light"]) {
@@ -165,6 +173,8 @@ async function selectInstance(id) {
   state.call = null;
   state.callId = null;
   state.elicitations = [];
+  state.catalogSelection = null;
+  state.catalogFilter = "";
   state.controls = false;
   controls.checked = false;
   detailKey = null;
@@ -210,14 +220,15 @@ function renderInstanceInfo() {
   controls.disabled = !instance?.connected;
   instanceInfo.replaceChildren();
   if (!instance) return;
-  for (const value of [
-    instance.connected ? "Connected" : "Disconnected",
-    instance.project_root,
-    `PID ${instance.pid ?? "—"}`,
-    `v${instance.version ?? "—"}`,
-    `Started ${timestamp(instance.started_at)}`,
+  for (const [label, value] of [
+    ["Workspace", instance.project_root],
+    ["Process", instance.pid ?? "—"],
+    ["Version", instance.version ?? "—"],
+    ["Started", timestamp(instance.started_at)],
   ]) {
-    if (value !== undefined) instanceInfo.append(element("span", "", value));
+    if (value !== undefined) instanceInfo.append(element("span", "admin-instance-meta", null, [
+      element("span", "admin-meta-label", label), element("span", "", value),
+    ]));
   }
 }
 
@@ -225,7 +236,7 @@ function renderInstanceInfo() {
 function renderPageTabs() {
   pageTabs.replaceChildren();
   if (!state.instanceId) return;
-  for (const [key, label] of [["history", "History"], ["monitors", "Monitors"], ["catalog", "Catalog"], ["settings", "Settings"]]) {
+  for (const [key, label] of [["history", "Activity"], ["catalog", "Tools & resources"], ["monitors", "Monitors"], ["settings", "Settings"]]) {
     const tab = button(label, () => {
       if (key === state.page) return;
       state.page = key;
@@ -233,6 +244,7 @@ function renderPageTabs() {
       renderPageTabs();
       renderPage();
     });
+    tab.setAttribute("aria-current", state.page === key ? "page" : "false");
     tab.setAttribute("aria-pressed", String(state.page === key));
     pageTabs.append(tab);
   }
@@ -284,6 +296,7 @@ async function refreshSelected() {
       api(instancePath("/elicitations", id)),
     ]);
     if (id !== state.instanceId || generation !== refreshGeneration || selection !== selectionGeneration) return;
+    const unchangedState = JSON.stringify(state.snapshot?.state) === JSON.stringify(snapshot.state);
     state.snapshot = snapshot;
     state.elicitations = collection(inquiries, "requests");
     renderInstanceInfo();
@@ -292,12 +305,22 @@ async function refreshSelected() {
       renderHistoryList();
       const latest = history().find((call) => call.id === state.callId);
       if (latest) { state.call = latest; renderCall(); }
-    } else if (state.page === "catalog" && body.querySelector(".admin-cards")) {
+    } else if (state.page === "catalog" && body.querySelector(".admin-catalog")) {
       const submit = body.querySelector(".admin-command-form button[type='submit']");
-      if (submit) submit.disabled = state.executing || !snapshot.instance?.connected;
-    } else {
+      if (submit) {
+        const executing = executingCommands.has(`${state.instanceId}/${state.toolName}`);
+        submit.disabled = executing || !snapshot.instance?.connected;
+        submit.textContent = executing ? "Executing…" : "Run tool";
+      }
+      const enable = body.querySelector(".admin-command-disabled button");
+      if (enable) enable.disabled = !snapshot.instance?.connected;
+    } else if (!["monitors", "settings"].includes(state.page) || !unchangedState) {
       const scroll = body.scrollTop;
+      const expanded = [...body.querySelectorAll("details[open] > summary")].map((summary) => summary.textContent);
       renderPage();
+      for (const summary of body.querySelectorAll("details > summary")) {
+        if (expanded.includes(summary.textContent)) summary.parentElement.open = true;
+      }
       body.scrollTop = scroll;
     }
     inform(null);
@@ -343,7 +366,9 @@ function renderHistory() {
   filter.value = state.filter;
   filter.addEventListener("input", () => { state.filter = filter.value; renderHistoryList(); });
   const count = element("span", "admin-history-count");
-  sidebar.append(element("div", "admin-history-filter", null, [filter, count]), element("div", "admin-history-list"));
+  sidebar.append(element("div", "admin-history-filter", null, [
+    element("h2", "", "Activity"), element("p", "admin-muted", "Tool calls from every connected client."), filter, count,
+  ]), element("div", "admin-history-list"));
   const detail = element("section", "admin-detail");
   detail.setAttribute("aria-label", "Selected invocation");
   layout.append(sidebar, detail);
@@ -376,7 +401,11 @@ function renderHistoryList() {
     outcome.dataset.state = call.status;
     const time = element("span", "admin-call-time", timestamp(call.started_at ?? call.queued_at ?? call.created_at));
     time.title = call.started_at ?? call.queued_at ?? call.created_at ?? "";
-    row.append(element("span", "admin-call-name", call.tool_name), time, outcome);
+    const args = Object.entries(call.arguments ?? {}).map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join(" · ");
+    const preview = element("span", "admin-call-preview", args || "No arguments");
+    preview.title = args;
+    row.append(element("span", "admin-call-name", call.tool_name), preview, time, outcome,
+      element("span", "admin-call-source", call.source === "admin" ? "Admin panel" : "MCP client"));
     list.append(row);
   }
   list.scrollTop = scroll;
@@ -538,17 +567,25 @@ async function showWidget(container, tool, call) {
 
 /** Project already supplied monitor snapshots; viewing monitors never calls MCP tools. */
 function renderMonitors() {
-  const section = element("section", "admin-section", null, [element("h2", "", "Service monitors")]);
+  const section = element("section", "admin-section", null, [
+    element("div", "admin-page-heading", null, [element("h2", "", "Service monitors"),
+      element("p", "admin-muted", "Live snapshots from the running server. Updated automatically.")]),
+  ]);
   const supplied = state.snapshot.state ?? {};
+  const stats = element("div", "admin-stats");
+  for (const [label, value] of [
+    ["Running processes", supplied.processes?.running ?? 0],
+    ["Completed processes", supplied.processes?.completed ?? 0],
+    ["Toolsets", supplied.toolsets?.items?.length ?? 0],
+    ["Clangd sessions", supplied.clangd?.sessions?.length ?? 0],
+  ]) stats.append(element("div", "admin-stat", null, [element("span", "admin-muted", label), element("strong", "", value)]));
+  section.append(stats);
   if (!Object.keys(supplied).length) section.append(element("p", "admin-muted", "No service state has been published."));
   const cards = element("div", "admin-cards");
   for (const [name, value] of Object.entries(supplied)) {
     if (name === "settings") continue;
     const card = element("section", "admin-card", null, [element("h3", "", name)]);
-    const items = Array.isArray(value) ? value : value?.processes ?? value?.sessions ?? value?.contexts ?? value?.toolsets;
-    if (Array.isArray(items) && items.length && items.every((item) => item && typeof item === "object")) {
-      card.append(recordsTable(items));
-    } else card.append(json(value));
+    card.append(stateFields(value));
     cards.append(card);
   }
   section.append(cards);
@@ -556,6 +593,26 @@ function renderMonitors() {
   raw.append(element("summary", "", "Complete state JSON"), json(supplied));
   section.append(raw);
   body.append(section);
+}
+
+/** Present retained state as labeled values and expandable record tables. */
+function stateFields(value) {
+  const container = element("div", "admin-state-fields");
+  if (!value || typeof value !== "object") { container.append(element("p", "admin-muted", value ?? "No data yet")); return container; }
+  const scalars = Object.entries(value).filter(([, item]) => item === null || typeof item !== "object");
+  if (scalars.length) container.append(metadata(scalars.map(([name, item]) => [name.replaceAll("_", " "), item === null ? "Not available" : typeof item === "boolean" ? (item ? "Yes" : "No") : item])));
+  for (const [name, item] of Object.entries(value)) {
+    if (item === null || typeof item !== "object") continue;
+    const details = element("details", "admin-state-group");
+    details.append(element("summary", "", `${name.replaceAll("_", " ")}${Array.isArray(item) ? ` (${item.length})` : ""}`));
+    if (Array.isArray(item)) {
+      if (!item.length) details.append(element("p", "admin-muted", "No entries."));
+      else if (item.every((record) => record && typeof record === "object")) details.append(recordsTable(item));
+      else details.append(element("pre", "admin-pre", item.join("\n")));
+    } else details.append(stateFields(item));
+    container.append(details);
+  }
+  return container;
 }
 
 /** Show every monitor field in a scrollable table, retaining nested values as JSON. */
@@ -583,121 +640,240 @@ function recordsTable(records) {
 
 /** Expose server settings as a read-only snapshot. */
 function renderSettings() {
-  const section = element("section", "admin-section", null, [element("h2", "", "Server settings")]);
-  section.append(element("p", "admin-muted", "Settings reflect the running server configuration."));
-  section.append(json({ instance: state.snapshot.instance, settings: state.snapshot.state?.settings ?? {} }));
-  body.append(section);
-}
-
-/** List the original SDK catalog and optionally expose explicit command controls. */
-function renderCatalog() {
-  const section = element("section", "admin-section", null, [element("h2", "", "MCP catalog")]);
-  const tools = collection(state.snapshot.tools, "tools");
-  if (state.controls) section.append(commandForm(tools));
-  else section.append(element("p", "admin-muted", "Command controls are disabled. Enable them above to prepare and execute a tool."));
+  const section = element("section", "admin-section", null, [element("div", "admin-page-heading", null, [
+    element("h2", "", "Server settings"), element("p", "admin-muted", "Read-only configuration of this running instance. Restart the server to apply changes."),
+  ])]);
   const cards = element("div", "admin-cards");
-  for (const tool of tools) {
-    const card = element("article", "admin-card", null, [element("h3", "", tool.name)]);
-    if (tool.description) card.append(element("p", "", tool.description));
-    const definition = element("details");
-    definition.append(element("summary", "", "Tool definition and schemas"), json(tool));
-    card.append(definition);
-    if (state.controls) card.append(button("Prepare command", () => {
-      state.toolName = tool.name;
-      state.arguments = "{}";
-      renderPage();
-      body.querySelector("textarea")?.focus();
-    }));
-    cards.append(card);
+  for (const [name, value] of [["Instance", state.snapshot.instance], ["Startup configuration", state.snapshot.state?.settings ?? {}]]) {
+    cards.append(element("section", "admin-card", null, [element("h3", "", name), stateFields(value)]));
   }
-  section.append(cards);
-  for (const [label, value, key] of [
-    ["Resources", state.snapshot.resources, "resources"],
-    ["Resource templates", state.snapshot.resource_templates, "resourceTemplates"],
-  ]) {
-    const group = element("section", "admin-catalog-group", null, [element("h3", "", label)]);
-    const records = collection(value, key);
-    if (!records.length) group.append(element("p", "admin-muted", "None registered."));
-    for (const resource of records) {
-      const details = element("details", "admin-card");
-      details.append(element("summary", "admin-resource-title", resource.uri ?? resource.uriTemplate ?? resource.name), json(resource));
-      if (typeof resource.uri === "string") {
-        const preview = element("div");
-        const instance = state.instanceId;
-        const read = button("Read resource", async () => {
-          read.disabled = true;
-          try {
-            const query = new URLSearchParams({ uri: resource.uri });
-            const result = await api(`${instancePath("/resources", instance)}?${query}`);
-            preview.replaceChildren();
-            for (const content of result?.contents ?? []) {
-              if (typeof content.text === "string") preview.append(element("pre", "admin-pre", content.text));
-            }
-            const original = element("details");
-            original.append(element("summary", "", "Complete resource JSON"), json(result));
-            preview.append(original);
-          } catch (error) {
-            preview.replaceChildren(element("p", "admin-error", error.message));
-          } finally { read.disabled = false; }
-        });
-        details.append(read, preview);
-      }
-      group.append(details);
-    }
-    section.append(group);
-  }
+  const raw = element("details", "admin-definition");
+  raw.append(element("summary", "", "Complete settings JSON"), json({ instance: state.snapshot.instance, settings: state.snapshot.state?.settings ?? {} }));
+  section.append(cards, raw);
   body.append(section);
 }
 
-/** Require a deliberate submit with literal JSON object arguments for every admin command. */
-function commandForm(tools) {
-  const form = element("form", "admin-command-form");
-  form.append(element("h3", "", "Execute a tool on this instance"));
-  const select = element("select");
-  select.setAttribute("aria-label", "Tool name");
-  for (const tool of tools) {
-    const option = element("option", "", tool.name);
-    option.value = tool.name;
-    select.append(option);
+/** Keep catalog choices separate from their working area so forms retain focus on refresh. */
+function renderCatalog() {
+  const layout = element("section", "admin-catalog");
+  const sidebar = element("aside", "admin-catalog-sidebar");
+  const search = element("input");
+  search.type = "search";
+  search.placeholder = "Find a tool or resource…";
+  search.setAttribute("aria-label", "Search MCP catalog");
+  search.value = state.catalogFilter;
+  const kinds = element("div", "admin-catalog-kinds");
+  const list = element("div", "admin-catalog-list");
+  const detail = element("section", "admin-catalog-detail");
+  detail.setAttribute("aria-label", "Selected catalog entry");
+  const groups = {
+    tools: collection(state.snapshot.tools, "tools"),
+    resources: collection(state.snapshot.resources, "resources"),
+    templates: collection(state.snapshot.resource_templates, "resourceTemplates"),
+  };
+  for (const [kind, label] of [["tools", "Tools"], ["resources", "Resources"], ["templates", "Templates"]]) {
+    const tab = button("", () => {
+      state.catalogKind = kind;
+      state.catalogSelection = null;
+      renderPage();
+    });
+    tab.append(document.createTextNode(label), element("span", "admin-count", groups[kind].length));
+    tab.setAttribute("aria-pressed", String(state.catalogKind === kind));
+    kinds.append(tab);
   }
-  if (!tools.some((tool) => tool.name === state.toolName)) state.toolName = tools[0]?.name ?? "";
-  select.value = state.toolName;
-  select.addEventListener("change", () => { state.toolName = select.value; });
-  const argumentsInput = element("textarea");
-  argumentsInput.spellcheck = false;
-  argumentsInput.value = state.arguments;
-  argumentsInput.addEventListener("input", () => { state.arguments = argumentsInput.value; });
-  form.append(element("label", "", "Tool", [select]), element("label", "", "Arguments (JSON object)", [argumentsInput]));
-  const submit = element("button", "", state.executing ? "Executing…" : "Execute command");
+  sidebar.append(element("div", "admin-catalog-filter", null, [
+    element("h2", "", "MCP catalog"), search, kinds,
+  ]), list);
+  layout.append(sidebar, detail);
+  body.append(layout);
+  const records = groups[state.catalogKind];
+  const recordKey = (record) => record.uri ?? record.uriTemplate ?? record.name;
+  if (!records.some((record) => recordKey(record) === state.catalogSelection)) {
+    state.catalogSelection = records[0] ? recordKey(records[0]) : null;
+  }
+
+  /** Filter navigation without replacing a partially filled command. */
+  function renderList() {
+    list.replaceChildren();
+    const needle = state.catalogFilter.toLocaleLowerCase();
+    const matched = records.filter((record) => `${record.name} ${record.description ?? ""} ${recordKey(record)}`.toLocaleLowerCase().includes(needle));
+    list.append(element("p", "admin-list-count", `${matched.length} ${state.catalogKind}`));
+    let group;
+    for (const record of matched) {
+      const namespace = record.name.split("_")[0];
+      const category = state.catalogKind === "tools"
+        ? ({ process: "Processes", processes: "Processes", toolset: "Toolsets", toolsets: "Toolsets" }[namespace] ?? namespace)
+        : null;
+      if (category && category !== group) {
+        list.append(element("div", "admin-catalog-category", category));
+        group = category;
+      }
+      const key = recordKey(record);
+      const row = button("", () => {
+        state.catalogSelection = key;
+        renderList();
+        renderEntry(record);
+      }, "admin-catalog-entry");
+      row.setAttribute("aria-pressed", String(key === state.catalogSelection));
+      row.append(element("span", "admin-entry-name", record.name ?? key));
+      if (record.description) row.append(element("span", "admin-entry-description", record.description.split("\n")[0]));
+      row.title = key;
+      list.append(row);
+    }
+    if (!matched.length) list.append(element("p", "admin-empty", "No matches. Try a different search."));
+  }
+
+  /** Inspect one original SDK definition and expose its matching operation. */
+  function renderEntry(record) {
+    detail.replaceChildren();
+    if (!record) {
+      detail.append(element("p", "admin-empty", "No entries registered in this category."));
+      return;
+    }
+    const type = state.catalogKind === "tools" ? "Tool" : state.catalogKind === "templates" ? "Resource template" : "Resource";
+    const top = element("div", "admin-entry-heading", null, [
+      element("span", "admin-eyebrow", type), element("h2", "", record.name ?? recordKey(record)),
+    ]);
+    if (record.description) top.append(element("p", "admin-description", record.description));
+    detail.append(top);
+    if (state.catalogKind === "tools") {
+      state.toolName = record.name;
+      const badges = element("div", "admin-tool-badges");
+      if (record.annotations?.readOnlyHint) badges.append(element("span", "admin-badge", "Read only"));
+      if (record.annotations?.destructiveHint) badges.append(element("span", "admin-badge admin-badge-warning", "Can change files or state"));
+      detail.append(badges);
+      if (state.controls) detail.append(commandForm(record));
+      else {
+        const enable = button("Enable command controls", () => {
+          controls.checked = true;
+          state.controls = true;
+          renderEntry(record);
+        }, "admin-primary");
+        enable.disabled = !state.snapshot.instance?.connected;
+        detail.append(element("div", "admin-command-disabled", null, [
+          element("h3", "", "Ready to run a tool?"),
+          element("p", "admin-muted", "Enable command controls to fill in parameters and execute on this workspace."), enable,
+        ]));
+      }
+    } else {
+      const instance = state.instanceId;
+      const generation = selectionGeneration;
+      detail.append(createResourceView(record, {
+        readResource: (uri) => api(`${instancePath("/resources", instance)}?${new URLSearchParams({ uri })}`),
+        complete: async (ref, argument, contextArguments) => {
+          const result = await api(instancePath("/completion", instance), {
+            method: "POST", value: { ref, argument, context: { arguments: contextArguments } },
+          });
+          if (generation !== selectionGeneration) throw new DOMException("Instance changed.", "AbortError");
+          return result;
+        },
+      }));
+    }
+    const definition = element("details", "admin-definition");
+    definition.append(element("summary", "", "Definition & JSON schema"), json(record));
+    detail.append(definition);
+  }
+  search.addEventListener("input", () => { state.catalogFilter = search.value; renderList(); });
+  renderList();
+  renderEntry(records.find((record) => recordKey(record) === state.catalogSelection));
+}
+
+/** Compose typed arguments, keeping an independent draft for each instance and tool. */
+function commandForm(tool) {
+  const key = `${state.instanceId}/${tool.name}`;
+  let draft = commandDrafts.get(key);
+  if (!draft) {
+    draft = { mode: "fields", raw: "{}", fields: createSchemaForm(tool.inputSchema, {}) };
+    commandDrafts.set(key, draft);
+  }
+  const form = element("form", "admin-command-form");
+  const modes = element("div", "admin-composer-toolbar");
+  modes.append(element("h3", "", "Parameters"));
+  const editor = element("div", "admin-command-editor");
+  const raw = element("textarea", "admin-json-input");
+  raw.setAttribute("aria-label", "Tool arguments as JSON");
+  raw.spellcheck = false;
+  raw.value = draft.raw;
+  raw.addEventListener("input", () => { draft.raw = raw.value; });
+  const localError = element("p", "admin-error");
+  localError.setAttribute("role", "alert");
+  localError.hidden = true;
+
+  /** Report argument errors next to the command being edited. */
+  function showError(message) {
+    localError.textContent = message ?? "";
+    localError.hidden = !message;
+  }
+
+  /** Synchronize modes only after validating the current input to prevent data loss. */
+  function readArguments() {
+    const args = draft.mode === "fields" ? draft.fields.getValue() : JSON.parse(raw.value);
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Arguments must be a JSON object.");
+    return args;
+  }
+
+  /** Move the same form DOM between views, preserving partially entered values. */
+  function renderEditor() {
+    modes.replaceChildren(element("h3", "", "Parameters"));
+    for (const [mode, label] of [["fields", "Form"], ["json", "JSON"]]) {
+      const toggle = button(label, () => {
+        if (mode === draft.mode) return;
+        try {
+          const value = draft.mode === "fields" ? draft.fields.getValue(false) : readArguments();
+          if (mode === "json") { draft.raw = JSON.stringify(value, null, 2); raw.value = draft.raw; }
+          else draft.fields.setValue(value);
+          draft.mode = mode;
+          showError(null);
+          renderEditor();
+        } catch (error) { showError(error.message); }
+      });
+      toggle.setAttribute("aria-pressed", String(draft.mode === mode));
+      modes.append(toggle);
+    }
+    editor.replaceChildren(draft.mode === "fields" ? draft.fields.element : raw);
+  }
+  renderEditor();
+  const submit = element("button", "admin-primary", executingCommands.has(key) ? "Executing…" : "Run tool");
   submit.type = "submit";
-  submit.disabled = state.executing || !state.snapshot.instance?.connected || !tools.length;
-  form.append(submit);
+  submit.disabled = executingCommands.has(key) || !state.snapshot.instance?.connected;
+  const footer = element("div", "admin-command-footer", null, [
+    submit, element("span", "admin-muted", "Runs on the selected workspace. Results appear in Activity."),
+  ]);
+  form.append(modes, editor, localError, footer);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.controls || state.executing) return;
+    if (!state.controls || executingCommands.has(key)) return;
     let args;
-    try {
-      args = JSON.parse(argumentsInput.value);
-      if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Arguments must be a JSON object.");
-    } catch (error) { inform(`Invalid arguments: ${error.message}`); return; }
+    try { args = readArguments(); } catch (error) { showError(error.message); return; }
     const instance = state.instanceId;
     const selection = selectionGeneration;
-    state.executing = true;
+    executingCommands.add(key);
     submit.disabled = true;
     submit.textContent = "Executing…";
+    showError(null);
     inform(null);
     try {
-      await api(instancePath(`/tools/${encodeURIComponent(select.value)}`, instance), { method: "POST", value: { arguments: args } });
+      await api(instancePath(`/tools/${encodeURIComponent(tool.name)}`, instance), { method: "POST", value: { arguments: args } });
       if (selection === selectionGeneration) {
-        state.page = "history";
-        state.callId = null;
-        renderPageTabs();
+        if (form.isConnected) {
+          state.page = "history";
+          state.callId = null;
+          renderPageTabs();
+        }
         await refreshSelected();
       }
-    } catch (error) { if (selection === selectionGeneration) inform(error.message); }
+    } catch (error) {
+      if (selection === selectionGeneration) {
+        if (form.isConnected) showError(error.message);
+        else inform(error.message);
+      }
+    }
     finally {
-      state.executing = false;
-      if (selection === selectionGeneration && state.page === "catalog") renderPage();
+      executingCommands.delete(key);
+      if (selection === selectionGeneration) {
+        submit.disabled = !state.snapshot.instance?.connected;
+        submit.textContent = "Run tool";
+      }
     }
   });
   return form;
@@ -731,18 +907,15 @@ function renderElicitations() {
     const details = element("details");
     details.append(element("summary", "", "Requested schema"), json(schema));
     form.append(details);
-    const content = element("textarea");
-    content.spellcheck = false;
-    content.value = "{}";
-    if (!urlMode) form.append(element("label", "", "Response content (JSON object)", [content]));
+    const content = createSchemaForm(schema, {});
+    if (!urlMode) form.append(content.element);
     const actions = element("div", "admin-result-tabs");
     for (const action of ["accept", "decline", "cancel"]) {
       actions.append(button(action[0].toUpperCase() + action.slice(1), async () => {
         let result = { action };
         if (action === "accept" && !urlMode) {
           try {
-            const value = JSON.parse(content.value);
-            if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Response content must be an object.");
+            const value = content.getValue();
             result = { action, content: value };
           } catch (error) { inform(error.message); return; }
         }

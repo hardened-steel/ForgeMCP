@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field
+import psutil
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
@@ -34,6 +35,7 @@ from mcp.types import (
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value, os_error_reason
 from forgemcp.progress import progress
 from forgemcp.text import tool_result
 
@@ -79,6 +81,7 @@ class ProcessRecord:
     transcript: list[ProcessLogEntry] = field(default_factory=list)
     next_line: int = 1
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    job: Any = field(default=None, repr=False)
 
     def append_log(self, stream: ProcessStream, text: str, time: float) -> None:
         """Append under the record lock; all streams share one line sequence."""
@@ -104,17 +107,36 @@ class ProcessRecord:
         )
 
     async def terminate(self, process: Process) -> None:
-        """Request termination, escalate to kill after two seconds, and reap the process."""
+        """Stop the process and its current descendants, escalating after two seconds."""
         try:
-            process.terminate()
+            children = psutil.Process(process.pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            children = []
+        host.close_process_job(self.job)
+        self.job = None
+        # Capture descendants before their parent exits and they are reparented.
+        for child in reversed(children):
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.terminate()
+        try:
+            with suppress(ProcessLookupError):
+                process.terminate()
             try:
                 async with asyncio.timeout(2):
                     await process.wait()
             except TimeoutError:
-                process.kill()
+                # A child retaining a pipe can delay asyncio's wait even after
+                # the direct process has exited, so close descendants first.
+                for child in reversed(children):
+                    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                        child.kill()
+                with suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
-        except ProcessLookupError:
-            await process.wait()
+        finally:
+            for child in reversed(children):
+                with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    child.kill()
 
     async def monitor(self, process: Process, stopping: asyncio.Event) -> None:
         """Track exit, stop requests, and total or idle timeout while updating process status."""
@@ -152,7 +174,10 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            message = f"Process {summary.process_id} interrupted by timeout {timeout.total}"
+                            message = (
+                                f"Process {summary.process_id} interrupted by total "
+                                f"timeout {timeout.total} s"
+                            )
 
                     if not finished and timeout.idle is not None:
                         async with self.lock:
@@ -169,7 +194,10 @@ class ProcessRecord:
                             timed_out = True
                             await self.terminate(process)
                             result = "interrupted"
-                            message = f"Process {summary.process_id} interrupted by idle {timeout.idle}"
+                            message = (
+                                f"Process {summary.process_id} interrupted by idle "
+                                f"timeout {timeout.idle} s"
+                            )
 
                 if finished:
                     async with self.lock:
@@ -177,7 +205,10 @@ class ProcessRecord:
                         self.status.current_status = result
                     logger.info(message)
                     if timed_out:
-                        raise ProcessError(message)
+                        raise ProcessError(
+                            f"{message}. Inspect process_get(process_id={summary.process_id}) "
+                            "and the operation's current state before deciding whether to retry."
+                        )
                     break
                 else:
                     async with self.lock:
@@ -217,8 +248,15 @@ class ProcessRecord:
                 await queue.put(ProcessOutput(stream=stream, text=text))
 
         except (OSError, UnicodeError) as error:
+            reason = (
+                os_error_reason(error)
+                if isinstance(error, OSError)
+                else "invalid encoded output"
+            )
             raise ProcessStreamError(
-                f"Cannot read process {self.summary.process_id} {stream}."
+                f"Cannot read process {self.summary.process_id} {stream}: {reason}. "
+                f"Configured encoding: {display_value(self.summary.encoding)}. "
+                f"Inspect process_get(process_id={self.summary.process_id}) for retained output."
             ) from error
         else:
             queue.put_nowait(None)
@@ -253,8 +291,14 @@ class ProcessRecord:
                     self.append_log("stdin", text, now)
                 await writer.drain()
         except (OSError, UnicodeError) as error:
+            reason = (
+                os_error_reason(error)
+                if isinstance(error, OSError)
+                else "text cannot be encoded"
+            )
             raise ProcessStreamError(
-                f"Cannot write process {self.summary.process_id} stdin."
+                f"Cannot write process {self.summary.process_id} stdin: {reason}. "
+                f"Inspect process_get(process_id={self.summary.process_id}) for its current state."
             ) from error
         finally:
             # Normal EOF already flushed above; cancellation must not wait for
@@ -426,12 +470,18 @@ class ProcessService:
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as error:
-            raise ProcessStartError(f"Cannot start executable {executable}.") from error
+            raise ProcessStartError(
+                f"Cannot start executable {display_value(str(executable))}: "
+                f"{os_error_reason(error)}. "
+                "No process was started; check that the executable exists, is permitted to run, "
+                "and has a native executable format supported by this host."
+            ) from error
 
         status = ProcessStatus(pid=process.pid, current_status="running")
         stdin = asyncio.Queue[str | None]()
         output = asyncio.Queue[ProcessOutput | None]()
         record = ProcessRecord(summary, status)
+        record.job = host.process_job(process.pid)
         self.records[summary.process_id] = record
         session = ProcessSession(
             process,
@@ -521,8 +571,27 @@ class ProcessService:
         async def process_get(
             ctx: Context,
             process_id: int,
-            lines: FirstLines | LastLines | LineRange | None = None,
-            time: FirstSeconds | LastSeconds | TimeRange | None = None,
+            lines: Annotated[
+                FirstLines | LastLines | LineRange | None,
+                Field(
+                    description=(
+                        'Choose exactly one object form: {"first": N}, {"last": N}, '
+                        'or {"start": A, "end": B}, with no extra fields. '
+                        "All values are integers >= 1; ranges require A <= B and include both ends."
+                    ),
+                ),
+            ] = None,
+            time: Annotated[
+                FirstSeconds | LastSeconds | TimeRange | None,
+                Field(
+                    description=(
+                        'Choose exactly one object form: {"first": N}, {"last": N}, '
+                        'or {"start": A, "end": B}, with no extra fields. '
+                        "Values are finite seconds from process start; N > 0, "
+                        "0 <= A < B, and the end is excluded."
+                    ),
+                ),
+            ] = None,
             max_bytes: Annotated[int, Field(ge=0)] = 65536,
         ) -> Annotated[CallToolResult, ProcessDetails]:
             """Read a log slice: time, then lines, then UTF-8 text bytes.
@@ -536,7 +605,16 @@ class ProcessService:
             await report_progress(0, total=1, message="Reading process transcript")
             record = self.records.get(process_id)
             if record is None:
-                raise ToolError(f"Process {process_id} is not retained.")
+                raise ToolError(
+                    f"Unknown process_id={process_id}: this process is not retained in this "
+                    "server session. "
+                    + available_values(
+                        (str(identifier) for identifier in self.records),
+                        "processes_overview()",
+                    )
+                    + " Process IDs are assigned by ForgeMCP, not operating-system PIDs; "
+                    "retained processes are lost when the server restarts."
+                )
             async with record.lock:
                 end = (
                     asyncio.get_running_loop().time()
@@ -600,7 +678,11 @@ class ProcessService:
         async def process_details(process_id: int) -> str:
             """Read the retained state and transcript for one process."""
             if process_id not in self.records:
-                raise ResourceNotFoundError()
+                raise ResourceNotFoundError(
+                    f"Unknown process_id={process_id}: the process is not retained in this "
+                    "server session. Call processes_overview() for current ForgeMCP process IDs. "
+                    "Retained processes are lost when the server restarts."
+                )
 
             record = self.records[process_id]
             async with record.lock:
@@ -788,6 +870,8 @@ class ProcessSession:
                 if self.failure is None:
                     self.failure = error
             finally:
+                host.close_process_job(self.record.job)
+                self.record.job = None
                 async with self.record.lock:
                     if self.record.status.current_status == "running":
                         self.record.status.current_status = (

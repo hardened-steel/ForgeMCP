@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from forgemcp import markdown
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value
 from forgemcp.progress import progress
 from forgemcp.process.service import ProcessService
 from forgemcp.text import tool_result
@@ -132,7 +133,11 @@ class ToolchainService:
         for toolset in self.toolsets:
             if toolset.id == toolset_id:
                 return toolset
-        raise ToolsetNotFoundError(f"Unknown toolset ID {toolset_id!r}.")
+        raise ToolsetNotFoundError(
+            f"Unknown toolset_id={display_value(toolset_id)}. "
+            + available_values((item.id for item in self.toolsets), "toolsets_list()")
+            + " Use an ID returned by that tool; toolsets are discovered at server startup."
+        )
 
     def get_tool(self, toolset_id: str, tool_name: str) -> ToolSpec | None:
         """Return a named tool from the selected toolset, or None when absent."""
@@ -155,22 +160,36 @@ class ToolchainService:
             open_world_hint=False,
         )
 
-        async def read_tool(tool: ToolSpec) -> ToolDetails:
+        async def read_tool(tool: ToolSpec) -> tuple[ToolDetails, str | None]:
             # Versions belong only to the current MCP response, never the spec.
             """Query an available version for this response while tolerating command and parser
             failures.
             """
             version = None
+            warning = None
             if "version" in tool.methods:
                 try:
                     version = await tool.methods["version"]()
-                except (ToolCommandError, ToolParserError):
-                    pass
-            return ToolDetails(
-                name=tool.name,
-                kind=tool.kind,
-                path=str(tool.path),
-                version=version,
+                except (ToolCommandError, ToolParserError) as error:
+                    explanation = (
+                        "the version output was not recognized"
+                        if isinstance(error, ToolParserError)
+                        else "the version command could not complete"
+                    )
+                    warning = (
+                        f"Version unavailable for {display_value(tool.name)}: {explanation}. "
+                        "Call processes_overview() to inspect retained version-probe processes."
+                    )
+            else:
+                warning = f"Version lookup is not implemented for {display_value(tool.name)}."
+            return (
+                ToolDetails(
+                    name=tool.name,
+                    kind=tool.kind,
+                    path=str(tool.path),
+                    version=version,
+                ),
+                warning,
             )
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=annotations)
@@ -205,15 +224,19 @@ class ToolchainService:
             total = len(toolset.tools)
             await report_progress(0, total=total, message="Reading tool versions")
             details = []
+            warnings = []
             for index, tool in enumerate(toolset.tools, start=1):
-                details.append(await read_tool(tool))
+                detail, warning = await read_tool(tool)
+                details.append(detail)
+                if warning is not None:
+                    warnings.append(warning)
                 await report_progress(
                     index,
                     total=total,
                     message=f"Read {tool.name}",
                 )
             result = ToolsetDetails(id=toolset.id, name=toolset.name, tools=details)
-            return tool_result(result, render_text(result))
+            return tool_result(result, "\n".join([render_text(result), *warnings]))
 
         apps.add_html_resource(self.WIDGET.uri, self.WIDGET.content)
 
@@ -236,13 +259,13 @@ class ToolchainService:
                 raise ResourceNotFoundError(str(error)) from error
             table = markdown.Table(["Tool", "Kind", "Absolute path", "Version"])
             for tool in toolset.tools:
-                detail = await read_tool(tool)
+                detail, warning = await read_tool(tool)
                 table.add(
                     [
                         detail.name,
                         detail.kind.value,
                         detail.path,
-                        detail.version or "Unknown",
+                        detail.version or warning or "Unknown",
                     ]
                 )
             return markdown.Document(

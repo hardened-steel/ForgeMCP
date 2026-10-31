@@ -12,12 +12,17 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.types import CallToolResult, InputRequiredResult, Tool
+from pydantic import ValidationError
 
 from forgemcp import __version__
 from forgemcp import local_ipc
@@ -30,6 +35,8 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import argument_errors, display_value
+from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
 from forgemcp.process.host import ProcessIdentity
 from forgemcp.process.errors import ProcessError
@@ -45,6 +52,50 @@ from forgemcp.workspace.errors import WorkspaceError
 logger = logging.getLogger(__name__)
 
 
+class ForgeMCPServer(MCPServer):
+    """Keep SDK execution while making rejected tool arguments concise and actionable."""
+
+    async def list_tools(self) -> list[Tool]:
+        """Advertise the same closed argument objects that call_tool enforces."""
+        tools = await super().list_tools()
+        for tool in tools:
+            tool.input_schema = {**tool.input_schema, "additionalProperties": False}
+        return tools
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        """Reject unknown keys, then let the SDK validate and execute each invocation once."""
+        tool = next((item for item in await self.list_tools() if item.name == name), None)
+        if tool is None:
+            raise ToolError(
+                f"Unknown tool {display_value(name)}. "
+                "Request tools/list to get available tool names."
+            )
+        fields = tool.input_schema.get("properties", {})
+        unknown = sorted(set(arguments) - set(fields))
+        if unknown:
+            messages = []
+            for parameter in unknown:
+                matches = get_close_matches(parameter, fields, n=1, cutoff=0.75)
+                suggestion = f" Did you mean {display_value(matches[0])}?" if matches else ""
+                messages.append(f"Unknown argument {display_value(parameter)}.{suggestion}")
+            messages.append(f"Allowed arguments: {', '.join(fields) or '(none)'}.")
+            raise ToolError("\n".join(messages))
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as error:
+            if (
+                not isinstance(error, UnexpectedToolError)
+                and isinstance(error.__cause__, ValidationError)
+            ):
+                raise ToolError(argument_errors(error.__cause__, tool.input_schema)) from error
+            raise
+
+
 @dataclass
 class ServerRuntime:
     """Own one workspace's services once while stdio and the in-process client use them."""
@@ -56,6 +107,7 @@ class ServerRuntime:
     analysis: ClangdService
     history: MemoryHistory
     settings: dict[str, Any]
+    git: GitService | None = None
     mcp: MCPServer = field(init=False)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -171,6 +223,10 @@ class ServerRuntime:
                     for context in self.builds.configurations.values()
                 ],
             },
+            "git": {
+                "last_status": self.git.last_status.model_dump(mode="json")
+                if self.git is not None and self.git.last_status is not None else None,
+            },
             "clangd": {
                 "closed": self.analysis.closed,
                 "subscription_failed": self.analysis.subscription_failure is not None,
@@ -265,6 +321,7 @@ def create_runtime(
     progress_interval: float = 1.0,
     cmake_profiles: list[list[str]] | None = None,
     cmake_toolset: str = "system",
+    git_toolset: str = "system",
 ) -> ServerRuntime:
     """Compose independent services and their shared transport lifetime explicitly."""
     validate_progress_interval(progress_interval)
@@ -312,7 +369,14 @@ def create_runtime(
         analysis,
         tools=analysis.PROVIDER_TOOLS,
     )
-    services = (workspace, processes, toolchains, builds, analysis)
+    repository = GitService(
+        workspace,
+        toolchains,
+        builds,
+        analysis,
+        toolset=git_toolset,
+    )
+    services = (workspace, processes, toolchains, builds, analysis, repository)
     apps = Apps()
     complete = Complete()
     history = MemoryHistory()
@@ -328,9 +392,11 @@ def create_runtime(
             "storage_root": str(workspace.storage_root),
             "progress_interval": progress_interval,
             "cmake_toolset": cmake_toolset,
+            "git_toolset": git_toolset,
             "cmake_profiles": cmake_profiles or [],
             "toolset_definitions": toolsets or [],
         },
+        git=repository,
     )
 
     @asynccontextmanager
@@ -346,7 +412,7 @@ def create_runtime(
             *(text for text in service_instructions if text),
         ]
     )
-    mcp = MCPServer(
+    mcp = ForgeMCPServer(
         name="forgemcp",
         title="ForgeMCP",
         description="Structured C/C++ development tools for one local workspace.",
@@ -380,6 +446,7 @@ def create_server(
     progress_interval: float = 1.0,
     cmake_profiles: list[list[str]] | None = None,
     cmake_toolset: str = "system",
+    git_toolset: str = "system",
 ) -> MCPServer:
     """Return the public SDK server for embedding, without starting an admin Hub."""
     return create_runtime(
@@ -389,6 +456,7 @@ def create_server(
         progress_interval=progress_interval,
         cmake_profiles=cmake_profiles,
         cmake_toolset=cmake_toolset,
+        git_toolset=git_toolset,
     ).mcp
 
 
@@ -418,6 +486,11 @@ def argument_parser() -> argparse.ArgumentParser:
         "--cmake-toolset",
         default="system",
         help="Toolset ID or exact name for automatic CMake profiles (default: system).",
+    )
+    parser.add_argument(
+        "--git-toolset",
+        default="system",
+        help="Toolset ID or exact name for Git operations (default: system).",
     )
     parser.add_argument(
         "--cmake-profile",
@@ -486,6 +559,7 @@ def main() -> None:
             storage_root=arguments.workspace_storage,
             progress_interval=arguments.progress_interval,
             cmake_profiles=arguments.cmake_profile,
+            git_toolset=arguments.git_toolset,
             cmake_toolset=arguments.cmake_toolset,
         )
     except (CMakeError, ToolchainError, WorkspaceError, ValueError) as error:
