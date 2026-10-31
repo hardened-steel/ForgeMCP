@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -29,6 +30,8 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
+from forgemcp.debugger.lldb_dap import LldbDapSession
+from forgemcp.debugger.service import DebuggerService
 from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
 from forgemcp.process.host import ProcessIdentity
@@ -57,6 +60,7 @@ class ServerRuntime:
     history: MemoryHistory
     settings: dict[str, Any]
     git: GitService | None = None
+    debugger: DebuggerService | None = None
     mcp: MCPServer = field(init=False)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -74,10 +78,7 @@ class ServerRuntime:
                     await self.analysis.initialize()
                 except BaseException:
                     self.closed = True
-                    try:
-                        await self.analysis.close()
-                    finally:
-                        await self.processes.close()
+                    await self.close_services()
                     raise
             self.users += 1
         try:
@@ -87,10 +88,18 @@ class ServerRuntime:
                 self.users -= 1
                 if self.users == 0:
                     self.closed = True
-                    try:
-                        await self.analysis.close()
-                    finally:
-                        await self.processes.close()
+                    await self.close_services()
+
+    async def close_services(self) -> None:
+        """Release debugger targets and analysis before their shared process transport."""
+        try:
+            if self.debugger is not None:
+                await self.debugger.close()
+        finally:
+            try:
+                await self.analysis.close()
+            finally:
+                await self.processes.close()
 
     async def state_snapshot(self) -> dict[str, Any]:
         """Read retained service state without scans, tool calls, or transcript copies."""
@@ -282,7 +291,18 @@ def create_runtime(
         analysis,
         toolset=git_toolset,
     )
-    services = (workspace, processes, toolchains, builds, analysis, repository)
+    debugger = DebuggerService(
+        toolchains,
+        {
+            "lldb-dap": partial(
+                LldbDapSession,
+                project_root=workspace.root,
+                storage_root=workspace.storage_root,
+            ),
+        },
+        progress_interval=progress_interval,
+    )
+    services = (workspace, processes, toolchains, builds, analysis, repository, debugger)
     apps = Apps()
     complete = Complete()
     history = MemoryHistory()
@@ -303,6 +323,7 @@ def create_runtime(
             "toolset_definitions": toolsets or [],
         },
         git=repository,
+        debugger=debugger,
     )
 
     @asynccontextmanager

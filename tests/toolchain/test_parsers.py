@@ -30,6 +30,7 @@ from forgemcp.toolchain.loader import load_tools
         ("clangd", "clangd version 20.1.2\n", "20.1.2"),
         ("git", "git version 2.49.0.windows.1\n", "2.49.0.windows.1"),
         ("gdb", "GNU gdb (Ubuntu 15.1-1ubuntu2) 15.1\n", "15.1"),
+        ("lldb-dap", "lldb-dap: LLVM (http://llvm.org/):\n  LLVM version 22.1.8\n", "22.1.8"),
     ],
 )
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
@@ -90,7 +91,7 @@ async def test_unrecognized_version_raises():
     assert session.exited and session.waited
 
 
-@pytest.mark.parametrize("name", ["cl", "link", "cppvsdbg", "lldb-dap"])
+@pytest.mark.parametrize("name", ["cl", "link", "cppvsdbg"])
 def test_tools_without_version_have_empty_methods(name):
     """Verify tools lacking a portable version probe expose no bound operations."""
     info = next(info for info in load_tools() if info.name == name)

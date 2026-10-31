@@ -3,8 +3,8 @@
 ForgeMCP is a Python MCP server for structured C and C++ development workflows.
 The repository contains workspace, process, toolchain, and initial CMake services.
 Clangd tools provide read-only analysis across CMake configurations with a shared
-result widget. External file reads ask for confirmation through MCP elicitation. Quality and
-debugger modules are planned.
+result widget. External file reads ask for confirmation through MCP elicitation.
+The debugger uses LLDB-DAP for native program control and dump inspection; Quality remains planned.
 
 ## Current MCP surface
 
@@ -18,6 +18,9 @@ debugger modules are planned.
   definitions, references, document symbols, and workspace symbols. Empty
   configuration selections use all available contexts.
 - No prompts are currently registered.
+- Debugger tools launch native programs, attach to local PIDs, and open user-mode
+  dumps through an explicitly selected LLDB-DAP toolset. They inspect threads,
+  stacks, variables, modules, exceptions, memory, and instructions with typed results.
 - Git tools inspect and modify the repository rooted at the workspace: status,
   diffs, history, blame, branches/tags/remotes, staging, commits, restore, stash,
   fetch/pull/push, merge/rebase/cherry-pick/revert, and conflict stages and continuation.
@@ -167,6 +170,9 @@ its input schema. These
 calls pass through the same SDK handlers, validation, and feature locks as stdio
 calls. There is no panel-wide execution queue. Existing modules decide which
 operations may run concurrently.
+Debugger tools are excluded from the admin command catalog and rejected by the
+admin bridge even when their names are submitted directly. They remain available
+to MCP clients; completed MCP results can still be reviewed in history.
 The panel can cancel its own running commands; calls initiated by an MCP client
 remain owned by that client.
 
@@ -495,6 +501,83 @@ The initial CMake slice does not yet include clean/project-inspection tools
 or syntax highlighting. Unit and in-process MCP tests cover profiles,
 command parsing, generator changes, result resources, and qualified paths.
 
+## Debugging
+
+Install `lldb-dap` in a discovered toolset, or supply its absolute executable path
+with the existing `--toolset NAME lldb-dap=PATH` operator option. Use
+`debugger_adapters` to obtain the available adapter and toolset IDs. No adapter
+starts until `debugger_launch`, `debugger_attach`, or `debugger_open_dump` is called.
+Debugging does not require CMake or a compilation database and does not rebuild a program.
+
+`debugger_launch` takes a `toolset_id`, `options`, and optional `initial` breakpoint
+plan. `options.executable` and `options.cwd` are project/storage paths;
+`arguments` are literal strings. `stop_on_entry` defaults to true. For example:
+
+```json
+{
+  "toolset_id": "system",
+  "options": {
+    "executable": "storage/build/debug/app.exe",
+    "arguments": ["--example"],
+    "cwd": "project/"
+  },
+  "initial": {
+    "sources": [
+      {"source": "project/src/main.cpp", "points": [{"line": 20}]}
+    ]
+  }
+}
+```
+
+Attach supplies `options.pid`, an optional `expected_started_at` process birth
+time, and an optional managed `executable`. Dump inspection supplies
+`options.dump_file` and an optional matching executable. Both accept
+`source_mappings` and `symbol_directories`. Dump and symbol inputs must stay in
+project/storage. Source locations may name external `root/` files; the debugger
+does not read them automatically. Source locations are marked unverified against
+the loaded binary, so changed files are not presented as confirmed build-time source.
+PDB, DWARF, and dump compatibility depend on the installed LLDB build and target.
+
+Keep the returned `session_id`. `debugger_sessions` lists retained snapshots;
+`debugger_get` reads one without contacting the adapter. Each snapshot has one
+`status` field: null, `kind=stopped` with stop details, `kind=exited` with the
+confirmed target exit code, or `kind=failed` with a session failure message.
+Connection `phase` and `target_state` distinguish adapter failure, target execution,
+partial thread stops, and dump inspection.
+Each runtime retains at most 128 sessions, including closed sessions; restart it
+to release that history when the limit is reached.
+
+Launch, attach, `debugger_continue`, `debugger_step`, and `debugger_pause` return
+an execution reference. Pass it to `debugger_wait` with the same session ID.
+The wait returns a saved stop/terminal observation, or a timeout with the current
+snapshot; timeout and cancellation of a wait leave the target running. Execution
+observations are bounded and can expire. After an uncertain command outcome, read
+state before deciding whether to repeat a control operation.
+
+Construct a stop token from `session_id` and `inspection_generation` in a stopped
+snapshot. Use `debugger_threads`, `debugger_stack`, `debugger_scopes`, and
+`debugger_variables` to inspect state. Frame, variable, and memory handles belong
+to that session and generation; continuing execution invalidates them. Stack,
+variables, and modules accept bounded `page` windows. Memory and disassembly take
+explicit bounded counts. `debugger_exception_info` supplies supported exception
+details. Available operations and exception filters appear in `capabilities`.
+Breakpoints are managed through `debugger_breakpoints`,
+`debugger_function_breakpoints`, and `debugger_exception_breakpoints`.
+Setting source or function breakpoints replaces the complete selected set.
+
+`debugger_close` terminates a program launched by that session, detaches from an
+attached program, or releases a dump. Its result distinguishes adapter closure
+from the confirmed target disposition. Server shutdown closes all debugger
+sessions before the process service. Each adapter's `adapter_process_id` identifies
+its retained transport transcript for `process_get`; that transcript contains DAP
+messages, including adapter output events. The module exposes no arbitrary
+debugger console, expression execution, memory/variable writes, terminal input,
+remote debugging, or kernel debugging.
+
+Every debugger tool has readable text, typed structured data, progress, an icon,
+and a result-only App. The App renders the saved invocation and performs no debugger
+calls. Debugger commands cannot be run from the admin panel.
+
 ## Git operations
 
 Git uses the executable and environment of `--git-toolset ID_OR_NAME` (default:
@@ -592,7 +675,8 @@ Built-ins cover CMake, CTest, Ninja, Make, MSBuild, MSVC (`cl`), `link`, Clang,
 `cppvsdbg`. The last adapter may be found as `OpenDebugAD7.exe` or VS Code's bundled
 `vsdbg.exe`; it has no portable version probe. An unknown or failed version probe
 leaves the discovered path available with a null version. Version methods for `cl`,
-`link`, `cppvsdbg`, and `lldb-dap` are not implemented in this iteration.
+`link`, and `cppvsdbg` are not implemented. LLDB-DAP has a version probe and a
+typed framed connection used by debugger sessions.
 
 Toolsets are discovered once per server lifetime; restart to discover changed
 installations. Detail tools and resources query available versions on each request,

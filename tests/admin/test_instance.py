@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mcp import Client
 from mcp.server import MCPServer
+from mcp.shared.exceptions import MCPError
 from mcp.types import (
     CallToolResult,
     ElicitRequestFormParams,
@@ -263,3 +265,70 @@ async def test_wire_fixture_matches_real_sdk_serialization(agent):
     )
     fixture = Path(__file__).parent / "fixtures" / "widget-wire.json"
     assert payload == json.loads(fixture.read_text(encoding="utf-8"))
+
+
+@pytest.mark.anyio
+async def test_debugger_tools_are_hidden_and_blocked_only_for_admin(request):
+    """Reject crafted admin debugging calls while preserving ordinary and MCP client calls."""
+    instance = request.getfixturevalue("agent")
+    executed = []
+
+    @instance.mcp.tool()
+    async def debugger_launch() -> str:
+        """Record whether debugging reached its SDK handler."""
+        executed.append("debugger")
+        return "debugger executed"
+
+    @instance.mcp.tool()
+    async def workspace_example() -> str:
+        """Keep non-debugging admin commands available."""
+        executed.append("workspace")
+        return "workspace executed"
+
+    async with Client(instance.mcp, read_timeout_seconds=5) as client:
+        original = await client.list_tools()
+        catalog = await instance.dispatch(client, "tools/list", {})
+        snapshot = await instance.dispatch(client, "snapshot", {})
+        assert {tool.name for tool in catalog.tools} == {"workspace_example"}
+        assert {tool.name for tool in snapshot["tools"]} == {"workspace_example"}
+        assert {tool.name for tool in original.tools} == {
+            "debugger_launch",
+            "workspace_example",
+        }
+        for name in ("debugger_launch", "debugger_sessions", "debugger_future_tool"):
+            with pytest.raises(MCPError, match="unavailable through the admin panel"):
+                await instance.dispatch(client, "tools/call", {"name": name})
+        assert not executed
+        ordinary = await instance.dispatch(
+            client,
+            "tools/call",
+            {"name": "workspace_example"},
+        )
+        assert not ordinary.is_error
+        direct = await client.call_tool("debugger_launch", {})
+        assert not direct.is_error
+        assert executed == ["workspace", "debugger"]
+
+
+@pytest.mark.anyio
+async def test_crafted_debugger_admin_request_returns_protocol_error(request):
+    """Return the admin protocol error before any client method can be executed."""
+    instance = request.getfixturevalue("agent")
+    connection = RecordingConnection()
+    await instance.handle_request(
+        connection,
+        None,
+        {
+            "id": "debugger-call",
+            "method": "tools/call",
+            "params": {"name": "debugger_step", "arguments": {}},
+        },
+    )
+    assert json.loads(connection.payloads[0]) == {
+        "type": "response",
+        "id": "debugger-call",
+        "error": {
+            "code": -32601,
+            "message": "Debugger tools are unavailable through the admin panel.",
+        },
+    }

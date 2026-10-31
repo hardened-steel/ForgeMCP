@@ -351,14 +351,23 @@ class InstanceAgent:
                 client.list_resource_templates(),
             )
             return {
-                "tools": tools.tools,
+                "tools": [tool for tool in tools.tools if not tool.name.startswith("debugger_")],
                 "resources": resources.resources,
                 "resource_templates": templates.resource_templates,
                 "history": self.history.list_calls(),
                 "state": await self.read_state(),
             }
         if method == "tools/list":
-            return await client.list_tools()
+            tools = await client.list_tools()
+            return tools.model_copy(
+                update={
+                    "tools": [
+                        tool
+                        for tool in tools.tools
+                        if not tool.name.startswith("debugger_")
+                    ],
+                },
+            )
         if method == "resources/list":
             return await client.list_resources()
         if method == "resources/templates/list":
@@ -378,6 +387,11 @@ class InstanceAgent:
             arguments = params.get("arguments", {})
             if not isinstance(name, str) or not isinstance(arguments, dict):
                 raise ValueError("Tool name and arguments are invalid.")
+            if name.startswith("debugger_"):
+                raise MCPError(
+                    code=-32601,
+                    message="Debugger tools are unavailable through the admin panel.",
+                )
             return await client.call_tool(name, arguments)
         if method == "history/list":
             return {"calls": self.history.list_calls()}
