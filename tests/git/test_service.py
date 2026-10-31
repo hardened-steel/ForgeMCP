@@ -9,6 +9,8 @@ import pytest
 
 from forgemcp.cmake.file_api import ConfigurationInputs
 from forgemcp.cmake.models import CompilationContext
+from forgemcp.git import parsers
+from forgemcp.git.errors import GitParseError
 from forgemcp.workspace.path import WorkspacePath
 
 
@@ -125,4 +127,37 @@ async def test_secondary_analysis_failure_preserves_completed_commit(git_project
         assert result["error"] is None
         assert result["head_before"] != result["head_after"]
         assert "synchronization failed" in result["synchronization_error"]
+        assert "Do not repeat the completed mutation" in result["synchronization_error"]
         assert "private diagnostic detail" not in str(result)
+
+
+@pytest.mark.anyio
+async def test_stdout_only_commit_failure_retains_a_useful_typed_outcome(git_project):
+    """Explain a nothing-to-commit exit while preserving the mutation result and unchanged HEAD."""
+    async with Client(git_project.runtime().mcp) as client:
+        response = await client.call_tool("git_commit", {"message": "No changes"})
+        assert not response.is_error
+        result = response.structured_content
+        assert result["head_before"] == result["head_after"]
+        assert "nothing to commit" in result["error"]
+        assert "stdout" in result["error"] and "process_get(process_id=" in result["error"]
+        assert "git_status()" in result["error"] and result["process_ids"]
+
+
+@pytest.mark.anyio
+async def test_parser_failure_points_to_original_process_without_returning_raw_data(
+    git_project,
+    monkeypatch,
+):
+    """Keep machine-output errors actionable without exposing the malformed record itself."""
+    def fail_status(_data):
+        """Model an incompatible porcelain record while keeping its contents private."""
+        raise GitParseError("Cannot parse Git porcelain v2 status.")
+
+    monkeypatch.setattr(parsers, "status", fail_status)
+    async with Client(git_project.runtime().mcp) as client:
+        response = await client.call_tool("git_status", {})
+        assert response.is_error
+        message = response.content[0].text
+        assert "porcelain v2 status" in message
+        assert "process_get(process_id=" in message and "compatibility" in message

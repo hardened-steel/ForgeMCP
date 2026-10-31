@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 
 from pydantic import BaseModel, Field
 
+from forgemcp.diagnostics import os_error_reason
 from forgemcp.process.errors import ProcessError
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.process.service import ProcessService
@@ -39,7 +40,10 @@ class TestResult(BaseModel):
 def parse_report(path: Path) -> list[TestCase]:
     """Read a JUnit report and classify each testcase as passed, failed, skipped, or not run."""
     if not path.is_file():
-        raise ToolParserError("CTest did not produce a JUnit report.")
+        raise ToolParserError(
+            "CTest did not produce its expected JUnit report. Inspect the CTest process "
+            "output to determine whether the selected tests started and JUnit output is supported."
+        )
     try:
         data = path.read_text(encoding="utf-8")
         root = ET.fromstring(data)
@@ -70,7 +74,17 @@ def parse_report(path: Path) -> list[TestCase]:
             )
         return results
     except (ET.ParseError, ValueError, OSError) as error:
-        raise ToolParserError("Cannot parse the CTest JUnit report.") from error
+        if isinstance(error, ET.ParseError):
+            line, column = error.position
+            reason = f"invalid XML at line {line}, column {column}"
+        elif isinstance(error, OSError):
+            reason = os_error_reason(error)
+        else:
+            reason = "invalid UTF-8 text or testcase duration"
+        raise ToolParserError(
+            f"Cannot parse the CTest JUnit report: {reason}. Inspect the CTest process "
+            "output; test outcomes could not be confirmed from the report."
+        ) from error
 
 
 class Test(Protocol):
@@ -112,6 +126,7 @@ def create_spec(
     async def version() -> str:
         """Run a bounded version probe, drain both output streams, and parse the ctest banner."""
         output = {"stdout": "", "stderr": ""}
+        session = None
         try:
             async with await processes.launch(
                 path,
@@ -127,9 +142,20 @@ def create_spec(
                     output[chunk.stream] += chunk.text[:remaining]
                 code = await session.wait()
                 if code != 0:
-                    raise ToolCommandError(f"{INFO.name}.version failed (exit {code}).")
+                    raise ToolCommandError(
+                        f"{INFO.name}.version failed (exit {code}). "
+                        f"Inspect process_get(process_id={session.process_id}).",
+                        process_id=session.process_id,
+                    )
         except ProcessError as error:
-            raise ToolCommandError(f"Cannot read {INFO.name} version.") from error
+            identifier = session.process_id if session is not None else None
+            hint = (
+                f" Inspect process_get(process_id={identifier})." if identifier is not None else ""
+            )
+            raise ToolCommandError(
+                f"Cannot read {INFO.name} version: {error}{hint}",
+                process_id=identifier,
+            ) from error
         for text in output.values():
             if match := re.search(
                 'ctest version ([0-9][0-9A-Za-z.+~-]*)',
@@ -137,7 +163,10 @@ def create_spec(
                 re.IGNORECASE | re.MULTILINE,
             ):
                 return match.group(1)
-        raise ToolParserError(f"Cannot parse {INFO.name} version.")
+        raise ToolParserError(
+            f"Cannot parse {INFO.name} version: expected a 'ctest version <version>' banner. "
+            f"Inspect process_get(process_id={session.process_id})."
+        )
 
     async def test(
         source: Path,

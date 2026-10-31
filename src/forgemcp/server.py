@@ -12,12 +12,17 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.types import CallToolResult, InputRequiredResult, Tool
+from pydantic import ValidationError
 
 from forgemcp import __version__
 from forgemcp import local_ipc
@@ -29,6 +34,7 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import argument_errors, display_value
 from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
 from forgemcp.process.host import ProcessIdentity
@@ -43,6 +49,50 @@ from forgemcp.workspace.diff import DiffProvider
 from forgemcp.workspace.errors import WorkspaceError
 
 logger = logging.getLogger(__name__)
+
+
+class ForgeMCPServer(MCPServer):
+    """Keep SDK execution while making rejected tool arguments concise and actionable."""
+
+    async def list_tools(self) -> list[Tool]:
+        """Advertise the same closed argument objects that call_tool enforces."""
+        tools = await super().list_tools()
+        for tool in tools:
+            tool.input_schema = {**tool.input_schema, "additionalProperties": False}
+        return tools
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        """Reject unknown keys, then let the SDK validate and execute each invocation once."""
+        tool = next((item for item in await self.list_tools() if item.name == name), None)
+        if tool is None:
+            raise ToolError(
+                f"Unknown tool {display_value(name)}. "
+                "Request tools/list to get available tool names."
+            )
+        fields = tool.input_schema.get("properties", {})
+        unknown = sorted(set(arguments) - set(fields))
+        if unknown:
+            messages = []
+            for parameter in unknown:
+                matches = get_close_matches(parameter, fields, n=1, cutoff=0.75)
+                suggestion = f" Did you mean {display_value(matches[0])}?" if matches else ""
+                messages.append(f"Unknown argument {display_value(parameter)}.{suggestion}")
+            messages.append(f"Allowed arguments: {', '.join(fields) or '(none)'}.")
+            raise ToolError("\n".join(messages))
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as error:
+            if (
+                not isinstance(error, UnexpectedToolError)
+                and isinstance(error.__cause__, ValidationError)
+            ):
+                raise ToolError(argument_errors(error.__cause__, tool.input_schema)) from error
+            raise
 
 
 @dataclass
@@ -318,7 +368,7 @@ def create_runtime(
             *(text for text in service_instructions if text),
         ]
     )
-    mcp = MCPServer(
+    mcp = ForgeMCPServer(
         name="forgemcp",
         title="ForgeMCP",
         description="Structured C/C++ development tools for one local workspace.",

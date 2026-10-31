@@ -151,7 +151,7 @@ class Connection:
             raise ToolParserError("Cannot serialize an LSP message.") from error
         except ProcessError as error:
             raise ToolCommandError(
-                "Cannot send an LSP message to clangd.",
+                f"Cannot send an LSP message to clangd: {error}",
                 process_id=self.process_id,
             ) from error
 
@@ -201,10 +201,14 @@ class Connection:
                     process_id=self.process_id,
                 )
         except (ValueError, UnicodeError, RecursionError) as error:
-            raise ToolParserError("clangd returned malformed LSP data.") from error
+            raise ToolParserError(
+                "clangd returned malformed LSP data: expected a valid Content-Length header "
+                "and a UTF-8 JSON-RPC message. "
+                f"Inspect process_get(process_id={self.process_id})."
+            ) from error
         except ProcessError as error:
             raise ToolCommandError(
-                "clangd process communication failed.",
+                f"clangd process communication failed: {error}",
                 process_id=self.process_id,
             ) from error
 

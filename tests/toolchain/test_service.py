@@ -389,8 +389,10 @@ async def test_unknown_ids_at_mcp_boundary(cpp_acceptance_project, monkeypatch):
         raise_exceptions=True,
     ) as client:
         result = await client.call_tool("toolset_get", {"toolset_id": "missing"})
-        assert result.is_error and "Unknown toolset" in result.content[0].text
-        with pytest.raises(MCPError, match="Unknown toolset"):
+        assert result.is_error and "toolset_id='missing'" in result.content[0].text
+        assert "'system'" in result.content[0].text
+        assert "toolsets_list()" in result.content[0].text
+        with pytest.raises(MCPError, match="toolset_id='missing'"):
             await client.read_resource("forgemcp://toolsets/missing")
 
 
@@ -495,9 +497,16 @@ async def test_mcp_version_failures_are_isolated_and_not_cached(
             }
             assert "environment" not in result.structured_content
             assert "PRIVATE_TRANSCRIPT" not in str(result.content)
+            text = result.content[0].text
+            assert "'failed': the version command could not complete" in text
+            assert "'unparsed': the version output was not recognized" in text
+            assert "not implemented for 'unavailable'" in text
+            assert "processes_overview()" in text
         resource = await client.read_resource("forgemcp://toolsets/system")
         text = resource.contents[0].text
-        assert "| good |" in text and "| 3 |" in text and "Unknown" in text
+        assert "| good |" in text and "| 3 |" in text
+        assert "version output was not recognized" in text
+        assert "not implemented for 'unavailable'" in text
         assert "PRIVATE_TRANSCRIPT" not in text
         assert calls.count("good") == 3
         assert calls.count("failed") == calls.count("unparsed") == 3

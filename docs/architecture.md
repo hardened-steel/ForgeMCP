@@ -26,6 +26,7 @@ src/forgemcp/
   server.py                     # composition root, CLI, MCPServer
   assets.py                     # package-relative Widget and IconFile helpers
   completion.py                 # one server-wide completion dispatcher
+  diagnostics.py                # bounded error values, catalog hints, SDK validation text
   admin/
     history.py                  # SDK middleware and in-memory tool-call records
     instance.py                 # one SDK client and reconnecting instance IPC bridge
@@ -1172,6 +1173,40 @@ methods translate them according to who can recover:
 - `ResourceNotFoundError` or another MCP error: the resource/request cannot be served;
 - any other exception: unexpected bug, logged server-side and sanitized by the SDK.
 
+Expected error messages identify the actual JSON argument, including nested fields
+and list indices, then explain the constraint or prerequisite and a concrete next
+step. Unknown identifiers include all available values for catalogs of up to eight
+items; larger catalogs report their size and an existing discovery call. Empty
+catalogs are explicit. Catalog hints use retained or already-read data without
+additional discovery processes. CMake target/test enumeration is not exposed;
+errors must not suggest a nonexistent listing tool.
+
+The small `ForgeMCPServer` specialization in the composition root uses the SDK's
+public `list_tools` and `call_tool` methods. It advertises closed top-level argument
+objects, rejects unknown argument names with a spelling suggestion when available,
+and formats SDK `ValidationError` details without input payloads, Pydantic links,
+or internal union branch names. Validation, resolver/elicitation execution, output
+conversion, and sanitization still belong to the SDK and run once per invocation.
+Union-object arguments such as process transcript selectors describe their valid
+forms and constraints in their schema; those descriptions also explain failures.
+
+`diagnostics.py` shares bounded escaped identifier rendering, small-catalog hints,
+OS explanations without native filename fields, and SDK validation formatting.
+Feature handlers retain operation-specific recovery decisions. Managed file errors
+keep project/storage qualification and distinguish source and destination roles.
+Source fragments, replacement text, full argument arrays, environments, malformed
+protocol payloads, and credentials are not added to diagnostic explanations.
+
+Process failures retain available process IDs and direct transcript lookup hints.
+Git uses stderr diagnostics with a bounded, credential-redacted stdout fallback
+when stderr is empty. Its typed repository state drives conflict recovery guidance.
+CMake per-profile errors and Git mutation errors retain their existing structured
+result contracts: a successful MCP exchange does not imply that every underlying
+operation succeeded. Messages distinguish pre-launch failure, partial or unknown
+mutation outcomes, and successful operations followed by synchronization warnings;
+they never advise blindly repeating completed mutations. Toolset version failures
+keep `version=null` and add textual explanations without changing result fields.
+
 Project-controlled text is data. It must not change server instructions, choose an
 executable, escape the workspace, or be copied into operational logs. Process
 consumers must explicitly select executables, construct arguments, choose timeout and
@@ -1191,6 +1226,11 @@ assert the public contract: schemas, Apps metadata, icons, progress, structured
 output, resources, prompts, and completions. The source acceptance project remains a
 portable fixture for later checks against real CMake, compilers, clangd, sanitizers,
 and debuggers; tests never operate on it in place.
+
+Expected-failure tests also check the parameter, useful constraint/choices or real
+recovery call, process provenance, and unchanged/partial mutation guarantees where
+relevant. SDK Client checks cover unknown argument rejection and concise validation
+messages; asserting only `is_error` does not establish the error contract.
 
 `.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
 frontend and Python wheel together. Python changes must also pass

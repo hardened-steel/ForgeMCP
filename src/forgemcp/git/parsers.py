@@ -4,7 +4,7 @@ import re
 
 from forgemcp.workspace.path import WorkspacePath
 
-from .errors import GitError
+from .errors import GitParseError
 from .models import GitBlameLine, GitChange, GitCommit, GitEntry, GitStatus
 
 
@@ -13,17 +13,17 @@ def utf8(value: bytes) -> str:
     try:
         return value.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise GitError("Git returned a non-UTF-8 name or metadata field.") from error
+        raise GitParseError("Git returned a non-UTF-8 name or metadata field.") from error
 
 
 def qualified(value: bytes) -> WorkspacePath:
     """Qualify a literal repository path while preserving whitespace and Unicode."""
     if not value:
-        raise GitError("Git returned an empty repository file path.")
+        raise GitParseError("Git returned an empty repository file path.")
     try:
         return WorkspacePath("project/" + utf8(value))
     except ValueError as error:
-        raise GitError("Git returned a noncanonical project path.") from error
+        raise GitParseError("Git returned a noncanonical project path.") from error
 
 
 def status(data: bytes) -> GitStatus:
@@ -76,7 +76,7 @@ def status(data: bytes) -> GitStatus:
                 )
             )
     except (KeyError, IndexError, ValueError, StopIteration) as error:
-        raise GitError("Cannot parse Git porcelain v2 status.") from error
+        raise GitParseError("Cannot parse Git porcelain v2 status.") from error
     return GitStatus(entries=entries, **headers)
 
 
@@ -105,7 +105,7 @@ def changes(data: bytes) -> list[GitChange]:
                 )
             )
     except (ValueError, StopIteration) as error:
-        raise GitError("Cannot parse Git raw diff records.") from error
+        raise GitParseError("Cannot parse Git raw diff records.") from error
     return result
 
 
@@ -117,7 +117,7 @@ def commits(data: bytes) -> list[GitCommit]:
     if fields[-1] == b"":
         fields.pop()
     if len(fields) % 9:
-        raise GitError("Cannot parse Git commit records.")
+        raise GitParseError("Cannot parse Git commit records.")
     result: list[GitCommit] = []
     for offset in range(0, len(fields), 9):
         values = [utf8(value) for value in fields[offset:offset + 9]]
@@ -156,18 +156,18 @@ def blame(data: bytes) -> list[GitBlameLine]:
                     )
                 )
             except (KeyError, ValueError) as error:
-                raise GitError("Cannot parse Git blame line.") from error
+                raise GitParseError("Cannot parse Git blame line.") from error
             current = {}
         elif match := re.fullmatch(
             rb"([0-9a-f]{40}(?:[0-9a-f]{24})?) ([0-9]+) ([0-9]+)(?: [0-9]+)?",
             raw,
         ):
             if current:
-                raise GitError("Git blame ended a record without a source line.")
+                raise GitParseError("Git blame ended a record without a source line.")
             current = dict(zip(("oid", "original", "line"), map(utf8, match.groups())))
         elif raw:
             key, _, value = raw.partition(b" ")
             current[utf8(key)] = utf8(value)
     if current:
-        raise GitError("Git blame ended a record without a source line.")
+        raise GitParseError("Git blame ended a record without a source line.")
     return result

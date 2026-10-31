@@ -123,6 +123,7 @@ def create_spec(
     async def version() -> str:
         """Run a bounded version probe, drain both output streams, and parse the cmake banner."""
         output = {"stdout": "", "stderr": ""}
+        session = None
         try:
             async with await processes.launch(
                 path,
@@ -138,9 +139,20 @@ def create_spec(
                     output[chunk.stream] += chunk.text[:remaining]
                 code = await session.wait()
                 if code != 0:
-                    raise ToolCommandError(f"{INFO.name}.version failed (exit {code}).")
+                    raise ToolCommandError(
+                        f"{INFO.name}.version failed (exit {code}). "
+                        f"Inspect process_get(process_id={session.process_id}).",
+                        process_id=session.process_id,
+                    )
         except ProcessError as error:
-            raise ToolCommandError(f"Cannot read {INFO.name} version.") from error
+            identifier = session.process_id if session is not None else None
+            hint = (
+                f" Inspect process_get(process_id={identifier})." if identifier is not None else ""
+            )
+            raise ToolCommandError(
+                f"Cannot read {INFO.name} version: {error}{hint}",
+                process_id=identifier,
+            ) from error
         for text in output.values():
             if match := re.search(
                 'cmake version ([0-9][0-9A-Za-z.+~-]*)',
@@ -148,7 +160,10 @@ def create_spec(
                 re.IGNORECASE | re.MULTILINE,
             ):
                 return match.group(1)
-        raise ToolParserError(f"Cannot parse {INFO.name} version.")
+        raise ToolParserError(
+            f"Cannot parse {INFO.name} version: expected a 'cmake version <version>' banner. "
+            f"Inspect process_get(process_id={session.process_id})."
+        )
 
     async def execute(
         source: Path,
@@ -208,7 +223,11 @@ def create_spec(
             parse,
         )
         if code != 0:
-            raise ToolCommandError(f"CMake could not list presets (exit {code}, process {process_id}).")
+            raise ToolCommandError(
+                f"CMake could not list presets (exit {code}). "
+                f"Inspect process_get(process_id={process_id}) for preset configuration errors.",
+                process_id=process_id,
+            )
         return result
 
     async def configure(

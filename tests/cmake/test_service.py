@@ -22,6 +22,101 @@ from forgemcp.workspace.path import WorkspacePath
 from tests.cmake.conftest import server, write_generation
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "expected"),
+    [
+        ("cmake_configure", {"profiles": []}, ["profiles=[]", "null", "presets"]),
+        (
+            "cmake_build",
+            {"profiles": ["presets", "presets"]},
+            ["profiles[1]", "profiles[0]", "duplicates"],
+        ),
+        (
+            "cmake_test",
+            {"profiles": ["typo"]},
+            ["profiles[0]", "typo", "presets", "cmake_profiles()"],
+        ),
+        ("cmake_build", {"targets": []}, ["targets=[]", "null", "defaults"]),
+        ("cmake_build", {"targets": ["valid", ""]}, ["targets[1]", "nonempty"]),
+        ("cmake_test", {"names": [""]}, ["names[0]", "exact test name"]),
+    ],
+)
+async def test_invalid_selections_identify_argument_and_recovery(
+    request,
+    tool,
+    arguments,
+    expected,
+):
+    """Reject invalid selections with a precise field and usable selection guidance."""
+    scenario = request.getfixturevalue("setup")
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(tool, arguments)
+    assert response.is_error
+    text = response.content[0].text
+    assert all(value in text for value in expected)
+    scenario.configure.assert_not_awaited()
+    scenario.build.assert_not_awaited()
+    scenario.test.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parameter", ["executable", "cwd"])
+async def test_external_execution_error_names_path_parameter(request, parameter):
+    """Identify which execution path violates the managed-root requirement."""
+    scenario = request.getfixturevalue("setup")
+    (scenario.workspace.root / "program").write_bytes(b"program")
+    arguments = {"executable": "project/program", parameter: "root/C:/outside"}
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_run_test", arguments)
+    assert response.is_error
+    assert parameter + "=" in response.content[0].text
+    assert "project/ or storage/" in response.content[0].text
+
+
+@pytest.mark.anyio
+async def test_direct_run_nul_error_names_argument_index(request):
+    """Report the invalid argument index without echoing other command arguments."""
+    scenario = request.getfixturevalue("setup")
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(
+            "cmake_run_test",
+            {"executable": "program", "arguments": ["private-value", "bad\0argument"]},
+        )
+    assert response.is_error
+    assert "arguments[1]" in response.content[0].text
+    assert "private-value" not in response.content[0].text
+
+
+def test_unusable_cache_preserves_cause_and_profile_recovery(request):
+    """Keep the cache failure and an exact configure call without exposing native roots."""
+    scenario = request.getfixturevalue("setup")
+    profile = scenario.service.plain_profile(ProfileDefinition(name="debug"))
+    with pytest.raises(CMakeError) as failure:
+        scenario.service.require_configured(profile)
+    text = str(failure.value)
+    assert "debug" in text and "CMakeCache.txt" in text
+    assert "storage/build/cmake-debug" in text
+    assert "cmake_configure(profiles=['debug'])" in text
+    assert str(scenario.workspace.root) not in text
+
+
+@pytest.mark.anyio
+async def test_preset_failure_lists_available_names(request):
+    """Use the already acquired preset catalog to explain a bad operator selection."""
+    scenario = request.getfixturevalue("setup")
+    scenario.service.definitions = (
+        ProfileDefinition(name="custom", configure_presets=["typo"]),
+    )
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_configure", {})
+    assert not response.is_error
+    error = response.structured_content["result"][0]["error"]
+    assert all(value in error for value in ("custom", "typo", "native", "operator"))
+    scenario.presets.assert_awaited_once()
+    scenario.configure.assert_not_awaited()
+
+
 @pytest.fixture
 def anyio_backend():
     """Run async tests on the asyncio backend used by the process and LSP services."""

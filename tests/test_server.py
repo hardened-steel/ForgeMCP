@@ -13,6 +13,7 @@ from mcp.client import advertise
 from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID
 from mcp.types import ElicitResult, ResourceTemplateReference
 from mcp.shared.exceptions import MCPError
+from pydantic import ValidationError
 
 from forgemcp.server import argument_parser, create_server
 from forgemcp.cmake.service import CMakeService
@@ -473,7 +474,7 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
             ):
                 with pytest.raises(
                     MCPError,
-                    match="Root must be 'project' or 'storage'",
+                    match="expected 'project' or 'storage'",
                 ):
                     await asyncio.wait_for(
                         client.read_resource(
@@ -483,11 +484,11 @@ async def test_invalid_resource_roots_fail_promptly_with_useful_errors(
                         ),
                         timeout=2,
                     )
-        with pytest.raises(MCPError, match="Path must start"):
+        with pytest.raises(MCPError, match="resource paths must start"):
             await client.read_resource("forgemcp://workspace/file")
         failed = await client.call_tool("workspace_delete", {"path": "project/src"})
         assert failed.is_error
-        assert "src:" in failed.content[0].text
+        assert "path='project/src'" in failed.content[0].text
 
 
 @pytest.mark.anyio
@@ -629,3 +630,112 @@ async def test_completions_follow_qualified_path_and_storage_context(cpp_accepta
         ) == ["project/service-data/index/"]
         listing = await client.read_resource("forgemcp://workspace/list?path=storage/index/")
         assert "data.xyz" in listing.contents[0].text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "expected"),
+    [
+        (
+            "processes_overview",
+            {"status": "finished"},
+            ("status", "'all'", "'running'", "'completed'"),
+        ),
+        (
+            "process_get",
+            {"process_id": 0, "lines": {"first": 1, "last": 1}},
+            ("lines", '{"first": N}', '{"last": N}', "A <= B"),
+        ),
+        (
+            "process_get",
+            {"process_id": 0, "time": {"start": 3, "end": 2}},
+            ("time", "finite seconds", "0 <= A < B"),
+        ),
+        (
+            "process_get",
+            {"process_id": 0, "max_bytes": -1},
+            ("max_bytes", "greater than or equal to 0"),
+        ),
+        ("workspace_read_file", {}, ("path", "Field required")),
+        ("missing_tool", {}, ("Unknown tool 'missing_tool'", "tools/list")),
+    ],
+)
+async def test_sdk_argument_errors_are_concise_and_actionable(
+    cpp_acceptance_project,
+    tool,
+    arguments,
+    expected,
+):
+    """Expose useful SDK validation details without implementation labels or Pydantic links."""
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        response = await client.call_tool(tool, arguments)
+    assert response.is_error
+    text = response.content[0].text
+    assert all(part in text for part in expected), text
+    assert "errors.pydantic.dev" not in text
+    assert "function-after" not in text and "FirstLines" not in text
+
+
+@pytest.mark.anyio
+async def test_unknown_argument_is_rejected_before_mutation_and_advertised_in_schema(
+    cpp_acceptance_project,
+):
+    """Reject misspelled argument names instead of ignoring them and executing a file write."""
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        tools = (await client.list_tools()).tools
+        assert all(tool.input_schema["additionalProperties"] is False for tool in tools)
+        response = await client.call_tool(
+            "workspace_write_file",
+            {
+                "path": "project/never-created.txt",
+                "text": "PRIVATE_BODY",
+                "texts": "PRIVATE_EXTRA",
+            },
+        )
+        assert response.is_error
+        text = response.content[0].text
+        assert "Unknown argument 'texts'" in text and "Did you mean 'text'?" in text
+        assert "Allowed arguments: path, text" in text
+        assert "PRIVATE_BODY" not in text and "PRIVATE_EXTRA" not in text
+    assert not (cpp_acceptance_project / "never-created.txt").exists()
+
+
+@pytest.mark.anyio
+async def test_internal_validation_failure_keeps_sdk_sanitization(
+    cpp_acceptance_project,
+    monkeypatch,
+):
+    """Do not mistake an implementation's ValidationError for rejected caller arguments."""
+    server = create_server(cpp_acceptance_project)
+
+    def broken_file(*args, **kwargs):
+        """Simulate an internal model failure containing private implementation details."""
+        raise ValidationError.from_exception_data(
+            "PrivateOutput",
+            [
+                {
+                    "type": "int_parsing",
+                    "loc": ("PRIVATE_FIELD",),
+                    "input": "PRIVATE_VALUE",
+                },
+            ],
+        )
+
+    monkeypatch.setattr(WorkspaceService, "require_file", broken_file)
+    async with Client(server) as client:
+        response = await client.call_tool("workspace_file_info", {"path": "project/README.md"})
+    assert response.is_error
+    text = response.content[0].text
+    assert "Error executing tool workspace_file_info" in text
+    assert "PRIVATE_FIELD" not in text and "PRIVATE_VALUE" not in text
+
+
+@pytest.mark.anyio
+async def test_missing_process_resource_explains_session_and_discovery(cpp_acceptance_project):
+    """Explain resource lookup failures using the ForgeMCP ID and current process catalog."""
+    async with Client(create_server(cpp_acceptance_project)) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource("forgemcp://processes/99999")
+    message = str(caught.value)
+    assert "process_id=99999" in message and "processes_overview()" in message
+    assert "server session" in message and "server restarts" in message
