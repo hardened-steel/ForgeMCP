@@ -115,6 +115,28 @@ Before designing or changing a module, read:
 - Raise domain-specific errors from business logic. At the MCP boundary use
   `ToolError` for failures the model can correct and MCP/resource errors for protocol
   or resource failures. Unexpected exceptions must remain sanitized by the SDK.
+- Make every expected tool failure actionable: name the actual JSON parameter
+  (including a list index or nested field), explain the violated constraint or
+  prerequisite, and give a concrete correction or an existing discovery call.
+  Distinguish missing values, invalid values, incompatible arguments, and
+  unavailable server state. Identify operator-only settings as such.
+- For unknown identifiers, list all available values when there are at most eight;
+  otherwise give the count and an existing tool or resource that lists them.
+  Explain empty catalogs explicitly. Use retained or already-read catalogs; do not
+  launch extra processes just to embellish an error or invent discovery tools.
+- Quote and bound short identifier values with `diagnostics.display_value`; do not
+  echo source fragments, replacement text, complete command arguments, credentials,
+  environments, or malformed protocol payloads. Keep managed paths qualified,
+  preserve OS `strerror` without native filename fields, and retain Git URL redaction.
+- When a process was started, preserve its process ID and provide an applicable
+  `process_get` hint. Explain known timeout/output limits. Distinguish an operation
+  that did not start, a partial mutation, an unknown outcome, and a completed
+  mutation with a secondary synchronization failure. Never advise blindly repeating
+  a mutation. Preserve established per-profile/per-operation error result contracts.
+- Keep tool argument checking in the SDK. The composition root rejects unknown
+  top-level argument names and formats SDK validation errors; new tool arguments
+  must carry enough schema descriptions to explain ambiguous union/object forms.
+  Do not catch unexpected exceptions or expose their raw text to improve a message.
 - Never print operational data to stdout while using stdio transport. Operational
   logs go to stderr and contain lifecycle summaries only. Detailed in-memory process
   transcripts may contain tool input and output; never copy them, source contents,
@@ -142,6 +164,11 @@ Before designing or changing a module, read:
 - Prefer small Pydantic result models over unstructured dictionaries for tools.
 - Test business methods directly and test MCP metadata/protocol behavior through the
   SDK's in-process `Client`.
+- Error tests must assert the offending parameter, useful reason/range/choices or
+  an existing recovery call, and relevant mutation/provenance guarantees; checking
+  only the exception type or `is_error` is insufficient. Include empty/large catalogs,
+  invalid combinations, and input redaction where applicable. Do not assert full
+  operating-system messages, which may be localized.
 - Service and protocol tests that need a workspace use the function-scoped
   `cpp_acceptance_project` fixture from `tests/conftest.py`. It copies the complete
   `examples/cpp-acceptance-project/` directory into `tmp_path`; tests may freely

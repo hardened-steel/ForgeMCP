@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from forgemcp.process.errors import ProcessStreamError
+from forgemcp.process.errors import ProcessStartError, ProcessStreamError
 from forgemcp.process.models import ProcessEncoding, ProcessOutput, ProcessTimeout
 from forgemcp.toolchain.errors import ToolCommandError, ToolParserError
 from forgemcp.toolchain.tools.lldb_dap import (
@@ -49,6 +49,7 @@ def process_with_output(wire: bytes, *, code: int = 0) -> SimpleNamespace:
         process_id=17,
         output=output,
         wait=AsyncMock(return_value=code),
+        close_stdin=AsyncMock(),
         write_stdin=AsyncMock(),
         close=AsyncMock(),
     )
@@ -300,3 +301,48 @@ async def test_connect_preserves_environment_and_closes_owned_process_on_cancel(
         timeout=ProcessTimeout(),
     )
     process.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["version", "connect"])
+async def test_adapter_launch_failure_does_not_expose_native_or_private_data(
+    cpp_acceptance_project,
+    operation,
+):
+    """Explain operator recovery without copying a failed process launch's private details."""
+    processes = SimpleNamespace(
+        launch=AsyncMock(side_effect=ProcessStartError("PRIVATE_NATIVE_PATH_AND_ENVIRONMENT")),
+    )
+    methods = create_spec(cpp_acceptance_project / "adapter", processes).methods
+    with pytest.raises(ToolCommandError) as failure:
+        if operation == "version":
+            await methods["version"]()
+        else:
+            async with methods["connect"](cpp_acceptance_project):
+                pytest.fail("A failed process must not yield a connection.")
+    text = str(failure.value)
+    assert "operator" in text and "toolset" in text
+    assert "PRIVATE" not in text and failure.value.process_id is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("code", [0, 7])
+async def test_version_failure_retains_launched_process_id(cpp_acceptance_project, code):
+    """Keep provenance for both unrecognized banners and nonzero probe exits."""
+    process = process_with_output(b"", code=code)
+
+    @asynccontextmanager
+    async def running_process():
+        """Own the scripted version-probe process through completion."""
+        yield process
+
+    processes = SimpleNamespace(launch=AsyncMock(return_value=running_process()))
+    methods = create_spec(cpp_acceptance_project / "adapter", processes).methods
+    with pytest.raises(ToolCommandError) as failure:
+        await methods["version"]()
+    assert failure.value.process_id == 17
+    if code == 0:
+        assert "4096 characters" in str(failure.value)
+        assert "process_get(process_id=17)" in str(failure.value)
+    else:
+        assert "exit 7" in str(failure.value)

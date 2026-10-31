@@ -18,6 +18,7 @@ from uuid import uuid4
 import psutil
 from pydantic import JsonValue, ValidationError
 
+from forgemcp.diagnostics import available_values, display_value, os_error_reason
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.spec import ToolSpec
 from forgemcp.toolchain.tools.lldb_dap import (
@@ -159,25 +160,50 @@ class LldbDapSession(DebugSession):
         """Validate finite positive deadlines for direct business callers."""
         value = default if timeout is None else timeout
         if not isfinite(value) or value <= 0:
-            raise DebugStateError("Debugger deadlines must be finite and greater than zero.")
+            raise DebugStateError(
+                "timeout must be finite and greater than zero seconds. "
+                "Omit timeout to use the operation's default deadline."
+            )
         return value
 
-    def managed(self, reference: WorkspacePath, *, directory: bool = False) -> Path:
+    def managed(
+        self,
+        reference: WorkspacePath,
+        *,
+        parameter: str,
+        directory: bool = False,
+    ) -> Path:
         """Resolve an existing input inside its own managed root without reading external files."""
         if reference.area == "root":
-            raise DebugStateError("Debugger input files must be inside project/ or storage/.")
+            raise DebugStateError(
+                f"{parameter} must be inside project/ or storage/. "
+                "Copy the input into a managed root and pass its qualified path."
+            )
         if any(ord(character) < 32 or character == "`" for character in reference):
-            raise DebugStateError("Debugger input paths cannot contain control characters.")
+            raise DebugStateError(
+                f"{parameter} cannot contain control characters or backticks. "
+                "Use a managed path without these characters."
+            )
         root = self.project_root if reference.area == "project" else self.storage_root
         try:
             path = (root / reference.relative).resolve()
             if not path.is_relative_to(root):
-                raise DebugStateError("Debugger input path escaped its managed root.")
+                raise DebugStateError(
+                    f"{parameter} resolves outside its managed root. "
+                    "Choose a project/ or storage/ path without an escaping link."
+                )
             if not (path.is_dir() if directory else path.is_file()):
-                raise DebugStateError(f"Debugger input does not exist: {reference}.")
+                kind = "directory" if directory else "file"
+                raise DebugStateError(
+                    f"{parameter}={display_value(str(reference))} must name an existing {kind}. "
+                    "Call workspace_list() or workspace_find_files() to locate the input."
+                )
             return path
         except OSError as error:
-            raise DebugStateError(f"Cannot inspect debugger input: {reference}.") from error
+            raise DebugStateError(
+                f"Cannot inspect {parameter}={display_value(str(reference))}: "
+                f"{os_error_reason(error)}. Check the input's existence and read permissions."
+            ) from error
 
     def source_path(self, value: str) -> WorkspacePath | None:
         """Qualify adapter locations without reading source files or following source contents."""
@@ -204,18 +230,35 @@ class LldbDapSession(DebugSession):
         arguments: dict[str, JsonValue] = {}
         if options.source_mappings:
             mappings: list[JsonValue] = []
-            for mapping in options.source_mappings:
+            for index, mapping in enumerate(options.source_mappings):
                 if any(character in mapping.source for character in ("\0", "\n", "\r")):
                     raise DebugStateError(
-                        "Source mapping prefixes cannot contain control characters."
+                        f"options.source_mappings[{index}].source cannot contain NUL or "
+                        "line breaks. Pass a literal debug-information path prefix."
                     )
                 mappings.append(
-                    [mapping.source, str(self.managed(mapping.destination, directory=True))]
+                    [
+                        mapping.source,
+                        str(
+                            self.managed(
+                                mapping.destination,
+                                parameter=f"options.source_mappings[{index}].destination",
+                                directory=True,
+                            )
+                        ),
+                    ]
                 )
             arguments["sourceMap"] = mappings
         if options.symbol_directories:
             directories = [
-                str(self.managed(item, directory=True)) for item in options.symbol_directories
+                str(
+                    self.managed(
+                        item,
+                        parameter=f"options.symbol_directories[{index}]",
+                        directory=True,
+                    )
+                )
+                for index, item in enumerate(options.symbol_directories)
             ]
             if any(
                 ord(character) < 32 or character == "`"
@@ -223,7 +266,9 @@ class LldbDapSession(DebugSession):
                 for character in directory
             ):
                 raise DebugStateError(
-                    "Symbol search paths cannot contain control characters or backticks.",
+                    "options.symbol_directories resolves through an operator-configured root "
+                    "containing control characters or backticks. The operator must choose "
+                    "a root without these characters.",
                 )
             arguments["initCommands"] = [
                 "settings set target.debug-file-search-paths "
@@ -234,11 +279,18 @@ class LldbDapSession(DebugSession):
     def active(self, *, live: bool = False) -> None:
         """Require an operational connection and optionally an executable target."""
         if self.state.phase != m.SessionPhase.ACTIVE:
-            raise DebugStateError("The debugger session is not active.")
+            raise DebugStateError(
+                f"session_id is not active (phase={self.state.phase.value}). "
+                "Call debugger_get() for its state; use debugger_launch(), debugger_attach(), "
+                "or debugger_open_dump() to open a new target."
+            )
         if live and self.state.mode == "dump":
-            raise DebugUnsupportedError("Crash dumps support inspection only.")
+            raise DebugUnsupportedError(
+                "session_id selects a crash dump, which supports inspection only. "
+                "Use debugger_launch() or debugger_attach() for execution control."
+            )
 
-    def check_stop(self, token: m.StopToken) -> None:
+    def check_stop(self, token: m.StopToken, parameter: str = "stop") -> None:
         """Reject foreign or invalidated stop references before and after inspection."""
         self.active()
         if (
@@ -251,16 +303,27 @@ class LldbDapSession(DebugSession):
                 m.TargetState.DUMP,
             )
         ):
-            raise DebugStaleReferenceError("The inspection reference is no longer current.")
+            raise DebugStaleReferenceError(
+                f"{parameter}.session_id or {parameter}.generation is no longer current. "
+                "Call debugger_get() for session_id and inspection_generation, then "
+                "obtain fresh references from debugger_threads()/debugger_stack(). "
+                "Wait for a stop if the target is running."
+            )
 
     def thread(self, reference: m.ThreadRef) -> int:
         """Resolve an opaque thread handle belonging to this session."""
-        if (
-            reference.session_id != self.state.session_id
-            or reference.handle not in self.thread_ids
-        ):
+        if reference.session_id != self.state.session_id:
             raise DebugStaleReferenceError(
-                "The thread reference is not retained by this session."
+                "thread.session_id does not match session_id. "
+                "Call debugger_threads() with the selected session_id for a current thread."
+            )
+        if reference.handle not in self.thread_ids:
+            raise DebugStaleReferenceError(
+                f"Unknown thread.handle={display_value(reference.handle)} for session_id. "
+                + available_values(
+                    self.thread_ids,
+                    f"debugger_threads(session_id={display_value(self.state.session_id)})",
+                )
             )
         return self.thread_ids[reference.handle]
 
@@ -270,7 +333,10 @@ class LldbDapSession(DebugSession):
             if native == identifier:
                 return m.ThreadRef(session_id=self.state.session_id, handle=handle)
         if len(self.thread_ids) >= self.MAX_HANDLES:
-            raise DebugStateError("The session thread-handle limit was reached.")
+            raise DebugStateError(
+                "session_id reached the 10000 thread-handle limit. Close this session with "
+                "debugger_close() and open a new target to release handles."
+            )
         handle = uuid4().hex
         self.thread_ids[handle] = identifier
         return m.ThreadRef(session_id=self.state.session_id, handle=handle)
@@ -284,7 +350,9 @@ class LldbDapSession(DebugSession):
         if handle is None:
             if len(self.handles) >= self.MAX_HANDLES:
                 raise DebugStateError(
-                    "The inspection-handle limit was reached; resume to release old handles."
+                    "session_id reached the 10000 inspection-handle limit. For a live target, "
+                    "resume only when intended to release old handles; for a dump, close "
+                    "with debugger_close() and reopen it to reset handles."
                 )
             handle = uuid4().hex
             self.handles[handle] = key
@@ -300,11 +368,22 @@ class LldbDapSession(DebugSession):
         self, reference: m.FrameRef | m.VariablesRef | m.MemoryRef, kind: str
     ) -> int | str:
         """Validate a generation and reference kind before reading the adapter object."""
-        self.check_stop(reference)
+        parameter = "frame" if kind == "frame" else "reference"
+        self.check_stop(reference, parameter)
         found = self.handles.get(reference.handle)
         if found is None or found[0] != kind:
+            discovery = {
+                "frame": "debugger_stack",
+                "variables": "debugger_scopes",
+                "memory": "debugger_stack",
+            }[kind]
             raise DebugStaleReferenceError(
-                "The inspection handle has an invalid type or has expired."
+                f"{parameter}.handle has an invalid type or has expired. "
+                + available_values(
+                    (handle for handle, value in self.handles.items() if value[0] == kind),
+                    f"{discovery} with current stop/thread or frame arguments",
+                )
+                + " Use references from this session's current inspection generation."
             )
         return found[1]
 
@@ -313,7 +392,11 @@ class LldbDapSession(DebugSession):
         while len(self.executions) >= self.MAX_EXECUTIONS:
             oldest, future = next(iter(self.executions.items()))
             if not future.done():
-                raise DebugStateError("Too many executions are awaiting a stop.")
+                raise DebugStateError(
+                    "session_id already retains 64 executions awaiting a stop. "
+                    "Call debugger_get() and debugger_wait() for a retained execution "
+                    "before issuing more control commands."
+                )
             del self.executions[oldest]
         identifier = uuid4().hex
         self.executions[identifier] = asyncio.get_running_loop().create_future()
@@ -330,9 +413,15 @@ class LldbDapSession(DebugSession):
         """Correlate one bounded DAP response while the independent reader handles events."""
         limit = self.deadline(timeout, self.timeouts.request)
         if self.connection is None:
-            raise DebugStateError("The debugger transport is not connected.")
+            raise DebugStateError(
+                "session_id has no connected debugger transport. Call debugger_get() "
+                "to inspect its phase; open a new target if this session has closed."
+            )
         if self.state.phase == m.SessionPhase.FAILED:
-            raise DebugAdapterError("The debugger adapter has failed.")
+            raise DebugAdapterError(
+                "session_id has a failed debugger adapter. Inspect debugger_get() "
+                "and the adapter transcript before opening another target."
+            )
         self.next_sequence += 1
         sequence = self.next_sequence
         future: asyncio.Future[dict[str, JsonValue]] = (
@@ -350,9 +439,18 @@ class LldbDapSession(DebugSession):
             ):
                 self.publish(target_state=m.TargetState.UNKNOWN, status=None)
             raise DebugTimeoutError(
-                f"Debugger request {command} exceeded its deadline.",
+                f"Debugger request {command} exceeded timeout={limit:g} seconds. "
+                "Inspect the session state and adapter transcript; a longer timeout "
+                "can be selected after confirming the command outcome.",
                 outcome_unknown=mutates,
             ) from error
+        except DebugAdapterError as error:
+            detail = f"LLDB-DAP {command} was not confirmed. {error}"
+            if mutates:
+                detail += (
+                    " The command may have changed the target; inspect its state before retrying."
+                )
+            raise DebugAdapterError(detail) from error
         except (ToolchainError, OSError) as error:
             raise DebugAdapterError("Cannot send a request to the debugger adapter.") from error
         finally:
@@ -365,6 +463,9 @@ class LldbDapSession(DebugSession):
 
     def fail(self, message: str) -> None:
         """Fail the connection without claiming that the target exited."""
+        message += " Target outcome is unknown. Inspect debugger_get() before another command."
+        if self.state.adapter_process_id is not None:
+            message += f" Inspect process_get(process_id={self.state.adapter_process_id})."
         self.publish(
             phase=m.SessionPhase.FAILED,
             target_state=m.TargetState.UNKNOWN,
@@ -393,7 +494,11 @@ class LldbDapSession(DebugSession):
                             )
                         else:
                             future.set_exception(
-                                DebugAdapterError(message.message or "Debugger request failed.")
+                                DebugAdapterError(
+                                    "The adapter rejected the debugger request. "
+                                    "Inspect its process transcript for details; verify the "
+                                    "selected target, permissions, and adapter capabilities."
+                                )
                             )
                 elif isinstance(message, DapEvent):
                     self.event(message)
@@ -486,11 +591,17 @@ class LldbDapSession(DebugSession):
     async def connect(self, mode: str) -> None:
         """Start the selected ToolSpec connection and negotiate supported domain operations."""
         if self.state.phase != m.SessionPhase.CREATED:
-            raise DebugStateError("A debugger session can open only one target.")
+            raise DebugStateError(
+                "session_id already opened a target. Use debugger_launch(), debugger_attach(), "
+                "or debugger_open_dump() to create a new session instead of reusing this one."
+            )
         self.publish(mode=mode, phase=m.SessionPhase.OPENING)
         methods = cast(Methods, self.tool.methods)
         if "connect" not in methods:
-            raise DebugUnsupportedError("The selected tool has no debugger transport.")
+            raise DebugUnsupportedError(
+                "adapter has no implemented debugger transport in this toolset. "
+                "Call debugger_adapters() to select a supported toolset_id/adapter pair."
+            )
         self.connection = await self.lifetime.enter_async_context(
             methods["connect"](self.project_root)
         )
@@ -547,6 +658,9 @@ class LldbDapSession(DebugSession):
         # DAP startup is an ordered operation, with cleanup beside its failure paths.
         # pylint: disable=too-many-branches,too-many-statements
         limit = self.deadline(timeout, self.timeouts.startup)
+        for index, source in enumerate(initial.sources):
+            self.managed(source.source, parameter=f"initial.sources[{index}].source")
+        self.validate_functions(initial.functions, "initial.functions")
         command: asyncio.Task[dict[str, JsonValue]] | None = None
         async with self.control_lock:
             try:
@@ -578,10 +692,17 @@ class LldbDapSession(DebugSession):
                     if self.state.phase == m.SessionPhase.FAILED:
                         raise DebugAdapterError("The debugger failed during initialization.")
                     if mode != "dump":
-                        for source in initial.sources:
-                            await self.set_breakpoints(source.source, source.points)
+                        for index, source in enumerate(initial.sources):
+                            await self.set_breakpoints(
+                                source.source,
+                                source.points,
+                                parameter=f"initial.sources[{index}].source",
+                            )
                         if initial.functions:
-                            await self.set_function_breakpoints(initial.functions)
+                            await self.set_function_breakpoints(
+                                initial.functions,
+                                parameter="initial.functions",
+                            )
                         filters = initial.exception_filters
                         if filters is None:
                             filters = [
@@ -590,7 +711,10 @@ class LldbDapSession(DebugSession):
                                 if item.default
                             ]
                         if filters or self.state.capabilities.exception_filters:
-                            await self.set_exception_breakpoints(filters)
+                            await self.set_exception_breakpoints(
+                                filters,
+                                parameter="initial.exception_filters",
+                            )
                     if self.configuration_done:
                         await self.request("configurationDone", {})
                     await command
@@ -609,9 +733,15 @@ class LldbDapSession(DebugSession):
                         )
                     return m.ExecutionReceipt(execution=execution, snapshot=self.snapshot())
             except TimeoutError as error:
-                await self.abort_start("Debugger startup exceeded its deadline.")
+                await self.abort_start(
+                    f"Debugger startup exceeded timeout={limit:g} seconds. Startup cleanup was "
+                    "attempted; inspect debugger_get() and the adapter transcript before "
+                    "opening another target."
+                )
                 raise DebugTimeoutError(
-                    "Debugger startup exceeded its deadline.",
+                    f"Debugger startup exceeded timeout={limit:g} seconds. Startup cleanup was "
+                    "attempted; inspect debugger_get() and the adapter transcript before "
+                    "opening another target.",
                     outcome_unknown=True,
                 ) from error
             except BaseException:
@@ -637,16 +767,17 @@ class LldbDapSession(DebugSession):
         timeout: float | None = None,
     ) -> m.ExecutionReceipt:
         """Launch a managed native executable with initial breakpoints and literal argv."""
-        executable = self.managed(options.executable)
+        executable = self.managed(options.executable, parameter="options.executable")
         if executable.suffix.lower() in (".bat", ".cmd"):
             raise DebugStateError(
-                "Debugger launch requires a native executable, not a batch file."
+                "options.executable requires a native executable; .bat and .cmd files are "
+                "unsupported. Build the native target with cmake_build() first."
             )
         arguments: dict[str, JsonValue] = {
             **self.source_arguments(options),
             "program": str(executable),
             "args": list(options.arguments),
-            "cwd": str(self.managed(options.cwd, directory=True)),
+            "cwd": str(self.managed(options.cwd, parameter="options.cwd", directory=True)),
             "env": dict(options.environment),
             "stopOnEntry": options.stop_on_entry,
             "runInTerminal": False,
@@ -665,17 +796,26 @@ class LldbDapSession(DebugSession):
             try:
                 if psutil.Process(options.pid).create_time() != options.expected_started_at:
                     raise DebugStateError(
-                        "The selected PID belongs to a different process instance."
+                        "options.expected_started_at does not match options.pid; "
+                        "the PID was reused "
+                        "or the birth time is incorrect. Verify the intended local process "
+                        "and supply its current PID and birth time before attaching."
                     )
             except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
-                raise DebugStateError("Cannot verify the selected process identity.") from error
+                raise DebugStateError(
+                    "Cannot verify options.pid and options.expected_started_at. "
+                    "Check that the intended local process exists and that the operator "
+                    "has permission to inspect and debug it."
+                ) from error
         arguments: dict[str, JsonValue] = {
             **self.source_arguments(options),
             "pid": options.pid,
             "stopOnEntry": options.stop_on_entry,
         }
         if options.executable is not None:
-            arguments["program"] = str(self.managed(options.executable))
+            arguments["program"] = str(
+                self.managed(options.executable, parameter="options.executable")
+            )
         return await self.start("attach", arguments, initial, timeout)
 
     async def open_dump(
@@ -687,10 +827,12 @@ class LldbDapSession(DebugSession):
         """Open an existing managed dump through LLDB's core-file attach path."""
         arguments: dict[str, JsonValue] = {
             **self.source_arguments(options),
-            "coreFile": str(self.managed(options.dump_file)),
+            "coreFile": str(self.managed(options.dump_file, parameter="options.dump_file")),
         }
         if options.executable is not None:
-            arguments["program"] = str(self.managed(options.executable))
+            arguments["program"] = str(
+                self.managed(options.executable, parameter="options.executable")
+            )
         await self.start("dump", arguments, m.BreakpointPlan(), timeout)
         return self.snapshot()
 
@@ -698,10 +840,14 @@ class LldbDapSession(DebugSession):
         """Allow initial configuration while opening and later live changes while active."""
         if self.state.phase not in (m.SessionPhase.OPENING, m.SessionPhase.ACTIVE):
             raise DebugStateError(
-                "The debugger cannot configure breakpoints in its current state."
+                f"session_id cannot configure breakpoints in phase {self.state.phase.value}. "
+                "Call debugger_get(); open a live target before changing breakpoints."
             )
         if self.state.mode == "dump":
-            raise DebugUnsupportedError("Crash dumps do not support breakpoints.")
+            raise DebugUnsupportedError(
+                "session_id selects a crash dump and cannot change breakpoints. "
+                "Use debugger_launch() or debugger_attach() for a live target."
+            )
 
     def breakpoints(
         self,
@@ -731,12 +877,15 @@ class LldbDapSession(DebugSession):
         points: list[m.SourceBreakpoint],
         *,
         timeout: float | None = None,
+        parameter: str = "source",
     ) -> m.BreakpointsResult:
         """Replace one file's breakpoints, including an empty request that clears them."""
         self.configurable()
         if len(points) > self.MAX_RECORDS:
-            raise DebugStateError("Select at most 1000 breakpoints per file.")
-        path = self.managed(source)
+            raise DebugStateError(
+                "points accepts at most 1000 breakpoints per file. Reduce points."
+            )
+        path = self.managed(source, parameter=parameter)
         body = await self.request(
             "setBreakpoints",
             {
@@ -745,6 +894,7 @@ class LldbDapSession(DebugSession):
                 "sourceModified": False,
             },
             timeout=timeout,
+            mutates=True,
         )
         return m.BreakpointsResult(
             snapshot=self.snapshot(),
@@ -752,26 +902,38 @@ class LldbDapSession(DebugSession):
             breakpoints=self.breakpoints(body, points),
         )
 
+    def validate_functions(self, functions: list[str], parameter: str) -> None:
+        """Reject invalid literal names before any initial target mutation."""
+        if len(functions) > self.MAX_RECORDS:
+            raise DebugStateError(f"{parameter} accepts at most 1000 names. Reduce the list.")
+        for index, value in enumerate(functions):
+            if not value or len(value) > 4096 or "\0" in value:
+                raise DebugStateError(
+                    f"{parameter}[{index}] must be a nonempty literal function name "
+                    "of at most 4096 characters without NUL. Correct or remove this entry."
+                )
+
     async def set_function_breakpoints(
         self,
         functions: list[str],
         *,
         timeout: float | None = None,
+        parameter: str = "functions",
     ) -> m.BreakpointsResult:
         """Replace function breakpoints using names interpreted only as adapter data."""
         self.configurable()
         if not self.state.capabilities.function_breakpoints:
-            raise DebugUnsupportedError("The adapter does not support function breakpoints.")
-        if len(functions) > self.MAX_RECORDS or any(
-            not value or len(value) > 4096 or "\0" in value for value in functions
-        ):
-            raise DebugStateError(
-                "Function breakpoints require bounded, nonempty literal names."
+            raise DebugUnsupportedError(
+                "session_id does not advertise function_breakpoints. Inspect "
+                "debugger_get().capabilities; use debugger_breakpoints() for source lines "
+                "or select another adapter with debugger_adapters()."
             )
+        self.validate_functions(functions, parameter)
         body = await self.request(
             "setFunctionBreakpoints",
             {"breakpoints": [{"name": name} for name in functions]},
             timeout=timeout,
+            mutates=True,
         )
         return m.BreakpointsResult(
             snapshot=self.snapshot(),
@@ -783,16 +945,25 @@ class LldbDapSession(DebugSession):
         filters: list[str],
         *,
         timeout: float | None = None,
+        parameter: str = "filters",
     ) -> m.ExceptionBreakpointsResult:
         """Apply only exception filters explicitly advertised by the adapter."""
         self.configurable()
         available = {item.id for item in self.state.capabilities.exception_filters}
-        if len(filters) > 100 or any(item not in available for item in filters):
-            raise DebugStateError("Select only advertised exception breakpoint filters.")
+        if len(filters) > 100:
+            raise DebugStateError(f"{parameter} accepts at most 100 filters. Reduce the list.")
+        for index, item in enumerate(filters):
+            if item not in available:
+                raise DebugStateError(
+                    f"{parameter}[{index}]={display_value(item)} is not an advertised filter. "
+                    + available_values(available, "debugger_get(session_id=...)")
+                    + " Read capabilities.exception_filters; pass [] to clear all filters."
+                )
         await self.request(
             "setExceptionBreakpoints",
             {"filters": list(filters)},
             timeout=timeout,
+            mutates=True,
         )
         return m.ExceptionBreakpointsResult(snapshot=self.snapshot(), filters=list(filters))
 
@@ -819,7 +990,10 @@ class LldbDapSession(DebugSession):
             return self.last_thread_id
         result = await self.threads()
         if not result.threads:
-            raise DebugStateError("The debugger has no target thread for this operation.")
+            raise DebugStateError(
+                "session_id has no target thread for execution control. Call debugger_threads() "
+                "and debugger_get() to confirm the target exists before continuing."
+            )
         return self.thread(result.threads[0].reference)
 
     async def resume(
@@ -868,7 +1042,10 @@ class LldbDapSession(DebugSession):
         async with self.control_lock:
             self.active(live=True)
             if self.state.target_state not in (m.TargetState.RUNNING, m.TargetState.UNKNOWN):
-                raise DebugStateError("The target is not running.")
+                raise DebugStateError(
+                    "session_id is not running; debugger_pause() requires a running or unknown "
+                    "target state. Inspect debugger_get(); a stopped target needs no pause."
+                )
             return await self.execute(
                 "pause",
                 {"threadId": await self.selected_thread()},
@@ -885,10 +1062,18 @@ class LldbDapSession(DebugSession):
         """Wait on a retained command outcome without cancelling its future or the target."""
         limit = self.deadline(timeout, self.timeouts.request)
         if execution.session_id != self.state.session_id:
-            raise DebugStaleReferenceError("The execution belongs to a different session.")
+            raise DebugStaleReferenceError(
+                "execution.session_id does not match session_id. Use the session_id and "
+                "execution returned together by the same execution command."
+            )
         future = self.executions.get(execution.execution_id)
         if future is None:
-            raise DebugReferenceExpiredError("The execution outcome has expired or is unknown.")
+            raise DebugReferenceExpiredError(
+                "execution.execution_id is unknown or its outcome has expired. Only the last "
+                "64 executions are retained. Use the execution returned by a control command "
+                "for this session, or inspect debugger_get() for the current state; do not "
+                "repeat the command just to recreate a reference."
+            )
         try:
             async with asyncio.timeout(limit):
                 result = await asyncio.shield(future)
@@ -946,7 +1131,11 @@ class LldbDapSession(DebugSession):
             and isinstance(self.state.status, m.StoppedStatus)
             and self.state.status.thread_id != thread.handle
         ):
-            raise DebugStateError("Only the confirmed stopped thread can be inspected.")
+            raise DebugStateError(
+                "thread.handle is not the confirmed stopped thread. Call debugger_get() for "
+                "status.thread_id and debugger_threads() for its reference, then pass that "
+                "thread with the current stop generation to debugger_stack()."
+            )
         body = await self.request(
             "stackTrace",
             {"threadId": identifier, "startFrame": page.start, "levels": page.count},
@@ -1009,7 +1198,7 @@ class LldbDapSession(DebugSession):
         """Read frame scopes only while the frame's inspection generation remains current."""
         native = self.resolve_reference(frame, "frame")
         body = await self.request("scopes", {"frameId": native}, timeout=timeout)
-        self.check_stop(frame)
+        self.check_stop(frame, "frame")
         values = list_value(body.get("scopes", []))
         scopes = []
         for value in values[: self.MAX_RECORDS]:
@@ -1042,7 +1231,7 @@ class LldbDapSession(DebugSession):
         if self.state.capabilities.variable_paging:
             arguments.update(start=page.start, count=page.count)
         body = await self.request("variables", arguments, timeout=timeout)
-        self.check_stop(reference)
+        self.check_stop(reference, "reference")
         values = list_value(body.get("variables", []))
         selected = (
             values[: page.count]
@@ -1088,7 +1277,10 @@ class LldbDapSession(DebugSession):
         """Read a bounded module window when the adapter advertises that operation."""
         self.active()
         if not self.state.capabilities.modules:
-            raise DebugUnsupportedError("The adapter does not support module inspection.")
+            raise DebugUnsupportedError(
+                "session_id does not advertise modules. Inspect debugger_get().capabilities "
+                "or select another supported adapter with debugger_adapters()."
+            )
         body = await self.request(
             "modules",
             {"startModule": page.start, "moduleCount": page.count},
@@ -1131,7 +1323,10 @@ class LldbDapSession(DebugSession):
         """Read adapter-reported exception detail for the selected current stop."""
         self.check_stop(stop)
         if not self.state.capabilities.exception_info:
-            raise DebugUnsupportedError("The adapter does not support exception detail.")
+            raise DebugUnsupportedError(
+                "session_id does not advertise exception_info. Inspect debugger_get().status "
+                "for the stop reason or select another adapter with debugger_adapters()."
+            )
         body = await self.request(
             "exceptionInfo",
             {"threadId": self.thread(thread)},
@@ -1158,20 +1353,26 @@ class LldbDapSession(DebugSession):
         """Read bounded bytes and explicitly preserve unavailable memory in sparse dumps."""
         native = self.resolve_reference(reference, "memory")
         if not self.state.capabilities.read_memory:
-            raise DebugUnsupportedError("The adapter does not support reading memory.")
+            raise DebugUnsupportedError(
+                "session_id does not advertise read_memory. Inspect debugger_get().capabilities "
+                "or select another adapter with debugger_adapters()."
+            )
         if (
             not is_integer(count)
             or count < 1
             or count > self.MAX_MEMORY
             or not is_integer(offset)
         ):
-            raise DebugStateError("Read between 1 and 65536 bytes with an integer offset.")
+            raise DebugStateError(
+                "count must be an integer from 1 to 65536 bytes and offset must be an integer. "
+                "Reduce count or split the read into bounded ranges."
+            )
         body = await self.request(
             "readMemory",
             {"memoryReference": native, "offset": offset, "count": count},
             timeout=timeout,
         )
-        self.check_stop(reference)
+        self.check_stop(reference, "reference")
         data = body.get("data")
         if data is not None:
             try:
@@ -1202,7 +1403,10 @@ class LldbDapSession(DebugSession):
         """Read a bounded instruction window with exact textual addresses."""
         native = self.resolve_reference(reference, "memory")
         if not self.state.capabilities.disassemble:
-            raise DebugUnsupportedError("The adapter does not support disassembly.")
+            raise DebugUnsupportedError(
+                "session_id does not advertise disassemble. Inspect debugger_get().capabilities "
+                "or select another adapter with debugger_adapters()."
+            )
         if (
             not is_integer(count)
             or count < 1
@@ -1210,14 +1414,15 @@ class LldbDapSession(DebugSession):
             or not is_integer(offset)
         ):
             raise DebugStateError(
-                "Read between 1 and 1000 instructions with an integer offset."
+                "count must be an integer from 1 to 1000 instructions and offset must be an "
+                "integer. Reduce count or split disassembly into bounded ranges."
             )
         body = await self.request(
             "disassemble",
             {"memoryReference": native, "instructionOffset": offset, "instructionCount": count},
             timeout=timeout,
         )
-        self.check_stop(reference)
+        self.check_stop(reference, "reference")
         instructions = []
         for value in list_value(body.get("instructions", []))[:count]:
             item = object_value(value)
@@ -1255,8 +1460,10 @@ class LldbDapSession(DebugSession):
                         self.state.mode,
                         "unknown",
                     )
-            except (DebugError, ToolchainError, OSError) as failure:
+            except (DebugError, ToolchainError) as failure:
                 error = str(failure)
+            except OSError as failure:
+                error = f"Adapter disconnect failed: {os_error_reason(failure)}."
             finally:
                 if self.reader is not None:
                     self.reader.cancel()
@@ -1264,8 +1471,12 @@ class LldbDapSession(DebugSession):
                         await self.reader
                 try:
                     await self.lifetime.aclose()
-                except (ToolchainError, OSError) as failure:
+                except ToolchainError as failure:
                     error = error or str(failure)
+                except OSError as failure:
+                    error = error or (
+                        f"Adapter transport cleanup failed: {os_error_reason(failure)}."
+                    )
                 self.connection = None
         else:
             await self.lifetime.aclose()
@@ -1277,6 +1488,14 @@ class LldbDapSession(DebugSession):
         self.handles.clear()
         self.handle_ids.clear()
         self.publish(phase=m.SessionPhase.CLOSED, inspection_generation=None)
+        if error is not None:
+            error += (
+                f" Adapter closed; target_outcome={outcome}. Inspect debugger_get() "
+                "and the local target before any further mutation; do not repeat startup "
+                "or execution commands to retry cleanup."
+            )
+            if self.state.adapter_process_id is not None:
+                error += f" Inspect process_get(process_id={self.state.adapter_process_id})."
         return m.CloseResult(
             adapter_closed=True,
             target_outcome=outcome,

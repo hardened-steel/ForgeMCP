@@ -12,6 +12,7 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.completion import Complete
 from forgemcp.process.service import ProcessService
+from forgemcp.server import create_runtime
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
 from forgemcp.toolchain.tools import cmake, ctest
@@ -72,6 +73,24 @@ def setup(cpp_acceptance_project):
         test=test,
         presets=presets,
     )
+
+
+@pytest.fixture
+def runtime(request):
+    """Compose the real server with isolated roots and already discovered scripted tools."""
+    scenario = request.getfixturevalue("setup")
+    result = create_runtime(
+        scenario.workspace.root,
+        storage_root=scenario.workspace.storage_root,
+        cmake_profiles=[
+            ["debug"],
+            ["release"],
+        ],
+        progress_interval=0,
+    )
+    result.toolchains.toolsets = scenario.service.toolchains.toolsets
+    result.toolchains.initialized = True
+    return result
 
 
 def server(service, workspace=None):

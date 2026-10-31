@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict
 
-from forgemcp.process.errors import ProcessError
+from forgemcp.process.errors import ProcessError, ProcessStartError
 from forgemcp.process.models import ProcessEncoding, ProcessTimeout
 from forgemcp.process.service import ProcessService
 
@@ -119,9 +119,19 @@ def create_spec(
     ) -> CommandResult:
         """Consume lossless framed Git output and leave full transcripts in ProcessService."""
         if max_bytes < 1:
-            raise ToolCommandError("Git output limit must be positive.")
-        if not arguments or any("\0" in argument for argument in arguments):
-            raise ToolCommandError("Git requires nonempty arguments without NUL characters.")
+            raise ToolCommandError(
+                f"max_bytes={max_bytes} is invalid; the Git output byte limit must be positive."
+            )
+        if not arguments:
+            raise ToolCommandError(
+                "arguments is empty; Git requires at least one command argument."
+            )
+        for argument in arguments:
+            if "\0" in argument:
+                raise ToolCommandError(
+                    f"arguments[{arguments.index(argument)}] contains NUL; "
+                    "literal Git arguments must not contain NUL."
+                )
         output = bytearray()
         errors = bytearray()
         process_id = None
@@ -152,16 +162,29 @@ def create_spec(
                     if chunk.stream == "stdout":
                         if len(output) + len(raw) > max_bytes:
                             raise ToolCommandError(
-                                "Git output exceeded its byte limit; narrow the requested result.",
+                                f"Git stdout exceeded its byte limit of {max_bytes} bytes; "
+                                "the structured result was not returned partially. "
+                                f"Inspect process_get(process_id={process_id}) for the transcript. "
+                                "Narrow paths or line/commit ranges "
+                                "when the calling tool supports it.",
                                 process_id=process_id,
                             )
                         output.extend(raw)
                     else:
                         errors.extend(raw[:max(0, 16 * 1024 - len(errors))])
                 code = await session.wait()
+        except ProcessStartError as error:
+            raise ToolCommandError(
+                "The configured Git executable could not be started; ask the operator to check "
+                "its installation and access permissions using toolsets_list() and "
+                "toolset_get(toolset_id=...).",
+                process_id=process_id,
+            ) from error
         except ProcessError as error:
             raise ToolCommandError(
-                "Git command could not complete; inspect its process transcript.",
+                f"Git command could not complete ({type(error).__name__}); "
+                f"configured time limits: total={timeout.total} s, idle={timeout.idle} s. "
+                "Inspect its process transcript with process_get(process_id=...).",
                 process_id=process_id,
             ) from error
         return CommandResult(

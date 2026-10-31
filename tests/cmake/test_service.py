@@ -22,6 +22,101 @@ from forgemcp.workspace.path import WorkspacePath
 from tests.cmake.conftest import server, write_generation
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "arguments", "expected"),
+    [
+        ("cmake_configure", {"profiles": []}, ["profiles=[]", "null", "presets"]),
+        (
+            "cmake_build",
+            {"profiles": ["presets", "presets"]},
+            ["profiles[1]", "profiles[0]", "duplicates"],
+        ),
+        (
+            "cmake_test",
+            {"profiles": ["typo"]},
+            ["profiles[0]", "typo", "presets", "cmake_profiles()"],
+        ),
+        ("cmake_build", {"targets": []}, ["targets=[]", "null", "defaults"]),
+        ("cmake_build", {"targets": ["valid", ""]}, ["targets[1]", "nonempty"]),
+        ("cmake_test", {"names": [""]}, ["names[0]", "exact test name"]),
+    ],
+)
+async def test_invalid_selections_identify_argument_and_recovery(
+    request,
+    tool,
+    arguments,
+    expected,
+):
+    """Reject invalid selections with a precise field and usable selection guidance."""
+    scenario = request.getfixturevalue("setup")
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(tool, arguments)
+    assert response.is_error
+    text = response.content[0].text
+    assert all(value in text for value in expected)
+    scenario.configure.assert_not_awaited()
+    scenario.build.assert_not_awaited()
+    scenario.test.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parameter", ["executable", "cwd"])
+async def test_external_execution_error_names_path_parameter(request, parameter):
+    """Identify which execution path violates the managed-root requirement."""
+    scenario = request.getfixturevalue("setup")
+    (scenario.workspace.root / "program").write_bytes(b"program")
+    arguments = {"executable": "project/program", parameter: "root/C:/outside"}
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_run_test", arguments)
+    assert response.is_error
+    assert parameter + "=" in response.content[0].text
+    assert "project/ or storage/" in response.content[0].text
+
+
+@pytest.mark.anyio
+async def test_direct_run_nul_error_names_argument_index(request):
+    """Report the invalid argument index without echoing other command arguments."""
+    scenario = request.getfixturevalue("setup")
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool(
+            "cmake_run_test",
+            {"executable": "program", "arguments": ["private-value", "bad\0argument"]},
+        )
+    assert response.is_error
+    assert "arguments[1]" in response.content[0].text
+    assert "private-value" not in response.content[0].text
+
+
+def test_unusable_cache_preserves_cause_and_profile_recovery(request):
+    """Keep the cache failure and an exact configure call without exposing native roots."""
+    scenario = request.getfixturevalue("setup")
+    profile = scenario.service.plain_profile(ProfileDefinition(name="debug"))
+    with pytest.raises(CMakeError) as failure:
+        scenario.service.require_configured(profile)
+    text = str(failure.value)
+    assert "debug" in text and "CMakeCache.txt" in text
+    assert "storage/build/cmake-debug" in text
+    assert "cmake_configure(profiles=['debug'])" in text
+    assert str(scenario.workspace.root) not in text
+
+
+@pytest.mark.anyio
+async def test_preset_failure_lists_available_names(request):
+    """Use the already acquired preset catalog to explain a bad operator selection."""
+    scenario = request.getfixturevalue("setup")
+    scenario.service.definitions = (
+        ProfileDefinition(name="custom", configure_presets=["typo"]),
+    )
+    async with Client(server(scenario.service)) as client:
+        response = await client.call_tool("cmake_configure", {})
+    assert not response.is_error
+    error = response.structured_content["result"][0]["error"]
+    assert all(value in error for value in ("custom", "typo", "native", "operator"))
+    scenario.presets.assert_awaited_once()
+    scenario.configure.assert_not_awaited()
+
+
 @pytest.fixture
 def anyio_backend():
     """Run async tests on the asyncio backend used by the process and LSP services."""
@@ -558,3 +653,199 @@ async def test_subscription_reports_successful_configs_and_removes_failed_or_mis
     finally:
         await updates.aclose()
     assert not setup.service.configuration_subscribers
+
+
+@pytest.mark.anyio
+async def test_startup_configures_once_without_blocking_mcp_or_restarting_for_another_client(
+    setup,
+    runtime,
+):
+    """Serve requests during startup configure and share one batch across lifespan users."""
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def configure(_source, build_directory, **_kwargs):
+        """Pause after the clangd subscription exists, then confirm each selected profile."""
+        assert runtime.analysis.configuration_task is not None
+        assert runtime.builds.configuration_subscribers
+        started.set()
+        await resume.wait()
+        write_generation(setup, name=build_directory.name.removeprefix("cmake-"))
+        return cmake.ConfigureResult(process_id=40)
+
+    setup.configure.side_effect = configure
+    async with asyncio.timeout(5), runtime.lifespan():
+        async with Client(runtime.mcp) as client:
+            await started.wait()
+            assert runtime.users == 2
+            response = await client.call_tool("cmake_profiles", {})
+            assert not response.is_error
+            assert (await runtime.state_snapshot())["cmake"]["startup_configure"]["running"]
+            resume.set()
+            await runtime.startup_configure_task
+            state = (await runtime.state_snapshot())["cmake"]["startup_configure"]
+            assert not state["running"] and state["error"] is None
+            assert [result["profile"] for result in state["results"]] == ["debug", "release"]
+            assert all(result["error"] is None for result in state["results"])
+        assert not runtime.closed
+        assert setup.configure.await_count == 2
+    assert runtime.closed and runtime.analysis.closed
+
+
+@pytest.mark.anyio
+async def test_startup_continues_after_profile_failure_and_retains_outcomes(setup, runtime, caplog):
+    """Publish successful contexts and retain failed executions without stopping the server."""
+    async def configure(_source, build_directory, **_kwargs):
+        """Fail debug while producing a usable release generation."""
+        if build_directory.name == "cmake-debug":
+            return cmake.ConfigureResult(return_code=1, process_id=41)
+        write_generation(setup, name="release")
+        return cmake.ConfigureResult(process_id=42)
+
+    setup.configure.side_effect = configure
+    with caplog.at_level("INFO", logger="forgemcp.server"):
+        async with asyncio.timeout(5), Client(runtime.mcp) as client:
+            await runtime.startup_configure_task
+            assert not (await client.call_tool("workspace_list", {})).is_error
+            state = (await runtime.state_snapshot())["cmake"]["startup_configure"]
+            assert state["results"][0]["error"] == "CMake configure exited with 1."
+            assert state["results"][0]["process_id"] == 41
+            assert state["results"][1]["error"] is None
+            assert state["results"][1]["process_id"] == 42
+            assert [context.id for context in await runtime.builds.compilation_contexts()] == [
+                "release",
+            ]
+    assert "2 executions, 1 failures" in caplog.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ToolCommandError("private command details"),
+        RuntimeError("private command details"),
+    ],
+)
+async def test_startup_batch_failure_keeps_server_available_and_sanitizes_logs(
+    runtime,
+    monkeypatch,
+    caplog,
+    failure,
+):
+    """Retain expected selection errors and sanitize unexpected background failures."""
+    monkeypatch.setattr(runtime.builds, "selection", AsyncMock(side_effect=failure))
+    async with asyncio.timeout(5), Client(runtime.mcp) as client:
+        await asyncio.gather(runtime.startup_configure_task, return_exceptions=True)
+        assert not (await client.call_tool("workspace_list", {})).is_error
+        state = (await runtime.state_snapshot())["cmake"]["startup_configure"]
+        assert state["results"] == [] and not state["running"]
+        assert state["error"] == (
+            str(failure)
+            if isinstance(failure, ToolCommandError)
+            else "Startup CMake configuration failed unexpectedly."
+        )
+    assert "private command details" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancels_startup_before_closing_clangd_and_releases_command_lock(
+    setup,
+    runtime,
+):
+    """Cancel an active configure before its subscriber and process service are closed."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    debugger_closed = asyncio.Event()
+
+    async def close_debugger():
+        """Keep debugger teardown after startup cancellation and before analysis teardown."""
+        assert cancelled.is_set() and not runtime.analysis.closed
+        debugger_closed.set()
+
+    runtime.debugger = MagicMock(close=close_debugger)
+
+    async def configure(*_args, **_kwargs):
+        """Wait for shutdown and verify clangd is alive while configure unwinds."""
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert not runtime.analysis.closed
+            cancelled.set()
+
+    setup.configure.side_effect = configure
+    async with asyncio.timeout(5):
+        async with runtime.lifespan():
+            await started.wait()
+            assert runtime.builds.operation_lock.locked()
+    assert cancelled.is_set() and runtime.startup_configure_task.cancelled()
+    assert debugger_closed.is_set()
+    assert not runtime.builds.operation_lock.locked()
+    assert not runtime.builds.configuration_subscribers
+    assert await runtime.builds.compilation_contexts() == []
+    assert runtime.analysis.closed
+
+
+@pytest.mark.anyio
+async def test_startup_publishes_context_before_later_profiles_finish(setup, runtime):
+    """Notify subscribers after each successful configure while the startup batch is running."""
+    release_started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def configure(_source, build_directory, **_kwargs):
+        """Confirm debug and pause release so the first context can be observed independently."""
+        name = build_directory.name.removeprefix("cmake-")
+        if name == "release":
+            release_started.set()
+            await resume.wait()
+        write_generation(setup, name=name)
+        return cmake.ConfigureResult()
+
+    setup.configure.side_effect = configure
+    updates = runtime.builds.configuration_updates()
+    assert await anext(updates) == []
+    try:
+        async with asyncio.timeout(5), runtime.lifespan():
+            await release_started.wait()
+            assert not runtime.startup_configure_task.done()
+            assert [context.id for context in await anext(updates)] == ["debug"]
+            resume.set()
+            await runtime.startup_configure_task
+            assert [context.id for context in await anext(updates)] == ["debug", "release"]
+    finally:
+        await updates.aclose()
+
+
+@pytest.mark.anyio
+async def test_explicit_configure_waits_for_active_startup_command(setup, runtime, monkeypatch):
+    """Serialize MCP configure with startup through the shared CMake operation lock."""
+    started = asyncio.Event()
+    manual_selected = asyncio.Event()
+    resume = asyncio.Event()
+    selection = runtime.builds.selection
+
+    async def select(profiles):
+        """Expose when the explicit request has selected its profiles and will acquire the lock."""
+        result = await selection(profiles)
+        if profiles is not None:
+            manual_selected.set()
+        return result
+
+    async def configure(_source, build_directory, **_kwargs):
+        """Hold the active command until the explicit request has reached the same lock."""
+        started.set()
+        await resume.wait()
+        write_generation(setup, name=build_directory.name.removeprefix("cmake-"))
+        return cmake.ConfigureResult()
+
+    monkeypatch.setattr(runtime.builds, "selection", select)
+    setup.configure.side_effect = configure
+    async with asyncio.timeout(5), Client(runtime.mcp) as client:
+        await started.wait()
+        manual = asyncio.create_task(client.call_tool("cmake_configure", {"profiles": ["debug"]}))
+        await manual_selected.wait()
+        assert setup.configure.await_count == 1 and not manual.done()
+        resume.set()
+        assert not (await manual).is_error
+        await runtime.startup_configure_task
+        assert setup.configure.await_count == 3

@@ -3,9 +3,28 @@
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from forgemcp.workspace.path import WorkspacePath
+
+
+def without_nul(value: str) -> str:
+    """Reject NUL without repeating literal arguments or function expressions."""
+    if "\0" in value:
+        raise ValueError("Literal text cannot contain NUL. Remove NUL from this entry.")
+    return value
+
+
+type LiteralText = Annotated[
+    str,
+    Field(max_length=32768, description="Literal text without NUL; at most 32768 characters."),
+    AfterValidator(without_nul),
+]
+type FunctionName = Annotated[
+    str,
+    Field(min_length=1, max_length=4096, description="Nonempty literal function name without NUL."),
+    AfterValidator(without_nul),
+]
 
 
 class DebugModel(BaseModel):
@@ -137,23 +156,31 @@ class SourceOptions(DebugModel):
 class LaunchOptions(SourceOptions):
     """Launch one managed native executable with literal arguments and environment."""
 
-    executable: WorkspacePath
-    arguments: list[str] = Field(default_factory=list, max_length=1024)
-    cwd: WorkspacePath = WorkspacePath("project/")
-    environment: dict[str, str] = Field(default_factory=dict, max_length=1024)
+    executable: WorkspacePath = Field(
+        description="Existing project/ or storage/ native executable.",
+    )
+    arguments: list[LiteralText] = Field(default_factory=list, max_length=1024)
+    cwd: WorkspacePath = Field(
+        default=WorkspacePath("project/"),
+        description="Existing project/ or storage/ working directory.",
+    )
+    environment: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=1024,
+        description="Literal environment overrides; names exclude '=' and NUL; values exclude NUL.",
+    )
     stop_on_entry: bool = True
 
-    @field_validator("arguments", "environment")
+    @field_validator("environment")
     @classmethod
-    def literal_text(cls, value: list[str] | dict[str, str]) -> list[str] | dict[str, str]:
-        """Reject NUL data and invalid environment keys before adapter dispatch."""
-        values = value if isinstance(value, list) else [*value.keys(), *value.values()]
-        if any("\0" in item or len(item) > 32768 for item in values):
-            raise ValueError(
-                "Arguments and environment values cannot contain NUL or exceed 32768 characters."
-            )
-        if isinstance(value, dict) and any(not key or "=" in key for key in value):
+    def literal_environment(cls, value: dict[str, str]) -> dict[str, str]:
+        """Validate overrides without including private environment keys in error locations."""
+        if any(not key or "=" in key for key in value):
             raise ValueError("Environment names must be nonempty and cannot contain '='.")
+        if any("\0" in item or len(item) > 32768 for item in [*value.keys(), *value.values()]):
+            raise ValueError(
+                "Environment names and values cannot contain NUL or exceed 32768 characters."
+            )
         return value
 
 
@@ -190,7 +217,7 @@ class BreakpointPlan(DebugModel):
     """Initial breakpoint configuration applied before program execution starts."""
 
     sources: list[SourceBreakpoints] = Field(default_factory=list, max_length=100)
-    functions: list[str] = Field(default_factory=list, max_length=1000)
+    functions: list[FunctionName] = Field(default_factory=list, max_length=1000)
     exception_filters: list[str] | None = Field(default=None, max_length=100)
 
 
@@ -204,8 +231,11 @@ class PageRequest(DebugModel):
 class StopToken(DebugModel):
     """The inspection generation expected by an execution or stack request."""
 
-    session_id: str
-    generation: int = Field(ge=0)
+    session_id: str = Field(description="Session ID from the same debugger_get() snapshot.")
+    generation: int = Field(
+        ge=0,
+        description="Current inspection_generation from debugger_get(); expires on resume.",
+    )
 
 
 class ThreadRef(DebugModel):

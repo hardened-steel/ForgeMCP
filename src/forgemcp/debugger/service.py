@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from forgemcp.assets import IconFile, Widget
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value
 from forgemcp.progress import progress
 from forgemcp.text import tool_result
 from forgemcp.toolchain.errors import ToolchainError
@@ -30,7 +31,15 @@ from .session import DebugSession
 from .text import render
 
 type SessionFactory = Callable[[str, ToolSpec], DebugSession]
-type Timeout = Annotated[float, Field(gt=0, le=300, allow_inf_nan=False)]
+type Timeout = Annotated[
+    float,
+    Field(
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+        description="timeout in seconds: finite, greater than 0 and at most 300.",
+    ),
+]
 
 
 class DebugAdapter(BaseModel):
@@ -94,17 +103,30 @@ class DebuggerService:
     def create_session(self, toolset_id: str, adapter: str) -> DebugSession:
         """Register a new session using only a selected supported ToolSpec."""
         if self.closed:
-            raise DebugStateError("The debugger service has closed.")
+            raise DebugStateError(
+                "The debugger service has closed. The operator must restart the server "
+                "before opening another session."
+            )
         if len(self.sessions) >= self.MAX_SESSIONS:
             raise DebugStateError(
-                "Retained debugger session limit reached; restart the server to release history.",
+                f"Retained debugger session limit ({self.MAX_SESSIONS}) reached. "
+                "Call debugger_sessions() to inspect history; the operator must restart "
+                "the server to release it. Closing a session retains its history.",
             )
         factory = self.factories.get(adapter)
         if factory is None:
-            raise DebugStateError(f"Unsupported debugger adapter: {adapter}.")
+            raise DebugStateError(
+                f"Unsupported debugger adapter: adapter={display_value(adapter)}. "
+                + available_values(self.factories, "debugger_adapters()")
+            )
         tool = self.toolchains.get_tool(toolset_id, adapter)
         if tool is None:
-            raise DebugStateError(f"Toolset {toolset_id!r} has no {adapter} adapter.")
+            raise DebugStateError(
+                f"toolset_id={display_value(toolset_id)} has no {adapter} adapter. "
+                "Call debugger_adapters() to select an available toolset_id/adapter pair. "
+                "If none are available, the operator must install LLDB-DAP and restart "
+                "the server or configure --toolset."
+            )
         identifier = uuid4().hex
         session = factory(identifier, tool)
         self.sessions[identifier] = session
@@ -115,7 +137,33 @@ class DebuggerService:
         try:
             return self.sessions[session_id]
         except KeyError as error:
-            raise DebugStateError(f"Unknown debugger session: {session_id}.") from error
+            raise DebugStateError(
+                f"Unknown debugger session: session_id={display_value(session_id)}. "
+                + available_values(self.sessions, "debugger_sessions()")
+                + " Session IDs belong to this server process; open a target first "
+                "if no sessions are retained."
+            ) from error
+
+    def error_text(
+        self,
+        error: DebugError | ToolchainError,
+        session: DebugSession | None = None,
+    ) -> str:
+        """Attach retained provenance and recovery without copying adapter payloads."""
+        detail = str(error)
+        if isinstance(error, DebugTimeoutError) and error.outcome_unknown:
+            detail += " Command outcome is unknown; do not blindly repeat the mutation."
+        process_id = getattr(error, "process_id", None)
+        if session is not None:
+            state = session.snapshot()
+            detail += (
+                f" Inspect debugger_get(session_id={display_value(state.session_id)}) "
+                "before issuing another command."
+            )
+            process_id = state.adapter_process_id or process_id
+        if process_id is not None:
+            detail += f" Inspect process_get(process_id={process_id}) for the adapter transcript."
+        return detail
 
     def snapshots(self, page: m.PageRequest) -> SessionsResult:
         """Read cached observations without contacting any adapter."""
@@ -145,19 +193,19 @@ class DebuggerService:
         changes_state = ToolAnnotations(read_only_hint=False, destructive_hint=True)
 
         @asynccontextmanager
-        async def operation(ctx: Context) -> AsyncGenerator[None]:
+        async def operation(
+            ctx: Context,
+            session_id: str | None = None,
+        ) -> AsyncGenerator[None]:
             """Report one bounded operation and translate recoverable domain errors."""
             report = progress(ctx, interval=self.progress_interval)
             await report(0, total=1, message="Starting debugger operation")
             try:
                 yield
-            except DebugTimeoutError as error:
-                detail = str(error)
-                if error.outcome_unknown:
-                    detail += " Execution outcome is unknown; inspect debugger_get before retrying."
-                raise ToolError(detail) from error
             except (DebugError, ToolchainError) as error:
-                raise ToolError(str(error)) from error
+                raise ToolError(
+                    self.error_text(error, self.sessions.get(session_id))
+                ) from error
             await report(1, total=1, message="Debugger result ready")
 
         @apps.tool(
@@ -197,7 +245,7 @@ class DebuggerService:
             ctx: Context,
         ) -> Annotated[CallToolResult, m.SessionSnapshot]:
             """Read one cached session state without contacting the debugger."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = self.get_session(session_id).snapshot()
             return tool_result(result, render(result))
 
@@ -225,9 +273,8 @@ class DebuggerService:
                     )
                 except BaseException as error:
                     await session.close()
-                    if isinstance(error, DebugError):
-                        identifier = session.snapshot().session_id
-                        raise ToolError(f"{error} Session: {identifier}.") from error
+                    if isinstance(error, (DebugError, ToolchainError)):
+                        raise ToolError(self.error_text(error, session)) from error
                     raise
             return tool_result(result, render(result))
 
@@ -255,9 +302,8 @@ class DebuggerService:
                     )
                 except BaseException as error:
                     await session.close()
-                    if isinstance(error, DebugError):
-                        identifier = session.snapshot().session_id
-                        raise ToolError(f"{error} Session: {identifier}.") from error
+                    if isinstance(error, (DebugError, ToolchainError)):
+                        raise ToolError(self.error_text(error, session)) from error
                     raise
             return tool_result(result, render(result))
 
@@ -283,9 +329,8 @@ class DebuggerService:
                     )
                 except BaseException as error:
                     await session.close()
-                    if isinstance(error, DebugError):
-                        identifier = session.snapshot().session_id
-                        raise ToolError(f"{error} Session: {identifier}.") from error
+                    if isinstance(error, (DebugError, ToolchainError)):
+                        raise ToolError(self.error_text(error, session)) from error
                     raise
             return tool_result(result, render(result))
 
@@ -302,7 +347,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.BreakpointsResult]:
             """Replace every source-line breakpoint for one managed source file."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).set_breakpoints(
                     source,
                     points,
@@ -317,12 +362,12 @@ class DebuggerService:
         )
         async def debugger_function_breakpoints(
             session_id: str,
-            functions: Annotated[list[str], Field(max_length=1000)],
+            functions: Annotated[list[m.FunctionName], Field(max_length=1000)],
             ctx: Context,
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.BreakpointsResult]:
             """Replace the function breakpoint names when the adapter supports them."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).set_function_breakpoints(
                     functions,
                     timeout=timeout,
@@ -341,7 +386,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ExceptionBreakpointsResult]:
             """Select exception stop filters advertised by the current session."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).set_exception_breakpoints(
                     filters,
                     timeout=timeout,
@@ -360,7 +405,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ExecutionReceipt]:
             """Continue from an expected stop; wait using the returned execution reference."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).resume(
                     stop,
                     timeout=timeout,
@@ -381,7 +426,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ExecutionReceipt]:
             """Step over, into, or out in one stopped thread."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).step(
                     thread,
                     stop,
@@ -401,7 +446,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ExecutionReceipt]:
             """Request a running program to stop without closing its session."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).pause(
                     timeout=timeout,
                 )
@@ -418,7 +463,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ThreadsResult]:
             """List the current bounded thread identities."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).threads(
                     timeout=timeout,
                 )
@@ -438,7 +483,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.StackResult]:
             """Read a stack page from the expected suspended generation."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).stack(
                     thread,
                     stop,
@@ -459,7 +504,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ScopesResult]:
             """List the variable scopes belonging to a retained stack frame."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).scopes(
                     frame,
                     timeout=timeout,
@@ -479,7 +524,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.VariablesResult]:
             """Read a page of locals, arguments, or object children."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).variables(
                     reference,
                     page or m.PageRequest(),
@@ -499,7 +544,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ModulesResult]:
             """Read a page of loaded modules and available symbol information."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).modules(
                     page or m.PageRequest(),
                     timeout=timeout,
@@ -519,7 +564,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.ExceptionInfo]:
             """Inspect exception details for the current stopped thread."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).exception_info(
                     thread,
                     stop,
@@ -541,7 +586,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.MemoryResult]:
             """Read a bounded memory range, preserving missing dump memory explicitly."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).read_memory(
                     reference,
                     offset,
@@ -564,7 +609,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.DisassemblyResult]:
             """Read a bounded sequence of instructions at an opaque memory reference."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).disassemble(
                     reference,
                     offset,
@@ -584,7 +629,7 @@ class DebuggerService:
             timeout: Timeout | None = None,
         ) -> Annotated[CallToolResult, m.CloseResult]:
             """Close by terminating a launched target, detaching, or releasing a dump."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).close(
                     timeout=timeout,
                 )
@@ -602,7 +647,7 @@ class DebuggerService:
             timeout: Timeout = 10.0,
         ) -> Annotated[CallToolResult, m.WaitResult]:
             """Wait for a stop or terminal observation; timeout leaves the target running."""
-            async with operation(ctx):
+            async with operation(ctx, session_id):
                 result = await self.get_session(session_id).wait_for_stop(
                     execution,
                     timeout=timeout,

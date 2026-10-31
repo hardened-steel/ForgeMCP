@@ -344,6 +344,11 @@ class HubService:
             elif operation == "calls":
                 method = "calls/get"
                 params = {"id": request.path_params["item_id"]}
+            elif operation == "completion" and request.method == "POST":
+                method = "completion/complete"
+                params = await request.json()
+                if not isinstance(params, dict):
+                    raise HubRequestError("Completion parameters must be a JSON object.", 400)
             elif operation == "tools" and request.method == "POST":
                 body = await request.json()
                 arguments = body.get("arguments", {})
@@ -457,7 +462,11 @@ class HubService:
                     self.api,
                     methods=["POST"],
                 ),
-                Route("/api/instances/{instance_id}/{operation}", self.api),
+                Route(
+                    "/api/instances/{instance_id}/{operation}",
+                    self.api,
+                    methods=["GET", "POST"],
+                ),
                 Route(
                     "/api/instances/{instance_id}/{operation}/{item_id}",
                     self.api,

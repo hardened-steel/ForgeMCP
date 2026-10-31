@@ -15,6 +15,7 @@ from urllib.request import url2pathname
 from pydantic import JsonValue, ValidationError
 
 from forgemcp.cmake.service import CompilationContext
+from forgemcp.diagnostics import display_value, os_error_reason
 from forgemcp.progress import Progress
 from forgemcp.toolchain.errors import ToolchainError
 from forgemcp.toolchain.tools.clangd import (
@@ -106,7 +107,10 @@ def lsp_position(value: Position) -> dict[str, JsonValue]:
 def validate_timeout(timeout: float) -> None:
     """Reject nonfinite or nonpositive analysis timeouts."""
     if not isfinite(timeout) or timeout <= 0:
-        raise ClangdError("Analysis timeout must be finite and greater than zero.")
+        raise ClangdError(
+            f"timeout={display_value(timeout)} must be a finite number greater than zero "
+            "seconds; omit timeout to use the 30-second default."
+        )
 
 
 class ClangdSession:
@@ -260,7 +264,14 @@ class ClangdSession:
         except ClangdError as error:
             failure = error
         except (ToolchainError, OSError, ValueError) as error:
-            failure = ClangdSessionError("clangd connection failed.")
+            reason = (
+                os_error_reason(error)
+                if isinstance(error, OSError)
+                else str(error)
+                if isinstance(error, ToolchainError)
+                else "invalid language-server message"
+            )
+            failure = ClangdSessionError(f"clangd connection failed: {reason}")
             failure.__cause__ = error
         except Exception as error:
             failure = ClangdSessionError("clangd response processing failed.")
@@ -385,7 +396,9 @@ class ClangdSession:
         )
         if encoding != "utf-32":
             raise ClangdProtocolError(
-                "This clangd must support UTF-32 positions, including external locations.",
+                f"clangd selected position encoding {display_value(encoding)}; "
+                "ForgeMCP requires 'utf-32', including for external locations. "
+                "The operator must select a clangd version supporting UTF-32 positions.",
             )
         await self.notify("initialized", {})
         self.initialized = True
@@ -422,9 +435,14 @@ class ClangdSession:
                 )
             if isinstance(error, asyncio.CancelledError):
                 raise
-            raise ClangdTimeoutError(f"{method} exceeded its timeout.") from error
+            raise ClangdTimeoutError(
+                f"{method} exceeded timeout={timeout:g} seconds. "
+                "Retry with a larger timeout or a smaller configuration selection."
+            ) from error
         except ToolchainError as error:
-            raise ClangdSessionError("Cannot communicate with clangd.") from error
+            raise ClangdSessionError(
+                f"Cannot communicate with clangd while requesting {display_value(method)}: {error}"
+            ) from error
         finally:
             self.pending.pop(identifier, None)
             self.methods.pop(identifier, None)
@@ -439,7 +457,9 @@ class ClangdSession:
         try:
             await self.connection.send(LspNotification(method, params))
         except ToolchainError as error:
-            raise ClangdSessionError("Cannot synchronize clangd.") from error
+            raise ClangdSessionError(
+                f"Cannot synchronize clangd for notification {display_value(method)}: {error}"
+            ) from error
 
     @asynccontextmanager
     async def open_document(
@@ -522,7 +542,9 @@ class ClangdSession:
                         await self.condition.wait()
         except TimeoutError as error:
             raise ClangdTimeoutError(
-                f"No diagnostics for {path} version {version} before the timeout.",
+                f"No diagnostics for path={display_value(str(path))}, document version "
+                f"{version}, within timeout={timeout:g} seconds. "
+                "Retry the analysis with a larger timeout.",
             ) from error
         await self.report(on_progress, f"Received diagnostics for {path}")
         return result

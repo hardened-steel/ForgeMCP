@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp import Client
 from mcp.client import advertise
-from mcp.server import MCPServer
 from mcp.server.apps import APP_MIME_TYPE, EXTENSION_ID, Apps
 from pydantic import ValidationError
 
@@ -16,7 +15,7 @@ from forgemcp.completion import Complete
 from forgemcp.debugger import models as m
 from forgemcp.debugger.errors import DebugAdapterError, DebugStateError
 from forgemcp.debugger.service import DebuggerService
-from forgemcp.server import ServerRuntime
+from forgemcp.server import ForgeMCPServer, ServerRuntime
 from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import ToolKind, Toolset, ToolSpec
 
@@ -110,7 +109,7 @@ def debugger_setup(cpp_acceptance_project: Path):
 
     service = DebuggerService(chains, {"lldb-dap": factory}, progress_interval=0)
     apps = Apps()
-    server = MCPServer("debugger-test", extensions=[apps])
+    server = ForgeMCPServer("debugger-test", extensions=[apps])
     service.register(server, apps, Complete())
     for binding in apps.tools():
         server.add_tool(binding.fn, meta=binding.meta, **binding.kwargs)
@@ -339,7 +338,7 @@ async def test_runtime_closes_debugger_only_after_last_lifespan_user():
         workspace=SimpleNamespace(),
         processes=SimpleNamespace(close=close_processes),
         toolchains=SimpleNamespace(initialize=AsyncMock()),
-        builds=SimpleNamespace(),
+        builds=SimpleNamespace(configure=AsyncMock(return_value=[])),
         analysis=SimpleNamespace(initialize=AsyncMock(), close=close_analysis),
         history=MemoryHistory(),
         settings={},
@@ -360,3 +359,101 @@ def test_session_budget_rejects_new_factory_work(setup, monkeypatch):
     with pytest.raises(DebugStateError, match="session limit"):
         setup.service.create_session("system", "lldb-dap")
     assert len(setup.created) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("count", [0, 2, 9])
+async def test_unknown_session_errors_use_retained_bounded_catalogs(setup, count):
+    """Explain empty and large registries while bounding untrusted IDs without new sessions."""
+    for _ in range(count):
+        setup.service.create_session("system", "lldb-dap")
+    identifier = "\n" * 200 + "PRIVATE_SUFFIX"
+    async with Client(setup.server) as client:
+        result = await client.call_tool("debugger_get", {"session_id": identifier})
+    text = result.content[0].text
+    assert result.is_error and "session_id=" in text and "debugger_sessions()" in text
+    assert "PRIVATE_SUFFIX" not in text and "\n" not in text
+    assert len(setup.created) == count
+    if count == 0:
+        assert "No values are currently available" in text and "open a target first" in text
+    elif count <= 8:
+        assert all(key in text for key in setup.service.sessions)
+    else:
+        assert "9 available values" in text
+        assert all(key not in text for key in setup.service.sessions)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "options,expected,private",
+    [
+        (
+            {"arguments": ["ok", "PRIVATE_ARGUMENT\0"]},
+            ["options.arguments[1]", "NUL", "Remove NUL"],
+            "PRIVATE_ARGUMENT",
+        ),
+        (
+            {"environment": {"PRIVATE=KEY": "PRIVATE_VALUE"}},
+            ["options.environment", "nonempty", "cannot contain '='"],
+            "PRIVATE",
+        ),
+        (
+            {"environment": {"TOKEN": "PRIVATE_VALUE\0"}},
+            ["options.environment", "NUL", "32768"],
+            "PRIVATE_VALUE",
+        ),
+        (
+            {"private_unknown": "PRIVATE_VALUE"},
+            ["options.private_unknown", "Extra inputs"],
+            "PRIVATE_VALUE",
+        ),
+    ],
+)
+async def test_sdk_option_errors_identify_fields_without_private_input(
+    setup,
+    options,
+    expected,
+    private,
+):
+    """Keep nested validation in the SDK and reject inputs before allocating a session."""
+    async with Client(setup.server) as client:
+        response = await client.call_tool(
+            "debugger_launch",
+            {
+                "toolset_id": "system",
+                "options": {"executable": "project/app.exe", **options},
+            },
+        )
+    text = response.content[0].text
+    assert response.is_error and all(value in text for value in expected)
+    assert private not in text and not setup.created
+
+
+@pytest.mark.parametrize("count", [0, 9])
+def test_unsupported_adapter_catalog_is_bounded_and_does_not_probe(setup, count):
+    """Explain unavailable implementations from retained factories without launching programs."""
+    factory = setup.service.factories["lldb-dap"]
+    setup.service.factories = {f"adapter-{index}": factory for index in range(count)}
+    with pytest.raises(DebugStateError) as failure:
+        setup.service.create_session("system", "unavailable")
+    text = str(failure.value)
+    assert "adapter='unavailable'" in text and "debugger_adapters()" in text
+    assert ("No values" if count == 0 else "9 available values") in text
+    assert not setup.created
+
+
+@pytest.mark.anyio
+async def test_unexpected_driver_error_keeps_sdk_sanitization_and_cleanup(setup, monkeypatch):
+    """Do not turn an implementation bug into a raw actionable domain error."""
+    monkeypatch.setattr(
+        ScriptedSession,
+        "launch",
+        AsyncMock(side_effect=RuntimeError("PRIVATE_INTERNAL_ERROR")),
+    )
+    async with Client(setup.server) as client:
+        result = await client.call_tool(
+            "debugger_launch",
+            {"toolset_id": "system", "options": {"executable": "project/app"}},
+        )
+    assert result.is_error and "PRIVATE_INTERNAL_ERROR" not in result.content[0].text
+    assert setup.created[0].closed == 1

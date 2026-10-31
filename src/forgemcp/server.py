@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,17 @@ from uuid import uuid4
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.types import CallToolResult, InputRequiredResult, Tool
+from pydantic import ValidationError
 
 from forgemcp import __version__
 from forgemcp import local_ipc
 from forgemcp.admin.history import MemoryHistory
 from forgemcp.admin.instance import InstanceAgent
 from forgemcp.cmake.errors import CMakeError
+from forgemcp.cmake.models import CMakeConfigureResult
 from forgemcp.cmake.profiles import parse_profiles
 from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
@@ -32,6 +38,7 @@ from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
 from forgemcp.debugger.lldb_dap import LldbDapSession
 from forgemcp.debugger.service import DebuggerService
+from forgemcp.diagnostics import argument_errors, display_value
 from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
 from forgemcp.process.host import ProcessIdentity
@@ -46,6 +53,50 @@ from forgemcp.workspace.diff import DiffProvider
 from forgemcp.workspace.errors import WorkspaceError
 
 logger = logging.getLogger(__name__)
+
+
+class ForgeMCPServer(MCPServer):
+    """Keep SDK execution while making rejected tool arguments concise and actionable."""
+
+    async def list_tools(self) -> list[Tool]:
+        """Advertise the same closed argument objects that call_tool enforces."""
+        tools = await super().list_tools()
+        for tool in tools:
+            tool.input_schema = {**tool.input_schema, "additionalProperties": False}
+        return tools
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        """Reject unknown keys, then let the SDK validate and execute each invocation once."""
+        tool = next((item for item in await self.list_tools() if item.name == name), None)
+        if tool is None:
+            raise ToolError(
+                f"Unknown tool {display_value(name)}. "
+                "Request tools/list to get available tool names."
+            )
+        fields = tool.input_schema.get("properties", {})
+        unknown = sorted(set(arguments) - set(fields))
+        if unknown:
+            messages = []
+            for parameter in unknown:
+                matches = get_close_matches(parameter, fields, n=1, cutoff=0.75)
+                suggestion = f" Did you mean {display_value(matches[0])}?" if matches else ""
+                messages.append(f"Unknown argument {display_value(parameter)}.{suggestion}")
+            messages.append(f"Allowed arguments: {', '.join(fields) or '(none)'}.")
+            raise ToolError("\n".join(messages))
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as error:
+            if (
+                not isinstance(error, UnexpectedToolError)
+                and isinstance(error.__cause__, ValidationError)
+            ):
+                raise ToolError(argument_errors(error.__cause__, tool.input_schema)) from error
+            raise
 
 
 @dataclass
@@ -65,6 +116,46 @@ class ServerRuntime:
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
     closed: bool = False
+    startup_configure_task: asyncio.Task[list[CMakeConfigureResult]] | None = None
+    startup_configure_results: list[CMakeConfigureResult] = field(default_factory=list)
+    startup_configure_error: str | None = None
+
+    def startup_configured(self, task: asyncio.Task[list[CMakeConfigureResult]]) -> None:
+        """Retain startup outcomes and log lifecycle summaries without command output."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.startup_configure_error = (
+                str(error)
+                if isinstance(error, (CMakeError, ToolchainError, ProcessError))
+                else "Startup CMake configuration failed unexpectedly."
+            )
+            logger.warning("Startup CMake configuration failed; the server remains available.")
+        else:
+            self.startup_configure_results = task.result()
+            failures = sum(result.error is not None for result in self.startup_configure_results)
+            logger.info(
+                "Startup CMake configuration finished: %d executions, %d failures.",
+                len(self.startup_configure_results),
+                failures,
+            )
+
+    async def close_services(self) -> None:
+        """Finish startup cancellation before closing its subscribers and process owner."""
+        try:
+            if self.startup_configure_task is not None:
+                self.startup_configure_task.cancel()
+                await asyncio.gather(self.startup_configure_task, return_exceptions=True)
+        finally:
+            try:
+                if self.debugger is not None:
+                    await self.debugger.close()
+            finally:
+                try:
+                    await self.analysis.close()
+                finally:
+                    await self.processes.close()
 
     @asynccontextmanager
     async def lifespan(self) -> AsyncGenerator[dict[str, object]]:
@@ -76,6 +167,8 @@ class ServerRuntime:
                 try:
                     await self.toolchains.initialize()
                     await self.analysis.initialize()
+                    self.startup_configure_task = asyncio.create_task(self.builds.configure())
+                    self.startup_configure_task.add_done_callback(self.startup_configured)
                 except BaseException:
                     self.closed = True
                     await self.close_services()
@@ -89,17 +182,6 @@ class ServerRuntime:
                 if self.users == 0:
                     self.closed = True
                     await self.close_services()
-
-    async def close_services(self) -> None:
-        """Release debugger targets and analysis before their shared process transport."""
-        try:
-            if self.debugger is not None:
-                await self.debugger.close()
-        finally:
-            try:
-                await self.analysis.close()
-            finally:
-                await self.processes.close()
 
     async def state_snapshot(self) -> dict[str, Any]:
         """Read retained service state without scans, tool calls, or transcript copies."""
@@ -133,6 +215,17 @@ class ServerRuntime:
                 ],
             },
             "cmake": {
+                "startup_configure": {
+                    "running": (
+                        self.startup_configure_task is not None
+                        and not self.startup_configure_task.done()
+                    ),
+                    "error": self.startup_configure_error,
+                    "results": [
+                        result.model_dump(mode="json")
+                        for result in self.startup_configure_results
+                    ],
+                },
                 "configurations": [
                     context.model_dump(mode="json")
                     for context in self.builds.configurations.values()
@@ -339,7 +432,7 @@ def create_runtime(
             *(text for text in service_instructions if text),
         ]
     )
-    mcp = MCPServer(
+    mcp = ForgeMCPServer(
         name="forgemcp",
         title="ForgeMCP",
         description="Structured C/C++ development tools for one local workspace.",

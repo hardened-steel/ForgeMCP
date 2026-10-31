@@ -129,8 +129,10 @@ async def test_ctest_report_statuses_and_exact_name_filter(cpp_acceptance_projec
     assert arguments[:2] == ["--preset", "native-test"]
     assert arguments[arguments.index("--tests-regex") + 1] == r"^(case\.\+\(x\))$"
     report.write_text("invalid XML")
-    with pytest.raises(ToolParserError):
+    with pytest.raises(ToolParserError) as malformed:
         ctest.parse_report(report)
+    assert "invalid XML at line 1, column 0" in str(malformed.value)
+    assert "outcomes could not be confirmed" in str(malformed.value)
     with pytest.raises(ToolCommandError) as failure:
         await methods["test"](
             cpp_acceptance_project,

@@ -28,6 +28,8 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [viteSingleFile()],
     build: {
+      // Preserve light-dark() so host and operator theme changes work at runtime.
+      cssTarget: "esnext",
       outDir: fileURLToPath(new URL("../src/forgemcp/assets", import.meta.url)),
       emptyOutDir: mode === "workspace",
       rollupOptions: {

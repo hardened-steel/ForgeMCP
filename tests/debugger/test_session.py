@@ -4,10 +4,14 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from mcp import Client
+from mcp.server.apps import Apps
 from pydantic import ValidationError
 
+from forgemcp.completion import Complete
 from forgemcp.debugger import models as m
 from forgemcp.debugger.errors import (
     DebugStaleReferenceError,
@@ -16,6 +20,9 @@ from forgemcp.debugger.errors import (
     DebugUnsupportedError,
 )
 from forgemcp.debugger.lldb_dap import LldbDapSession
+from forgemcp.debugger.service import DebuggerService
+from forgemcp.server import ForgeMCPServer
+from forgemcp.toolchain.service import ToolchainService
 from forgemcp.toolchain.spec import ToolKind, ToolSpec
 from forgemcp.toolchain.tools.lldb_dap import DapEvent, DapRequest, DapResponse
 from forgemcp.workspace.path import WorkspacePath
@@ -239,6 +246,22 @@ def token(session: LldbDapSession) -> m.StopToken:
     )
 
 
+@pytest.fixture(name="debugger_server")
+def debugger_server_fixture(scenario):
+    """Mount the concrete scripted driver through the production SDK error boundary."""
+    session, _, _ = scenario
+    service = DebuggerService(ToolchainService(SimpleNamespace()), {}, progress_interval=0)
+    service.sessions[session.snapshot().session_id] = session
+    apps = Apps()
+    server = ForgeMCPServer("debugger-errors", extensions=[apps])
+    service.register(server, apps, Complete())
+    for binding in apps.resources():
+        server.add_resource(binding.resource)
+    for binding in apps.tools():
+        server.add_tool(binding.fn, meta=binding.meta, **binding.kwargs)
+    return server
+
+
 @pytest.mark.anyio
 async def test_initial_configuration_precedes_launch_response_and_early_stop_is_retained(
     scenario,
@@ -312,10 +335,14 @@ async def test_inspection_memory_handles_and_step_invalidate_old_references(scen
         assert (
             await session.wait_for_stop(next_execution.execution, timeout=0.2)
         ).outcome == "stopped"
-        with pytest.raises(DebugStaleReferenceError):
+        with pytest.raises(DebugStaleReferenceError) as stale_frame:
             await session.scopes(frame.reference)
-        with pytest.raises(DebugStaleReferenceError):
+        assert "frame.generation" in str(stale_frame.value)
+        assert "debugger_stack()" in str(stale_frame.value)
+        with pytest.raises(DebugStaleReferenceError) as stale_stop:
             await session.resume(stop)
+        assert "stop.generation" in str(stale_stop.value)
+        assert "inspection_generation" in str(stale_stop.value)
     finally:
         await session.close()
 
@@ -509,3 +536,196 @@ def test_status_union_and_bounded_options_are_validated():
         m.DebugTimeouts(request=float("nan"))
     with pytest.raises(ValidationError):
         m.LaunchOptions(executable=WorkspacePath("project/main"), arguments=["bad\0arg"])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "changes,field,reason",
+    [
+        ({"executable": "project/missing"}, "options.executable", "existing file"),
+        ({"cwd": "project/debug/debug_main.cpp"}, "options.cwd", "existing directory"),
+        (
+            {"source_mappings": [{"source": "prefix", "destination": "project/missing"}]},
+            "options.source_mappings[0].destination",
+            "existing directory",
+        ),
+        (
+            {"symbol_directories": ["project/missing"]},
+            "options.symbol_directories[0]",
+            "existing directory",
+        ),
+    ],
+)
+async def test_invalid_launch_paths_name_nested_field_before_start(
+    scenario,
+    changes,
+    field,
+    reason,
+):
+    """Identify the exact managed input without native roots or any adapter launch."""
+    session, peer, root = scenario
+    selected = m.LaunchOptions.model_validate({**options().model_dump(), **changes})
+    with pytest.raises(DebugStateError) as failure:
+        await session.launch(selected, m.BreakpointPlan())
+    text = str(failure.value)
+    assert field in text and reason in text and "workspace_list()" in text
+    assert str(root) not in text and not peer.opened and not peer.sent
+
+
+@pytest.mark.anyio
+async def test_initial_source_is_checked_before_launching_target(scenario):
+    """A missing initial source must not launch a target before rejecting the plan."""
+    session, peer, _ = scenario
+    with pytest.raises(DebugStateError) as failure:
+        await session.launch(
+            options(),
+            m.BreakpointPlan(
+                sources=[m.SourceBreakpoints(source=WorkspacePath("project/missing.cpp"))],
+            ),
+        )
+    assert "initial.sources[0].source" in str(failure.value)
+    assert "existing file" in str(failure.value) and not peer.opened
+
+
+@pytest.mark.anyio
+async def test_sdk_adapter_rejection_redacts_payload_and_retains_process_hint(
+    scenario,
+    debugger_server,
+    monkeypatch,
+):
+    """Return safe command context and provenance instead of raw adapter error payloads."""
+    session, peer, _ = scenario
+    response = peer.response
+
+    def reject(request, body=None):
+        """Inject a rejected inspection with private compiler and environment fragments."""
+        if request.command == "threads":
+            peer.queue.put_nowait(
+                DapResponse(
+                    300,
+                    request.seq,
+                    request.command,
+                    False,
+                    message="PRIVATE_PAYLOAD\n" * 1000,
+                )
+            )
+        else:
+            response(request, body)
+
+    monkeypatch.setattr(peer, "response", reject)
+    try:
+        await session.launch(options(), m.BreakpointPlan())
+        async with Client(debugger_server) as client:
+            result = await client.call_tool("debugger_threads", {"session_id": "debug-session"})
+        text = result.content[0].text
+        assert result.is_error and "LLDB-DAP threads" in text and "rejected" in text
+        assert "debugger_get(session_id='debug-session')" in text
+        assert "process_get(process_id=17)" in text and "PRIVATE_PAYLOAD" not in text
+        assert not peer.closed
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_sdk_uncertain_timeout_and_close_preserve_recovery(scenario, debugger_server):
+    """Distinguish an unconfirmed mutation from cleanup and preserve retained provenance."""
+    session, peer, _ = scenario
+    try:
+        receipt = await session.launch(options(), m.BreakpointPlan())
+        await session.wait_for_stop(receipt.execution, timeout=0.2)
+        peer.ignore.add("continue")
+        async with Client(debugger_server) as client:
+            result = await client.call_tool(
+                "debugger_continue",
+                {
+                    "session_id": "debug-session",
+                    "stop": token(session).model_dump(),
+                    "timeout": 0.01,
+                },
+            )
+            text = result.content[0].text
+            assert result.is_error and "timeout=0.01 seconds" in text
+            assert "outcome is unknown" in text and "do not blindly repeat" in text
+            assert "process_get(process_id=17)" in text and "debugger_get(" in text
+            assert not peer.closed and session.snapshot().target_state == m.TargetState.UNKNOWN
+            peer.ignore.add("disconnect")
+            closed = await client.call_tool(
+                "debugger_close",
+                {"session_id": "debug-session", "timeout": 0.01},
+            )
+        result = closed.structured_content
+        assert not closed.is_error and result["adapter_closed"]
+        assert result["target_outcome"] == "unknown"
+        assert "process_get(process_id=17)" in result["error"]
+        assert "Adapter closed" in result["error"] and "do not repeat" in result["error"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("count", [0, 2, 9])
+async def test_exception_filter_errors_use_available_capabilities(scenario, count):
+    """Name the rejected filter and disclose only bounded retained capability choices."""
+    session, peer, _ = scenario
+    peer.capabilities["exceptionBreakpointFilters"] = [
+        {"filter": f"filter-{index}", "label": f"Filter {index}"}
+        for index in range(count)
+    ]
+    try:
+        await session.launch(options(), m.BreakpointPlan())
+        before = len(peer.sent)
+        with pytest.raises(DebugStateError) as failure:
+            await session.set_exception_breakpoints(["invalid"])
+        text = str(failure.value)
+        assert "filters[0]='invalid'" in text and "capabilities.exception_filters" in text
+        assert "debugger_get(" in text and "pass []" in text
+        assert len(peer.sent) == before
+        if count == 0:
+            assert "No values" in text
+        elif count <= 8:
+            assert all(f"filter-{index}" in text for index in range(count))
+        else:
+            assert "9 available values" in text and "filter-0" not in text
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("count", [0, 2, 9])
+async def test_unknown_thread_and_frame_handles_use_bounded_retained_catalogs(scenario, count):
+    """Reject invalid inspection identities before I/O with choices from the correct handle kind."""
+    session, peer, _ = scenario
+    try:
+        receipt = await session.launch(options(), m.BreakpointPlan())
+        await session.wait_for_stop(receipt.execution, timeout=0.2)
+        session.thread_ids.clear()
+        for index in range(count):
+            session.thread_reference(index)
+            session.reference("frame", index)
+        before = len(peer.sent)
+        with pytest.raises(DebugStaleReferenceError) as thread_error:
+            session.thread(m.ThreadRef(session_id="debug-session", handle="missing"))
+        with pytest.raises(DebugStaleReferenceError) as frame_error:
+            await session.scopes(
+                m.FrameRef(
+                    session_id="debug-session",
+                    generation=session.snapshot().inspection_generation,
+                    handle="missing",
+                ),
+            )
+        assert "thread.handle" in str(thread_error.value)
+        assert "debugger_threads(" in str(thread_error.value)
+        assert "frame.handle" in str(frame_error.value)
+        assert "debugger_stack" in str(frame_error.value)
+        assert len(peer.sent) == before
+        hint = {0: "No values", 2: "Available values", 9: "9 available values"}[count]
+        for error in (thread_error.value, frame_error.value):
+            assert hint in str(error)
+        if count == 2:
+            assert all(handle in str(thread_error.value) for handle in session.thread_ids)
+            assert all(handle in str(frame_error.value) for handle in session.handles)
+        elif count == 9:
+            assert all(handle not in str(thread_error.value) for handle in session.thread_ids)
+            assert all(handle not in str(frame_error.value) for handle in session.handles)
+    finally:
+        await session.close()

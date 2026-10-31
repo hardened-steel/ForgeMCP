@@ -27,6 +27,7 @@ src/forgemcp/
   server.py                     # composition root, CLI, MCPServer
   assets.py                     # package-relative Widget and IconFile helpers
   completion.py                 # one server-wide completion dispatcher
+  diagnostics.py                # bounded error values, catalog hints, SDK validation text
   admin/
     history.py                  # SDK middleware and in-memory tool-call records
     instance.py                 # one SDK client and reconnecting instance IPC bridge
@@ -86,8 +87,10 @@ interfaces and factories for hypothetical parsers or kit providers.
    optional persistent administration client use the same services. The workspace
    defaults to the server process working directory. The first lifespan user awaits
    toolchain and clangd initialization; reference-counted users share that completed
-   initialization. Only the final user closes analysis and managed processes,
-   including cleanup after discovery failure.
+   initialization. After the clangd subscription exists, one background task
+   configures all effective CMake profiles without delaying MCP readiness. Only
+   the final user cancels and awaits that task, then closes analysis and managed
+   processes, including cleanup after discovery failure.
 
 `create_server` remains the embedding entrypoint returning the SDK `MCPServer`;
 it does not start an administration Hub. The CLI creates a runtime and enables its
@@ -398,6 +401,16 @@ must belong to this project, and build/test configurations must match their cach
 Known plain build directories receive CMake File API queries and request a compilation
 database. Native presets retain control over these settings and directories.
 
+`CMakeService.configure` owns the batch shared by server startup and the
+`cmake_configure` handler. The handler supplies per-invocation MCP progress;
+startup runs without a request Context. Both callers use the same operation lock,
+per-profile error isolation, File API confirmation, and context publication. The
+runtime retains startup outcomes and process IDs in its CMake monitor, consumes
+background task failures, and exposes expected batch errors while sanitizing
+unexpected failures. Operational logs contain only lifecycle counts. Additional
+lifespan users share the same task, and shutdown awaits its cancellation before
+closing clangd or ProcessService. Startup uses the default 600-second command timeout.
+
 Commands are typed methods on bound CMake/CTest ToolSpecs and launch only through
 ProcessService. Callable protocols preserve their positional and keyword signatures.
 Tool files own process consumption and parsing: CMake presets/cache/configure/build
@@ -482,8 +495,8 @@ structural mutations invalidate every such tree because glob presence is unknown
 No glob expression is interpreted or rescanned. Content-only edits of globbed
 source files remain ordinary source edits unless also listed in `inputs`.
 Missing files and changed contents invalidate through hashes, independently of
-mtime. No operation auto-configures, removes stale artifacts, or watches external
-changes. Configure and build also verify inputs at their controlled boundaries;
+mtime. Workspace operations do not auto-configure, remove stale artifacts, or watch
+external changes. Configure and build also verify inputs at their controlled boundaries;
 external editor/IDE/process changes are not guaranteed to be noticed.
 
 A CMake operation lock serializes configure/build with each Workspace before-to-
@@ -689,7 +702,8 @@ CMake retains successful configurations as
 `CompilationContext(id, toolset_id, build_directory, compilation_database)`.
 It exposes candidates only while their build directory has a confirmed input
 baseline and its database exists. Existing artifacts at startup have unknown
-freshness and provide no context until a new configure confirms them. Build directories come from profile parameters;
+freshness and provide no context until the background startup configure (or an
+explicit configure) confirms them. Build directories come from profile parameters;
 a single native preset can use an explicitly configured build directory (`-B`).
 Unknown directories are omitted rather than parsing command output or guessing
 CMake preset expansion. Clangd additionally excludes contexts whose toolset lacks clangd.
@@ -834,6 +848,15 @@ cancellation-safe: launch terminates its target, attach detaches, and dump relea
 analysis resources. Close results report physical adapter closure independently
 from confirmed or unknown target disposition. ProcessService retains the only full
 protocol transcript; the driver keeps no second full journal.
+
+Debugger errors identify the JSON field, including nested option and initial
+breakpoint paths. Initial source paths and literal function names are validated
+before target launch. Unknown session/adapter IDs and exception filters use retained
+catalogs with the shared eight-value limit. SDK validation keeps argument indices
+without repeating argument text or environment data. Adapter rejections do not echo
+raw protocol messages; errors link the retained session and adapter process transcript.
+Timeouts explain the deadline and uncertain mutations; close errors retain the
+physical closure and target disposition instead of suggesting another launch.
 
 All debugger tools use one packaged `debugger-result.html` widget and separate icon,
 explicit typed SDK responses, and a feature-owned readable text renderer. The widget
@@ -1121,8 +1144,8 @@ network administration service.
 ### SDK reuse and call history
 
 Hub commands use the existing SDK client methods for catalog listing, tool calls,
-resource reads, and template listing. This preserves handler schemas, validation,
-real request Context, progress, and SDK elicitation behavior. Direct
+resource reads, template listing, and completions. This preserves handler schemas,
+validation, real request Context, progress, and SDK elicitation behavior. Direct
 `MCPServer.call_tool()` is not used by HTTP handlers: it bypasses middleware and
 does not construct a transport request Context. Apps support is advertised by the
 in-process client. Concurrent commands reach the same feature service instances;
@@ -1180,6 +1203,7 @@ the authenticated browser session, `/api/events` streams invalidations, and
 | `GET /resources` | SDK static resource listing |
 | `GET /resource-templates` | SDK resource-template listing |
 | `GET /resources?uri=...` | Read the selected resource through the SDK |
+| `POST /completion` | Request native SDK completion with MCP `ref`, `argument`, and optional `context.arguments` |
 | `GET /elicitations` | Pending questions for this instance's admin client |
 | `POST /elicitations/{id}` | Supply an SDK elicitation `{"result": {...}}` |
 
@@ -1196,7 +1220,12 @@ registering a runtime; `unregister` ends an instance's registration.
 
 Each registered runtime has a tab with its own selected history record, catalog,
 read-only settings, and monitors. Existing tool schemas drive command controls,
-with JSON arguments available for complete input. Command controls are initially
+with labeled fields for ordinary input and JSON arguments available for complete
+input. Resource-template fields request native MCP completions using the original
+template reference and other entered parameters as context. The same bridge accepts
+prompt references without inventing a separate suggestion provider. Completion
+requests use the authenticated, CSRF-protected `POST /completion` route and never
+execute a tool. Command controls are initially
 hidden and must be explicitly enabled in the panel; this UI choice does not create
 a second authorization or validation policy for the tools.
 
@@ -1235,6 +1264,40 @@ methods translate them according to who can recover:
 - `ResourceNotFoundError` or another MCP error: the resource/request cannot be served;
 - any other exception: unexpected bug, logged server-side and sanitized by the SDK.
 
+Expected error messages identify the actual JSON argument, including nested fields
+and list indices, then explain the constraint or prerequisite and a concrete next
+step. Unknown identifiers include all available values for catalogs of up to eight
+items; larger catalogs report their size and an existing discovery call. Empty
+catalogs are explicit. Catalog hints use retained or already-read data without
+additional discovery processes. CMake target/test enumeration is not exposed;
+errors must not suggest a nonexistent listing tool.
+
+The small `ForgeMCPServer` specialization in the composition root uses the SDK's
+public `list_tools` and `call_tool` methods. It advertises closed top-level argument
+objects, rejects unknown argument names with a spelling suggestion when available,
+and formats SDK `ValidationError` details without input payloads, Pydantic links,
+or internal union branch names. Validation, resolver/elicitation execution, output
+conversion, and sanitization still belong to the SDK and run once per invocation.
+Union-object arguments such as process transcript selectors describe their valid
+forms and constraints in their schema; those descriptions also explain failures.
+
+`diagnostics.py` shares bounded escaped identifier rendering, small-catalog hints,
+OS explanations without native filename fields, and SDK validation formatting.
+Feature handlers retain operation-specific recovery decisions. Managed file errors
+keep project/storage qualification and distinguish source and destination roles.
+Source fragments, replacement text, full argument arrays, environments, malformed
+protocol payloads, and credentials are not added to diagnostic explanations.
+
+Process failures retain available process IDs and direct transcript lookup hints.
+Git uses stderr diagnostics with a bounded, credential-redacted stdout fallback
+when stderr is empty. Its typed repository state drives conflict recovery guidance.
+CMake per-profile errors and Git mutation errors retain their existing structured
+result contracts: a successful MCP exchange does not imply that every underlying
+operation succeeded. Messages distinguish pre-launch failure, partial or unknown
+mutation outcomes, and successful operations followed by synchronization warnings;
+they never advise blindly repeating completed mutations. Toolset version failures
+keep `version=null` and add textual explanations without changing result fields.
+
 Project-controlled text is data. It must not change server instructions, choose an
 executable, escape the workspace, or be copied into operational logs. Process
 consumers must explicitly select executables, construct arguments, choose timeout and
@@ -1254,6 +1317,11 @@ assert the public contract: schemas, Apps metadata, icons, progress, structured
 output, resources, prompts, and completions. The source acceptance project remains a
 portable fixture for later checks against real CMake, compilers, clangd, sanitizers,
 and debuggers; tests never operate on it in place.
+
+Expected-failure tests also check the parameter, useful constraint/choices or real
+recovery call, process provenance, and unchanged/partial mutation guarantees where
+relevant. SDK Client checks cover unknown argument rejection and concise validation
+messages; asserting only `is_error` does not establish the error contract.
 
 `.\.venv\Scripts\python.exe -m build --wheel` is the release build: it builds the
 frontend and Python wheel together. Python changes must also pass

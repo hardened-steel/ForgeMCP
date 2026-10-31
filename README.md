@@ -165,8 +165,10 @@ Each instance tab offers:
   confirmation for commands initiated from the panel.
 
 Settings are read-only. Command controls start hidden; select **Enable command
-controls** to call an existing tool with literal JSON arguments; the catalog shows
-its input schema. These
+controls** to call an existing tool using fields generated from its input schema.
+JSON input remains available for complete arguments. Resource templates provide
+parameter fields and native MCP completion suggestions, using other entered
+parameters as context. These
 calls pass through the same SDK handlers, validation, and feature locks as stdio
 calls. There is no panel-wide execution queue. Existing modules decide which
 operations may run concurrently.
@@ -380,9 +382,19 @@ no source preview because explicit external reads require confirmation.
 CMake owns which configurations can supply clangd compilation contexts. After a
 successful configure/generate, ForgeMCP reads `cmakeFiles-v1` from a new CMake
 File API reply and records SHA-256 hashes of that build directory's configuration
-inputs in `project/` and `storage/`. Hashes and dependency lists live in memory;
-restart the server and run `cmake_configure` to confirm contexts again. Existing
-File API replies and `compile_commands.json` alone do not confirm current inputs.
+inputs in `project/` and `storage/`. Hashes and dependency lists live in memory.
+Each server startup configures all effective profiles once in the background after
+toolset discovery and clangd subscription setup. MCP requests remain available;
+clangd receives contexts as individual profiles finish. Existing File API replies
+and `compile_commands.json` alone do not confirm current inputs.
+
+Startup uses the same configure settings, build-directory ownership checks,
+generator-change cleanup, and 600-second per-command timeout as `cmake_configure`.
+One failed profile does not stop the remaining profiles or the server. The admin
+panel's CMake monitor retains startup results, process IDs, and any batch error;
+command transcripts remain available through `process_get`. A second client of
+the same server does not repeat startup configuration. Server shutdown cancels
+and awaits startup configure before closing clangd and managed processes.
 
 Workspace writes, edits, moves, deletions, and directory creation check known
 inputs at the operation boundary. Actual input changes withdraw affected contexts
@@ -561,6 +573,12 @@ to that session and generation; continuing execution invalidates them. Stack,
 variables, and modules accept bounded `page` windows. Memory and disassembly take
 explicit bounded counts. `debugger_exception_info` supplies supported exception
 details. Available operations and exception filters appear in `capabilities`.
+
+Errors identify the affected JSON field and link retained session and adapter
+process information. Use the suggested `debugger_get` and `process_get` calls to
+inspect an unconfirmed command before deciding on further execution. Invalid initial
+source paths are rejected before launching the target. Raw adapter error payloads,
+argument text, and environment values are kept out of error messages.
 Breakpoints are managed through `debugger_breakpoints`,
 `debugger_function_breakpoints`, and `debugger_exception_breakpoints`.
 Setting source or function breakpoints replaces the complete selected set.
@@ -684,6 +702,29 @@ without caching them. Listing toolsets does not launch version probes. All probe
 `vswhere`, and the command capturing `VsDevCmd` plus `set` remain visible in the process
 overview and retain their transcripts. Toolset resources omit environments; the
 environment capture's stdout is retained in its ordinary process transcript.
+
+## Understanding tool errors
+
+Expected tool errors name the invalid argument or missing prerequisite and explain
+how to correct it. Small catalogs list available values; larger catalogs point to
+an existing listing tool such as `toolsets_list`, `cmake_profiles`,
+`clangd_configurations`, `processes_overview`, or `git_remotes`. Unknown argument
+names are rejected instead of being silently ignored, with spelling suggestions
+when possible. Process transcript selector errors describe their valid JSON forms.
+
+For example, an unknown profile identifies `profiles` and either lists its valid
+names or recommends `cmake_profiles()`. A bad edit identifies `old_text` and suggests
+reading the current file or choosing a unique fragment, without repeating source
+text. Toolset installation and profile configuration errors explicitly require
+operator setup; toolsets are discovered once at startup.
+
+When a command started, use its returned process ID with `process_get` to read its
+transcript. CMake profile failures and Git mutation failures remain in the result's
+`error` fields even when the MCP exchange itself succeeded. A mutation may have
+partially completed; inspect the returned state and `git_status` before repeating
+Git operations. A synchronization warning after a completed operation does not mean
+the commit or push should be repeated. Retained process and result-resource IDs
+belong to the current server process and disappear when it stops.
 
 ## Tests
 

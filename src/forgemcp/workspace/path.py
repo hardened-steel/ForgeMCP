@@ -8,6 +8,8 @@ from typing import Literal, cast
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
 
+from forgemcp.diagnostics import display_value
+
 
 class WorkspacePath(str):
     """A canonical managed path accepting project-relative input, or an explicit root/ location."""
@@ -46,9 +48,20 @@ class WorkspacePath(str):
         """Reject unknown areas, ambiguous separators, and paths escaping their declared root."""
         area, separator, relative = self.partition("/")
         if area not in ("project", "storage", "root") or not separator:
-            raise ValueError("Workspace path must start with project/, storage/, or root/.")
-        if "\\" in relative or "\0" in relative:
-            raise ValueError("Workspace paths use '/' and cannot contain NUL.")
+            raise ValueError(
+                f"Invalid workspace path={display_value(self)}: use a relative path such as "
+                "'src/main.cpp', or a project/, storage/, or root/ prefix."
+            )
+        if "\\" in relative:
+            raise ValueError(
+                f"Invalid workspace path={display_value(self)}: use '/' separators, "
+                "for example 'project/src/main.cpp'."
+            )
+        if "\0" in relative:
+            raise ValueError(
+                f"Invalid workspace path={display_value(self)}: NUL characters are forbidden; "
+                "remove them from the path."
+            )
         windows = PureWindowsPath(relative)
         if area == "root":
             native = windows if windows.drive else PurePosixPath(relative)
@@ -58,12 +71,21 @@ class WorkspacePath(str):
                 or any(part in (".", "..") for part in relative.split("/"))
                 or relative.startswith(("//?/", "//./"))
             ):
-                raise ValueError("root/ must be followed by a canonical absolute path.")
+                raise ValueError(
+                    f"Invalid workspace path={display_value(self)}: root/ must be followed "
+                    "by a canonical absolute path without '.' or '..' components, repeated "
+                    "separators, or a trailing slash; for example 'root/C:/SDK/header.h' "
+                    "on Windows or 'root//usr/include/header.h' on Unix."
+                )
             return self
         if windows.drive or windows.root or any(
             part in ("", ".", "..") for part in relative.split("/") if relative
         ):
-            raise ValueError("Workspace path must contain a canonical relative path.")
+            raise ValueError(
+                f"Invalid workspace path={display_value(self)}: managed paths must be relative "
+                "and cannot contain '..', remaining '.' components, repeated separators, "
+                "or a drive letter. Use a path such as 'project/src/main.cpp'."
+            )
         return self
 
     @property
@@ -81,8 +103,14 @@ class WorkspacePath(str):
     def absolute(self) -> Path:
         """Return a native absolute external path and reject other areas or host-relative values."""
         if self.area != "root":
-            raise ValueError("Only root/ paths contain a native absolute path.")
+            raise ValueError(
+                f"Invalid path={display_value(self)}: only root/ paths contain a native "
+                "absolute path; use managed-path resolution for project/ and storage/."
+            )
         path = Path(self.relative)
         if not path.is_absolute():
-            raise ValueError("The external path is not absolute on this host.")
+            raise ValueError(
+                f"Invalid path={display_value(self)}: the external path is not absolute "
+                "on this host; use root/ followed by an absolute path for the server's OS."
+            )
         return path

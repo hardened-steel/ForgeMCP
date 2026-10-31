@@ -5,6 +5,8 @@ import asyncio
 import pytest
 from mcp import Client
 
+from forgemcp.cmake import file_api
+from forgemcp.cmake.errors import CMakeError
 from forgemcp.cmake.file_api import generation, read_generation
 from forgemcp.cmake.profiles import ProfileDefinition
 from forgemcp.cmake.workspace import CMakeProvider
@@ -13,6 +15,32 @@ from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.service import ResultProvider
 
 from tests.cmake.conftest import server, write_generation
+
+
+@pytest.mark.parametrize(
+    ("contents", "limit", "expected"),
+    [
+        ('{"oversized": true}', 8, ["8-byte size limit"]),
+        ('{\ninvalid-json}', 100, ["line 2", "column 1", "cmake_configure"]),
+    ],
+)
+def test_file_api_reply_error_identifies_metadata_and_cause(
+    cpp_acceptance_project,
+    monkeypatch,
+    contents,
+    limit,
+    expected,
+):
+    """Report bounded metadata locations and size or JSON causes without native roots."""
+    path = cpp_acceptance_project / "reply.json"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(file_api, "MAX_REPLY_BYTES", limit)
+    with pytest.raises(CMakeError) as failure:
+        file_api.read_reply(path, cpp_acceptance_project, cpp_acceptance_project / "storage")
+    text = str(failure.value)
+    assert "project/reply.json" in text
+    assert all(value in text for value in expected)
+    assert str(cpp_acceptance_project) not in text
 
 
 @pytest.mark.anyio

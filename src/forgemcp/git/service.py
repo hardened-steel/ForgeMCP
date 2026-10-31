@@ -33,6 +33,7 @@ from forgemcp.assets import IconFile, Widget
 from forgemcp.clangd.service import ClangdService, FileChange
 from forgemcp.cmake.service import CMakeService
 from forgemcp.completion import Complete
+from forgemcp.diagnostics import available_values, display_value, os_error_reason
 from forgemcp.process.models import ProcessTimeout
 from forgemcp.progress import progress
 from forgemcp.text import tool_result
@@ -43,7 +44,7 @@ from forgemcp.workspace.path import WorkspacePath
 from forgemcp.workspace.service import WorkspaceService
 
 from . import parsers
-from .errors import GitError
+from .errors import GitError, GitParseError
 from .models import (
     GitBlame,
     GitBlob,
@@ -80,14 +81,43 @@ invocation: ContextVar[Invocation] = ContextVar("forgemcp_git_invocation")
 
 def literal_identifier(value: str, label: str) -> str:
     """Keep literal identifiers from becoming command options or NUL-delimited records."""
-    if not value or value.startswith("-") or "\0" in value or "\n" in value or "\r" in value:
-        raise GitError(f"{label} must be a nonempty literal identifier without an option prefix.")
-    return value
+    if not value:
+        reason = "must not be empty"
+    elif value.startswith("-"):
+        reason = "must not begin with '-'"
+    elif any(character in value for character in ("\0", "\n", "\r")):
+        reason = "must not contain NUL, newline, or carriage-return characters"
+    else:
+        return value
+    raise GitError(f"{label}={display_value(redact(value))} {reason}.")
 
 
 def redact(value: str) -> str:
     """Remove URL user-info before exposing configured addresses or command errors."""
     return re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]+@", r"\1[redacted]@", value)
+
+
+def failure_reason(result: git.CommandResult) -> str:
+    """Describe a failed exit with a bounded diagnostic and its original transcript location."""
+    diagnostic = result.stderr.strip()
+    stream = "stderr"
+    if not diagnostic:
+        diagnostic = result.stdout[:4096].decode("utf-8", errors="replace").strip()
+        stream = "stdout"
+    diagnostic = re.sub(
+        r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*$",
+        r"\1[redacted]",
+        redact(diagnostic),
+    )
+    detail = (
+        f" Git diagnostic ({stream}): {display_value(diagnostic)}."
+        if diagnostic
+        else " Git returned no stdout or stderr diagnostic."
+    )
+    return (
+        f"Git exited with {result.return_code}.{detail} "
+        f"Inspect process_get(process_id={result.process_id}) for the transcript."
+    )
 
 
 class GitService:
@@ -129,6 +159,7 @@ class GitService:
         """Serialize repository requests with Workspace and retain per-call process provenance."""
         report = progress(ctx, interval=self.workspace.progress_interval)
         await report(0, message="Opening Git repository")
+        active: Invocation | None = None
         try:
             async with self.workspace.serialized_operation():
                 selected = [
@@ -137,11 +168,24 @@ class GitService:
                     if self.toolset in (item.id, item.name)
                 ]
                 if len(selected) != 1:
-                    raise GitError(f"Expected one Git toolset matching {self.toolset!r}.")
+                    raise GitError(
+                        f"The operator's --git-toolset={display_value(self.toolset)} matched "
+                        f"{len(selected)} toolsets; exactly one is required. "
+                        + available_values(
+                            (item.id for item in self.toolchains.list_toolsets()),
+                            "toolsets_list()",
+                        )
+                        + " Ask the operator to select an unambiguous toolset ID and restart."
+                    )
                 tool = self.toolchains.get_tool(selected[0].id, "git")
                 if tool is None:
-                    raise GitError("The selected toolset has no Git executable.")
-                token = invocation.set(Invocation(cast(git.Methods, tool.methods), report))
+                    raise GitError(
+                        f"Toolset {display_value(selected[0].id)} has no Git executable. "
+                        f"Inspect toolset_get(toolset_id={display_value(selected[0].id)}). "
+                        "Ask the operator to configure Git or select another --git-toolset."
+                    )
+                active = Invocation(cast(git.Methods, tool.methods), report)
+                token = invocation.set(active)
                 try:
                     async with asyncio.timeout(620):
                         await self.repository()
@@ -151,11 +195,22 @@ class GitService:
                     await report(call.updates, message="Git request completed")
                 finally:
                     invocation.reset(token)
+        except GitParseError as error:
+            hint = (
+                f"Inspect process_get(process_id={active.process_ids[-1]}) "
+                if active is not None and active.process_ids
+                else "Inspect processes_overview() "
+            )
+            raise ToolError(
+                f"{error} {hint}and report a Git output compatibility issue."
+            ) from error
         except (GitError, ToolchainError) as error:
             raise ToolError(str(error)) from error
         except TimeoutError as error:
             raise ToolError(
-                "Git request exceeded its total deadline; inspect status before retrying.",
+                "Git request exceeded its 620 s total deadline. "
+                "The operation may have partially completed; inspect git_status() before retrying. "
+                "Use processes_overview() and process_get(process_id=...) to inspect transcripts.",
             ) from error
 
     async def command(
@@ -182,14 +237,17 @@ class GitService:
         except ToolCommandError as error:
             if error.process_id is not None:
                 call.process_ids.append(error.process_id)
-            raise GitError(
-                f"{redact(str(error))} Process: {error.process_id}. "
-                "Inspect repository status before retrying a mutation.",
-            ) from error
+            hint = (
+                f" Inspect process_get(process_id={error.process_id})."
+                if error.process_id is not None
+                else " No process ID is available; check the operator's Git installation."
+            )
+            if not read_only:
+                hint += " Inspect git_status() before retrying this mutation."
+            raise GitError(f"{redact(str(error))}{hint}") from error
         call.process_ids.append(result.process_id)
         if check and result.return_code:
-            reason = redact(result.stderr.strip()) or f"Git exited with {result.return_code}."
-            raise GitError(f"{reason} Process: {result.process_id}.")
+            raise GitError(failure_reason(result))
         return result
 
     async def repository(self) -> None:
@@ -197,29 +255,77 @@ class GitService:
         result = await self.command(["rev-parse", "--show-toplevel"])
         root = Path(parsers.utf8(result.stdout).rstrip("\r\n")).resolve()
         if root != self.workspace.root:
-            raise GitError("The configured workspace must be the Git worktree root.")
+            raise GitError(
+                "The configured workspace must be the Git worktree root; "
+                "the current workspace is a subdirectory of another repository. "
+                "Ask the operator to restart ForgeMCP with --workspace set to that worktree root."
+            )
 
-    async def revision(self, value: str) -> str:
+    async def revision(self, value: str, label: str = "revision") -> str:
         """Resolve a single commit to its immutable OID before using it in another command."""
-        literal_identifier(value, "Revision")
+        literal_identifier(value, label)
         result = await self.command(
             ["rev-parse", "--verify", "--end-of-options", value + "^{commit}"],
+            check=False,
         )
+        if result.return_code:
+            raise GitError(
+                f"{label}={display_value(redact(value))} could not be resolved to a commit. "
+                "Use git_log(), git_branches(), or git_tags() to find a revision. "
+                + failure_reason(result)
+            )
         return parsers.utf8(result.stdout).strip()
 
-    def paths(self, paths: Sequence[WorkspacePath]) -> list[str]:
+    async def branch_name(
+        self,
+        value: str,
+        label: str,
+        *,
+        full: bool = False,
+    ) -> None:
+        """Check a literal branch name while keeping launch failures distinct from invalid names."""
+        literal_identifier(value, label)
+        arguments = (
+            ["check-ref-format", "refs/heads/" + value]
+            if full
+            else ["check-ref-format", "--branch", value]
+        )
+        result = await self.command(arguments, check=False)
+        if result.return_code:
+            raise GitError(
+                f"{label}={display_value(redact(value))} is not a valid branch name. "
+                "Use git_branches() to inspect existing branch references. "
+                + failure_reason(result)
+            )
+
+    def paths(self, paths: Sequence[WorkspacePath], label: str = "paths") -> list[str]:
         """Accept only explicit project paths and reject links or Git administrative paths."""
         if not paths or len(paths) > 1000:
-            raise GitError("Select between 1 and 1000 explicit project paths.")
+            raise GitError(
+                f"{label} contains {len(paths)} paths; select between 1 and 1000 "
+                "explicit project paths. Use git_status() to inspect changed files."
+            )
         result = []
-        for path in paths:
+        for index, path in enumerate(paths):
+            selected = f"{label}[{index}]" if label == "paths" else label
+            argument = f"{selected}={display_value(str(path))}"
             if path.area != "project" or path.relative == ".":
-                raise GitError("Select explicit paths inside project/, not a root or storage path.")
+                raise GitError(
+                    f"{argument} is not an explicit project source path. "
+                    "Select paths such as 'project/src/main.cpp'; "
+                    "Git tools do not accept project/, storage/, or root/ locations. "
+                    "Use git_status() to inspect changed files."
+                )
             if any(part.casefold() == ".git" for part in Path(path.relative).parts):
-                raise GitError("Git administrative paths cannot be selected as source files.")
+                raise GitError(
+                    f"{argument} selects Git administrative data; select a project source file."
+                )
             native = self.workspace.root / path.relative
             if not native.parent.resolve().is_relative_to(self.workspace.root):
-                raise GitError("Git paths cannot traverse links outside the project.")
+                raise GitError(
+                    f"{argument} traverses a link outside the project; "
+                    "select a path whose parent remains inside project/."
+                )
             result.append(path.relative)
         return result
 
@@ -242,7 +348,9 @@ class GitService:
                 return cast(GitOperation, name)
             if "ambiguous" in result.stderr:
                 raise GitError(
-                    "An operation pseudoref is ambiguous with a branch; inspect refs first."
+                    f"Git operation reference {display_value(reference)} "
+                    "is ambiguous with a branch. Inspect git_branches() and ask the operator "
+                    "to resolve the reference collision."
                 )
         return None
 
@@ -281,7 +389,10 @@ class GitService:
                     changes = await self.source_files(before, after) if source_changes else []
                 except (GitError, ToolchainError):
                     sync_error = (
-                        "Git completed, but its resulting source state could not be inspected."
+                        "Git command execution finished, but its resulting repository state "
+                        "could not be inspected; HEAD and conflicts are unknown. "
+                        "Do not repeat the mutation before checking git_status(). "
+                        "Inspect the returned process_ids with process_get(process_id=...)."
                     )
             finally:
                 try:
@@ -294,7 +405,30 @@ class GitService:
                 # A secondary synchronization error must not conceal a completed commit/push.
                 except Exception as error:  # pylint: disable=broad-exception-caught
                     await self.analysis.close_sessions()
-                    sync_error = f"Source synchronization failed: {type(error).__name__}."
+                    outcome = (
+                        "The Git command succeeded. Do not repeat the completed mutation. "
+                        if result is not None and result.return_code == 0
+                        else "Git may have partially changed the repository. "
+                    )
+                    sync_error = (
+                        (sync_error + " " if sync_error else "")
+                        + outcome
+                        + f"CMake/clangd source synchronization failed ({type(error).__name__}); "
+                        "analysis sessions were closed. Inspect git_status() and the returned "
+                        "process_ids with process_get(process_id=...)."
+                    )
+        reason = failure_reason(result) if result.return_code else None
+        if reason is not None:
+            if after.operation is not None:
+                reason += (
+                    f" Unfinished operation: {after.operation}. Inspect git_status() and "
+                    "git_conflicts(); resolve any conflicts and stage their files with "
+                    "git_stage(paths=...), then use "
+                    "git_continue(action='continue'). Use git_continue(action='abort') "
+                    "to explicitly abandon the operation."
+                )
+            else:
+                reason += " Inspect git_status() before retrying the mutation."
         return GitMutation(
             head_before=before.head,
             head_after=after.head,
@@ -307,11 +441,7 @@ class GitService:
             ],
             changes=after.entries,
             process_ids=invocation.get().process_ids.copy(),
-            error=(
-                (redact(result.stderr.strip()) or f"Git exited with {result.return_code}.")
-                if result.return_code
-                else None
-            ),
+            error=reason,
             synchronization_error=sync_error,
             updates=(
                 [redact(line) for line in parsers.utf8(result.stdout).splitlines() if "\t" in line]
@@ -343,7 +473,10 @@ class GitService:
             except FileNotFoundError:
                 kind = 3
             except OSError as error:
-                raise GitError("Cannot inspect a changed source path.") from error
+                raise GitError(
+                    f"Cannot inspect changed source path {display_value(str(path))}: "
+                    f"{os_error_reason(error)}. Check access permissions and inspect git_status()."
+                ) from error
             else:
                 kind = 2
             changes.append(FileChange(path, kind))
@@ -360,16 +493,26 @@ class GitService:
         """Read native raw metadata and patch output for the same resolved comparison."""
         arguments = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames"]
         if mode != "revision" and (base is not None or target is not None):
-            raise GitError("base and target apply only to mode=revision.")
+            raise GitError(
+                "base and target apply only to mode='revision'; "
+                f"received mode={display_value(mode)}, "
+                f"base={display_value(redact(base) if base is not None else None)}, "
+                f"target={display_value(redact(target) if target is not None else None)}. "
+                "Remove base/target or select mode='revision'."
+            )
         if mode == "staged":
             arguments.append("--cached")
         elif mode == "revision":
             if base is None:
-                raise GitError("Revision comparisons require base.")
-            base = await self.revision(base)
+                raise GitError(
+                    "mode='revision' requires base. Supply a commit or reference, "
+                    "for example base='HEAD~1'; "
+                    "use git_log() or git_branches() to inspect revisions."
+                )
+            base = await self.revision(base, "base")
             arguments.append(base)
             if target is not None:
-                target = await self.revision(target)
+                target = await self.revision(target, "target")
                 arguments.append(target)
         suffix = ["--", *(self.paths(paths) if paths is not None else [])]
         raw = await self.command([*arguments, "--raw", "--no-abbrev", "-z", *suffix])
@@ -411,7 +554,7 @@ class GitService:
                 f"--skip={skip}",
                 oid,
                 "--",
-                *(self.paths([path]) if path else []),
+                *(self.paths([path], "path") if path else []),
             ],
         )
         commits = parsers.commits(result.stdout)
@@ -443,7 +586,7 @@ class GitService:
         for line in result.stdout.splitlines():
             fields = line.split(b"\0")
             if len(fields) != 4:
-                raise GitError("Cannot parse Git reference records.")
+                raise GitParseError("Cannot parse Git reference records: expected four NUL fields.")
             name, oid, upstream, current = map(parsers.utf8, fields)
             refs.append(
                 GitRef(name=name, oid=oid, upstream=upstream or None, current=current == "*"),
@@ -452,10 +595,15 @@ class GitService:
 
     async def remote(self, name: str) -> str:
         """Require a configured remote name rather than accepting a URL or helper command."""
-        literal_identifier(name, "Remote")
+        literal_identifier(name, "remote")
         result = await self.command(["remote"])
-        if name not in parsers.utf8(result.stdout).splitlines():
-            raise GitError(f"Unknown configured remote {name!r}.")
+        names = parsers.utf8(result.stdout).splitlines()
+        if name not in names:
+            raise GitError(
+                f"remote={display_value(redact(name))} is not configured. "
+                + available_values(names, "git_remotes()")
+                + (" Ask the operator to configure a remote." if not names else "")
+            )
         return name
 
     # The SDK requires all explicitly typed decorated entrypoints to remain local.
@@ -521,7 +669,10 @@ class GitService:
             async with self.request(ctx):
                 history = await self.history(revision, 1, 0, None)
                 if not history.commits:
-                    raise GitError("An unborn HEAD has no commit to show.")
+                    raise GitError(
+                        "revision='HEAD' has no commit to show because the current branch "
+                        "is unborn. Inspect git_status(); git_show requires an existing commit."
+                    )
                 commit = history.commits[0]
                 if commit.parents:
                     diff = await self.diff("revision", commit.parents[0], commit.oid, None, 3)
@@ -572,9 +723,12 @@ class GitService:
         ) -> Annotated[CallToolResult, GitBlame]:
             """Attribute a committed UTF-8 file or inclusive line range to its commits."""
             async with self.request(ctx):
-                selected = self.paths([path])[0]
+                selected = self.paths([path], "path")[0]
                 if end_line is not None and end_line < start_line:
-                    raise GitError("end_line must not precede start_line.")
+                    raise GitError(
+                        f"end_line={end_line} must not precede start_line={start_line}. "
+                        "Use an inclusive line range with end_line >= start_line."
+                    )
                 oid = await self.revision(revision)
                 command = await self.command(
                     [
@@ -680,7 +834,11 @@ class GitService:
             """Commit the current index with a supplied message and normal repository hooks."""
             async with self.request(ctx):
                 if not message.strip() or "\0" in message:
-                    raise GitError("A nonempty commit message without NUL is required.")
+                    reason = "contains NUL" if "\0" in message else "is empty or whitespace-only"
+                    raise GitError(
+                        f"message {reason}. Supply a commit message containing at least "
+                        "one non-whitespace character and no NUL."
+                    )
                 result = await self.mutate(
                     ["commit", *(["--amend"] if amend else []), "--file=-"],
                     source_changes=True,
@@ -696,7 +854,11 @@ class GitService:
         ) -> Annotated[CallToolResult, GitMutation]:
             """Restore selected working files from the index or an explicit commit."""
             async with self.request(ctx):
-                options = [f"--source={await self.revision(source)}"] if source is not None else []
+                options = (
+                    [f"--source={await self.revision(source, 'source')}"]
+                    if source is not None
+                    else []
+                )
                 result = await self.mutate(
                     ["restore", "--worktree", *options, "--", *self.paths(paths)],
                     source_changes=True,
@@ -713,12 +875,14 @@ class GitService:
         ) -> Annotated[CallToolResult, GitMutation]:
             """Create a branch or delete one, requiring explicit force for unmerged deletion."""
             async with self.request(ctx):
-                literal_identifier(name, "Branch")
-                await self.command(["check-ref-format", "--branch", name])
+                await self.branch_name(name, "name")
                 if action == "create":
                     if force:
-                        raise GitError("force applies only to explicit branch deletion.")
-                    command = ["branch", name, await self.revision(start_point)]
+                        raise GitError(
+                            "force=true applies only to action='delete'; "
+                            "received action='create'. Remove force to create a branch."
+                        )
+                    command = ["branch", name, await self.revision(start_point, "start_point")]
                 else:
                     command = ["branch", "-D" if force else "-d", name]
                 result = await self.mutate(command, source_changes=True)
@@ -733,13 +897,15 @@ class GitService:
         ) -> Annotated[CallToolResult, GitMutation]:
             """Switch or create a branch without force or automatic stash."""
             async with self.request(ctx):
-                literal_identifier(branch, "Branch")
-                await self.command(["check-ref-format", "--branch", branch])
+                await self.branch_name(branch, "branch")
                 if start_point is not None and not create:
-                    raise GitError("start_point requires create=true.")
+                    raise GitError(
+                        f"start_point={display_value(redact(start_point))} requires create=true; "
+                        "received create=false. Omit start_point to switch to an existing branch."
+                    )
                 command = ["switch", "--no-guess", *(["-c"] if create else []), branch]
                 if start_point is not None:
-                    command.append(await self.revision(start_point))
+                    command.append(await self.revision(start_point, "start_point"))
                 result = await self.mutate(command, source_changes=True)
                 return tool_result(result, render(result))
 
@@ -761,7 +927,9 @@ class GitService:
                     if fields[-1] == b"":
                         fields.pop()
                     if len(fields) % 3:
-                        raise GitError("Cannot parse Git stash records.")
+                        raise GitParseError(
+                            "Cannot parse Git stash records: expected groups of three NUL fields."
+                        )
                     state = await self.status()
                     result = GitStashResult(
                         head_before=state.head,
@@ -782,7 +950,7 @@ class GitService:
                     return tool_result(result, render(result))
                 if action == "save":
                     if message is not None and "\0" in message:
-                        raise GitError("Stash messages cannot contain NUL.")
+                        raise GitError("message contains NUL; remove it from the stash message.")
                     command = [
                         "stash",
                         "push",
@@ -791,7 +959,11 @@ class GitService:
                     ]
                 else:
                     if not re.fullmatch(r"stash@\{[0-9]+\}", reference):
-                        raise GitError("Select a stash reflog reference such as stash@{0}.")
+                        raise GitError(
+                            f"reference={display_value(redact(reference))} is invalid; "
+                            "expected stash@{N}, for example stash@{0}. "
+                            "Use git_stash(action='list') to list available references."
+                        )
                     command = ["stash", action, reference]
                 changed = await self.mutate(command, source_changes=True)
                 result = GitStashResult(**changed.model_dump())
@@ -827,7 +999,10 @@ class GitService:
             """Pull without auto-stash; fast-forward only is the default integration strategy."""
             async with self.request(ctx):
                 if branch is not None and remote is None:
-                    raise GitError("An explicit branch requires an explicit configured remote.")
+                    raise GitError(
+                        f"branch={display_value(redact(branch))} requires remote; "
+                        "received remote=null. Use git_remotes() to choose a configured remote."
+                    )
                 command = ["pull", "--no-recurse-submodules", "--no-autostash"]
                 if strategy == "rebase":
                     command.extend(["--rebase", "--ff"])
@@ -842,8 +1017,7 @@ class GitService:
                 if remote is not None:
                     command.append(await self.remote(remote))
                 if branch is not None:
-                    literal_identifier(branch, "Remote branch")
-                    await self.command(["check-ref-format", "refs/heads/" + branch])
+                    await self.branch_name(branch, "branch", full=True)
                     command.append("refs/heads/" + branch)
                 result = await self.mutate(command, source_changes=True)
                 return tool_result(result, render(result))
@@ -862,13 +1036,21 @@ class GitService:
                 state = await self.status()
                 target = branch or state.branch
                 if target is None:
-                    raise GitError("Detached HEAD requires an explicit destination branch.")
-                literal_identifier(target, "Destination branch")
-                await self.command(["check-ref-format", "refs/heads/" + target])
+                    raise GitError(
+                        "branch is required because HEAD is detached. Specify the destination "
+                        "branch explicitly; inspect git_branches() for existing references."
+                    )
+                await self.branch_name(target, "branch", full=True)
                 command = ["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no"]
                 if expected_remote_oid is not None:
                     if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected_remote_oid):
-                        raise GitError("expected_remote_oid must be a full remote object ID.")
+                        raise GitError(
+                            "expected_remote_oid must contain exactly 40 or 64 hexadecimal "
+                            f"characters; received {display_value(redact(expected_remote_oid))} "
+                            f"({len(expected_remote_oid)} characters). Inspect git_branches() "
+                            "for the last fetched remote-tracking OID; use git_fetch(remote=...) "
+                            "to refresh it before deciding whether to replace history."
+                        )
                     command.append(f"--force-with-lease=refs/heads/{target}:{expected_remote_oid}")
                 if set_upstream:
                     command.append("--set-upstream")
@@ -885,7 +1067,7 @@ class GitService:
             """Merge one commit, preserving conflicts for explicit resolution and continuation."""
             async with self.request(ctx):
                 if message is not None and "\0" in message:
-                    raise GitError("Merge message cannot contain NUL.")
+                    raise GitError("message contains NUL; remove it from the merge message.")
                 command = ["merge", "--no-autostash", "--no-edit"]
                 if message is not None:
                     command.extend(["--message", message])
@@ -912,8 +1094,14 @@ class GitService:
             """Cherry-pick an explicit ordered commit list with resumable conflict state."""
             async with self.request(ctx):
                 if not revisions or len(revisions) > 100:
-                    raise GitError("Select between 1 and 100 commits.")
-                resolved = [await self.revision(value) for value in revisions]
+                    raise GitError(
+                        f"revisions contains {len(revisions)} commits; select between 1 and 100. "
+                        "Use git_log() to inspect commit IDs."
+                    )
+                resolved = [
+                    await self.revision(value, f"revisions[{index}]")
+                    for index, value in enumerate(revisions)
+                ]
                 result = await self.mutate(
                     [
                         "cherry-pick",
@@ -933,8 +1121,14 @@ class GitService:
             """Revert an ordered commit list without opening an editor."""
             async with self.request(ctx):
                 if not revisions or len(revisions) > 100:
-                    raise GitError("Select between 1 and 100 commits.")
-                resolved = [await self.revision(value) for value in revisions]
+                    raise GitError(
+                        f"revisions contains {len(revisions)} commits; select between 1 and 100. "
+                        "Use git_log() to inspect commit IDs."
+                    )
+                resolved = [
+                    await self.revision(value, f"revisions[{index}]")
+                    for index, value in enumerate(revisions)
+                ]
                 result = await self.mutate(
                     [
                         "revert",
@@ -1005,12 +1199,22 @@ class GitService:
             async with self.request(ctx):
                 current = await self.operation()
                 selected = operation or current
-                if selected is None or (current is not None and selected != current):
+                if current is None:
                     raise GitError(
-                        "Select the current unfinished merge/rebase/cherry-pick/revert operation.",
+                        f"There is no unfinished Git operation for action={display_value(action)}. "
+                        "Use git_status() to inspect repository state."
+                    )
+                if selected != current:
+                    raise GitError(
+                        f"operation={display_value(selected)} does not match the unfinished "
+                        f"operation {display_value(current)}. Use git_status() to inspect state; "
+                        f"select operation={display_value(current)} or omit operation."
                     )
                 if selected == "merge" and action == "skip":
-                    raise GitError("Merge supports continue or abort, not skip.")
+                    raise GitError(
+                        "action='skip' is not supported for operation='merge'. "
+                        "Allowed actions: 'continue', 'abort'."
+                    )
                 command = [
                     "-c",
                     "core.editor=true",

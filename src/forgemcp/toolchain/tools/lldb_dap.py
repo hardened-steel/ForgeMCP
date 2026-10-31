@@ -113,7 +113,7 @@ def content_length(header: bytes, maximum: int) -> int:
         raise ValueError("Invalid DAP content length.")
     length = int(lengths[0])
     if length > maximum:
-        raise ToolParserError("DAP message exceeds the byte limit.")
+        raise ToolParserError(f"DAP message exceeds the {maximum}-byte limit for a body.")
     return length
 
 
@@ -163,7 +163,10 @@ class Connection:
                 separators=(",", ":"),
             ).encode("utf-8")
             if len(body) > self.MAX_MESSAGE_BYTES:
-                raise ToolParserError("Outgoing DAP message exceeds the byte limit.")
+                raise ToolParserError(
+                    "Outgoing DAP message exceeds the "
+                    f"{self.MAX_MESSAGE_BYTES}-byte limit for a body."
+                )
             header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
             async with self.write_lock:
                 await self.session.write_stdin((header + body).decode("latin_1"))
@@ -194,10 +197,14 @@ class Connection:
                         end = buffer.find(b"\r\n\r\n")
                         if end < 0:
                             if len(buffer) > self.MAX_HEADER_BYTES:
-                                raise ToolParserError("DAP header exceeds the byte limit.")
+                                raise ToolParserError(
+                                    f"DAP header exceeds the {self.MAX_HEADER_BYTES}-byte limit."
+                                )
                             break
                         if end > self.MAX_HEADER_BYTES:
-                            raise ToolParserError("DAP header exceeds the byte limit.")
+                            raise ToolParserError(
+                                f"DAP header exceeds the {self.MAX_HEADER_BYTES}-byte limit."
+                            )
                         length = content_length(
                             bytes(buffer[:end]),
                             self.MAX_MESSAGE_BYTES,
@@ -259,6 +266,7 @@ def create_spec(
         # Version probes deliberately retain each tool's explicit process policy.
         # pylint: disable=duplicate-code
         output = {"stdout": "", "stderr": ""}
+        session = None
         try:
             async with await processes.launch(
                 path,
@@ -278,7 +286,11 @@ def create_spec(
                         process_id=session.process_id,
                     )
         except ProcessError as error:
-            raise ToolCommandError("Cannot read lldb-dap version.") from error
+            raise ToolCommandError(
+                "Cannot read lldb-dap version within its 15-second limit. "
+                "The operator should check the selected executable and toolset environment.",
+                process_id=session.process_id if session is not None else None,
+            ) from error
         for text in output.values():
             if match := re.search(
                 r"(?:LLVM|lldb-dap|lldb) version ([0-9][^\s]*)",
@@ -286,13 +298,18 @@ def create_spec(
                 re.IGNORECASE,
             ):
                 return match.group(1)
-        raise ToolParserError("Cannot parse lldb-dap version.")
+        raise ToolCommandError(
+            "Cannot parse lldb-dap version from the first 4096 characters of each stream. "
+            f"Inspect process_get(process_id={session.process_id}).",
+            process_id=session.process_id,
+        )
 
     @asynccontextmanager
     async def connect(cwd: Path) -> AsyncGenerator[Connection]:
         """Own an adapter process with reversible bytes and no session-wide timeout."""
         # Each ToolSpec explicitly owns its process environment and stream policy.
         # pylint: disable=duplicate-code
+        session = None
         try:
             async with await processes.launch(
                 path,
@@ -305,7 +322,12 @@ def create_spec(
             ) as session:
                 yield Connection(session)
         except ProcessError as error:
-            raise ToolCommandError("Cannot run lldb-dap.") from error
+            raise ToolCommandError(
+                "Cannot run lldb-dap for the selected toolset_id/adapter. "
+                "Call debugger_adapters(); the operator should check the selected "
+                "executable and toolset environment before opening another target.",
+                process_id=session.process_id if session is not None else None,
+            ) from error
 
     methods: Methods = {
         "connect": connect,
