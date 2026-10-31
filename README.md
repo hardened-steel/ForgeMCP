@@ -162,8 +162,10 @@ Each instance tab offers:
   confirmation for commands initiated from the panel.
 
 Settings are read-only. Command controls start hidden; select **Enable command
-controls** to call an existing tool with literal JSON arguments; the catalog shows
-its input schema. These
+controls** to call an existing tool using fields generated from its input schema.
+JSON input remains available for complete arguments. Resource templates provide
+parameter fields and native MCP completion suggestions, using other entered
+parameters as context. These
 calls pass through the same SDK handlers, validation, and feature locks as stdio
 calls. There is no panel-wide execution queue. Existing modules decide which
 operations may run concurrently.

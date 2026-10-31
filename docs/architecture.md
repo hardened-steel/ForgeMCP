@@ -1058,8 +1058,8 @@ network administration service.
 ### SDK reuse and call history
 
 Hub commands use the existing SDK client methods for catalog listing, tool calls,
-resource reads, and template listing. This preserves handler schemas, validation,
-real request Context, progress, and SDK elicitation behavior. Direct
+resource reads, template listing, and completions. This preserves handler schemas,
+validation, real request Context, progress, and SDK elicitation behavior. Direct
 `MCPServer.call_tool()` is not used by HTTP handlers: it bypasses middleware and
 does not construct a transport request Context. Apps support is advertised by the
 in-process client. Concurrent commands reach the same feature service instances;
@@ -1117,6 +1117,7 @@ the authenticated browser session, `/api/events` streams invalidations, and
 | `GET /resources` | SDK static resource listing |
 | `GET /resource-templates` | SDK resource-template listing |
 | `GET /resources?uri=...` | Read the selected resource through the SDK |
+| `POST /completion` | Request native SDK completion with MCP `ref`, `argument`, and optional `context.arguments` |
 | `GET /elicitations` | Pending questions for this instance's admin client |
 | `POST /elicitations/{id}` | Supply an SDK elicitation `{"result": {...}}` |
 
@@ -1133,7 +1134,12 @@ registering a runtime; `unregister` ends an instance's registration.
 
 Each registered runtime has a tab with its own selected history record, catalog,
 read-only settings, and monitors. Existing tool schemas drive command controls,
-with JSON arguments available for complete input. Command controls are initially
+with labeled fields for ordinary input and JSON arguments available for complete
+input. Resource-template fields request native MCP completions using the original
+template reference and other entered parameters as context. The same bridge accepts
+prompt references without inventing a separate suggestion provider. Completion
+requests use the authenticated, CSRF-protected `POST /completion` route and never
+execute a tool. Command controls are initially
 hidden and must be explicitly enabled in the panel; this UI choice does not create
 a second authorization or validation policy for the tools.
 
