@@ -18,6 +18,7 @@ const widgets = {
   "cmake-run-test": "cmake-run-test",
   clangd: "clangd-result",
   "git-result": "git-result",
+  "debugger-result": "debugger-result",
   admin: "admin",
   sandbox: "sandbox",
 };

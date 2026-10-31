@@ -29,6 +29,7 @@ class CustomBuildHook(BuildHookInterface):
             Path(self.root) / "src" / "forgemcp" / "assets" / "process-details.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "toolsets.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "clangd-result.html",
+            Path(self.root) / "src" / "forgemcp" / "assets" / "debugger-result.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "admin.html",
             Path(self.root) / "src" / "forgemcp" / "assets" / "sandbox.html",
             *(

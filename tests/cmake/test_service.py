@@ -755,6 +755,14 @@ async def test_shutdown_cancels_startup_before_closing_clangd_and_releases_comma
     """Cancel an active configure before its subscriber and process service are closed."""
     started = asyncio.Event()
     cancelled = asyncio.Event()
+    debugger_closed = asyncio.Event()
+
+    async def close_debugger():
+        """Keep debugger teardown after startup cancellation and before analysis teardown."""
+        assert cancelled.is_set() and not runtime.analysis.closed
+        debugger_closed.set()
+
+    runtime.debugger = MagicMock(close=close_debugger)
 
     async def configure(*_args, **_kwargs):
         """Wait for shutdown and verify clangd is alive while configure unwinds."""
@@ -771,6 +779,7 @@ async def test_shutdown_cancels_startup_before_closing_clangd_and_releases_comma
             await started.wait()
             assert runtime.builds.operation_lock.locked()
     assert cancelled.is_set() and runtime.startup_configure_task.cancelled()
+    assert debugger_closed.is_set()
     assert not runtime.builds.operation_lock.locked()
     assert not runtime.builds.configuration_subscribers
     assert await runtime.builds.compilation_contexts() == []

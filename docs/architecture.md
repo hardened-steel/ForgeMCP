@@ -8,7 +8,8 @@ external-program lifecycle, text transcripts, timeouts, and a read-only inspecti
 surface for development commands. CMake now configures, builds, and tests operator
 profiles, and directly runs explicit test executables with command-line arguments.
 Read-only clangd analysis is mounted through MCP tools and workspace
-result providers, with a shared analysis widget. Quality and debugger remain future work.
+result providers, with a shared analysis widget. Debugger sessions provide native
+control and user-mode dump inspection through LLDB-DAP. Quality remains future work.
 The `toolchain` service discovers independent toolsets once at startup and exposes
 their paths and on-demand versions through a read-only MCP surface.
 CLI instances also join a same-user local administration Hub by default. Each
@@ -554,6 +555,9 @@ module. `close()` and context exit stop a remaining process and await all worker
 session exposes `process_id` and `returncode` without exposing its queue protocol as
 the consumer API.
 
+Closing an empty stdin after the child has closed its pipe is normal EOF. Errors
+flushing buffered input or an encoder's final bytes remain process stream failures.
+
 Two local operator actions also belong to the process module: `start_detached`
 starts a Hub with explicit arguments and disconnected standard streams, and
 `open_browser` opens the operator-requested admin URL. They are not MCP execution
@@ -587,8 +591,11 @@ Cancellation of an individual I/O or wait operation does not close the session.
 Explicit `close()` and context exit await cleanup, including during cancellation.
 Launch directly awaits `asyncio.create_subprocess_exec` without a separate task or
 custom cancellation handler. Cleanup after worker failure drains unread pipes without
-retaining the discarded tail. Process
-groups and descendant-tree management are intentionally outside the current scope.
+retaining the discarded tail. Termination also closes an owned Windows job and
+stops captured descendants through psutil. Windows jobs use kill-on-close, including
+when the managed parent finishes; this is relevant when a debugger adapter owns a
+launched target. Detaching and preserving an adapter-launched child is not an
+available debugger close policy.
 
 The read-only MCP surface consists of `processes_overview(status)`,
 `process_get(process_id)`, their widgets, `forgemcp://processes`, and
@@ -650,10 +657,9 @@ There is no generic ToolCommand, parser registry, or CommandExecution wrapper.
 
 Current implementations provide only version methods, with a 15-second process limit
 and a small retained banner from each output stream. They consume both streams and
-check exit status before returning a parsed version string. `cl`, `link`, `cppvsdbg`,
-and `lldb-dap` currently have empty method dictionaries. Longer sessions can later be
-exposed through explicitly typed iterator or context-manager methods without changing
-the containers.
+check exit status before returning a parsed version string. `cl`, `link`, and
+`cppvsdbg` currently have empty method dictionaries. LLDB-DAP additionally exposes
+its typed connection context manager, preserving the existing ToolSpec containers.
 
 Only MCP detail handlers call `methods["version"]()` when available. Versions are not
 cached: each details request obtains fresh values; unsupported, failed, or unrecognized
@@ -794,6 +800,75 @@ External diagnostics are excluded, but symbol locations may reference external f
 The path type exposes an inline JSON Schema string, without a `$ref` indirection.
 External files never have text/raw mirror resources, even after reading is approved;
 resource requests for them raise `ResourceNotFoundError`.
+
+## Debugger sessions
+
+`DebuggerService` receives ToolchainService and an explicit
+adapter-name-to-session-factory mapping from `server.py`. LLDB-DAP is the initial
+implementation. This abstract session boundary is an explicit product requirement
+for future adapters; there is no dynamic plugin discovery or generic driver hierarchy.
+No debugger process starts during server initialization. Sessions belong to the
+runtime and close before ProcessService at final shutdown. The admin bridge hides
+all `debugger_*` tools and rejects direct calls before SDK execution. Debugger
+handlers and drivers contain no administration-specific execution logic.
+
+`debugger/session.py` defines `DebugSession`, the adapter-independent ABC for launch,
+attach, dump opening, breakpoints, control, bounded waiting, inspection, and closing.
+`debugger/models.py` holds shared Pydantic options and results used by the service,
+driver, and text presentation. Public file paths use WorkspacePath. The concrete
+`LldbDapSession` in `debugger/lldb_dap.py` owns DAP request correlation, its single
+continuous reader, capability interpretation, target state, and opaque handles.
+The selected `toolchain/tools/lldb_dap.py` ToolSpec owns its ProcessSession and
+framed connection, exposing typed request, response, and event envelopes. UTF-8
+body byte lengths are transported through strict reversible Latin-1, as with clangd.
+Protocol headers and message bodies have explicit limits. Process lifetime has no
+total/idle timeout; individual debugger operations have finite deadlines.
+
+Startup interleaves the pending launch/attach request with the adapter's initialized
+event, initial breakpoints, and configurationDone. It never awaits launch completion
+before configuring. User options do not supply raw debugger commands or expressions.
+Source breakpoints use lines; source locations do not mislabel DAP UTF-16 columns
+as clangd's code-point coordinates. Source paths remain unverified against the
+loaded image; automatic external source reads and binary freshness claims are absent.
+Git/source changes and CMake context invalidation do not restart live debug sessions.
+
+Each snapshot separates session phase from target execution state and contains
+exactly one nullable discriminated `status`: stopped details, target exit code,
+or adapter/session failure. There are no parallel snapshot stop/error/exit-code
+fields. A transport failure never supplies an invented target exit code. The driver
+retains monotonic state revisions and separate inspection generations. Frames,
+variable containers, and memory handles are opaque and bound to one session and
+generation. Inspection verifies the generation both before and after the response.
+Resume-implying operations invalidate references before sending requests, even if
+the adapter emits no continued event. Partial thread stops remain explicit.
+
+Execution receipts identify bounded retained futures. Stop/terminal observations
+are captured even when they arrive before the caller starts waiting. A wait timeout
+returns current state without cancelling execution. Cancelling ordinary inspection
+or waiting does not close the target. A timed-out control request can have an
+unknown outcome and is not automatically retried. Closing is idempotent and
+cancellation-safe: launch terminates its target, attach detaches, and dump releases
+analysis resources. Close results report physical adapter closure independently
+from confirmed or unknown target disposition. ProcessService retains the only full
+protocol transcript; the driver keeps no second full journal.
+
+Debugger errors identify the JSON field, including nested option and initial
+breakpoint paths. Initial source paths and literal function names are validated
+before target launch. Unknown session/adapter IDs and exception filters use retained
+catalogs with the shared eight-value limit. SDK validation keeps argument indices
+without repeating argument text or environment data. Adapter rejections do not echo
+raw protocol messages; errors link the retained session and adapter process transcript.
+Timeouts explain the deadline and uncertain mutations; close errors retain the
+physical closure and target disposition instead of suggesting another launch.
+
+All debugger tools use one packaged `debugger-result.html` widget and separate icon,
+explicit typed SDK responses, and a feature-owned readable text renderer. The widget
+renders one immutable invocation and makes no tool calls. Scripted adapter tests
+exercise protocol ordering, references, capabilities, cancellation, sparse memory,
+and closing. Opt-in real LLDB-DAP checks build isolated acceptance fixtures and
+exercise launch/inspection/stepping, attach/detach, and Windows minidump inspection.
+Set `FORGEMCP_REAL_DEBUGGER=1` to run them with LLVM, CMake, Ninja, and a working
+compiler environment. No automated widget tests are added.
 
 ## MCP Apps and widget packaging
 
@@ -1282,7 +1357,7 @@ The likely order is:
    process launches continue through ProcessService.
 2. finish migrating backend tests for Workspace providers and clangd lifecycle;
 3. formatting, static analysis, and sanitizer parsing;
-4. debugger adapter lifecycle and DAP operations;
+4. extend debugger coverage to additional qualified adapters and target formats;
 5. persistent process transcripts and configurable retention limits.
 
 This ordering is guidance, not a framework contract. Add the smallest end-to-end slice

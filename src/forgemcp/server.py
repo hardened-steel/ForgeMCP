@@ -13,6 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import get_close_matches
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -35,6 +36,8 @@ from forgemcp.cmake.service import CMakeService
 from forgemcp.cmake.workspace import CMakeProvider
 from forgemcp.clangd.service import ClangdService
 from forgemcp.completion import Complete
+from forgemcp.debugger.lldb_dap import LldbDapSession
+from forgemcp.debugger.service import DebuggerService
 from forgemcp.diagnostics import argument_errors, display_value
 from forgemcp.git.service import GitService
 from forgemcp.process.service import ProcessService
@@ -108,6 +111,7 @@ class ServerRuntime:
     history: MemoryHistory
     settings: dict[str, Any]
     git: GitService | None = None
+    debugger: DebuggerService | None = None
     mcp: MCPServer = field(init=False)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -145,9 +149,13 @@ class ServerRuntime:
                 await asyncio.gather(self.startup_configure_task, return_exceptions=True)
         finally:
             try:
-                await self.analysis.close()
+                if self.debugger is not None:
+                    await self.debugger.close()
             finally:
-                await self.processes.close()
+                try:
+                    await self.analysis.close()
+                finally:
+                    await self.processes.close()
 
     @asynccontextmanager
     async def lifespan(self) -> AsyncGenerator[dict[str, object]]:
@@ -376,7 +384,18 @@ def create_runtime(
         analysis,
         toolset=git_toolset,
     )
-    services = (workspace, processes, toolchains, builds, analysis, repository)
+    debugger = DebuggerService(
+        toolchains,
+        {
+            "lldb-dap": partial(
+                LldbDapSession,
+                project_root=workspace.root,
+                storage_root=workspace.storage_root,
+            ),
+        },
+        progress_interval=progress_interval,
+    )
+    services = (workspace, processes, toolchains, builds, analysis, repository, debugger)
     apps = Apps()
     complete = Complete()
     history = MemoryHistory()
@@ -397,6 +416,7 @@ def create_runtime(
             "toolset_definitions": toolsets or [],
         },
         git=repository,
+        debugger=debugger,
     )
 
     @asynccontextmanager
