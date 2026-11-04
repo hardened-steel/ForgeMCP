@@ -1077,8 +1077,20 @@ interval, then CMake's source-change interval. CMake finishes and releases its l
 before clangd reconciles approved contexts. `CMakeProvider` and Git share
 `begin_source_change`/`finish_source_change`; unknown changes withdraw uncertain
 contexts. Source notifications combine pre/post dirty paths with committed tree
-diffs, without a project scan. Failure/cancellation still finalizes dependency
-checks; refresh failures cannot conceal a completed commit or push. There is no
+diffs. Before and after each mutation, bounded `git ls-files --cached --others
+--exclude-standard -z` catalogs supply source paths for `lstat` kind/existence
+snapshots, limited to 100,000 distinct paths and the existing command output budget.
+Snapshots also include explicit stage/unstage/restore paths; the after-snapshot
+retains every before-path even if it left the index or became ignored. Staging,
+committing, and ref-only changes therefore preserve structural-dependent contexts
+when physical paths and kinds remain unchanged. Actual additions, deletions,
+renames, and type changes invalidate structural-dependent trees; newly visible
+paths with no previous kind are conservatively structural changes. Source text is
+not read for these snapshots, and linked parents cannot escape the project root.
+Ignored-only changes and empty directories outside this catalog are not tracked.
+Failure/cancellation still finalizes dependency checks; unknown post-command state
+withdraws uncertain contexts. A failed pre-command snapshot starts no mutation.
+Refresh failures cannot conceal a completed commit or push. There is no
 Hub-wide execution queue or cross-instance source/build coordination.
 
 Every Git tool binds `assets/git-result.html`, built from `frontend/git-result.html`,

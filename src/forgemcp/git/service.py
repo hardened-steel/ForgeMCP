@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+import stat
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -134,6 +135,7 @@ class GitService:
     COMMIT_URI = "forgemcp://git/commits/{revision}"
     COMMIT_FORMAT = "%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B"
     MAX_BYTES = 4 * 1024 * 1024
+    MAX_SOURCE_PATHS = 100_000
 
     def __init__(
         self,
@@ -369,12 +371,13 @@ class GitService:
         self,
         arguments: Sequence[str],
         *,
-        source_changes: bool = False,
+        source_paths: Sequence[WorkspacePath] = (),
         stdin: str | None = None,
     ) -> GitMutation:
         """Run a mutation once and reconcile source consumers even after partial failure."""
         before = await self.status()
-        completed = False
+        sources = await self.source_snapshot(source_paths)
+        structural = True
         sync_error = None
         result = None
         after = GitStatus()
@@ -383,23 +386,29 @@ class GitService:
             context = await self.cmake.begin_source_change()
             try:
                 result = await self.command(arguments, check=False, read_only=False, stdin=stdin)
-                completed = True
                 try:
                     after = await self.status()
-                    changes = await self.source_files(before, after) if source_changes else []
+                    structural = sources != await self.source_snapshot(sources)
+                    changes = await self.source_files(before, after)
                 except (GitError, ToolchainError):
                     sync_error = (
-                        "Git command execution finished, but its resulting repository state "
-                        "could not be inspected; HEAD and conflicts are unknown. "
-                        "Do not repeat the mutation before checking git_status(). "
-                        "Inspect the returned process_ids with process_get(process_id=...)."
+                        "Git command execution finished, but the resulting repository/source "
+                        "state could not be fully verified. Treat unverified state as unknown. "
+                        + (
+                            "The Git command succeeded. Do not repeat the completed mutation. "
+                            if result.return_code == 0
+                            else "The Git command failed and may have partially changed the "
+                            "repository. Do not repeat it before checking git_status(). "
+                        )
+                        + "Inspect git_status() and the returned process_ids with "
+                        "process_get(process_id=...)."
                     )
             finally:
                 try:
                     await self.cmake.finish_source_change(
                         context,
-                        structural=source_changes,
-                        uncertain=not completed or changes is None,
+                        structural=structural,
+                        uncertain=result is None or changes is None,
                     )
                     await self.analysis.refresh_source_changes(changes)
                 # A secondary synchronization error must not conceal a completed commit/push.
@@ -450,6 +459,62 @@ class GitService:
             ),
         )
 
+    async def source_snapshot(
+        self,
+        paths: Collection[WorkspacePath] = (),
+    ) -> dict[WorkspacePath, int | None]:
+        """Record physical kinds of Git-visible paths, retaining previous and explicit names.
+
+        Newly visible paths have an unknown previous kind and conservatively change the
+        snapshot without reading source text.
+        """
+        result = await self.command(
+            ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        )
+        selected = set(paths)
+        for raw in result.stdout.split(b"\0"):
+            if raw:
+                selected.add(parsers.qualified(raw))
+        if len(selected) > self.MAX_SOURCE_PATHS:
+            raise GitError(
+                f"Git source snapshot exceeds the {self.MAX_SOURCE_PATHS}-path limit. "
+                "Inspect git_status() and exclude generated or unrelated untracked files "
+                "with .gitignore before another Git mutation. "
+                f"Inspect process_get(process_id={result.process_id}) for the source catalog."
+            )
+        snapshot = {}
+        try:
+            for index, path in enumerate(selected):
+                snapshot[path] = self.source_kind(path)
+                if index % 256 == 0:
+                    await asyncio.sleep(0)
+        except GitError as error:
+            raise GitError(
+                f"{error} Inspect process_get(process_id={result.process_id}) "
+                "for the source catalog."
+            ) from error
+        return snapshot
+
+    def source_kind(self, path: WorkspacePath) -> int | None:
+        """Inspect a project entry itself without following it or escaping through its parents."""
+        native = self.workspace.root / path.relative
+        try:
+            if not native.parent.resolve().is_relative_to(self.workspace.root):
+                raise GitError(
+                    f"Cannot inspect source path {display_value(str(path))}: its parent "
+                    "traverses a link outside project/. Inspect git_status() and ask the "
+                    "operator to keep source parents inside the configured project."
+                )
+            metadata = native.lstat()
+            return stat.S_IFLNK if native.is_junction() else stat.S_IFMT(metadata.st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise GitError(
+                f"Cannot inspect source path {display_value(str(path))}: "
+                f"{os_error_reason(error)}. Check access permissions and inspect git_status()."
+            ) from error
+
     async def source_files(self, before: GitStatus, after: GitStatus) -> list[FileChange]:
         """Combine dirty paths and committed tree changes without scanning the project."""
         affected = {entry.path for entry in [*before.entries, *after.entries]}
@@ -468,17 +533,7 @@ class GitService:
                     affected.add(change.original_path)
         changes = []
         for path in sorted(affected):
-            try:
-                (self.workspace.root / path.relative).lstat()
-            except FileNotFoundError:
-                kind = 3
-            except OSError as error:
-                raise GitError(
-                    f"Cannot inspect changed source path {display_value(str(path))}: "
-                    f"{os_error_reason(error)}. Check access permissions and inspect git_status()."
-                ) from error
-            else:
-                kind = 2
+            kind = 3 if self.source_kind(path) is None else 2
             changes.append(FileChange(path, kind))
         return changes
 
@@ -798,7 +853,7 @@ class GitService:
             async with self.request(ctx):
                 result = await self.mutate(
                     ["add", "--all", "--", *self.paths(paths)],
-                    source_changes=True,
+                    source_paths=paths,
                 )
                 return tool_result(result, render(result))
 
@@ -822,7 +877,7 @@ class GitService:
                         *selected,
                     ]
                 )
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command, source_paths=paths)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=writes)
@@ -841,7 +896,6 @@ class GitService:
                     )
                 result = await self.mutate(
                     ["commit", *(["--amend"] if amend else []), "--file=-"],
-                    source_changes=True,
                     stdin=message,
                 )
                 return tool_result(result, render(result))
@@ -861,7 +915,7 @@ class GitService:
                 )
                 result = await self.mutate(
                     ["restore", "--worktree", *options, "--", *self.paths(paths)],
-                    source_changes=True,
+                    source_paths=paths,
                 )
                 return tool_result(result, render(result))
 
@@ -885,7 +939,7 @@ class GitService:
                     command = ["branch", name, await self.revision(start_point, "start_point")]
                 else:
                     command = ["branch", "-D" if force else "-d", name]
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=writes)
@@ -906,7 +960,7 @@ class GitService:
                 command = ["switch", "--no-guess", *(["-c"] if create else []), branch]
                 if start_point is not None:
                     command.append(await self.revision(start_point, "start_point"))
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=writes)
@@ -965,7 +1019,7 @@ class GitService:
                             "Use git_stash(action='list') to list available references."
                         )
                     command = ["stash", action, reference]
-                changed = await self.mutate(command, source_changes=True)
+                changed = await self.mutate(command)
                 result = GitStashResult(**changed.model_dump())
                 return tool_result(result, render(result))
 
@@ -985,7 +1039,6 @@ class GitService:
                         "--prune" if prune else "--no-prune",
                         name,
                     ],
-                    source_changes=True,
                 )
                 return tool_result(result, render(result))
 
@@ -1019,7 +1072,7 @@ class GitService:
                 if branch is not None:
                     await self.branch_name(branch, "branch", full=True)
                     command.append("refs/heads/" + branch)
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=network)
@@ -1055,7 +1108,7 @@ class GitService:
                 if set_upstream:
                     command.append("--set-upstream")
                 command.extend([name, f"HEAD:refs/heads/{target}"])
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=writes)
@@ -1072,7 +1125,7 @@ class GitService:
                 if message is not None:
                     command.extend(["--message", message])
                 command.append(await self.revision(revision))
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @apps.tool(resource_uri=self.WIDGET.uri, icons=[icon], annotations=writes)
@@ -1081,7 +1134,6 @@ class GitService:
             async with self.request(ctx):
                 result = await self.mutate(
                     ["rebase", "--no-autostash", await self.revision(revision)],
-                    source_changes=True,
                 )
                 return tool_result(result, render(result))
 
@@ -1108,7 +1160,6 @@ class GitService:
                         *(["--mainline", str(mainline)] if mainline else []),
                         *resolved,
                     ],
-                    source_changes=True,
                 )
                 return tool_result(result, render(result))
 
@@ -1136,7 +1187,6 @@ class GitService:
                         *(["--mainline", str(mainline)] if mainline else []),
                         *resolved,
                     ],
-                    source_changes=True,
                 )
                 return tool_result(result, render(result))
 
@@ -1223,7 +1273,7 @@ class GitService:
                     selected.replace("_", "-"),
                     f"--{action}",
                 ]
-                result = await self.mutate(command, source_changes=True)
+                result = await self.mutate(command)
                 return tool_result(result, render(result))
 
         @mcp.resource(self.STATUS_URI, mime_type="text/plain", icons=[icon])
