@@ -1,6 +1,7 @@
 import { App, PostMessageTransport, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { createResultView } from "./result-view.js";
 import { loadResultClangd, loadResultDiff, loadResultSkippedFiles } from "./result-resources.js";
+import { restoreStructuredContent } from "./tool-result.js";
 import "./widget.css";
 
 /** Lifecycle bridge and immutable result-resource loading; never calls tools. */
@@ -27,7 +28,8 @@ export async function connectWidget({ toolName, describe, renderValue }) {
   };
   app.addEventListener("toolinput", invalidate(view.pending));
   app.addEventListener("toolinputpartial", invalidate(view.pending));
-  app.addEventListener("toolresult", async (result) => {
+  app.addEventListener("toolresult", async (message) => {
+    const result = restoreStructuredContent(message);
     const current = ++generation;
     view.receive(result);
     const data = result?.structuredContent;

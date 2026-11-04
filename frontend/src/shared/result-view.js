@@ -346,7 +346,7 @@ export function createResultView(root, { toolName, describe, renderValue }) {
   function receive(result) {
     if (disposed) return;
     clear("");
-    if (!result || result.structuredContent === undefined || result.isError) {
+    if (!result || result.structuredContent == null || result.isError) {
       const texts = (result?.content ?? []).filter((item) => item.type === "text").map((item) => item.text);
       const message = result?.isError ? "Tool returned an error." : "No structured result was provided.";
       content.append(element("p", "fm-empty", message));

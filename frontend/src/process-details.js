@@ -1,5 +1,6 @@
 import { App, PostMessageTransport, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { timestamp } from "./shared/presentation.js";
+import { restoreStructuredContent } from "./shared/tool-result.js";
 import { processStatus } from "./process-status.js";
 import "./shared/widget.css";
 import "./process.css";
@@ -170,7 +171,8 @@ const contextChanged = (context) => {
   }
 };
 app.addEventListener("toolinput", () => { details = undefined; render(); footer.textContent = "Reading process…"; });
-app.addEventListener("toolresult", (result) => {
+app.addEventListener("toolresult", (message) => {
+  const result = restoreStructuredContent(message);
   if (result?.isError || !result?.structuredContent) {
     footer.textContent = "Process result unavailable.";
     return;
