@@ -644,6 +644,13 @@ CMake alone determines compilation-context eligibility and notifies clangd throu
 its existing subscription. Source notifications combine Git dirty paths and
 committed tree changes; unknown changes use conservative invalidation. No external
 file watcher or cross-instance execution queue is added.
+Git snapshots the existence and types of tracked and nonignored untracked paths
+before and after mutations, retaining previous paths and explicitly selected file
+paths. Index/ref changes and commits, including `nothing to commit`, keep clangd
+sessions when working-file structure and CMake inputs remain unchanged. Actual
+path/type changes or an unknown outcome can invalidate contexts. Snapshots read no
+source contents, include at most 100,000 distinct paths, and do not track ignored-only
+changes or empty directories outside the catalog.
 
 Git output is bounded to 4 MiB per command; narrow the request when the limit is
 exceeded. Each command has a 300-second deadline and each request a 620-second
