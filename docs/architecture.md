@@ -955,6 +955,19 @@ top-level fields in `summary`, and `titleKey` plus an optional `categoryKey` for
 record headings and local filtering. It must not modify or discard original fields.
 The original structured object remains the source for JSON and copying.
 
+Both the shared App bridge and the separate `process_get` widget restore missing
+or null `structuredContent` from text-only history replay through
+`shared/tool-result.js`. Existing structured data and tool errors take precedence.
+Recovery accepts exactly one complete JSON object among the text content blocks,
+optionally wrapped in a JSON or unlabelled Markdown code fence. Multiple JSON
+objects, arrays, scalars, malformed JSON, and prose surrounding JSON leave the
+original response unchanged. The recovered envelope goes to both rendering and
+the existing immutable-resource loaders without changing the original content or
+metadata, issuing tool calls, or inferring fields from readable text. This is a
+compatibility path for retained JSON responses; current plain-text fallbacks do
+not carry enough data for recovery, and volatile linked resources remain unavailable
+after their owning server restarts.
+
 Use the existing renderer for new results that fit these two forms. If a future
 feature needs a specialized view, reuse `widget.css` and the shared controls and
 formatters; add only its actual presentation needs. Do not copy a stylesheet into a
@@ -1026,8 +1039,9 @@ These requirements apply to all existing and future widgets:
   apply initial and changed host theme, fonts, style variables and safe-area insets.
   A widget remains bound to its original invocation; it is not reused for a later
   call. Ignore late clipboard completion after teardown. Show useful waiting,
-  empty, error and missing-structured-data states; do not parse text fallback into
-  invented structured data. Use semantic controls, visible focus, accessible icon
+  empty, error and missing-structured-data states. Only the complete-JSON history
+  recovery described above may supply missing structured data; never infer fields
+  from readable text. Use semantic controls, visible focus, accessible icon
   labels and copy/status feedback. Load no external assets; host fonts are applied
   through the SDK. Useful MCP text fallback remains independent of the widget.
 

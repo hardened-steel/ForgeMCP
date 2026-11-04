@@ -58,6 +58,12 @@ without making additional tool calls. Process times are readable to seconds; JSO
 copying preserve the original precision. A toolsets list shows summaries, while a
 `toolset_get` result shows the details returned by that call.
 
+When a host restores chat history without `structuredContent`, widgets can recover
+the result from a single complete JSON object retained in a text content block,
+including a fenced JSON block. This supports older JSON tool responses; current
+plain-text responses alone cannot restore the structured result. Linked result
+resources still disappear when the server restarts.
+
 ForgeMCP can directly run an explicitly selected test executable inside the
 project or storage root; it does not expose shell commands or external executable
 paths over MCP. Feature services use
